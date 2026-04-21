@@ -12,9 +12,11 @@
 //!
 //! Per-frame flow:
 //!   1. `akiva_frame(ts)` is called by the worker's rAF loop.
-//!   2. All queued events are drained and dispatched via `handle_event`.
+//!   2. All queued events are drained and dispatched via `handle_event`,
+//!      which routes them through the framework to the active activity.
 //!   3. Scheduler runs ready tasks up to the frame budget.
-//!   4. Display manager renders the frame.
+//!   4. Framework renders the frame; the resulting `FrameCommands` buffer
+//!      is flushed to the HAL through `DisplayManager::flush`.
 
 pub mod display_manager;
 pub mod event_queue;
@@ -28,8 +30,11 @@ pub mod wasm_loader;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use akiva_framework::activity as fw_act;
+use akiva_framework::{self as framework, Framework};
+
 use crate::display_manager::DisplayManager;
-use crate::event_queue::{Event, EventQueue, PointerPhase};
+use crate::event_queue::{Event, EventQueue, KeyPhase, PointerPhase};
 use crate::scheduler::Scheduler;
 
 /// Global kernel state. There is exactly one of these per OS instance.
@@ -39,6 +44,9 @@ struct Kernel {
     scheduler: Scheduler,
     events: EventQueue,
     display: DisplayManager,
+    /// Lazy-initialised in `akiva_boot` because `Framework` allocates and
+    /// therefore cannot be `const`-constructed.
+    framework: Option<Framework>,
     frame_count: u64,
     last_frame_ms: f64,
 }
@@ -49,35 +57,58 @@ impl Kernel {
             scheduler: Scheduler::new(),
             events: EventQueue::new(),
             display: DisplayManager::new(),
+            framework: None,
             frame_count: 0,
             last_frame_ms: 0.0,
         }
     }
 
     fn handle_event(&mut self, ev: Event) {
+        let ts = self.last_frame_ms;
         match ev {
-            Event::Pointer { x, y, phase, .. } => match phase {
-                PointerPhase::Down => self.display.set_pointer(x, y, true),
-                PointerPhase::Move => {
-                    // Preserve pressed flag across moves by only updating if
-                    // the pointer is already active.
-                    let pressed = self.display.pointer_pressed();
-                    self.display.set_pointer(x, y, pressed);
+            Event::Pointer { x, y, button, phase } => {
+                if let Some(fw) = self.framework.as_mut() {
+                    fw.dispatch_pointer(
+                        fw_act::PointerEvent { x, y, button, phase: map_pointer_phase(phase) },
+                        ts,
+                    );
                 }
-                PointerPhase::Up => self.display.set_pointer(x, y, false),
-                PointerPhase::Cancel => self.display.pointer_leave(),
-            },
-            Event::Key { code, phase, .. } => {
-                log::debug(&format!("kernel: key {:?} code={}", phase, code));
+            }
+            Event::Key { code, modifiers, phase } => {
+                if let Some(fw) = self.framework.as_mut() {
+                    fw.dispatch_key(
+                        fw_act::KeyEvent { code, modifiers, phase: map_key_phase(phase) },
+                        ts,
+                    );
+                }
             }
             Event::Resize { width_px, height_px, density } => {
                 self.display.on_resize(width_px, height_px, density);
-                log::debug(&format!("kernel: resize {}x{} @ {}", width_px, height_px, density));
+                if let Some(fw) = self.framework.as_mut() {
+                    fw.set_metrics(fw_act::SurfaceMetrics { width_px, height_px, density });
+                }
             }
             Event::Visibility { visible } => {
                 log::debug(&format!("kernel: visibility={}", visible));
             }
         }
+    }
+}
+
+fn map_pointer_phase(p: PointerPhase) -> fw_act::PointerPhase {
+    match p {
+        PointerPhase::Down => fw_act::PointerPhase::Down,
+        PointerPhase::Move => fw_act::PointerPhase::Move,
+        PointerPhase::Up => fw_act::PointerPhase::Up,
+        PointerPhase::Cancel => fw_act::PointerPhase::Cancel,
+    }
+}
+
+fn map_key_phase(p: KeyPhase) -> fw_act::KeyPhase {
+    match p {
+        KeyPhase::Down => fw_act::KeyPhase::Down,
+        KeyPhase::Repeat => fw_act::KeyPhase::Repeat,
+        KeyPhase::Up => fw_act::KeyPhase::Up,
     }
 }
 
@@ -110,13 +141,23 @@ pub extern "C" fn akiva_boot() {
     let k = kernel();
     k.scheduler.init();
     k.display.init();
-    bump_boot_counter();
+
+    let boot_count = bump_boot_counter();
+    let mut fw = framework::boot(boot_count);
+    let m = k.display.metrics();
+    fw.set_metrics(fw_act::SurfaceMetrics {
+        width_px: m.width_px,
+        height_px: m.height_px,
+        density: m.density,
+    });
+    k.framework = Some(fw);
 }
 
 /// Exercises the storage HAL end-to-end: read a u32 counter under
-/// `sys/boot_count`, increment it, write it back. The value is logged so
-/// persistence can be verified by reloading the tab and watching it grow.
-fn bump_boot_counter() {
+/// `sys/boot_count`, increment it, write it back. The returned value is
+/// the post-increment count, fed into `framework::boot` so the Shell can
+/// display it.
+fn bump_boot_counter() -> u32 {
     const KEY: &str = "sys/boot_count";
     let prev = match storage::read(KEY) {
         Ok(bytes) if bytes.len() == 4 => {
@@ -126,7 +167,7 @@ fn bump_boot_counter() {
         Err(storage::StorageError::NotFound) => 0,
         Err(e) => {
             log::warn(&format!("boot_count read failed: {:?}", e));
-            return;
+            return 0;
         }
     };
     let next = prev.wrapping_add(1);
@@ -134,6 +175,7 @@ fn bump_boot_counter() {
         Ok(()) => log::info(&format!("kernel: boot #{} (prev={})", next, prev)),
         Err(e) => log::warn(&format!("boot_count write failed: {:?}", e)),
     }
+    next
 }
 
 /// Main loop tick. Called by the host on every rAF (or fixed cadence when
@@ -150,7 +192,14 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
     }
 
     k.scheduler.run_ready(timestamp_ms);
-    k.display.render_frame(timestamp_ms);
+
+    // Render through the framework, then flush the resulting command
+    // buffer to the HAL. The split keeps HAL calls confined to the kernel
+    // crate so the framework stays wasm-target-agnostic.
+    if let Some(fw) = k.framework.as_mut() {
+        let frame = fw.render_frame(timestamp_ms);
+        k.display.flush(frame);
+    }
 }
 
 /// Deliver an input/system event pushed by the HAL into a kernel-allocated

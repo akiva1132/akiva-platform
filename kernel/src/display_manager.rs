@@ -2,18 +2,20 @@
 //!
 //! A "display" is one OffscreenCanvas owned by a tab. The leader owns the
 //! kernel; each follower tab contributes exactly one display surface. The
-//! display manager tracks per-display metrics (size, density) and routes
-//! the frame to the right renderer backend.
+//! display manager tracks per-display metrics (size, density) and flushes
+//! the framework's [`FrameCommands`] buffer to the HAL's immediate-mode
+//! draw calls each frame.
 //!
-//! Phase 1b: single display, immediate-mode HAL calls, plus a pointer
-//! indicator that moves with the mouse — this is the visible proof that
-//! the full event pipeline (DOM → tab.js → worker → akiva_on_event →
-//! EventQueue → Kernel::handle_event → DisplayManager::set_pointer)
-//! works end-to-end.
+//! Phase 2a handover: the Phase 1b pointer indicator + banner moved into
+//! the framework's Shell activity. This module now only owns:
+//!   1. Surface metrics (picked up at init from HAL getters).
+//!   2. The "apply FrameCommands" loop (rendering happens here because
+//!      the kernel owns the `extern "C"` HAL imports, not the framework).
 //!
-//! Phase 2 replaces the inline draw calls with the RendererBackend trait
-//! described in ARCHITECTURE.md §10: the kernel builds a FrameCommands
-//! buffer and submits it to a pluggable backend (Canvas2D / WebGPU).
+//! Phase 2b will swap the immediate-mode HAL calls for a pluggable
+//! [`RendererBackend`] trait per ARCHITECTURE.md §10.
+
+use akiva_framework::compositor::{FrameCommands, PaintOp};
 
 use crate::host;
 
@@ -33,17 +35,8 @@ pub struct Display {
     pub visible: bool,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PointerState {
-    pub x: f32,
-    pub y: f32,
-    pub pressed: bool,
-    pub active: bool,   // false = we've never seen a pointer event
-}
-
 pub struct DisplayManager {
     primary: Display,
-    pointer: PointerState,
     initialised: bool,
 }
 
@@ -55,7 +48,6 @@ impl DisplayManager {
                 metrics: SurfaceMetrics { width_px: 0, height_px: 0, density: 1.0 },
                 visible: true,
             },
-            pointer: PointerState { x: 0.0, y: 0.0, pressed: false, active: false },
             initialised: false,
         }
     }
@@ -78,45 +70,31 @@ impl DisplayManager {
         self.primary.metrics = SurfaceMetrics { width_px: w, height_px: h, density };
     }
 
-    pub fn set_pointer(&mut self, x: f32, y: f32, pressed: bool) {
-        self.pointer = PointerState { x, y, pressed, active: true };
-    }
-
-    pub fn pointer_leave(&mut self) {
-        self.pointer.active = false;
-        self.pointer.pressed = false;
-    }
-
-    pub fn pointer_pressed(&self) -> bool {
-        self.pointer.pressed
-    }
-
-    pub fn render_frame(&mut self, _timestamp_ms: f64) {
+    /// Walk a frame buffer and issue the corresponding HAL calls. No-op
+    /// until the display has been initialised.
+    pub fn flush(&mut self, frame: &FrameCommands) {
         if !self.initialised { return; }
-
-        const BG: u32 = 0xff101418; // very dark charcoal
-        const FG: u32 = 0xffe0e0e0;
-        const POINTER_IDLE: u32 = 0x80_88ccff;
-        const POINTER_DOWN: u32 = 0xff_ff5577;
-
-        // SAFETY: all HAL draw calls accept primitive args; no pointers here.
+        // SAFETY: all HAL draw calls take primitives or pointers into
+        // UTF-8 slices we own for the duration of the call.
         unsafe {
-            host::hal_draw_clear(BG);
-
-            let label = "Akiva Kernel v0.0.1";
-            host::hal_draw_text(24.0, 48.0, 18.0, FG, label.as_ptr(), label.len());
-
-            if self.pointer.active {
-                let colour = if self.pointer.pressed { POINTER_DOWN } else { POINTER_IDLE };
-                // Simple 24×24 square centred on the pointer.
-                let size: f32 = 24.0;
-                host::hal_draw_rect(
-                    self.pointer.x - size * 0.5,
-                    self.pointer.y - size * 0.5,
-                    size, size, colour,
-                );
+            for op in frame.ops() {
+                match op {
+                    PaintOp::Clear { rgba } => host::hal_draw_clear(*rgba),
+                    PaintOp::FillRect { x, y, w, h, rgba } => {
+                        host::hal_draw_rect(*x, *y, *w, *h, *rgba);
+                    }
+                    PaintOp::DrawText { x, y, size, rgba, text } => {
+                        let bytes = text.as_bytes();
+                        host::hal_draw_text(*x, *y, *size, *rgba, bytes.as_ptr(), bytes.len());
+                    }
+                    // Clip/transform are no-ops against the immediate-mode
+                    // HAL for now; Phase 2b renderer backend honours them.
+                    PaintOp::PushClip { .. }
+                    | PaintOp::PopClip
+                    | PaintOp::PushTransform { .. }
+                    | PaintOp::PopTransform => {}
+                }
             }
-
             host::hal_draw_present();
         }
     }
@@ -126,4 +104,6 @@ impl DisplayManager {
     }
 
     pub fn primary(&self) -> Display { self.primary }
+
+    pub fn metrics(&self) -> SurfaceMetrics { self.primary.metrics }
 }

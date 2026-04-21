@@ -129,6 +129,10 @@
 
 ## שלב 2 — Framework Core: Activity + Package + Resource Managers
 
+**סטטוס (אפריל 2026):**
+- 🟢 **Phase 2a seed** הושלם: הframework מחובר ל-kernel, Activity state machine אמיתי (Initial→Created→Started→Resumed→Paused→Stopped→Destroyed עם אכיפת מעברים חוקיים), task stack, launch modes Standard + SingleTop, Shell system activity שמצייר banner + pointer indicator דרך ה-compositor. הinput/render flow כעת עובר framework→activity. ראה [framework/src/activity.rs](framework/src/activity.rs), [framework/src/activity_manager.rs](framework/src/activity_manager.rs), [framework/src/shell.rs](framework/src/shell.rs).
+- ⏳ Phase 2b: wasm-loaded app activities, PackageManager persistence, ResourceManager qualifier matching, SingleTask/SingleInstance launch modes.
+
 **מטרה:** Framework שיודע על אפליקציות, טוען manifest, ומנהל activity lifecycle. עדיין אין אפליקציות אמיתיות.
 
 **רכיבים שנבנים:**

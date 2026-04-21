@@ -95,8 +95,9 @@ akiva-platform/
 - ✅ Leader election + multi-tab + failover (Web Locks + BroadcastChannel)
 - ✅ Event pipeline end-to-end (DOM → Worker → Kernel → Canvas)
 - ✅ Storage: OPFS + SyncAccessHandle, ‏`kernel::storage` KV סינכרוני. ראה [docs/storage.md](docs/storage.md)
+- ✅ Framework seed (Phase 2a): Activity lifecycle state machine, Shell system activity, render pipeline compositor→HAL. ראה [framework/src/activity_manager.rs](framework/src/activity_manager.rs)
 - 🟡 Phase 1b שלם חלקית: cross-tab rendering עדיין לא מומש (follower displays רק נרשמים)
-- ⏳ Phase 2 (Framework) — לא התחיל
+- ⏳ Phase 2b (wasm app loader, PackageManager persistence, ResourceManager qualifiers) — לא התחיל
 
 ראה [ROADMAP.md](ROADMAP.md) לפירוט סטטוס ו-[docs/runtime-web.md](docs/runtime-web.md) לתיעוד מלא של ה-HAL.
 
