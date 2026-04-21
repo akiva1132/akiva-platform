@@ -13,6 +13,7 @@
 // the main thread is a thin input/output surface.
 
 import { Canvas2DBackend } from "./renderer/canvas2d.js";
+import { Storage, SR_BAD_KEY } from "./storage.js";
 
 /** @type {WebAssembly.Instance | null} */
 let instance = null;
@@ -24,6 +25,8 @@ let primary = null;
 let backend = null;
 /** Kernel init state. */
 let booted = false;
+/** Persistent KV store. Initialised before akiva_boot. */
+const storage = new Storage();
 /** UTF-8 decoder for host-side reading of kernel strings. */
 const decoder = new TextDecoder("utf-8");
 
@@ -60,6 +63,11 @@ self.addEventListener("message", (e) => {
 });
 
 async function bootKernel(kernelUrl, _tabId) {
+  // Storage must be ready before the kernel can call hal_storage_* from
+  // within akiva_boot. The load itself is async (OPFS handle creation),
+  // but every subsequent kernel-visible operation is synchronous.
+  await storage.load((level, text) => self.postMessage({ type: "log", level: levelCode(level), text }));
+
   const resp = await fetch(kernelUrl);
   if (!resp.ok) throw new Error(`fetch ${kernelUrl}: ${resp.status}`);
   const bytes = await resp.arrayBuffer();
@@ -136,9 +144,9 @@ function buildImports() {
     },
     hal_draw_present: () => backend?.present(),
 
-    hal_storage_read:   (_kptr, _klen, _outLenPtr) => 0, // Phase 2
-    hal_storage_write:  (_kptr, _klen, _vptr, _vlen) => 1,
-    hal_storage_delete: (_kptr, _klen) => 1,
+    hal_storage_read:   (kptr, klen, outLenPtr) => halStorageRead(kptr, klen, outLenPtr),
+    hal_storage_write:  (kptr, klen, vptr, vlen) => halStorageWrite(kptr, klen, vptr, vlen),
+    hal_storage_delete: (kptr, klen) => halStorageDelete(kptr, klen),
 
     hal_post_to_display: (displayId, ptr, len) => {
       const bytes = readBytes(ptr, len);
@@ -147,6 +155,53 @@ function buildImports() {
   };
   return { env };
 }
+
+// ── Storage bridge ──────────────────────────────────────────────────────
+//
+// Kernel-facing signatures (see kernel/src/host.rs):
+//   hal_storage_read(kptr, klen, out_len_ptr) -> *u8
+//     returns null on miss; otherwise a kernel-allocated buffer whose
+//     length has been written to *out_len_ptr. Kernel owns and frees it.
+//   hal_storage_write(kptr, klen, vptr, vlen) -> u32   // 0 = ok
+//   hal_storage_delete(kptr, klen) -> u32              // 0 = ok
+
+function halStorageRead(kptr, klen, outLenPtr) {
+  const key = readUtf8(kptr, klen);
+  if (!key) { writeUsize(outLenPtr, 0); return 0; }
+  const val = storage.get(key);
+  if (val === null) { writeUsize(outLenPtr, 0); return 0; }
+  // Hand the kernel a copy in its own memory so it controls the lifetime.
+  const ptr = instance.exports.akiva_alloc(val.byteLength);
+  if (ptr === 0) { writeUsize(outLenPtr, 0); return 0; }
+  new Uint8Array(memory.buffer, ptr, val.byteLength).set(val);
+  writeUsize(outLenPtr, val.byteLength);
+  return ptr;
+}
+
+function halStorageWrite(kptr, klen, vptr, vlen) {
+  const key = readUtf8(kptr, klen);
+  if (!key) return SR_BAD_KEY;
+  // Copy immediately — set() copies again defensively, but reading from
+  // wasm memory via a view is only safe before any allocation/growth.
+  const val = new Uint8Array(memory.buffer, vptr, vlen).slice();
+  return storage.set(key, val);
+}
+
+function halStorageDelete(kptr, klen) {
+  const key = readUtf8(kptr, klen);
+  if (!key) return SR_BAD_KEY;
+  return storage.delete(key);
+}
+
+// Writes a usize (32-bit on wasm32) into kernel memory.
+function writeUsize(ptr, value) {
+  new DataView(memory.buffer).setUint32(ptr, value >>> 0, true);
+}
+
+// Flush + release the OPFS handle if the worker is being torn down.
+// Browsers auto-release on worker termination, but flushing first
+// reduces the window where a crash leaves the file mid-write.
+self.addEventListener("unload", () => storage.close());
 
 // ── Event forwarding ────────────────────────────────────────────────────
 

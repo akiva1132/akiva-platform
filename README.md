@@ -23,6 +23,7 @@
 - [docs/abi.md](docs/abi.md) — חוזה ה-ABI (WIT / Component Model)
 - [docs/sdk-rust.md](docs/sdk-rust.md) — SDK לפיתוח אפליקציות ב-Rust
 - [docs/runtime-web.md](docs/runtime-web.md) — JS HAL: leader election, transport, event pipeline
+- [docs/storage.md](docs/storage.md) — OPFS-backed KV store
 - [docs/notifications.md](docs/notifications.md) — Notifications (MVP-thin)
 - [docs/testing.md](docs/testing.md) — אסטרטגיית בדיקות
 - [docs/observability.md](docs/observability.md) — Logging, tracing, debugging
@@ -93,7 +94,8 @@ akiva-platform/
 - ✅ Kernel wasm רץ ב-Dedicated Worker
 - ✅ Leader election + multi-tab + failover (Web Locks + BroadcastChannel)
 - ✅ Event pipeline end-to-end (DOM → Worker → Kernel → Canvas)
-- 🟡 Phase 1b שלם חלקית: cross-tab rendering ו-storage (OPFS) טרם יושמו
+- ✅ Storage: OPFS + SyncAccessHandle, ‏`kernel::storage` KV סינכרוני. ראה [docs/storage.md](docs/storage.md)
+- 🟡 Phase 1b שלם חלקית: cross-tab rendering עדיין לא מומש (follower displays רק נרשמים)
 - ⏳ Phase 2 (Framework) — לא התחיל
 
 ראה [ROADMAP.md](ROADMAP.md) לפירוט סטטוס ו-[docs/runtime-web.md](docs/runtime-web.md) לתיעוד מלא של ה-HAL.

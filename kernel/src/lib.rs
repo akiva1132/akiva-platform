@@ -110,6 +110,30 @@ pub extern "C" fn akiva_boot() {
     let k = kernel();
     k.scheduler.init();
     k.display.init();
+    bump_boot_counter();
+}
+
+/// Exercises the storage HAL end-to-end: read a u32 counter under
+/// `sys/boot_count`, increment it, write it back. The value is logged so
+/// persistence can be verified by reloading the tab and watching it grow.
+fn bump_boot_counter() {
+    const KEY: &str = "sys/boot_count";
+    let prev = match storage::read(KEY) {
+        Ok(bytes) if bytes.len() == 4 => {
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        }
+        Ok(_) => 0,
+        Err(storage::StorageError::NotFound) => 0,
+        Err(e) => {
+            log::warn(&format!("boot_count read failed: {:?}", e));
+            return;
+        }
+    };
+    let next = prev.wrapping_add(1);
+    match storage::write(KEY, &next.to_le_bytes()) {
+        Ok(()) => log::info(&format!("kernel: boot #{} (prev={})", next, prev)),
+        Err(e) => log::warn(&format!("boot_count write failed: {:?}", e)),
+    }
 }
 
 /// Main loop tick. Called by the host on every rAF (or fixed cadence when
