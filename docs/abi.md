@@ -94,11 +94,17 @@ extern "C" fn akiva_app_render(handle: u32, ts_ms: f64, out_len_ptr: *mut u32) -
 // level: 0=trace 1=debug 2=info 3=warn 4=error (מקביל ל-hal_log של ה-kernel).
 // ptr/len: תוך ה-memory של ה-app; ה-host קורא אותן inline.
 extern "C" fn akiva_host_log(level: u32, ptr: *const u8, len: u32);
+
+// Measure the rendered width of a UTF-8 string at the given font size,
+// in the same font the renderer uses (system-ui stack). Height is
+// deterministic from `size` (line-height ratio), so the host only
+// returns width; the SDK computes height locally.
+extern "C" fn akiva_host_text_width(ptr: *const u8, len: u32, size: f32) -> f32;
 ```
 
 כל app מקבל את ה-set הבסיסי הזה אוטומטית ללא הצהרה. הרחבות נוספות (finish, start_activity, storage read/write, intent dispatch) תיכנסנה כשאפליקציות אמיתיות יצטרכו אותן, ובכפוף למבחני §1.2 — כל הרחבה דורשת use case מוכח ו-mapping ל-WIT interface ב-§5.
 
-ב-v1 כל ה-imports יתמפו ל-interfaces המובנים של ה-world `akiva:app/host`: `log`, `activity-api`, `storage`, `intent`, וכו'. נקודת ה-mapping: `akiva_host_log` ⇔ `log.log(level, msg)`.
+ב-v1 כל ה-imports יתמפו ל-interfaces המובנים של ה-world `akiva:app/host`: `log`, `activity-api`, `storage`, `intent`, וכו'. נקודת ה-mapping: `akiva_host_log` ⇔ `log.log(level, msg)`, `akiva_host_text_width` ⇔ `text.measure-width(text, size)`.
 
 ### 2.4 Imports (kernel → host) — `hal_app_*`
 

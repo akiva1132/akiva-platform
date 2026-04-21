@@ -14,6 +14,8 @@
 // WebAssembly compile) so `hal_app_register` can return a ready handle
 // from within kernel code — no promise juggling needed.
 
+import { fontString } from "./renderer/canvas2d.js";
+
 export class AppRegistry {
   /**
    * @param {object} deps
@@ -32,6 +34,20 @@ export class AppRegistry {
     this._processes = new Map();
     this._nextHandle = 1;
     this._decoder = new TextDecoder("utf-8");
+
+    // Dedicated 1×1 context used only for `measureText`. Sharing the
+    // renderer's main context would work but ties measurement to display
+    // readiness — an app can call `text_width` before the display has
+    // attached. Keeping it separate also lets us `font=` it freely
+    // without thrashing the renderer's state.
+    this._measureCanvas = new OffscreenCanvas(1, 1);
+    this._measureCtx = this._measureCanvas.getContext("2d");
+  }
+
+  /** Width in pixels of `text` at `size_px` in the shared UI font. */
+  measureTextWidth(text, size_px) {
+    this._measureCtx.font = fontString(size_px);
+    return this._measureCtx.measureText(text).width;
   }
 
   // ── Public API (called by worker.js `hal_app_*` bridges) ────────────────
@@ -216,6 +232,15 @@ export class AppRegistry {
           if (!proc?.memory) return;
           const text = self._decoder.decode(new Uint8Array(proc.memory.buffer, ptr, len));
           self._log(LEVEL_NAMES[level] ?? "info", `[${packageId}] ${text}`);
+        },
+        akiva_host_text_width: (ptr, len, size) => {
+          const proc = self._processes.get(packageId);
+          // A length of 0 is a legitimate call (empty label) and should
+          // return 0 without touching memory.
+          if (len === 0) return 0;
+          if (!proc?.memory) return 0;
+          const text = self._decoder.decode(new Uint8Array(proc.memory.buffer, ptr, len));
+          return self.measureTextWidth(text, size);
         },
       },
     };

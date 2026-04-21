@@ -5,6 +5,16 @@
 // adds a WebGPU backend and a feature-detection shim that picks the best
 // available option at boot.
 
+// Font stack used everywhere we draw text. Must stay in lockstep with
+// the measurement path in app_registry.js — any divergence and the
+// SDK's intrinsic widths won't match what lands on the canvas.
+export const FONT_FAMILY = "system-ui, -apple-system, sans-serif";
+
+/** Canonical `CanvasRenderingContext2D.font` value for a given size. */
+export function fontString(size_px) {
+  return `${size_px}px ${FONT_FAMILY}`;
+}
+
 export class Canvas2DBackend {
   constructor() {
     /** @type {OffscreenCanvas|null} */
@@ -50,7 +60,7 @@ export class Canvas2DBackend {
   drawText(x, y, size_px, rgba, text) {
     if (!this.ctx) return;
     this.ctx.fillStyle = rgbaToCss(rgba);
-    this.ctx.font = `${size_px}px system-ui, -apple-system, sans-serif`;
+    this.ctx.font = fontString(size_px);
     this.ctx.fillText(text, x, y);
   }
 

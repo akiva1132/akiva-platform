@@ -205,7 +205,14 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         if self.presented { return; }
         self.presented = true;
 
-        let sizes = layout::measure(&self.nodes, root, self.viewport, self.density);
+        // Wire the layout engine to the host's text measurer. The
+        // indirection (rather than calling `runtime::text_width`
+        // directly inside `measure`) keeps layout independently
+        // testable — tests pass a deterministic fake.
+        let sizes = layout::measure(
+            &self.nodes, root, self.viewport, self.density,
+            &|text, size| crate::runtime::text_width(text, size),
+        );
         let mut rects: HashMap<NodeId, Rect> = HashMap::new();
         layout::layout(&self.nodes, root, Rect { x: 0.0, y: 0.0, w: self.viewport.0, h: self.viewport.1 }, &sizes, &mut rects);
 

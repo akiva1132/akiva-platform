@@ -5,8 +5,10 @@
 //! 1. [`measure`] — bottom-up recursion that produces an intrinsic size
 //!    for every node. Stacks sum their children along the main axis and
 //!    take max along the cross; leaves report content-derived sizes.
-//!    Text metrics are estimated (`chars * size * 0.55`) because the
-//!    host hasn't exposed real font metrics yet; close enough for MVP.
+//!    Text width comes from the caller-supplied measurer (wired to the
+//!    host's `CanvasRenderingContext2D.measureText` in production); the
+//!    vertical extent stays a `size × line-height-ratio` computation
+//!    because single-line metrics from the host don't add much there.
 //!
 //! 2. [`layout`] — top-down placement. The root gets the full viewport
 //!    as its rect; each stack hands its children slices off the main
@@ -19,25 +21,31 @@ use std::collections::HashMap;
 use super::node::{Node, NodeId};
 use super::Rect;
 
-/// Character width estimate (fraction of font size) for mono-ish
-/// system-ui. Sans-serif is closer to 0.50; bold closer to 0.60. The
-/// middle-ground 0.55 over-estimates narrow text slightly, which
-/// leaves a comfortable tap target and avoids clipping.
-const TEXT_CHAR_W_RATIO: f32 = 0.55;
-
 /// Line-height multiplier for intrinsic text height — matches the
 /// ~1.3 default line-height of most UA stylesheets, which is what
 /// Canvas2D `fillText` visually implies.
 const TEXT_LINE_H_RATIO: f32 = 1.3;
+
+/// Estimate-based width used when the host isn't available (tests,
+/// fallback). 0.55 × size × char-count over-estimates narrow glyphs
+/// slightly, which leaves a comfortable tap target and avoids
+/// clipping. Kept `pub(crate)` so tests can assert against it.
+/// Only referenced from tests — in production builds the measurer
+/// path goes through `runtime::text_width`.
+#[cfg(test)]
+pub(crate) fn estimate_text_width(text: &str, size: f32) -> f32 {
+    text.chars().count() as f32 * size * 0.55
+}
 
 pub fn measure(
     nodes: &[Node],
     root: NodeId,
     viewport: (f32, f32),
     _density: f32,
+    text_width: &dyn Fn(&str, f32) -> f32,
 ) -> HashMap<NodeId, (f32, f32)> {
     let mut out = HashMap::new();
-    measure_node(nodes, root, viewport, &mut out);
+    measure_node(nodes, root, viewport, text_width, &mut out);
     out
 }
 
@@ -45,18 +53,19 @@ fn measure_node(
     nodes: &[Node],
     id: NodeId,
     avail: (f32, f32),
+    text_width: &dyn Fn(&str, f32) -> f32,
     out: &mut HashMap<NodeId, (f32, f32)>,
 ) -> (f32, f32) {
     let size = match &nodes[id] {
         Node::Text { text, size, .. } => {
-            let w = text.chars().count() as f32 * *size * TEXT_CHAR_W_RATIO;
+            let w = text_width(text, *size);
             let h = *size * TEXT_LINE_H_RATIO;
             (w, h)
         }
         Node::Rect { min, .. } => *min,
         Node::Spacer { min } => *min,
         Node::Button { label, label_size, pad, .. } => {
-            let label_w = label.chars().count() as f32 * *label_size * TEXT_CHAR_W_RATIO;
+            let label_w = text_width(label, *label_size);
             let label_h = *label_size * TEXT_LINE_H_RATIO;
             (label_w + 2.0 * pad.0, label_h + 2.0 * pad.1)
         }
@@ -68,7 +77,7 @@ fn measure_node(
             let mut max_w: f32 = 0.0;
             let mut sum_h: f32 = 0.0;
             for (i, c) in children.iter().enumerate() {
-                let (cw, ch) = measure_node(nodes, *c, inner_avail, out);
+                let (cw, ch) = measure_node(nodes, *c, inner_avail, text_width, out);
                 if cw > max_w { max_w = cw; }
                 sum_h += ch;
                 if i + 1 < children.len() { sum_h += gap; }
@@ -83,7 +92,7 @@ fn measure_node(
             let mut sum_w: f32 = 0.0;
             let mut max_h: f32 = 0.0;
             for (i, c) in children.iter().enumerate() {
-                let (cw, ch) = measure_node(nodes, *c, inner_avail, out);
+                let (cw, ch) = measure_node(nodes, *c, inner_avail, text_width, out);
                 sum_w += cw;
                 if ch > max_h { max_h = ch; }
                 if i + 1 < children.len() { sum_w += gap; }
@@ -180,7 +189,7 @@ mod tests {
     #[test]
     fn text_measures_from_char_count_and_size() {
         let nodes = vec![text("abc", 10.0)];
-        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0, &estimate_text_width);
         // 3 chars × 10.0 × 0.55 = 16.5;   10.0 × 1.3 = 13.0
         assert_eq!(sizes[&0], (16.5, 13.0));
     }
@@ -188,7 +197,7 @@ mod tests {
     #[test]
     fn rect_reports_its_min_size() {
         let nodes = vec![rect(40.0, 20.0)];
-        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0, &estimate_text_width);
         assert_eq!(sizes[&0], (40.0, 20.0));
     }
 
@@ -198,7 +207,7 @@ mod tests {
             id: "b".into(), label: "ok".into(), label_size: 10.0,
             bg: 0, bg_pressed: 0, fg: 0, pad: (8.0, 4.0),
         }];
-        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0, &estimate_text_width);
         // label: 2 × 10.0 × 0.55 = 11.0 + 2×8 = 27; 13.0 + 2×4 = 21
         assert_eq!(sizes[&0], (27.0, 21.0));
     }
@@ -209,7 +218,7 @@ mod tests {
             rect(10.0, 5.0), rect(20.0, 7.0),
             Node::VStack { children: vec![0, 1], gap: 3.0, padding: (0.0, 0.0, 0.0, 0.0) },
         ];
-        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
         // max(10, 20) = 20; 5 + 7 + 3 = 15
         assert_eq!(sizes[&2], (20.0, 15.0));
     }
@@ -220,7 +229,7 @@ mod tests {
             rect(10.0, 5.0), rect(20.0, 7.0),
             Node::HStack { children: vec![0, 1], gap: 3.0, padding: (0.0, 0.0, 0.0, 0.0) },
         ];
-        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
         // 10 + 20 + 3 = 33; max(5, 7) = 7
         assert_eq!(sizes[&2], (33.0, 7.0));
     }
@@ -231,7 +240,7 @@ mod tests {
             rect(10.0, 10.0),
             Node::VStack { children: vec![0], gap: 0.0, padding: (4.0, 5.0, 6.0, 7.0) },
         ];
-        let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0, &estimate_text_width);
         // w: 10 + 7 + 5 = 22;  h: 10 + 4 + 6 = 20
         assert_eq!(sizes[&1], (22.0, 20.0));
     }
@@ -241,7 +250,7 @@ mod tests {
         let nodes = vec![
             Node::VStack { children: vec![], gap: 10.0, padding: (3.0, 3.0, 3.0, 3.0) },
         ];
-        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0, &estimate_text_width);
         // gap doesn't apply to zero children; padding remains.
         assert_eq!(sizes[&0], (6.0, 6.0));
     }
@@ -252,7 +261,7 @@ mod tests {
             rect(10.0, 5.0),
             Node::VStack { children: vec![0], gap: 100.0, padding: (0.0, 0.0, 0.0, 0.0) },
         ];
-        let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0, &estimate_text_width);
         assert_eq!(sizes[&1], (10.0, 5.0));
     }
 
@@ -264,7 +273,7 @@ mod tests {
             rect(10.0, 5.0), rect(10.0, 7.0),
             Node::VStack { children: vec![0, 1], gap: 3.0, padding: (0.0, 0.0, 0.0, 0.0) },
         ];
-        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
         layout(&nodes, 2, Rect { x: 100.0, y: 200.0, w: 500.0, h: 500.0 }, &sizes, &mut rects);
         // Root at slot origin.
@@ -281,7 +290,7 @@ mod tests {
             rect(10.0, 5.0), rect(15.0, 5.0),
             Node::HStack { children: vec![0, 1], gap: 4.0, padding: (0.0, 0.0, 0.0, 0.0) },
         ];
-        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
         layout(&nodes, 2, Rect { x: 50.0, y: 0.0, w: 500.0, h: 500.0 }, &sizes, &mut rects);
         assert!(approx(rects[&0].x, 50.0));
@@ -295,7 +304,7 @@ mod tests {
             rect(10.0, 10.0),
             Node::VStack { children: vec![0], gap: 0.0, padding: (4.0, 5.0, 6.0, 7.0) },
         ];
-        let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
         layout(&nodes, 1, Rect { x: 0.0, y: 0.0, w: 500.0, h: 500.0 }, &sizes, &mut rects);
         // Child shifted right by left-pad (7) and down by top-pad (4).
@@ -308,7 +317,7 @@ mod tests {
         // Slot smaller than measured intrinsic — place() should clamp so
         // paint doesn't overdraw the slot.
         let nodes = vec![rect(100.0, 100.0)];
-        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
         layout(&nodes, 0, Rect { x: 0.0, y: 0.0, w: 40.0, h: 30.0 }, &sizes, &mut rects);
         assert!(approx(rects[&0].w, 40.0));
@@ -327,7 +336,7 @@ mod tests {
             /* 4 */ Node::VStack { children: vec![3], gap: 0.0, padding: (0.0,0.0,0.0,0.0) },
             /* 5 */ Node::HStack { children: vec![2, 4], gap: 3.0, padding: (0.0,0.0,0.0,0.0) },
         ];
-        let sizes = measure(&nodes, 5, (1000.0, 1000.0), 1.0);
+        let sizes = measure(&nodes, 5, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
         layout(&nodes, 5, Rect { x: 0.0, y: 0.0, w: 500.0, h: 500.0 }, &sizes, &mut rects);
         // Left VStack at x=0; its children also at x=0.

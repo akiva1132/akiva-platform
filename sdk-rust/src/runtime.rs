@@ -22,11 +22,33 @@ use std::collections::HashMap;
 
 use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase};
 
-// Host-provided log sink. Matches the `env.akiva_host_log` import the
-// worker's `AppRegistry._buildAppImports` installs. Rustdoc doesn't
-// render docs on extern blocks, so this is a plain comment.
+// Host-provided imports. Matches `AppRegistry._buildAppImports` in
+// runtime/web/app_registry.js. Gated on wasm32 so non-wasm builds
+// (cargo test) link without needing to provide the symbols — the
+// corresponding helper functions below fall back to in-process
+// approximations when the host isn't available.
+#[cfg(target_arch = "wasm32")]
 extern "C" {
     pub fn akiva_host_log(level: u32, ptr: *const u8, len: u32);
+    pub fn akiva_host_text_width(ptr: *const u8, len: u32, size: f32) -> f32;
+}
+
+/// Measure a rendered UTF-8 string's width at `size` pixels. On wasm
+/// this calls through to the host's `CanvasRenderingContext2D.measureText`
+/// against the same font the renderer uses, so SDK layout agrees with
+/// what actually lands on screen. On non-wasm builds (tests) this falls
+/// back to the cheap `chars × size × 0.55` estimate — layout tests that
+/// depend on exact numbers should pass in their own fake to avoid
+/// coupling to this heuristic.
+pub fn text_width(text: &str, size: f32) -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        akiva_host_text_width(text.as_ptr(), text.len() as u32, size)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        text.chars().count() as f32 * size * 0.55
+    }
 }
 
 /// Minimum paint-op capacity we pre-allocate per slot. Grows on demand;

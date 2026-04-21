@@ -12,14 +12,17 @@ pub const LEVEL_ERROR: u32 = 4;
 
 #[doc(hidden)]
 pub fn __emit(level: u32, msg: &str) {
-    let bytes = msg.as_bytes();
-    // SAFETY: slice is valid for `bytes.len()`; host reads only. On wasm
-    // targets `akiva_host_log` is an import supplied by the worker. On
-    // non-wasm (unit tests), the extern isn't linked — but sdk-rust is
-    // only ever built for wasm, so this is fine.
+    // On wasm the host supplies `akiva_host_log`. On non-wasm (cargo
+    // test, docs) the extern isn't in scope — we swallow the message
+    // so apps' log macros don't block unit tests. Level is unused in
+    // the fallback; tag it so the compiler doesn't warn.
+    #[cfg(target_arch = "wasm32")]
     unsafe {
+        let bytes = msg.as_bytes();
         crate::runtime::akiva_host_log(level, bytes.as_ptr(), bytes.len() as u32);
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    { let _ = (level, msg); }
 }
 
 #[macro_export]
