@@ -1,20 +1,31 @@
 // Tab HAL.
 //
-// Each browser tab runs this module. The tab is responsible for:
-//   1. Owning the canvas and input surface.
-//   2. Participating in leader election (see leader.js).
-//   3. If leader: spawning the Dedicated Worker that hosts the kernel wasm.
-//   4. If follower: using the broadcast channel as the kernel transport.
-//   5. Transferring an OffscreenCanvas to the worker so all rendering
-//      happens off-main-thread. Followers don't transfer — they receive
-//      frame deltas from the leader and render onto their own canvas.
+// Each browser tab runs this module. Responsibilities:
+//   1. Own the canvas and input surface.
+//   2. Run a leader-election Session (see leader.js).
+//   3. On becoming leader (either immediately or via promotion from
+//      follower on failover): transfer the canvas to a Dedicated Worker
+//      that hosts the kernel wasm.
+//   4. On becoming follower: stay main-thread-side, pipe input + resize
+//      to the leader via the broadcast channel.
 //
-// Matches ARCHITECTURE.md §9 (single-instance architecture) and §10
-// (renderer backend) — the pluggable backend lives inside the worker.
+// The Session abstracts transport. We call `session.send(...)` the same
+// way regardless of role; it routes to the worker (leader) or the
+// BroadcastChannel (follower).
+//
+// Lifecycle of the canvas:
+//   - From mount until we become leader: main-thread owned, sized in JS.
+//   - After becoming leader: ownership transferred to the worker via
+//     `transferControlToOffscreen()`. All width/height changes from here
+//     on are sent as "resize" messages; the worker applies them inside
+//     its own context.
+//
+// See docs/runtime-web.md for the full protocol.
 
-import { electLeader } from "./leader.js";
+import { Session } from "./leader.js";
 
 const KERNEL_URL = "./akiva-kernel.wasm";
+const WORKER_URL = new URL("./worker.js", import.meta.url);
 const CHANNEL = "akiva.os";
 const LEADER_LOCK = "akiva.os.leader";
 
@@ -24,61 +35,114 @@ const bootEl = document.getElementById("akiva-boot");
 const tabId = crypto.randomUUID();
 
 const dpr = () => self.devicePixelRatio || 1;
-function sizeCanvasToViewport(canvas) {
-  const ratio = dpr();
-  const w = Math.max(1, Math.floor(window.innerWidth * ratio));
-  const h = Math.max(1, Math.floor(window.innerHeight * ratio));
-  if (canvas.width !== w) canvas.width = w;
-  if (canvas.height !== h) canvas.height = h;
-  return { width_px: w, height_px: h, density: ratio };
-}
 
-/** Uniform transport interface over Worker (leader) or BroadcastChannel (follower). */
-function makeTransport(role, port) {
-  if (role === "leader") {
-    return {
-      send: (msg, transfer = []) => port.postMessage(msg, transfer),
-      on:   (handler) => port.addEventListener("message", (e) => handler(e.data)),
-    };
-  }
-  // Follower: wrap broadcast channel so messages are namespaced and
-  // addressed to/from the leader.
+function computeMetrics() {
+  const ratio = dpr();
   return {
-    send: (msg) => port.postMessage({ type: "follower_msg", payload: msg }),
-    on:   (handler) => port.addEventListener("message", (e) => {
-      if (e.data?.type === "leader_msg") handler(e.data.payload);
-    }),
+    width_px:  Math.max(1, Math.floor(window.innerWidth  * ratio)),
+    height_px: Math.max(1, Math.floor(window.innerHeight * ratio)),
+    density:   ratio,
   };
 }
 
-function attachCanvas(transport, role, canvas) {
-  const metrics = sizeCanvasToViewport(canvas);
-  if (role === "leader") {
-    // Only the leader can transfer the canvas to the worker it owns.
-    const offscreen = canvas.transferControlToOffscreen();
-    transport.send(
-      { type: "attach_display", tabId, surface: offscreen, metrics },
-      [offscreen],
-    );
-  } else {
-    // Follower: keep the canvas main-thread-side; the leader pushes frame
-    // deltas back which we apply locally (Phase 2). For now the follower
-    // canvas just shows the boot banner.
-    transport.send({ type: "register_follower_display", tabId, metrics });
-  }
-
-  window.addEventListener("resize", () => {
-    const m = sizeCanvasToViewport(canvas);
-    transport.send({ type: "resize", tabId, metrics: m });
-  });
+/** Canvas sizing is valid only while the canvas is main-thread-owned.
+ *  Once transferControlToOffscreen has been called, this function must
+ *  not be called again — resize is handled inside the worker. */
+function applyCanvasSize(canvas, metrics) {
+  canvas.width  = metrics.width_px;
+  canvas.height = metrics.height_px;
 }
 
-function forwardInput(transport, canvas) {
+/** Per-tab mutable state that survives role transitions. */
+const state = {
+  ownsCanvas: true,   // true until we transferControlToOffscreen
+  canvasTransferred: false,
+  metrics: computeMetrics(),
+};
+
+// Initial canvas size. Safe regardless of role; after promotion we stop
+// touching it from here.
+applyCanvasSize(surfaceEl, state.metrics);
+
+const session = new Session({
+  channel: CHANNEL,
+  lockName: LEADER_LOCK,
+  tabId,
+  kernelUrl: KERNEL_URL,
+  workerUrl: WORKER_URL,
+});
+
+session.addEventListener("role", (e) => onRoleChange(e.detail));
+session.addEventListener("message", (e) => onKernelMessage(e.detail));
+session.addEventListener("panic", (e) => onPanic(e.detail.text));
+
+// Input + resize forwarding are hooked exactly once. The Session takes
+// care of routing to the right place based on its current role.
+installInputForwarding(surfaceEl);
+installResizeHandler(surfaceEl);
+
+session.start().catch((err) => onPanic(`boot failed: ${err?.message ?? err}`));
+
+// ── Role handling ────────────────────────────────────────────────────
+
+function onRoleChange({ role, promoted }) {
+  console.log(
+    `[akiva] tab ${tabId.slice(0, 8)} — role=${role}${promoted ? " (promoted)" : ""}`,
+  );
+
+  if (role === "leader") {
+    // Transfer the canvas to the worker. Only valid if we haven't
+    // transferred before — which is guaranteed by design since we only
+    // transfer on becoming leader, and leader is terminal (no demotion).
+    if (!state.canvasTransferred) {
+      const offscreen = surfaceEl.transferControlToOffscreen();
+      state.canvasTransferred = true;
+      state.ownsCanvas = false;
+      session.send(
+        { type: "attach_display", tabId, surface: offscreen, metrics: state.metrics },
+        [offscreen],
+      );
+    }
+    // If we were promoted from follower, the boot banner was already
+    // hidden back when we first became follower. Either way, hide it.
+    bootEl.classList.add("hidden");
+  } else if (role === "follower") {
+    // Register with the current leader so it can composite a follower
+    // display in the future (Phase 2). We also hide the boot banner —
+    // the OS is alive, we just don't own it.
+    session.send({ type: "register_follower_display", tabId, metrics: state.metrics });
+    bootEl.classList.add("hidden");
+  }
+}
+
+function onKernelMessage(msg) {
+  switch (msg?.type) {
+    case "boot_ok":
+      bootEl.classList.add("hidden");
+      break;
+    case "log":
+      console.log(`[kernel ${msg.level}] ${msg.text}`);
+      break;
+    case "panic":
+      onPanic(msg.text);
+      break;
+  }
+}
+
+function onPanic(text) {
+  console.error("[akiva] panic:", text);
+  bootEl.classList.remove("hidden");
+  bootEl.textContent = `Akiva crashed: ${text}`;
+}
+
+// ── Input forwarding ─────────────────────────────────────────────────
+
+function installInputForwarding(canvas) {
   const rect = () => canvas.getBoundingClientRect();
 
   const pointerEvent = (phase) => (e) => {
     const r = rect(); const ratio = dpr();
-    transport.send({
+    session.send({
       type: "event", kind: "pointer", tabId,
       x: (e.clientX - r.left) * ratio,
       y: (e.clientY - r.top) * ratio,
@@ -93,7 +157,7 @@ function forwardInput(transport, canvas) {
   canvas.addEventListener("pointercancel", pointerEvent("cancel"));
 
   const keyEvent = (phase) => (e) => {
-    transport.send({
+    session.send({
       type: "event", kind: "key", tabId,
       code: e.keyCode | 0, modifiers: encodeModifiers(e), phase,
     });
@@ -103,10 +167,19 @@ function forwardInput(transport, canvas) {
   canvas.addEventListener("keyup", keyEvent("up"));
 
   document.addEventListener("visibilitychange", () => {
-    transport.send({
+    session.send({
       type: "event", kind: "visibility", tabId,
       visible: document.visibilityState === "visible",
     });
+  });
+}
+
+function installResizeHandler(canvas) {
+  window.addEventListener("resize", () => {
+    const m = computeMetrics();
+    state.metrics = m;
+    if (state.ownsCanvas) applyCanvasSize(canvas, m);
+    session.send({ type: "resize", tabId, metrics: m });
   });
 }
 
@@ -116,44 +189,3 @@ function encodeModifiers(e) {
 function shouldPassThroughKey(e) {
   return e.key === "F5" || e.key === "F12" || (e.ctrlKey && (e.key === "r" || e.key === "R"));
 }
-
-function onKernelMessage(msg) {
-  switch (msg?.type) {
-    case "boot_ok":
-      bootEl.classList.add("hidden");
-      break;
-    case "log":
-      console.log(`[kernel ${msg.level}] ${msg.text}`);
-      break;
-    case "panic":
-      bootEl.classList.remove("hidden");
-      bootEl.textContent = `Akiva crashed: ${msg.text}`;
-      break;
-    default:
-      break;
-  }
-}
-
-async function boot() {
-  const { role, port } = await electLeader({
-    channel: CHANNEL,
-    lockName: LEADER_LOCK,
-    spawnLeader: () => {
-      const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
-      worker.postMessage({ type: "init", kernelUrl: KERNEL_URL, tabId });
-      return worker;
-    },
-  });
-
-  console.log(`[akiva] tab ${tabId.slice(0, 8)} — role=${role}`);
-
-  const transport = makeTransport(role, port);
-  transport.on(onKernelMessage);
-  attachCanvas(transport, role, surfaceEl);
-  forwardInput(transport, surfaceEl);
-}
-
-boot().catch((err) => {
-  console.error("[akiva] boot failed", err);
-  bootEl.textContent = `Akiva failed to boot: ${err?.message ?? err}`;
-});

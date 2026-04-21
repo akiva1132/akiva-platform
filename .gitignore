@@ -8,6 +8,9 @@ Cargo.lock.bak
 *.wasm.map
 /dist/
 /build/
+# The kernel wasm is built into target/ and copied here by the dev workflow;
+# never commit the copy.
+runtime/web/akiva-kernel.wasm
 
 # wit-bindgen generated (kept in tree if committed; ignore if regenerated)
 # bindings/generated/

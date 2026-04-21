@@ -1,97 +1,184 @@
-// Leader election.
+// Leader election + transport session.
 //
-// Pattern: Web Locks for primacy + BroadcastChannel for discovery and
-// follower↔leader messaging. ARCHITECTURE.md §9 walks through why this
-// beats SharedWorker (Safari support, lifetime guarantees).
+// A single `Session` instance per tab coordinates with all other tabs of
+// the same origin. It handles:
 //
-//   1. Every tab requests `navigator.locks.request(LEADER_LOCK, exclusive)`.
-//      The winner becomes leader — its callback stays active until the
-//      tab closes, at which point the lock is released and a follower
-//      takes over automatically.
-//   2. On tab startup, a short probe on the broadcast channel discovers
-//      whether there already is a leader. Followers then use the same
-//      channel as their transport.
+//   - Initial election: race the Web Lock while probing the broadcast
+//     channel for an existing leader.
+//   - Steady-state transport: leader talks directly to its worker;
+//     follower talks to the leader over the broadcast channel.
+//   - Failover: if the current leader dies, its Web Lock is released by
+//     the browser. Every follower's pending lock request is queued FIFO;
+//     the next one in line is promoted to leader automatically.
 //
-// Phase 2 upgrades follower↔leader transport from BroadcastChannel to
-// per-tab MessagePorts. BroadcastChannel cannot transfer ports, so the
-// upgrade path goes: leader posts a Worker-hosted MessagePort URL that
-// the follower opens via `SharedWorker` (feature-detected), or the
-// follower negotiates a dedicated ReadableStream pair.
+// See docs/runtime-web.md for the full protocol and the failover
+// walkthrough.
+//
+// Events emitted on the Session (as CustomEvent):
+//   - "role":    detail = { role: "leader"|"follower", promoted: boolean }
+//   - "message": detail = the kernel-side message payload
+//   - "panic":   detail = { text: string }  (leader crashed irrecoverably)
 
-const PROBE_TIMEOUT_MS = 120;
+const PROBE_TIMEOUT_MS = 150;
+const LOCK_WAIT_SOFT_MS = 25;
 
-/**
- * @param {{
- *   channel: string,
- *   lockName: string,
- *   spawnLeader: () => Worker,
- * }} opts
- * @returns {Promise<{
- *   role: "leader"|"follower",
- *   port: Worker|BroadcastChannel
- * }>}
- */
-export async function electLeader(opts) {
-  const bc = new BroadcastChannel(opts.channel);
-
-  // 1. Probe: is there already a leader?
-  const leaderReady = await probeForLeader(bc);
-  if (leaderReady) {
-    // We're a follower; use the broadcast channel as our transport.
-    return { role: "follower", port: bc };
+export class Session extends EventTarget {
+  /**
+   * @param {{
+   *   channel: string,     // BroadcastChannel name
+   *   lockName: string,    // Web Lock name
+   *   tabId: string,       // stable ID of this tab
+   *   kernelUrl: string,   // URL of akiva-kernel.wasm
+   *   workerUrl: URL,      // URL of worker.js
+   * }} opts
+   */
+  constructor(opts) {
+    super();
+    this.opts = opts;
+    this.role = "electing";           // "electing" | "follower" | "leader"
+    this.worker = null;
+    this.bc = new BroadcastChannel(opts.channel);
+    this._onLockAcquired = null;
+    this._boundBcListener = this._onBroadcast.bind(this);
+    this.bc.addEventListener("message", this._boundBcListener);
   }
 
-  // 2. Race for the lock. Whoever wins becomes leader.
-  return await raceForLock(opts, bc);
-}
-
-function probeForLeader(bc) {
-  return new Promise((resolve) => {
-    const probeId = crypto.randomUUID();
-    const timeout = setTimeout(() => {
-      bc.removeEventListener("message", onMsg);
-      resolve(false);
-    }, PROBE_TIMEOUT_MS);
-
-    const onMsg = (e) => {
-      if (e.data?.type === "leader_here" && e.data.probeId === probeId) {
-        clearTimeout(timeout);
-        bc.removeEventListener("message", onMsg);
-        resolve(true);
-      }
-    };
-    bc.addEventListener("message", onMsg);
-    bc.postMessage({ type: "probe", probeId });
-  });
-}
-
-function raceForLock(opts, bc) {
-  return new Promise((resolve, reject) => {
-    navigator.locks.request(opts.lockName, { mode: "exclusive" }, async (lock) => {
-      if (!lock) { reject(new Error("leader lock unavailable")); return; }
-
-      const worker = opts.spawnLeader();
-
-      // Answer future probes so newly-opened tabs find us.
-      bc.addEventListener("message", (e) => {
-        if (e.data?.type === "probe") {
-          bc.postMessage({ type: "leader_here", probeId: e.data.probeId });
-        } else if (e.data?.type === "follower_msg") {
-          // Forward follower messages into the worker.
-          worker.postMessage(e.data.payload);
-        }
-      });
-
-      // Forward worker-originated messages out to followers.
-      worker.addEventListener("message", (wev) => {
-        bc.postMessage({ type: "leader_msg", payload: wev.data });
-      });
-
-      resolve({ role: "leader", port: worker });
-
-      // Hold the lock for the lifetime of this tab. We never resolve;
-      // when the tab closes the lock is released and a follower takes over.
+  /** Kick off election. Resolves once we have a role (leader or follower). */
+  async start() {
+    // Fire the lock request in the background. The callback fires the
+    // moment the lock is available — either immediately (no prior leader)
+    // or later (after a prior leader's tab closes).
+    const lockAcquired = new Promise((resolve) => { this._onLockAcquired = resolve; });
+    navigator.locks.request(this.opts.lockName, { mode: "exclusive" }, async () => {
+      this._becomeLeader();
+      this._onLockAcquired?.();
+      // Hold the lock for the lifetime of this tab. The browser releases
+      // it on tab close, unblocking the next follower in line.
       await new Promise(() => {});
-    }).catch(reject);
-  });
+    }).catch((err) => {
+      this._emit("panic", { text: `lock request failed: ${err?.message ?? err}` });
+    });
+
+    // Race: did we get the lock fast (meaning no prior leader)?
+    const gotLockFast = await Promise.race([
+      lockAcquired.then(() => true),
+      delay(LOCK_WAIT_SOFT_MS).then(() => false),
+    ]);
+    if (gotLockFast) return;
+
+    // Slow lock → someone else is leader. Confirm via probe.
+    const existingLeader = await this._probeForLeader();
+    if (existingLeader) {
+      this._becomeFollower();
+      return;
+    }
+
+    // No probe reply and no lock yet. Two legitimate cases:
+    //   1. Prior leader died mid-boot; our lock will be granted soon.
+    //   2. Prior leader is slow / throttled. Either way, wait it out.
+    await lockAcquired;
+  }
+
+  /** Send a message toward the kernel. Behaviour depends on role. */
+  send(message, transferList = []) {
+    if (this.role === "leader") {
+      this.worker.postMessage(message, transferList);
+    } else if (this.role === "follower") {
+      // BroadcastChannel cannot transfer objects. This is a leaky
+      // abstraction on purpose — callers that need zero-copy transfer
+      // (OffscreenCanvas) must be leader before calling. See tab.js for
+      // how we defer canvas transfer until after promotion.
+      if (transferList.length) {
+        console.warn("[session] follower send dropped transferList:", transferList);
+      }
+      this.bc.postMessage({ type: "follower_msg", payload: message });
+    } else {
+      console.warn("[session] send() called before role assigned");
+    }
+  }
+
+  /** Teardown. Idempotent. */
+  dispose() {
+    this.bc.removeEventListener("message", this._boundBcListener);
+    this.bc.close();
+    if (this.worker) {
+      try { this.worker.terminate(); } catch {}
+      this.worker = null;
+    }
+  }
+
+  // ── Internals ────────────────────────────────────────────────────────
+
+  _becomeFollower() {
+    if (this.role !== "electing") return;
+    this.role = "follower";
+    this._emit("role", { role: "follower", promoted: false });
+  }
+
+  _becomeLeader() {
+    const promoted = this.role === "follower";
+    this.role = "leader";
+
+    this.worker = new Worker(this.opts.workerUrl, { type: "module" });
+    this.worker.postMessage({
+      type: "init",
+      kernelUrl: this.opts.kernelUrl,
+      tabId: this.opts.tabId,
+    });
+    this.worker.addEventListener("message", (e) => {
+      // Deliver locally.
+      this._emit("message", e.data);
+      // Relay to followers. BroadcastChannel is our one-to-many fanout.
+      this.bc.postMessage({ type: "leader_msg", payload: e.data });
+    });
+
+    this._emit("role", { role: "leader", promoted });
+  }
+
+  _onBroadcast(e) {
+    const msg = e.data;
+    if (!msg || typeof msg !== "object") return;
+
+    if (this.role === "leader") {
+      if (msg.type === "probe") {
+        // New tab is probing. Confirm we're alive.
+        this.bc.postMessage({ type: "leader_here", probeId: msg.probeId });
+      } else if (msg.type === "follower_msg") {
+        this.worker?.postMessage(msg.payload);
+      }
+      return;
+    }
+
+    // Follower: consume relayed leader messages.
+    if (msg.type === "leader_msg") {
+      this._emit("message", msg.payload);
+    }
+    // Probe answers are handled inline in _probeForLeader; we don't care here.
+  }
+
+  _probeForLeader() {
+    return new Promise((resolve) => {
+      const probeId = crypto.randomUUID();
+      const timeout = setTimeout(() => {
+        this.bc.removeEventListener("message", onMsg);
+        resolve(false);
+      }, PROBE_TIMEOUT_MS);
+
+      const onMsg = (e) => {
+        if (e.data?.type === "leader_here" && e.data.probeId === probeId) {
+          clearTimeout(timeout);
+          this.bc.removeEventListener("message", onMsg);
+          resolve(true);
+        }
+      };
+      this.bc.addEventListener("message", onMsg);
+      this.bc.postMessage({ type: "probe", probeId });
+    });
+  }
+
+  _emit(name, detail) {
+    this.dispatchEvent(new CustomEvent(name, { detail }));
+  }
 }
+
+function delay(ms) { return new Promise((r) => setTimeout(r, ms)); }

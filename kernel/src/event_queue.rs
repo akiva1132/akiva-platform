@@ -1,21 +1,24 @@
 //! Event queue.
 //!
 //! All input / system / IPC events land here before dispatch. The kernel
-//! drains the queue once per frame. Events are decoded from a host-provided
-//! byte buffer into typed variants so the rest of the kernel never touches
-//! raw bytes.
+//! drains the queue once per frame and handles each event against the
+//! subsystems that care. Events are decoded from a host-provided byte
+//! buffer into typed variants; the rest of the kernel never touches raw
+//! bytes.
 //!
 //! Wire format (little-endian, stable across kernel and HAL):
-//!   - input.pointer: { x: f32, y: f32, button: u8, phase: u8 }
-//!   - input.key:     { code: u32, modifiers: u8, phase: u8 }
-//!   - input.resize:  { w: u32, h: u32, density_q8_8: u32 }
-//!   - system.visibility: { visible: u8 }
+//!   - input.pointer (kind=1): { x: f32, y: f32, button: u8, phase: u8 }
+//!   - input.key     (kind=2): { code: u32, modifiers: u8, phase: u8 }
+//!   - input.resize  (kind=3): { w: u32, h: u32, density_q8_8: u32 }
+//!   - system.visibility (kind=4): { visible: u8 }
+//!
+//! See docs/runtime-web.md §4 for the full pipeline, including where this
+//! queue sits between the worker's `akiva_on_event` and the kernel frame
+//! loop.
 
 use std::collections::VecDeque;
 
-use crate::scheduler::Scheduler;
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerPhase {
     Down = 0,
     Move = 1,
@@ -23,7 +26,7 @@ pub enum PointerPhase {
     Cancel = 3,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyPhase {
     Down = 0,
     Repeat = 1,
@@ -100,10 +103,8 @@ impl EventQueue {
         self.inner.push_back(ev);
     }
 
-    pub fn drain_into(&mut self, sched: &mut Scheduler) {
-        while let Some(ev) = self.inner.pop_front() {
-            sched.on_event(ev);
-        }
+    pub fn pop(&mut self) -> Option<Event> {
+        self.inner.pop_front()
     }
 
     pub fn len(&self) -> usize { self.inner.len() }

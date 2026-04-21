@@ -1,14 +1,20 @@
 //! Akiva kernel.
 //!
-//! Runs as a single wasm module inside a Dedicated Worker held by the leader
-//! tab. Owns the global state of the OS: process table, scheduler, event
-//! queue, storage, and display list. The framework layer (activity manager,
-//! package manager, etc.) is linked in as a library and runs in the same
-//! address space.
+//! Runs as a single wasm module inside a Dedicated Worker held by the
+//! leader tab. Owns the global state of the OS: process table, scheduler,
+//! event queue, storage, and display list. The framework layer (activity
+//! manager, package manager, etc.) is linked in as a library and runs in
+//! the same address space.
 //!
-//! The JS HAL calls the exports in this module (`boot`, `frame`, `on_event`,
-//! `shutdown`); the kernel calls back into the HAL via the imports declared
-//! in `host.rs`.
+//! The JS HAL calls the exports in this module (`boot`, `frame`,
+//! `on_event`, `shutdown`); the kernel calls back into the HAL via the
+//! imports declared in `host.rs`.
+//!
+//! Per-frame flow:
+//!   1. `akiva_frame(ts)` is called by the worker's rAF loop.
+//!   2. All queued events are drained and dispatched via `handle_event`.
+//!   3. Scheduler runs ready tasks up to the frame budget.
+//!   4. Display manager renders the frame.
 
 pub mod display_manager;
 pub mod event_queue;
@@ -23,7 +29,7 @@ pub mod wasm_loader;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::display_manager::DisplayManager;
-use crate::event_queue::{Event, EventQueue};
+use crate::event_queue::{Event, EventQueue, PointerPhase};
 use crate::scheduler::Scheduler;
 
 /// Global kernel state. There is exactly one of these per OS instance.
@@ -47,6 +53,32 @@ impl Kernel {
             last_frame_ms: 0.0,
         }
     }
+
+    fn handle_event(&mut self, ev: Event) {
+        match ev {
+            Event::Pointer { x, y, phase, .. } => match phase {
+                PointerPhase::Down => self.display.set_pointer(x, y, true),
+                PointerPhase::Move => {
+                    // Preserve pressed flag across moves by only updating if
+                    // the pointer is already active.
+                    let pressed = self.display.pointer_pressed();
+                    self.display.set_pointer(x, y, pressed);
+                }
+                PointerPhase::Up => self.display.set_pointer(x, y, false),
+                PointerPhase::Cancel => self.display.pointer_leave(),
+            },
+            Event::Key { code, phase, .. } => {
+                log::debug(&format!("kernel: key {:?} code={}", phase, code));
+            }
+            Event::Resize { width_px, height_px, density } => {
+                self.display.on_resize(width_px, height_px, density);
+                log::debug(&format!("kernel: resize {}x{} @ {}", width_px, height_px, density));
+            }
+            Event::Visibility { visible } => {
+                log::debug(&format!("kernel: visibility={}", visible));
+            }
+        }
+    }
 }
 
 static BOOTED: AtomicBool = AtomicBool::new(false);
@@ -55,15 +87,15 @@ static mut KERNEL: Kernel = Kernel::new();
 /// Grab a mutable reference to the kernel singleton.
 ///
 /// Safety: wasm in a worker is single-threaded; entry points are mutually
-/// exclusive because the host calls them serially. We rely on that invariant
-/// rather than a RefCell to avoid the runtime check.
+/// exclusive because the host calls them serially. We rely on that
+/// invariant rather than a RefCell to avoid the runtime check.
 #[inline(always)]
 fn kernel() -> &'static mut Kernel {
     // SAFETY: see item docs.
     unsafe { &mut *core::ptr::addr_of_mut!(KERNEL) }
 }
 
-// ── Exports: called by the JS HAL ─────────────────────────────────────────
+// ── Exports: called by the JS HAL ─────────────────────────────────────
 
 /// Initialise the kernel. Called once after the worker has loaded the wasm
 /// and wired up imports. Must complete before any `frame` call.
@@ -88,7 +120,11 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
     k.frame_count = k.frame_count.wrapping_add(1);
     k.last_frame_ms = timestamp_ms;
 
-    k.events.drain_into(&mut k.scheduler);
+    // Drain all queued events and dispatch.
+    while let Some(ev) = k.events.pop() {
+        k.handle_event(ev);
+    }
+
     k.scheduler.run_ready(timestamp_ms);
     k.display.render_frame(timestamp_ms);
 }
@@ -121,7 +157,7 @@ pub extern "C" fn akiva_shutdown() {
     k.display.shutdown();
 }
 
-// ── Memory ABI: host<->guest transfers ────────────────────────────────────
+// ── Memory ABI: host<->guest transfers ────────────────────────────────
 
 /// Allocate `size` bytes inside kernel memory and return a pointer the host
 /// can write into. Host must call `akiva_dealloc` with the same size.
@@ -149,4 +185,3 @@ pub unsafe extern "C" fn akiva_dealloc(ptr: *mut u8, size: usize) {
 pub extern "C" fn akiva_abi_version() -> *const u8 {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr()
 }
-

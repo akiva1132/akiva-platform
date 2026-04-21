@@ -5,9 +5,11 @@
 //! display manager tracks per-display metrics (size, density) and routes
 //! the frame to the right renderer backend.
 //!
-//! Phase 1a: single display, immediate-mode HAL calls. The boot screen is
-//! a solid fill + the kernel version string — just enough to prove that
-//! end-to-end wiring works.
+//! Phase 1b: single display, immediate-mode HAL calls, plus a pointer
+//! indicator that moves with the mouse — this is the visible proof that
+//! the full event pipeline (DOM → tab.js → worker → akiva_on_event →
+//! EventQueue → Kernel::handle_event → DisplayManager::set_pointer)
+//! works end-to-end.
 //!
 //! Phase 2 replaces the inline draw calls with the RendererBackend trait
 //! described in ARCHITECTURE.md §10: the kernel builds a FrameCommands
@@ -31,8 +33,17 @@ pub struct Display {
     pub visible: bool,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PointerState {
+    pub x: f32,
+    pub y: f32,
+    pub pressed: bool,
+    pub active: bool,   // false = we've never seen a pointer event
+}
+
 pub struct DisplayManager {
     primary: Display,
+    pointer: PointerState,
     initialised: bool,
 }
 
@@ -44,6 +55,7 @@ impl DisplayManager {
                 metrics: SurfaceMetrics { width_px: 0, height_px: 0, density: 1.0 },
                 visible: true,
             },
+            pointer: PointerState { x: 0.0, y: 0.0, pressed: false, active: false },
             initialised: false,
         }
     }
@@ -66,25 +78,45 @@ impl DisplayManager {
         self.primary.metrics = SurfaceMetrics { width_px: w, height_px: h, density };
     }
 
+    pub fn set_pointer(&mut self, x: f32, y: f32, pressed: bool) {
+        self.pointer = PointerState { x, y, pressed, active: true };
+    }
+
+    pub fn pointer_leave(&mut self) {
+        self.pointer.active = false;
+        self.pointer.pressed = false;
+    }
+
+    pub fn pointer_pressed(&self) -> bool {
+        self.pointer.pressed
+    }
+
     pub fn render_frame(&mut self, _timestamp_ms: f64) {
         if !self.initialised { return; }
-        // Phase 1a: clear + version label. This is the minimal proof of
-        // life for the end-to-end boot path.
+
         const BG: u32 = 0xff101418; // very dark charcoal
         const FG: u32 = 0xffe0e0e0;
+        const POINTER_IDLE: u32 = 0x80_88ccff;
+        const POINTER_DOWN: u32 = 0xff_ff5577;
 
         // SAFETY: all HAL draw calls accept primitive args; no pointers here.
         unsafe {
             host::hal_draw_clear(BG);
+
             let label = "Akiva Kernel v0.0.1";
-            host::hal_draw_text(
-                24.0,
-                48.0,
-                18.0,
-                FG,
-                label.as_ptr(),
-                label.len(),
-            );
+            host::hal_draw_text(24.0, 48.0, 18.0, FG, label.as_ptr(), label.len());
+
+            if self.pointer.active {
+                let colour = if self.pointer.pressed { POINTER_DOWN } else { POINTER_IDLE };
+                // Simple 24×24 square centred on the pointer.
+                let size: f32 = 24.0;
+                host::hal_draw_rect(
+                    self.pointer.x - size * 0.5,
+                    self.pointer.y - size * 0.5,
+                    size, size, colour,
+                );
+            }
+
             host::hal_draw_present();
         }
     }

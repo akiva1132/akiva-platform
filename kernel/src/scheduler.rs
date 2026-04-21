@@ -2,17 +2,16 @@
 //!
 //! The kernel runs a single work queue per OS instance. Tasks come from
 //! three sources:
-//!   1. Input events delivered by `akiva_on_event` (drained each frame)
-//!   2. Timers armed by apps (min resolution = one frame)
-//!   3. IPC messages: intent resolution, broadcast delivery (post-MVP)
+//!   1. Input events delivered by `akiva_on_event` (drained each frame,
+//!      dispatched in `Kernel::handle_event`, not here).
+//!   2. Timers armed by apps (min resolution = one frame).
+//!   3. IPC messages: intent resolution, broadcast delivery (post-MVP).
 //!
 //! There is no preemption: each task runs to completion. Apps are expected
-//! to split long work across frames. Watchdog (phase 2+) will trap apps
+//! to split long work across frames. Watchdog (Phase 2+) will trap apps
 //! that exceed a budget per frame.
 
 use std::collections::VecDeque;
-
-use crate::event_queue::Event;
 
 pub type TaskFn = Box<dyn FnOnce() + 'static>;
 
@@ -50,11 +49,6 @@ impl Scheduler {
             }
         }
         self.deadline_ms = None;
-    }
-
-    pub fn on_event(&mut self, _ev: Event) {
-        // MVP: events are dispatched by the activity manager; the scheduler
-        // only owns the queue. Wired up in Phase 2 when the AM arrives.
     }
 
     pub fn shutdown(&mut self) {
