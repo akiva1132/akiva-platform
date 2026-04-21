@@ -49,7 +49,7 @@ pub mod prelude {
 ///
 /// impl Activity for HelloApp {
 ///     fn on_render(&mut self, _ctx: &mut Context, canvas: &mut Canvas) {
-///         canvas.clear(0x202030ff);
+///         canvas.clear(0xff202030);  // 0xAARRGGBB — alpha first
 ///         canvas.draw_text(20.0, 40.0, 24.0, 0xffffffff, "Hello, Akiva!");
 ///     }
 /// }

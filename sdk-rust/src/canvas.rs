@@ -21,7 +21,11 @@ const OP_PUSH_TRANSFORM:  u8 = 5;
 const OP_POP_TRANSFORM:   u8 = 6;
 
 /// Paint surface handed to `Activity::on_render`. All coordinates are in
-/// dp (density-independent pixels); colors are `0xRRGGBBAA`.
+/// dp (density-independent pixels); colors are **`0xAARRGGBB`** — alpha
+/// first, then red, green, blue. That matches the renderer backend on
+/// the host side and the Shell's conventions; the name `rgba` on the
+/// parameter is a legacy from the wire format and does *not* indicate
+/// byte order.
 ///
 /// The canvas is write-only and order-preserving: the host replays ops in
 /// the exact sequence issued here. Apps that want retained-mode rendering

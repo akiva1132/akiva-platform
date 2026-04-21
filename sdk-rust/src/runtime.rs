@@ -22,8 +22,9 @@ use std::collections::HashMap;
 
 use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase};
 
-/// Host-provided log sink. Matches the `env.akiva_host_log` import the
-/// worker's `AppRegistry._buildAppImports` installs.
+// Host-provided log sink. Matches the `env.akiva_host_log` import the
+// worker's `AppRegistry._buildAppImports` installs. Rustdoc doesn't
+// render docs on extern blocks, so this is a plain comment.
 extern "C" {
     pub fn akiva_host_log(level: u32, ptr: *const u8, len: u32);
 }

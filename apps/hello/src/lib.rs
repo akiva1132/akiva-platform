@@ -30,25 +30,27 @@ impl Activity for HelloMain {
     }
 
     fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+        // Color format on this platform is 0xAARRGGBB — alpha first, then RGB.
+        // Same as the Shell and the framework paint ops.
         self.frame = self.frame.wrapping_add(1);
         let w = ctx.metrics.width_px as f32;
         let h = ctx.metrics.height_px as f32;
 
-        // Background — slight gradient feeling via two rects.
-        c.clear(0x0f1420ff);
-        c.fill_rect(0.0, h - 4.0, w, 4.0, 0x2a3f66ff);
+        // Background + bottom accent stripe.
+        c.clear(0xff0f1420);
+        c.fill_rect(0.0, h - 4.0, w, 4.0, 0xff2a3f66);
 
         // Title.
-        c.draw_text(24.0, 48.0, 28.0, 0xf0f4faff, "Hello, Akiva!");
-        c.draw_text(24.0, 76.0, 14.0, 0x9aa8bcff, "akiva-app-hello · ABI v0.1.0");
+        c.draw_text(24.0, 48.0, 28.0, 0xfff0f4fa, "Hello, Akiva!");
+        c.draw_text(24.0, 76.0, 14.0, 0xff9aa8bc, "akiva-app-hello · ABI v0.1.0");
 
         // Frame counter + canvas size.
         let line = format!("frame {} · surface {}×{}", self.frame, ctx.metrics.width_px, ctx.metrics.height_px);
-        c.draw_text(24.0, h - 24.0, 14.0, 0x7e8aa0ff, &line);
+        c.draw_text(24.0, h - 24.0, 14.0, 0xff7e8aa0, &line);
 
-        // Pointer reticle — coloured by button state.
+        // Pointer reticle — coloured by button state. Half-alpha when idle.
         if let Some((px, py)) = self.pointer {
-            let color = if self.pointer_down { 0xff6a4aff } else { 0x4a9eff80 };
+            let color = if self.pointer_down { 0xffff6a4a } else { 0x804a9eff };
             let s = 20.0;
             c.fill_rect(px - s / 2.0, py - s / 2.0, s, s, color);
         }
