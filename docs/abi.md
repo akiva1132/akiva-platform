@@ -4,16 +4,143 @@
 
 ה-ABI מגדיר איך wasm component של אפליקציה מדבר עם ה-runtime. חוזה יציב, מתועד, version-tracked, מתואר ב-**WIT (WebAssembly Interface Types)** של ה-Component Model.
 
-## 2. עקרונות
+## 1.1 שני רבדים: v0 "raw" ↔ v1 "component"
+
+התיעוד מחולק לשני מצבים:
+
+| רובד | מצב | איפה מוגדר |
+|---|---|---|
+| **v0 — Raw exports** | המצב הנוכחי ב-Phase 2b. apps הם פשוט `wasm32-unknown-unknown` modules שמייצאים `extern "C"` functions. אין Component Model, אין wit-bindgen. | §2 למטה |
+| **v1 — Component Model** | היעד. apps הם Components שמייצאים את ה-world `akiva:app/guest` ומייבאים `akiva:app/host`. | §3 ואילך |
+
+הסיבה לרובד הכפול: ל-browser wasm עדיין אין runtime מובנה ל-Component Model. אימוץ מוקדם של wit-bindgen מחייב toolchain ו-glue נוספים לכל שפה. ה-v0 הוא חוזה זמני שמאפשר לנו ל-boot את הפלטפורמה ב-Rust ללא תלויות חיצוניות, תוך שמירה על ה-v1 כ-shape של העתיד.
+
+המעבר מ-v0 ל-v1 יהיה additive, לא breaking: ה-WIT interfaces ב-§5 תוכננו כך שה-raw ABI של v0 נמפה אליהם 1:1 (משפחות הקריאות זהות).
+
+---
+
+## 2. App ABI v0 — raw exports (Phase 2b)
+
+### 2.1 מודל ריצה
+
+כל app הוא wasm module עצמאי שה-host (worker.js) טוען לצד ה-kernel wasm. ה-kernel **לא** מזהה את האפליקציה ב-address space שלו — הוא שולח את הבקשות ל-host דרך imports בשם `hal_app_*`, וה-host מנתב אותן ל-instance הנכון של ה-app. יש לכך יתרונות מיידיים: isolation בין apps, memory growth עצמאי, crash containment.
+
+```
+  Kernel wasm           Worker JS host            App wasm (one per package)
+  ───────────           ──────────────            ─────────────────────────
+  WasmActivity   ──►    hal_app_lifecycle   ──►   akiva_app_on_resume(handle)
+  (framework)           (routes by handle)         (app-side)
+                  ◄──   bytes via hal_app_render  ◄── akiva_app_render → *u8
+```
+
+ה-`handle` הוא `u32` לא-אפסי שה-host מקצה ב-`hal_app_register` ושומר בו את ה-tuple `(package_id, class, wasm_instance)`. ל-kernel אין מושג מה ה-handle מייצג.
+
+### 2.2 Exports שה-app חייב לספק
+
+כל app חייב לייצא את הפונקציות הבאות (C ABI):
+
+```rust
+// Memory — ה-host משתמש בכדי להזריק data ל-app (intents, saved state, ...).
+extern "C" fn akiva_app_alloc(size: u32) -> *mut u8;
+extern "C" fn akiva_app_dealloc(ptr: *mut u8, size: u32);
+
+// ABI version — null-terminated UTF-8 ("0.1.0").
+extern "C" fn akiva_app_abi_version() -> *const u8;
+
+// Lifecycle — handle הוא per-activity.
+extern "C" fn akiva_app_create(handle: u32, class_ptr: *const u8, class_len: u32);
+extern "C" fn akiva_app_start(handle: u32);
+extern "C" fn akiva_app_resume(handle: u32);
+extern "C" fn akiva_app_pause(handle: u32);
+extern "C" fn akiva_app_stop(handle: u32);
+extern "C" fn akiva_app_destroy(handle: u32);
+
+// Input.
+extern "C" fn akiva_app_pointer(
+    handle: u32, x: f32, y: f32, button: u32, phase: u32, ts_ms: f64,
+);
+extern "C" fn akiva_app_key(
+    handle: u32, code: u32, modifiers: u32, phase: u32, ts_ms: f64,
+);
+extern "C" fn akiva_app_resize(
+    handle: u32, width_px: u32, height_px: u32, density: f32,
+);
+
+// Render — מחזיר את הכתובת של buffer paint-ops ב-memory של ה-app.
+// ה-host קורא את האורך מ-*out_len_ptr, מעתיק, וממשיך.
+extern "C" fn akiva_app_render(handle: u32, ts_ms: f64, out_len_ptr: *mut u32) -> *const u8;
+```
+
+ה-buffer שמוחזר מ-`akiva_app_render` הוא app-owned: ה-app חייב להחזיק אותו בחיים לפחות עד הקריאה הבאה ל-`akiva_app_render` עם אותו handle. ה-convention הוא buffer per-handle שנמחזר כל frame — מקצה פעם אחת, מנקה עם `clear()`, ומחזיר את הכתובת שוב.
+
+### 2.3 Imports (host → app) — נשארים ל-2b.3+
+
+Apps יקבלו גישה ל-host דרך imports בשם `akiva_host_*`. המסגרת המלאה (log, finish, start_activity, storage) תוגדר ב-Phase 2b.3 כש-sdk-rust יצטרך אותה. ברובד ה-v1 כל אלה יתמפו ל-WIT interfaces ב-§5.
+
+### 2.4 Imports (kernel → host) — `hal_app_*`
+
+אלה imports שה-kernel wasm מבקש; ה-host (worker.js) מספק. מוגדרים ב-[kernel/src/host.rs](../kernel/src/host.rs):
+
+```rust
+fn hal_app_register(
+    package_id_ptr: *const u8, package_id_len: usize,
+    class_ptr: *const u8,      class_len: usize,
+) -> u32;  // 0 = unknown package/class
+fn hal_app_unregister(handle: u32);
+fn hal_app_lifecycle(handle: u32, transition: u32);  // 0=Create .. 5=Destroy
+fn hal_app_pointer(handle: u32, x: f32, y: f32, button: u32, phase: u32, ts_ms: f64);
+fn hal_app_key(handle: u32, code: u32, modifiers: u32, phase: u32, ts_ms: f64);
+fn hal_app_resize(handle: u32, width_px: u32, height_px: u32, density: f32);
+fn hal_app_render(handle: u32, ts_ms: f64, out_ptr: *mut u8, out_cap: u32) -> u32;
+// ^ returns total bytes produced by the app. If > out_cap the kernel's
+//   buffer was truncated; kernel should retry with a larger allocation.
+```
+
+### 2.5 Paint-op wire format
+
+ה-app מ-serialize את פקודות הציור שלו ל-stream שטוח של bytes שה-kernel מפרשר חזרה ל-[`FrameCommands`](../framework/src/compositor.rs). כל op מתחיל ב-`u8` opcode:
+
+| Opcode | Op          | Payload (little-endian)                                          |
+|--------|-------------|------------------------------------------------------------------|
+| `0x00` | `Clear`     | `u32 rgba`                                                       |
+| `0x01` | `FillRect`  | `f32 x, f32 y, f32 w, f32 h, u32 rgba`                          |
+| `0x02` | `DrawText`  | `f32 x, f32 y, f32 size, u32 rgba, u32 len, <len> UTF-8 bytes`  |
+| `0x03` | `PushClip`  | `f32 x, f32 y, f32 w, f32 h`                                    |
+| `0x04` | `PopClip`   | —                                                                |
+| `0x05` | `PushTransform` | `f32 dx, f32 dy, f32 scale`                                  |
+| `0x06` | `PopTransform`  | —                                                             |
+
+הקודק המלא ב-[framework/src/wasm_activity.rs](../framework/src/wasm_activity.rs) — `encode_op` / `decode_frame`. תוספות (additive) יקבלו opcodes חדשים ב-continuation של הרצף; ה-decoder דוחה opcodes לא מוכרים כ-error (אי אפשר לדעת את אורך ה-payload כדי לדלג).
+
+### 2.6 שכבת הביניים ב-framework
+
+ב-framework עצמו:
+
+- `akiva_framework::wasm_activity::WasmHost` — trait שה-kernel מיישם (`KernelWasmHost`) דרך ה-externs למעלה; בבדיקות יחידה מיישמים `MockHost` שמצבע את הקריאות.
+- `WasmActivity` — struct שמיישם את ה-`Activity` trait הפנימי, ומעביר כל callback ל-`WasmHost` עם ה-handle שלו. זו נקודת ה-bridge היחידה בין ה-framework ל-wasm apps.
+- `LifecycleTransition`, `opcode::*`, `encode_op`, `decode_frame` — ה-ABI במלואו מרוכז במקום אחד.
+
+### 2.7 מה לא כלול ב-v0
+
+- **Imports נוספים ל-app** — ל-2b.3 יתווספו `akiva_host_log`, `akiva_host_finish`, ואחרים. אפליקציות ב-v0 יכולות רק לצייר ולהגיב לקלט.
+- **State save/restore** — `on_save_state` נכנס בפאזה מאוחרת יותר.
+- **Intents** — routing בין apps מופעל ב-Phase 3.
+- **Permissions** — ה-host פשוט יטען את ה-wasm; ה-PermissionController יבוא מאוחר.
+
+---
+
+> **שאר המסמך מתאר את רובד v1 (Component Model).** הסעיפים הממוספרים שלהלן (עקרונות, WIT definitions, capability model וכו') נשארים כ-spec היעד. הם אינם מתממשים ב-Phase 2b, אבל חוזקת ה-API של §2 מעוצבת במודע להתיישר איתם.
+
+## 3. עקרונות (v1)
 
 1. **Component Model + WIT** — ה-ABI מוגדר דרך [WIT](https://component-model.bytecodealliance.org/design/wit.html). אין `extern "C"`, אין raw pointers ידניים, אין alloc/free ידני בצד ה-host. `wit-bindgen` מייצר את קוד ה-glue אוטומטית לכל שפה (Rust, C, Go, Python, JS).
 2. **Typed resources** — widgets, activities, intents הם `resource` של WIT, לא `u32 handle`. זה נותן type safety ו-lifetime management שה-runtime אוכף.
 3. **Strings, records, lists, options, results** — ברמה native של WIT. אין marshalling ידני.
 4. **Version-tracked** — כל world מקבל SemVer (`akiva:app/activity@0.1.0`). breaking changes → major bump.
-5. **Capability via imports** — אפליקציה מקבלת רק imports שה-runtime החליט להעניק. Permission denied = import חסר = link error, לא runtime check. ראה סעיף 5.
+5. **Capability via imports** — אפליקציה מקבלת רק imports שה-runtime החליט להעניק. Permission denied = import חסר = link error, לא runtime check. ראה סעיף 6.
 6. **Additive only בתוך major** — תוספות תואמות-אחורה בתוך gap של major version.
 
-## 3. מבנה המודול
+## 4. מבנה המודול
 
 אפליקציית Akiva היא **Component** שמיישמת את ה-world `akiva:app/guest` ומייבאת את ה-world `akiva:app/host`.
 
@@ -35,7 +162,7 @@ akiva:app package:
 
 ---
 
-## 4. WIT Definitions
+## 5. WIT Definitions
 
 ### 4.1 Shared types
 
@@ -422,7 +549,7 @@ world host {
     import resources;
     import intent;
     import activity-api;
-    import storage;      // gated by capability (see section 5)
+    import storage;      // gated by capability (see section 6)
     import log;
     import system;
 }
@@ -434,7 +561,7 @@ set, and instantiates only if every import is permitted.
 
 ---
 
-## 5. Capability-via-imports Model
+## 6. Capability-via-imports Model
 
 Permissions in Akiva are enforced at **instantiation time**, not at call time.
 
@@ -462,7 +589,7 @@ Benefits over a runtime-check model:
 
 ---
 
-## 6. Observability hooks
+## 7. Observability hooks
 
 The `log` interface is always imported. Output is sinked in the host as
 follows:
@@ -477,7 +604,7 @@ See [docs/observability.md](observability.md) for how the host wires this up.
 
 ---
 
-## 7. Example — Calculator boot (conceptual)
+## 8. Example — Calculator boot (conceptual)
 
 ```
 Runtime:       instantiate(calc.wasm, imports={widget, resources, intent,
@@ -501,7 +628,7 @@ Runtime:       next frame re-layout + re-composite
 
 ---
 
-## 8. Not in v0.1 ABI
+## 9. Not in v1 ABI
 
 - Network (`network` interface — post-MVP).
 - Camera / microphone / sensors.
@@ -511,7 +638,7 @@ Runtime:       next frame re-layout + re-composite
 - Broadcast receivers (post-MVP).
 - PendingIntent (post-MVP).
 
-## 9. Versioning
+## 10. Versioning
 
 - Each interface has its own SemVer. Guest declares via `abi-version()`.
 - Runtime keeps a compatibility matrix: "runtime X can host guests with ABI

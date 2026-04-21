@@ -152,6 +152,20 @@ function buildImports() {
       const bytes = readBytes(ptr, len);
       self.postMessage({ type: "display_frame", displayId, bytes }, [bytes.buffer]);
     },
+
+    // ── App runtime (Phase 2b.2 stubs) ────────────────────────────────────
+    // Contract matches kernel/src/host.rs `hal_app_*`. Real implementation
+    // — instantiate app wasms from OPFS, forward to their `akiva_app_*`
+    // exports — lands in Phase 2b.3. For now everything fails cleanly so
+    // the kernel is free to compile the `KernelWasmHost` adapter without
+    // any runtime behaviour change.
+    hal_app_register: (_pidPtr, _pidLen, _clsPtr, _clsLen) => 0, // 0 = no such app
+    hal_app_unregister: (_handle) => {},
+    hal_app_lifecycle: (_handle, _transition) => {},
+    hal_app_pointer: (_handle, _x, _y, _button, _phase, _ts) => {},
+    hal_app_key: (_handle, _code, _mods, _phase, _ts) => {},
+    hal_app_resize: (_handle, _w, _h, _density) => {},
+    hal_app_render: (_handle, _ts, _outPtr, _outCap) => 0, // 0 bytes of paint ops
   };
   return { env };
 }

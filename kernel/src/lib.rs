@@ -189,6 +189,118 @@ fn map_storage_err(e: storage::StorageError) -> akiva_framework::storage::Storag
     }
 }
 
+/// Adapter that routes framework `WasmHost` calls to the matching
+/// `hal_app_*` imports. Zero-sized: the host side owns all per-instance
+/// state (wasm instance, memory, alloc pair), keyed by the returned
+/// handle.
+///
+/// Not wired into `framework::boot` yet — [`akiva_framework::wasm_activity`]
+/// exists as the ABI contract, but app instantiation lands in Phase 2b.3.
+#[allow(dead_code)]
+struct KernelWasmHost;
+
+impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
+    fn register(
+        &self,
+        package_id: &str,
+        class: &str,
+    ) -> Option<akiva_framework::wasm_activity::AppHandle> {
+        let pid = package_id.as_bytes();
+        let cls = class.as_bytes();
+        // SAFETY: slices valid for their lengths, host reads only.
+        let raw = unsafe {
+            host::hal_app_register(pid.as_ptr(), pid.len(), cls.as_ptr(), cls.len())
+        };
+        akiva_framework::wasm_activity::AppHandle::new(raw)
+    }
+
+    fn unregister(&self, handle: akiva_framework::wasm_activity::AppHandle) {
+        unsafe { host::hal_app_unregister(handle.get()) }
+    }
+
+    fn lifecycle(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        t: akiva_framework::wasm_activity::LifecycleTransition,
+    ) {
+        unsafe { host::hal_app_lifecycle(handle.get(), t as u32) }
+    }
+
+    fn pointer(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        ev: fw_act::PointerEvent,
+        ts_ms: f64,
+    ) {
+        unsafe {
+            host::hal_app_pointer(
+                handle.get(),
+                ev.x, ev.y,
+                ev.button as u32,
+                akiva_framework::wasm_activity::pointer_phase_wire(ev.phase),
+                ts_ms,
+            )
+        }
+    }
+
+    fn key(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        ev: fw_act::KeyEvent,
+        ts_ms: f64,
+    ) {
+        unsafe {
+            host::hal_app_key(
+                handle.get(),
+                ev.code,
+                ev.modifiers as u32,
+                akiva_framework::wasm_activity::key_phase_wire(ev.phase),
+                ts_ms,
+            )
+        }
+    }
+
+    fn resize(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        m: fw_act::SurfaceMetrics,
+    ) {
+        unsafe { host::hal_app_resize(handle.get(), m.width_px, m.height_px, m.density) }
+    }
+
+    fn render(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        ts_ms: f64,
+        out: &mut akiva_framework::compositor::FrameCommands,
+    ) {
+        // 16 KiB is generous for per-frame paint ops; the retry branch
+        // doubles up if an app ever needs more, at the cost of a second
+        // render. Apps producing huge frames should use layered views
+        // instead of fat single frames.
+        let mut buf = vec![0u8; 16 * 1024];
+        let needed = unsafe {
+            host::hal_app_render(handle.get(), ts_ms, buf.as_mut_ptr(), buf.len() as u32)
+        } as usize;
+        if needed > buf.len() {
+            log::warn(&format!(
+                "app {}: paint buffer too small ({} > {}); retrying",
+                handle.get(), needed, buf.len()
+            ));
+            buf = vec![0u8; needed];
+            let got = unsafe {
+                host::hal_app_render(handle.get(), ts_ms, buf.as_mut_ptr(), buf.len() as u32)
+            } as usize;
+            buf.truncate(got.min(buf.len()));
+        } else {
+            buf.truncate(needed);
+        }
+        if let Err(e) = akiva_framework::wasm_activity::decode_frame(&buf, out) {
+            log::warn(&format!("app {}: paint decode failed: {:?}", handle.get(), e));
+        }
+    }
+}
+
 /// Exercises the storage HAL end-to-end: read a u32 counter under
 /// `sys/boot_count`, increment it, write it back. The returned value is
 /// the post-increment count, fed into `framework::boot` so the Shell can
