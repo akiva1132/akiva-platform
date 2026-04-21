@@ -1,0 +1,39 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+*.rs.bk
+
+# Wasm build artifacts
+*.wasm.map
+/dist/
+/build/
+
+# wit-bindgen generated (kept in tree if committed; ignore if regenerated)
+# bindings/generated/
+
+# Node / web tooling
+node_modules/
+/runtime/web/node_modules/
+npm-debug.log*
+yarn-error.log
+pnpm-debug.log*
+.pnpm-store/
+package-lock.json
+
+# Playwright
+/test-results/
+/playwright-report/
+/playwright/.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Env / local
+.env
+.env.local
+*.log
