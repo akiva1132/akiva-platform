@@ -14,6 +14,7 @@
 
 import { Canvas2DBackend } from "./renderer/canvas2d.js";
 import { Storage, SR_BAD_KEY } from "./storage.js";
+import { AppRegistry } from "./app_registry.js";
 
 /** @type {WebAssembly.Instance | null} */
 let instance = null;
@@ -27,6 +28,12 @@ let backend = null;
 let booted = false;
 /** Persistent KV store. Initialised before akiva_boot. */
 const storage = new Storage();
+/** App wasm registry. Lazily binds to kernel memory once the kernel is booted. */
+const apps = new AppRegistry({
+  storage,
+  kernelMemory: () => memory,
+  log: (level, text) => self.postMessage({ type: "log", level: levelCode(level), text }),
+});
 /** UTF-8 decoder for host-side reading of kernel strings. */
 const decoder = new TextDecoder("utf-8");
 
@@ -153,19 +160,18 @@ function buildImports() {
       self.postMessage({ type: "display_frame", displayId, bytes }, [bytes.buffer]);
     },
 
-    // ── App runtime (Phase 2b.2 stubs) ────────────────────────────────────
-    // Contract matches kernel/src/host.rs `hal_app_*`. Real implementation
-    // — instantiate app wasms from OPFS, forward to their `akiva_app_*`
-    // exports — lands in Phase 2b.3. For now everything fails cleanly so
-    // the kernel is free to compile the `KernelWasmHost` adapter without
-    // any runtime behaviour change.
-    hal_app_register: (_pidPtr, _pidLen, _clsPtr, _clsLen) => 0, // 0 = no such app
-    hal_app_unregister: (_handle) => {},
-    hal_app_lifecycle: (_handle, _transition) => {},
-    hal_app_pointer: (_handle, _x, _y, _button, _phase, _ts) => {},
-    hal_app_key: (_handle, _code, _mods, _phase, _ts) => {},
-    hal_app_resize: (_handle, _w, _h, _density) => {},
-    hal_app_render: (_handle, _ts, _outPtr, _outCap) => 0, // 0 bytes of paint ops
+    // ── App runtime (Phase 2b.3) ─────────────────────────────────────────
+    // Contract matches kernel/src/host.rs `hal_app_*`. Routes to the
+    // `AppRegistry` which owns one WebAssembly.Instance per installed
+    // package and one handle per framework-side activity slot.
+    hal_app_register: (pidPtr, pidLen, clsPtr, clsLen) =>
+      apps.register(readUtf8(pidPtr, pidLen), readUtf8(clsPtr, clsLen)),
+    hal_app_unregister: (handle) => apps.unregister(handle),
+    hal_app_lifecycle:  (handle, transition) => apps.lifecycle(handle, transition),
+    hal_app_pointer:    (handle, x, y, button, phase, ts) => apps.pointer(handle, x, y, button, phase, ts),
+    hal_app_key:        (handle, code, mods, phase, ts) => apps.key(handle, code, mods, phase, ts),
+    hal_app_resize:     (handle, w, h, density) => apps.resize(handle, w, h, density),
+    hal_app_render:     (handle, ts, outPtr, outCap) => apps.render(handle, ts, outPtr, outCap),
   };
   return { env };
 }

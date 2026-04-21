@@ -89,6 +89,21 @@
 - **נגישות native מובנית**: כל widget מכריז על עצמו ל-accessibility tree (לא דרך DOM/ARIA, אלא דרך AOM — Accessibility Object Model). אפליקציה שלא מגדירה נגישות לא מקבלת אישור בחנות.
 - **Review סטנדרטי**: חנות עקיבא מקיימת review לכל אפליקציה. אפליקציה שלא עומדת בסטנדרטים לא נכנסת. זה מאפשר baseline איכות שלא קיים ב-web פתוח.
 
+### 3.5 מודל ההפצה — פתוחה לפיתוח, מבוקרת בהפצה
+
+אקוסיסטם איכותי לא נוצר לבד. פלטפורמות שהשאירו את ההפצה פתוחה לחלוטין מתמלאות במהירות ב-wrappers של אתרים, copy-paste apps, ו-misuse של permissions. מצד שני, פלטפורמה שסוגרת את השער למפתחים הופכת לגן-חתום ואין בה חיים.
+
+העמדה של עקיבא: **פתוחה לפיתוח, מבוקרת בהפצה**. זו לא החלטה שיווקית בלבד — היא החלטה ארכיטקטונית, כי היא מעצבת את ה-API של PackageManager, את ה-permission model, ואת publisher identity.
+
+העקרונות:
+
+- **Packages חתומים.** לכל app יש publisher identity ו-manifest חתום. unsigned packages לא מותקנים מה-registry הראשי.
+- **Registry רשמי כברירת מחדל.** מקור ההתקנה העיקרי, עם quality + security gate. apps שלא עוברים — לא מופיעים.
+- **Sideload למפתחים בלבד.** dev-mode flag מאפשר התקנה מקומית ישירות מ-manifest ללא חתימה, ורק ב-sessions מסומנות כ-dev. המשתמש הרגיל לא יוכל להתקין package לא חתום "במקרה".
+- **Publisher identity מצטברת.** מוניטין, היסטוריית violations, trust tiers — משפיעים על מה ש-app יכולה לבקש ב-permissions, לא רק על visibility בחנות.
+
+**מה לא ב-MVP:** ה-registry עצמו, תהליך ה-review, publisher verification ו-trust tiers. הם מופיעים כאן כדי ש-API surface של PackageManager וה-permission model יתוכננו מראש בצורה שתומכת בהם — ולא יצטרכו rewrite ברגע שפתאום יש חנות.
+
 ---
 
 ## 4. מה עקיבא *אינה* — הבהרות חשובות

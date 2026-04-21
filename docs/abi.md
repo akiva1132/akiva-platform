@@ -17,6 +17,18 @@
 
 המעבר מ-v0 ל-v1 יהיה additive, לא breaking: ה-WIT interfaces ב-§5 תוכננו כך שה-raw ABI של v0 נמפה אליהם 1:1 (משפחות הקריאות זהות).
 
+## 1.2 עיקרון: ABI narrow-by-design
+
+ABI v0 קטן בכוונה — 7 exports app-side ו-7 imports kernel→host. זה לא accident; זה policy. ABI רחב מדי מוקדם מדי הופך לעוגן שמאט כל שינוי עתידי, ומכתיב decisions שכבת framework לעוד שנים.
+
+כל הרחבה ל-ABI — בין אם export חדש ב-app, import חדש ב-host, או שדה חדש ב-wire format — חייבת לעבור על שלושת המבחנים:
+
+1. **Use case מוכח.** לפחות reference app אחד שבלי ההרחבה לא פועל בצורה סבירה. "might be useful later" לא מספיק.
+2. **Cross-app justification.** הרחבה שמשרתת app בודד או use case נישתי שייכת ל-framework או ל-sdk, לא ל-ABI. ABI משרת רק את הדברים שכל app, או runtime core, חייבים.
+3. **Forward-compat ל-v1.** יש mapping ברור ל-WIT interface ב-§5. אם ההרחבה לא מתורגמת לצורה נקייה ב-Component Model, זה תמרור אזהרה שה-shape שלה לא נכון.
+
+הכלל המעשי: עדיף פונקציה אחת חסרה היום מאשר שבע פונקציות מיותרות שנצטרך לגרור לנצח. הרחבות נוספות ל-`hal_app_*` או ל-paint-op opcodes עוברות review מפורש ב-PR, ומתועדות בסעיף גרסאות (§10).
+
 ---
 
 ## 2. App ABI v0 — raw exports (Phase 2b)
@@ -73,9 +85,20 @@ extern "C" fn akiva_app_render(handle: u32, ts_ms: f64, out_len_ptr: *mut u32) -
 
 ה-buffer שמוחזר מ-`akiva_app_render` הוא app-owned: ה-app חייב להחזיק אותו בחיים לפחות עד הקריאה הבאה ל-`akiva_app_render` עם אותו handle. ה-convention הוא buffer per-handle שנמחזר כל frame — מקצה פעם אחת, מנקה עם `clear()`, ומחזיר את הכתובת שוב.
 
-### 2.3 Imports (host → app) — נשארים ל-2b.3+
+### 2.3 Imports (host → app)
 
-Apps יקבלו גישה ל-host דרך imports בשם `akiva_host_*`. המסגרת המלאה (log, finish, start_activity, storage) תוגדר ב-Phase 2b.3 כש-sdk-rust יצטרך אותה. ברובד ה-v1 כל אלה יתמפו ל-WIT interfaces ב-§5.
+ה-host מייצא ל-wasm של האפליקציה imports תחת module name `env`. המינימום המונח ב-Phase 2b.3:
+
+```rust
+// Write a UTF-8 string to the host log with per-app prefix.
+// level: 0=trace 1=debug 2=info 3=warn 4=error (מקביל ל-hal_log של ה-kernel).
+// ptr/len: תוך ה-memory של ה-app; ה-host קורא אותן inline.
+extern "C" fn akiva_host_log(level: u32, ptr: *const u8, len: u32);
+```
+
+כל app מקבל את ה-set הבסיסי הזה אוטומטית ללא הצהרה. הרחבות נוספות (finish, start_activity, storage read/write, intent dispatch) תיכנסנה כשאפליקציות אמיתיות יצטרכו אותן, ובכפוף למבחני §1.2 — כל הרחבה דורשת use case מוכח ו-mapping ל-WIT interface ב-§5.
+
+ב-v1 כל ה-imports יתמפו ל-interfaces המובנים של ה-world `akiva:app/host`: `log`, `activity-api`, `storage`, `intent`, וכו'. נקודת ה-mapping: `akiva_host_log` ⇔ `log.log(level, msg)`.
 
 ### 2.4 Imports (kernel → host) — `hal_app_*`
 
@@ -122,10 +145,10 @@ fn hal_app_render(handle: u32, ts_ms: f64, out_ptr: *mut u8, out_cap: u32) -> u3
 
 ### 2.7 מה לא כלול ב-v0
 
-- **Imports נוספים ל-app** — ל-2b.3 יתווספו `akiva_host_log`, `akiva_host_finish`, ואחרים. אפליקציות ב-v0 יכולות רק לצייר ולהגיב לקלט.
+- **Imports מלאים** — רק `akiva_host_log` זמין ב-Phase 2b.3. `finish`, `start_activity`, `storage`, notifications — כל אלה ידרשו PR נפרד ויעברו את מבחני §1.2.
 - **State save/restore** — `on_save_state` נכנס בפאזה מאוחרת יותר.
 - **Intents** — routing בין apps מופעל ב-Phase 3.
-- **Permissions** — ה-host פשוט יטען את ה-wasm; ה-PermissionController יבוא מאוחר.
+- **Permissions** — ה-host טוען כל wasm עם ה-imports הבסיסיים בלבד. PermissionController נכנס ב-v1 כשה-imports נהיים conditional.
 
 ---
 

@@ -144,7 +144,9 @@ pub extern "C" fn akiva_boot() {
 
     let boot_count = bump_boot_counter();
     let mut kstore = KernelStorage;
-    let (mut fw, report) = framework::boot(boot_count, &mut kstore);
+    let host: std::rc::Rc<dyn akiva_framework::wasm_activity::WasmHost> =
+        std::rc::Rc::new(KernelWasmHost);
+    let (mut fw, report) = framework::boot(boot_count, &mut kstore, host);
     log::info(&format!("packages: {} loaded", report.packages_loaded));
     for (id, err) in &report.package_errors {
         log::warn(&format!("package '{id}' failed to load: {err}"));
@@ -190,13 +192,9 @@ fn map_storage_err(e: storage::StorageError) -> akiva_framework::storage::Storag
 }
 
 /// Adapter that routes framework `WasmHost` calls to the matching
-/// `hal_app_*` imports. Zero-sized: the host side owns all per-instance
-/// state (wasm instance, memory, alloc pair), keyed by the returned
-/// handle.
-///
-/// Not wired into `framework::boot` yet — [`akiva_framework::wasm_activity`]
-/// exists as the ABI contract, but app instantiation lands in Phase 2b.3.
-#[allow(dead_code)]
+/// `hal_app_*` imports. Zero-sized: the host side (worker.js) owns all
+/// per-instance state — wasm module, linear memory, paint scratch —
+/// keyed by the returned handle.
 struct KernelWasmHost;
 
 impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {

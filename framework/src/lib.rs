@@ -26,12 +26,15 @@ pub mod wasm_activity;
 pub mod widgets;
 pub mod window_manager;
 
+use std::rc::Rc;
+
 use activity::{ActivityContext, KeyEvent, PointerEvent, SurfaceMetrics};
 use activity_manager::{ActivityId, ActivityManager, LaunchMode, LifecycleState};
 use compositor::{Compositor, FrameCommands};
 use package_manager::LoadError;
 use shell::ShellActivity;
 use storage::Storage;
+use wasm_activity::{WasmActivity, WasmHost};
 
 /// Summary the kernel prints after `boot` returns. Keeps logging out of
 /// the framework — the framework has no host log binding and we don't
@@ -52,8 +55,15 @@ pub struct BootReport {
 /// storage smoke test is observable end-to-end. `storage` is the KV
 /// store the framework uses for the package index and per-package
 /// manifests — borrowed only for the duration of boot; post-boot calls
-/// that need persistence take it explicitly.
-pub fn boot(boot_count: u32, storage: &mut dyn Storage) -> (Framework, BootReport) {
+/// that need persistence take it explicitly. `host` is the wasm-app
+/// runtime seam: framework-side `WasmActivity` factories call it to
+/// instantiate and drive user-app wasm modules. The framework never
+/// touches app memory directly.
+pub fn boot(
+    boot_count: u32,
+    storage: &mut dyn Storage,
+    host: Rc<dyn WasmHost>,
+) -> (Framework, BootReport) {
     let mut fw = Framework {
         activities: ActivityManager::new(),
         packages: package_manager::PackageManager::new(),
@@ -75,8 +85,33 @@ pub fn boot(boot_count: u32, storage: &mut dyn Storage) -> (Framework, BootRepor
     });
     let report = BootReport { packages_loaded, package_errors };
 
-    // Register + launch the system shell. Failure here is a boot-time
-    // bug, not a runtime condition — panic is appropriate.
+    // Register every installed package's entry activity as a
+    // `WasmActivity` factory. The host owns the wasm process (one per
+    // package); each `launch()` hands the framework a fresh handle
+    // identifying one activity slot inside that process. Collecting
+    // first avoids borrowing `fw.packages` while we mutate
+    // `fw.activities`.
+    let entries: Vec<(String, String, LaunchMode)> = fw.packages.list()
+        .map(|r| {
+            let launch_mode = r.launch_mode_of(&r.entry_class).unwrap_or(LaunchMode::Standard);
+            (r.id.clone(), r.entry_class.clone(), launch_mode)
+        })
+        .collect();
+    for (pkg, class, launch_mode) in entries {
+        let host_for_factory = host.clone();
+        let pkg_for_factory = pkg.clone();
+        let class_for_factory = class.clone();
+        fw.activities.register(&pkg, &class, launch_mode, move || {
+            let handle = host_for_factory
+                .register(&pkg_for_factory, &class_for_factory)
+                .expect("wasm app register failed");
+            Box::new(WasmActivity::new(handle, host_for_factory.clone()))
+        });
+    }
+
+    // Register + launch the system shell. Must come last so a hypothetical
+    // user package claiming the shell's id can't shadow it. Failure here
+    // is a boot-time bug, not a runtime condition — panic is appropriate.
     fw.activities.register(shell::PACKAGE_ID, shell::ENTRY_CLASS, LaunchMode::SingleTop, move || {
         Box::new(ShellActivity::new(boot_count))
     });

@@ -743,3 +743,23 @@ let backend: Box<dyn RendererBackend> = if gpu_available() {
 - SELinux (אנחנו wasm sandbox)
 - Hardware services (ה-browser מטפל)
 - SystemServer כ-process נפרד (אצלנו framework ב-runtime instance)
+
+## 16. Introspection Surface
+
+**עיקרון:** כשה-runtime לא DOM, כלי ה-debug הרגילים של הדפדפן (Elements, Inspect) מאבדים גישה למבנה ה-UI. המערכת חייבת לספק **שכבת introspection נפרדת** כ-first-class concern, לא כ-afterthought — אחרת פיתוח non-DOM הופך מהר ל"עיוור".
+
+### הבחנה בין שתי שכבות
+
+- **Runtime UI** — ה-renderer האמיתי (Canvas2D/WebGPU; §10), widget tree, frame commands. זה מה שהמשתמש רואה.
+- **Introspection** — overlays שמציגים מצב פנימי: widget-tree inspector, event trace, activity-stack view, resource-resolution log, frame timing. נפרד מה-renderer ומנותק מה-widget tree של האפליקציה.
+
+### עקרונות מימוש
+
+- יושב ב-**framework**, לא ב-kernel. קורא מצב דרך APIs פנימיים קיימים של ActivityManager / ResourceManager / Compositor — בלי להרחיב את ה-ABI של האפליקציה.
+- מופעל רק במצב dev (flag ברמת ה-session, לא per-app).
+- רץ כ-overlay נפרד על גבי ה-`FrameCommands` של ה-Compositor, לא מתערבב בתוכו.
+- חשיפה אל מחוץ ל-worker דרך `postMessage` אל ה-tab, כדי שבעתיד תיכתב DevTools extension שתציג את ה-trace באופן אינטראקטיבי.
+
+### MVP vs עתיד
+
+ב-MVP אנחנו **לא** מממשים introspection. הסעיף הזה עוגן ארכיטקטוני שמונע מצב שבו נוסיף debug APIs ad-hoc שמזהמים את ה-ABI. המימוש בפועל יבוא כשה-shell יתחיל להכיל יותר מ-"kernel: boot" — כנראה סביב Phase 3 (window manager + task switcher), כשה-widget tree יהיה מורכב מספיק כדי להצדיק inspector.
