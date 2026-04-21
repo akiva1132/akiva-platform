@@ -139,15 +139,10 @@ async function installOneDevApp(name, log) {
   }
   const packageId = idMatch[1];
 
-  // Already installed? Skip the fetch + write.
-  const enc = new TextEncoder();
-  const dec = new TextDecoder("utf-8");
-  const existing = storage.get("sys/packages/index");
-  const ids = existing
-    ? dec.decode(existing).split("\n").filter((s) => s.length > 0)
-    : [];
-  if (ids.includes(packageId)) return;
-
+  // Dev mode: always overwrite on boot. Otherwise a `build.sh` rebuild
+  // wouldn't actually reach the running app — OPFS would keep serving the
+  // first wasm we ever staged. Re-installing is a local fetch + a couple
+  // of OPFS writes, which is cheap.
   const wasmResp = await fetch(`./dev-apps/${name}/app.wasm`);
   if (!wasmResp.ok) {
     log("warn", `dev-apps/${name}/app.wasm: ${wasmResp.status} (did you run apps/${name}/build.sh?)`);
@@ -155,13 +150,22 @@ async function installOneDevApp(name, log) {
   }
   const wasmBytes = new Uint8Array(await wasmResp.arrayBuffer());
 
+  const enc = new TextEncoder();
+  const dec = new TextDecoder("utf-8");
   storage.set(`packages/${packageId}/manifest.toml`, enc.encode(manifestText));
   storage.set(`packages/${packageId}/app.wasm`, wasmBytes);
 
-  ids.push(packageId);
-  ids.sort();
-  storage.set("sys/packages/index", enc.encode(ids.join("\n")));
-  log("info", `dev install: ${packageId} (${wasmBytes.byteLength} bytes)`);
+  const existing = storage.get("sys/packages/index");
+  const ids = existing
+    ? dec.decode(existing).split("\n").filter((s) => s.length > 0)
+    : [];
+  const fresh = !ids.includes(packageId);
+  if (fresh) {
+    ids.push(packageId);
+    ids.sort();
+    storage.set("sys/packages/index", enc.encode(ids.join("\n")));
+  }
+  log("info", `dev install: ${packageId} (${wasmBytes.byteLength} bytes${fresh ? ", new" : ", refreshed"})`);
 }
 
 function attachDisplay(msg) {
