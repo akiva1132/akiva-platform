@@ -18,6 +18,7 @@ pub mod log;
 pub mod res;
 pub mod runtime;
 pub mod storage;
+pub mod ui;
 
 pub use activity::{Activity, ActivityContext, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState};
 pub use app::{App, AppContext};
@@ -29,6 +30,7 @@ pub mod prelude {
     pub use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState};
     pub use crate::canvas::Canvas;
     pub use crate::intent::{Intent, IntentBuilder};
+    pub use crate::ui::{Ui, UiState};
     pub use crate::{log_debug, log_error, log_info, log_trace, log_warn};
 }
 

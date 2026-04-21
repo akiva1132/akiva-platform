@@ -1,16 +1,16 @@
 //! Hello Akiva — first-party smoke-test app.
 //!
-//! Paints a solid background, centres a title, draws a frame counter, and
-//! flashes a square at the pointer. That's enough to prove every lane of
-//! the ABI: alloc/dealloc, lifecycle, resize, pointer, render.
+//! Phase 3a demo: everything is declared through the widget toolkit
+//! (`akiva_sdk::ui`) rather than raw canvas ops. Paints a title, a live
+//! counter, and two buttons that mutate it — exercises text, rect,
+//! stacks, padding, and the click-detection path end-to-end.
 
 use akiva_sdk::prelude::*;
 
 #[derive(Default)]
 struct HelloMain {
-    frame: u64,
-    pointer: Option<(f32, f32)>,
-    pointer_down: bool,
+    ui: UiState,
+    count: i32,
 }
 
 impl Activity for HelloMain {
@@ -20,40 +20,42 @@ impl Activity for HelloMain {
     }
 
     fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
-        self.pointer = Some((ev.x, ev.y));
-        self.pointer_down = matches!(ev.phase, PointerPhase::Down | PointerPhase::Move)
-            && ev.button != 0xff;
-        // Collapse noisy `Move` spam: only log Down / Up.
-        if matches!(ev.phase, PointerPhase::Down) {
-            log_debug!("pointer down at ({:.0}, {:.0})", ev.x, ev.y);
-        }
+        // Feed the UI state so it can correlate pointer-down events with
+        // the widgets laid out during the next `present()`. No manual
+        // hit-testing in this app — the widgets own that now.
+        self.ui.feed_pointer(ev);
     }
 
     fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
-        // Color format on this platform is 0xAARRGGBB — alpha first, then RGB.
-        // Same as the Shell and the framework paint ops.
-        self.frame = self.frame.wrapping_add(1);
-        let w = ctx.metrics.width_px as f32;
-        let h = ctx.metrics.height_px as f32;
-
-        // Background + bottom accent stripe.
+        // Paint the dark backdrop ourselves — the widget toolkit doesn't
+        // have a full-surface "scene background" concept yet. The rest
+        // is declarative.
         c.clear(0xff0f1420);
-        c.fill_rect(0.0, h - 4.0, w, 4.0, 0xff2a3f66);
 
-        // Title.
-        c.draw_text(24.0, 48.0, 28.0, 0xfff0f4fa, "Hello, Akiva!");
-        c.draw_text(24.0, 76.0, 14.0, 0xff9aa8bc, "akiva-app-hello · ABI v0.1.0");
+        let mut ui = Ui::new(&mut self.ui, ctx, c);
 
-        // Frame counter + canvas size.
-        let line = format!("frame {} · surface {}×{}", self.frame, ctx.metrics.width_px, ctx.metrics.height_px);
-        c.draw_text(24.0, h - 24.0, 14.0, 0xff7e8aa0, &line);
+        let title = ui.text("Hello, Akiva!").size(28.0).color(0xfff0f4fa).build();
+        let subtitle = ui.text("akiva-app-hello · ABI v0.1.0 · widgets")
+            .size(13.0).color(0xff9aa8bc).build();
 
-        // Pointer reticle — coloured by button state. Half-alpha when idle.
-        if let Some((px, py)) = self.pointer {
-            let color = if self.pointer_down { 0xffff6a4a } else { 0x804a9eff };
-            let s = 20.0;
-            c.fill_rect(px - s / 2.0, py - s / 2.0, s, s, color);
-        }
+        let counter_label = ui.text(&format!("count = {}", self.count))
+            .size(20.0).color(0xffe0e6f0).build();
+
+        let dec = ui.button("dec", "−1");
+        let inc = ui.button("inc", "+1");
+        let reset = ui.button("reset", "Reset");
+        let buttons = ui.h_stack(&[dec, inc, reset]).gap(12.0).build();
+
+        let root = ui.v_stack(&[title, subtitle, counter_label, buttons])
+            .gap(16.0)
+            .padding(24.0)
+            .build();
+
+        ui.present(root);
+
+        if ui.was_clicked("inc")   { self.count += 1; log_debug!("inc → {}", self.count); }
+        if ui.was_clicked("dec")   { self.count -= 1; log_debug!("dec → {}", self.count); }
+        if ui.was_clicked("reset") { self.count = 0;  log_debug!("reset"); }
     }
 }
 
