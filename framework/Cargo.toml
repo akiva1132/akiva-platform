@@ -11,6 +11,18 @@ description = "Akiva Platform framework: activity manager, package manager, wind
 crate-type = ["rlib"]
 
 [dependencies]
+# Manifest parsing. `toml` with only `parse` keeps the dep tree tight; we
+# deserialize straight into typed structs via `serde`.
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+# Transitive dep of `toml`; pinned below 2.10 because 2.10+ requires
+# edition2024 (Rust ≥1.85) and we support stable Rust 1.82+.
+indexmap = { version = ">=2, <2.10", default-features = false }
+
+[features]
+# Exposes `storage::MemoryStorage` to dependents (kernel, tests). Always
+# compiled in when running `cargo test -p akiva-framework`.
+memory-storage = []
 
 [package.metadata.akiva]
 role = "framework"

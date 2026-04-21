@@ -143,7 +143,12 @@ pub extern "C" fn akiva_boot() {
     k.display.init();
 
     let boot_count = bump_boot_counter();
-    let mut fw = framework::boot(boot_count);
+    let mut kstore = KernelStorage;
+    let (mut fw, report) = framework::boot(boot_count, &mut kstore);
+    log::info(&format!("packages: {} loaded", report.packages_loaded));
+    for (id, err) in &report.package_errors {
+        log::warn(&format!("package '{id}' failed to load: {err}"));
+    }
     let m = k.display.metrics();
     fw.set_metrics(fw_act::SurfaceMetrics {
         width_px: m.width_px,
@@ -151,6 +156,37 @@ pub extern "C" fn akiva_boot() {
         density: m.density,
     });
     k.framework = Some(fw);
+}
+
+/// Adapter that lets the framework read the kernel's OPFS-backed KV
+/// store through its abstract `Storage` trait. Zero-sized: the backing
+/// module is addressed via free functions, so there's no per-instance
+/// state to carry.
+struct KernelStorage;
+
+impl akiva_framework::storage::Storage for KernelStorage {
+    fn read(&self, key: &str) -> Result<Vec<u8>, akiva_framework::storage::StorageError> {
+        storage::read(key).map_err(map_storage_err)
+    }
+    fn write(
+        &mut self,
+        key: &str,
+        value: &[u8],
+    ) -> Result<(), akiva_framework::storage::StorageError> {
+        storage::write(key, value).map_err(map_storage_err)
+    }
+    fn delete(&mut self, key: &str) -> Result<(), akiva_framework::storage::StorageError> {
+        storage::delete(key).map_err(map_storage_err)
+    }
+}
+
+fn map_storage_err(e: storage::StorageError) -> akiva_framework::storage::StorageError {
+    use akiva_framework::storage::StorageError as FwErr;
+    match e {
+        storage::StorageError::NotFound => FwErr::NotFound,
+        storage::StorageError::BadKey => FwErr::BadKey,
+        storage::StorageError::Io => FwErr::Io,
+    }
 }
 
 /// Exercises the storage HAL end-to-end: read a u32 counter under

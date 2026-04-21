@@ -16,25 +16,44 @@ pub mod akml;
 pub mod compositor;
 pub mod intent;
 pub mod layout;
+pub mod manifest;
 pub mod package_manager;
 pub mod permissions;
 pub mod resource_manager;
 pub mod shell;
+pub mod storage;
+pub mod wasm_activity;
 pub mod widgets;
 pub mod window_manager;
 
 use activity::{ActivityContext, KeyEvent, PointerEvent, SurfaceMetrics};
 use activity_manager::{ActivityId, ActivityManager, LaunchMode, LifecycleState};
 use compositor::{Compositor, FrameCommands};
+use package_manager::LoadError;
 use shell::ShellActivity;
+use storage::Storage;
+
+/// Summary the kernel prints after `boot` returns. Keeps logging out of
+/// the framework — the framework has no host log binding and we don't
+/// want to invent one just for a single line at startup.
+#[derive(Debug, Default)]
+pub struct BootReport {
+    /// Number of packages successfully rehydrated from storage.
+    pub packages_loaded: usize,
+    /// Per-package load failures, `(package_id, error_message)`. Empty on
+    /// a clean first boot. The kernel logs these at warn level.
+    pub package_errors: Vec<(String, String)>,
+}
 
 /// Framework boot. Called once by the kernel during `akiva_boot` after
-/// the display surface is live and storage is loaded.
+/// the display surface is live and persistent storage is loaded.
 ///
-/// `boot_count` is fed in from the kernel's persistence smoke test so the
-/// Shell can show "boot #N" to confirm storage is working end-to-end. In
-/// Phase 2b this will be replaced by proper package metadata.
-pub fn boot(boot_count: u32) -> Framework {
+/// `boot_count` feeds the Shell a visible "boot #N" so the kernel's
+/// storage smoke test is observable end-to-end. `storage` is the KV
+/// store the framework uses for the package index and per-package
+/// manifests — borrowed only for the duration of boot; post-boot calls
+/// that need persistence take it explicitly.
+pub fn boot(boot_count: u32, storage: &mut dyn Storage) -> (Framework, BootReport) {
     let mut fw = Framework {
         activities: ActivityManager::new(),
         packages: package_manager::PackageManager::new(),
@@ -48,6 +67,14 @@ pub fn boot(boot_count: u32) -> Framework {
         active: None,
     };
 
+    // Rehydrate installed packages from storage. A corrupt manifest is
+    // reported but not fatal — the Shell and healthy apps stay usable.
+    let mut package_errors: Vec<(String, String)> = Vec::new();
+    let packages_loaded = fw.packages.load_installed(storage, |id, e: LoadError| {
+        package_errors.push((id.to_string(), format!("{e:?}")));
+    });
+    let report = BootReport { packages_loaded, package_errors };
+
     // Register + launch the system shell. Failure here is a boot-time
     // bug, not a runtime condition — panic is appropriate.
     fw.activities.register(shell::PACKAGE_ID, shell::ENTRY_CLASS, LaunchMode::SingleTop, move || {
@@ -58,7 +85,7 @@ pub fn boot(boot_count: u32) -> Framework {
         .expect("shell launch");
     fw.active = Some(shell_id);
     fw.drive_to_resumed(shell_id, 0.0);
-    fw
+    (fw, report)
 }
 
 /// Aggregate handle exposed to the kernel. All cross-subsystem calls go

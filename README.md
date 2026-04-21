@@ -96,8 +96,9 @@ akiva-platform/
 - ✅ Event pipeline end-to-end (DOM → Worker → Kernel → Canvas)
 - ✅ Storage: OPFS + SyncAccessHandle, ‏`kernel::storage` KV סינכרוני. ראה [docs/storage.md](docs/storage.md)
 - ✅ Framework seed (Phase 2a): Activity lifecycle state machine, Shell system activity, render pipeline compositor→HAL. ראה [framework/src/activity_manager.rs](framework/src/activity_manager.rs)
+- ✅ PackageManager persistence (Phase 2b.1): manifest parser מלא, OPFS-backed install/uninstall/rehydrate, Storage trait שמפריד framework מ-kernel. ראה [framework/src/manifest.rs](framework/src/manifest.rs), [framework/src/package_manager.rs](framework/src/package_manager.rs)
 - 🟡 Phase 1b שלם חלקית: cross-tab rendering עדיין לא מומש (follower displays רק נרשמים)
-- ⏳ Phase 2b (wasm app loader, PackageManager persistence, ResourceManager qualifiers) — לא התחיל
+- ⏳ Phase 2b המשך: App ABI + host-side wasm loader + apps/hello אמיתית
 
 ראה [ROADMAP.md](ROADMAP.md) לפירוט סטטוס ו-[docs/runtime-web.md](docs/runtime-web.md) לתיעוד מלא של ה-HAL.
 

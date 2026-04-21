@@ -80,8 +80,19 @@ offset  size    content
 ברמת ה-kernel ה-namespace הוא שטוח. הפרדה בין אפליקציות היא **convention** ב-SDK:
 
 - `sdk-rust::storage::Store::open(app)` יחזיק את `app.id` פנימית וידביק אותו אוטומטית לכל key: `"com.acme.calc/theme"` וכו'.
-- ה-kernel המסגרת רשאית להשתמש ב-prefix `sys/` לשימוש פנימי שלה (למשל `sys/boot_count`, `sys/pm/installed`).
+- ה-framework רשאי להשתמש ב-prefix `sys/` לשימוש פנימי (`sys/boot_count`, `sys/packages/index`).
+- חבילות מותקנות יושבות תחת `packages/{id}/...` — ראה `framework/src/package_manager.rs`. ה-PackageManager ניגש אל ה-storage דרך ה-trait `framework::storage::Storage`; ב-runtime האמיתי ה-kernel מספק `KernelStorage` שעטיפה של `kernel::storage`, ובבדיקות יחידה `MemoryStorage` החלופי.
 - מפתחות app-id בפורמט DNS-reverse: `com.acme.calc`. ה-slash מפריד את ה-path.
+
+### מפתחות שמורים למערכת
+
+| Key | בעלים | תוכן |
+|---|---|---|
+| `sys/boot_count` | kernel | `u32` LE — מונה boots (smoke test) |
+| `sys/packages/index` | framework.package_manager | רשימת package IDs, LF-separated |
+| `packages/{id}/manifest.toml` | framework.package_manager | תוכן ה-manifest UTF-8 |
+| `packages/{id}/app.wasm` | framework.package_manager | ה-module של ה-app |
+| `{app.id}/...` | SDK (per-app sandbox) | storage לאפליקציה |
 
 ב-Phase 2 (PermissionManager) אכיפה תעבור לשכבת ה-SDK/framework: ה-framework ידחה ניסיון של app לקרוא מפתח שלא מתחיל ב-`{own-app-id}/`.
 

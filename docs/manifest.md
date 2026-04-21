@@ -141,6 +141,27 @@ default_locale = "en"
 - ❌ intent_filter עם action ריק
 - ❌ permission declared שלא קיים בסיסטם
 
+### Implementation (Phase 2b.1)
+
+המימוש ב-[framework/src/manifest.rs](../framework/src/manifest.rs) מכסה את השורות שאפשר לאמת בלי cross-package context:
+
+| בדיקה | סטטוס | איפה |
+|---|---|---|
+| TOML syntax | ✅ | `toml` crate |
+| שדות חובה (`app.id`, `app.name`, `app.version`, `app.version_code`, `app.min_abi_version`, `runtime.wasm`) | ✅ | `normalize()` + serde |
+| `app.id` reverse-domain legal (`[a-z0-9_-]`, at least one `.`, no leading digit) | ✅ | `validate_app_id` |
+| `app.version` / `min_abi_version` semver `MAJOR.MINOR.PATCH[-prerelease]` | ✅ | `validate_semver` |
+| `min_abi_version` ≤ runtime ABI | ✅ | `check_abi` ב-`package_manager` (בדיקה same-major בלבד כרגע) |
+| entry activity קיים | ✅ | `normalize()` |
+| ייחודיות `id` של activity באפליקציה | ✅ | `normalize_activities` |
+| `launch_mode` ערך חוקי | ✅ | `normalize_activities` |
+| `intent_filter` עם רשימת `actions` לא ריקה | ✅ | `normalize_activities` |
+| `runtime.wasm` קובץ קיים ומייצא את ה-hooks | ⏳ Phase 2b.2+ | loader side |
+| Resource references (`@string/...`, `@drawable/...`) | ⏳ Phase 3 | ResourceManager |
+| Permission declarations קיימות ב-system | ⏳ Post-MVP | PermissionController |
+
+Defaults (§5) מוחלים ב-`normalize()`: `exported` מחושב אוטומטית מנוכחות `intent_filters`, `task_affinity` ברירת מחדל ל-`app.id`, `launch_mode` ברירת מחדל ל-`standard`, וכו'.
+
 ## 7. מבנה חבילה
 
 ```
