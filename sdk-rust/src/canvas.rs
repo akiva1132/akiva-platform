@@ -37,6 +37,12 @@ pub struct Canvas<'a> {
 impl<'a> Canvas<'a> {
     pub(crate) fn new(buf: &'a mut Vec<u8>) -> Self { Self { buf } }
 
+    /// Current byte count in the paint stream. Only exposed for tests
+    /// inside the SDK that need to assert "the canvas didn't grow"; app
+    /// code has no business reading this.
+    #[cfg(test)]
+    pub(crate) fn buf_len(&self) -> usize { self.buf.len() }
+
     /// Fill the entire surface with a single color. Paints at the bottom
     /// of the stack — a typical frame starts with `clear`.
     pub fn clear(&mut self, rgba: u32) {

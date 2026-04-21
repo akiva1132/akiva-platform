@@ -147,6 +147,12 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         id
     }
 
+    /// Bytes written to the canvas so far. Test-only — exists so we can
+    /// assert "double-present produced no new paint ops" without having
+    /// to drop `Ui` mid-frame.
+    #[cfg(test)]
+    pub(crate) fn canvas_len(&self) -> usize { self.canvas.buf_len() }
+
     // ── Builders ─────────────────────────────────────────────────────
     //
     // All builders return borrowing configurators that terminate with
@@ -231,5 +237,207 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
     /// multiple times — returns the same answer until next frame.
     pub fn was_clicked(&self, id: &str) -> bool {
         self.state.current_clicks.iter().any(|s| s == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activity::{Metrics, PointerPhase};
+
+    fn pointer(x: f32, y: f32, phase: PointerPhase) -> PointerEvent {
+        PointerEvent { x, y, button: 0, phase }
+    }
+
+    fn ctx<'a>(class: &'a str) -> Context<'a> {
+        Context {
+            metrics: Metrics { width_px: 800, height_px: 600, density: 1.0 },
+            timestamp_ms: 0.0,
+            pointer: None,
+            class,
+        }
+    }
+
+    #[test]
+    fn new_state_is_empty() {
+        let s = UiState::new();
+        assert!(s.hit_rects.is_empty());
+        assert!(s.pending_clicks.is_empty());
+        assert!(s.current_clicks.is_empty());
+    }
+
+    #[test]
+    fn feed_pointer_captures_down_ignores_others() {
+        let mut s = UiState::new();
+        s.feed_pointer(pointer(10.0, 10.0, PointerPhase::Move));
+        s.feed_pointer(pointer(10.0, 10.0, PointerPhase::Up));
+        s.feed_pointer(pointer(10.0, 10.0, PointerPhase::Cancel));
+        assert!(s.pending_clicks.is_empty());
+
+        s.feed_pointer(pointer(42.0, 7.0, PointerPhase::Down));
+        assert_eq!(s.pending_clicks, vec![(42.0, 7.0)]);
+    }
+
+    #[test]
+    fn was_clicked_is_false_before_any_present() {
+        let s = UiState::new();
+        // No Ui built at all — was_clicked on a bare state reads the
+        // still-empty `current_clicks`. We emulate by borrowing through
+        // a throwaway Ui that never presents.
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui_state = s;
+        let ui = Ui::new(&mut ui_state, &c, &mut canvas);
+        assert!(!ui.was_clicked("anything"));
+    }
+
+    #[test]
+    fn click_inside_button_rect_registers() {
+        let mut state = UiState::new();
+        // Button placed at origin. A "Go" label (2 chars, 14pt, pad
+        // 16/10) gives roughly 47×38 — so (10, 10) is safely inside
+        // without tripping the half-open right/bottom edges.
+        state.feed_pointer(pointer(10.0, 10.0, PointerPhase::Down));
+
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let btn = ui.button("go", "Go");
+        ui.present(btn);
+        assert!(ui.was_clicked("go"));
+        assert!(!ui.was_clicked("nope"));
+    }
+
+    #[test]
+    fn click_outside_any_button_registers_nothing() {
+        let mut state = UiState::new();
+        // Button will be small and near origin; click far to the right.
+        state.feed_pointer(pointer(500.0, 500.0, PointerPhase::Down));
+
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let btn = ui.button("go", "Go");
+        ui.present(btn);
+        assert!(!ui.was_clicked("go"));
+    }
+
+    #[test]
+    fn multiple_buttons_resolve_to_the_hit_one() {
+        let mut state = UiState::new();
+
+        // Build the tree once to learn where button B ends up, feed a
+        // click there, then rebuild + present. Two Ui lifetimes in
+        // sequence matches real usage: on_pointer runs against last
+        // frame's rects, on_render rebuilds.
+        let c = ctx("t");
+
+        let rect_b;
+        {
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let a = ui.button("a", "A");
+            let b = ui.button("b", "B");
+            let row = ui.h_stack(&[a, b]).gap(4.0).build();
+            ui.present(row);
+            rect_b = *state.hit_rects.get("b").expect("b rect");
+        }
+        // Click in the middle of B.
+        state.feed_pointer(pointer(rect_b.x + rect_b.w / 2.0, rect_b.y + rect_b.h / 2.0, PointerPhase::Down));
+
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let a = ui.button("a", "A");
+        let b = ui.button("b", "B");
+        let row = ui.h_stack(&[a, b]).gap(4.0).build();
+        ui.present(row);
+        assert!(ui.was_clicked("b"));
+        assert!(!ui.was_clicked("a"));
+    }
+
+    #[test]
+    fn pending_click_is_consumed_by_present() {
+        let mut state = UiState::new();
+        state.feed_pointer(pointer(5.0, 5.0, PointerPhase::Down));
+
+        let c = ctx("t");
+        {
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let btn = ui.button("g", "G");
+            ui.present(btn);
+            assert!(ui.was_clicked("g"));
+        }
+        // Next frame: no new clicks fed → was_clicked must be false.
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let btn = ui.button("g", "G");
+        ui.present(btn);
+        assert!(!ui.was_clicked("g"));
+    }
+
+    #[test]
+    fn hit_rects_reset_between_frames() {
+        let mut state = UiState::new();
+        let c = ctx("t");
+
+        // Frame 1: register button "a".
+        {
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let btn = ui.button("a", "A");
+            ui.present(btn);
+            assert!(state.hit_rects.contains_key("a"));
+        }
+        // Frame 2: different tree — "a" must vanish from hit_rects so
+        // an old click in its former location can't fire a ghost tap.
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let btn = ui.button("b", "B");
+        ui.present(btn);
+        assert!(!state.hit_rects.contains_key("a"));
+        assert!(state.hit_rects.contains_key("b"));
+    }
+
+    #[test]
+    fn double_present_is_a_noop() {
+        // Calling present twice in one frame should neither double-paint
+        // nor consume extra clicks. The protection is cosmetic — an
+        // honest mistake by the app shouldn't corrupt state.
+        let mut state = UiState::new();
+        state.feed_pointer(pointer(10.0, 10.0, PointerPhase::Down));
+
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let btn = ui.button("g", "G");
+        ui.present(btn);
+        let bytes_after_first = ui.canvas_len();
+        ui.present(btn);
+        assert_eq!(ui.canvas_len(), bytes_after_first);
+    }
+
+    #[test]
+    fn rect_contains_is_half_open() {
+        // Left + top edges inclusive, right + bottom exclusive. This
+        // matches typical pixel-grid conventions and means a click at
+        // the exact boundary between two widgets resolves to the one
+        // further down-right.
+        let r = Rect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 };
+        assert!(r.contains(10.0, 20.0));   // top-left corner
+        assert!(r.contains(39.999, 59.999));
+        assert!(!r.contains(40.0, 20.0));  // just past the right edge
+        assert!(!r.contains(10.0, 60.0));  // just past the bottom edge
+        assert!(!r.contains(9.9, 20.0));
     }
 }
