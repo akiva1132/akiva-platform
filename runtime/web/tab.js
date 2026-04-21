@@ -91,11 +91,21 @@ function onRoleChange({ role, promoted }) {
   );
 
   if (role === "leader") {
-    // Transfer the canvas to the worker. Only valid if we haven't
-    // transferred before — which is guaranteed by design since we only
-    // transfer on becoming leader, and leader is terminal (no demotion).
     if (!state.canvasTransferred) {
-      const offscreen = surfaceEl.transferControlToOffscreen();
+      // Fresh metrics at transfer time — viewport may have changed while
+      // we were follower (resize during wait).
+      state.metrics = computeMetrics();
+      applyCanvasSize(surfaceEl, state.metrics);
+
+      console.log(`[akiva] transferring canvas to worker (${state.metrics.width_px}x${state.metrics.height_px})`);
+      let offscreen;
+      try {
+        offscreen = surfaceEl.transferControlToOffscreen();
+      } catch (err) {
+        console.error("[akiva] transferControlToOffscreen failed:", err);
+        onPanic(`canvas transfer failed: ${err?.message ?? err}`);
+        return;
+      }
       state.canvasTransferred = true;
       state.ownsCanvas = false;
       session.send(
@@ -103,13 +113,8 @@ function onRoleChange({ role, promoted }) {
         [offscreen],
       );
     }
-    // If we were promoted from follower, the boot banner was already
-    // hidden back when we first became follower. Either way, hide it.
     bootEl.classList.add("hidden");
   } else if (role === "follower") {
-    // Register with the current leader so it can composite a follower
-    // display in the future (Phase 2). We also hide the boot banner —
-    // the OS is alive, we just don't own it.
     session.send({ type: "register_follower_display", tabId, metrics: state.metrics });
     bootEl.classList.add("hidden");
   }

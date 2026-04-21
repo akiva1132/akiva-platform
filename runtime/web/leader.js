@@ -39,6 +39,7 @@ export class Session extends EventTarget {
     this.worker = null;
     this.bc = new BroadcastChannel(opts.channel);
     this._onLockAcquired = null;
+    this._pendingSends = [];
     this._boundBcListener = this._onBroadcast.bind(this);
     this.bc.addEventListener("message", this._boundBcListener);
   }
@@ -50,7 +51,14 @@ export class Session extends EventTarget {
     // or later (after a prior leader's tab closes).
     const lockAcquired = new Promise((resolve) => { this._onLockAcquired = resolve; });
     navigator.locks.request(this.opts.lockName, { mode: "exclusive" }, async () => {
-      this._becomeLeader();
+      console.log(`[session] ${this.opts.tabId.slice(0, 8)} acquired leader lock (was: ${this.role})`);
+      try {
+        this._becomeLeader();
+      } catch (err) {
+        console.error("[session] _becomeLeader threw:", err);
+        this._emit("panic", { text: `become-leader failed: ${err?.message ?? err}` });
+        return;
+      }
       this._onLockAcquired?.();
       // Hold the lock for the lifetime of this tab. The browser releases
       // it on tab close, unblocking the next follower in line.
@@ -79,22 +87,34 @@ export class Session extends EventTarget {
     await lockAcquired;
   }
 
-  /** Send a message toward the kernel. Behaviour depends on role. */
+  /** Send a message toward the kernel. Behaviour depends on role. If a
+   *  role hasn't been assigned yet, the message is queued and flushed on
+   *  the first `role` event — avoids dropping early resize/input events
+   *  that arrive during the ~25-175ms election window. */
   send(message, transferList = []) {
     if (this.role === "leader") {
       this.worker.postMessage(message, transferList);
-    } else if (this.role === "follower") {
-      // BroadcastChannel cannot transfer objects. This is a leaky
-      // abstraction on purpose — callers that need zero-copy transfer
-      // (OffscreenCanvas) must be leader before calling. See tab.js for
-      // how we defer canvas transfer until after promotion.
+      return;
+    }
+    if (this.role === "follower") {
       if (transferList.length) {
+        // BroadcastChannel cannot transfer objects. This is a leaky
+        // abstraction on purpose — callers that need zero-copy transfer
+        // (OffscreenCanvas) must be leader before calling. See tab.js for
+        // how we defer canvas transfer until after promotion.
         console.warn("[session] follower send dropped transferList:", transferList);
       }
       this.bc.postMessage({ type: "follower_msg", payload: message });
-    } else {
-      console.warn("[session] send() called before role assigned");
+      return;
     }
+    // Role not assigned yet: buffer.
+    this._pendingSends.push({ message, transferList });
+  }
+
+  _flushPending() {
+    const queued = this._pendingSends;
+    this._pendingSends = [];
+    for (const { message, transferList } of queued) this.send(message, transferList);
   }
 
   /** Teardown. Idempotent. */
@@ -113,13 +133,22 @@ export class Session extends EventTarget {
     if (this.role !== "electing") return;
     this.role = "follower";
     this._emit("role", { role: "follower", promoted: false });
+    this._flushPending();
   }
 
   _becomeLeader() {
+    if (this.role === "leader") return;
     const promoted = this.role === "follower";
     this.role = "leader";
 
     this.worker = new Worker(this.opts.workerUrl, { type: "module" });
+    this.worker.addEventListener("error", (e) => {
+      console.error("[session] worker error:", e.message, e);
+      this._emit("panic", { text: `worker error: ${e.message}` });
+    });
+    this.worker.addEventListener("messageerror", (e) => {
+      console.error("[session] worker messageerror:", e);
+    });
     this.worker.postMessage({
       type: "init",
       kernelUrl: this.opts.kernelUrl,
@@ -133,6 +162,7 @@ export class Session extends EventTarget {
     });
 
     this._emit("role", { role: "leader", promoted });
+    this._flushPending();
   }
 
   _onBroadcast(e) {
