@@ -356,12 +356,16 @@ mod tests {
         }
     }
 
-    fn make_ctx<'a>(finish: &'a mut bool) -> ActivityContext<'a> {
+    fn make_ctx<'a>(
+        finish: &'a mut bool,
+        launch: &'a mut Option<crate::activity::LaunchRequest>,
+    ) -> ActivityContext<'a> {
         ActivityContext {
             metrics: SurfaceMetrics { width_px: 800, height_px: 600, density: 1.0 },
             timestamp_ms: 1234.0,
             pointer: None,
             finish_requested: finish,
+            launch_requested: launch,
         }
     }
 
@@ -372,7 +376,8 @@ mod tests {
         host.take_calls(); // drop register
         let mut act = WasmActivity::new(handle, host.clone());
         let mut finish = false;
-        let mut ctx = make_ctx(&mut finish);
+        let mut launch = None;
+        let mut ctx = make_ctx(&mut finish, &mut launch);
         act.on_create(&mut ctx);
         act.on_start(&mut ctx);
         act.on_resume(&mut ctx);
@@ -398,7 +403,8 @@ mod tests {
         host.take_calls();
         let mut act = WasmActivity::new(handle, host.clone());
         let mut finish = false;
-        let mut ctx = make_ctx(&mut finish);
+        let mut launch = None;
+        let mut ctx = make_ctx(&mut finish, &mut launch);
         ctx.timestamp_ms = 42.5;
         act.on_pointer(&mut ctx, PointerEvent { x: 10.0, y: 20.0, button: 0, phase: PointerPhase::Down });
         assert_eq!(host.take_calls(), vec![Call::Pointer(handle.get(), 10.0, 20.0, 42.5)]);
@@ -419,7 +425,8 @@ mod tests {
 
         let mut act = WasmActivity::new(handle, host.clone());
         let mut finish = false;
-        let mut ctx = make_ctx(&mut finish);
+        let mut launch = None;
+        let mut ctx = make_ctx(&mut finish, &mut launch);
         let mut frame = FrameCommands::new();
         act.render(&mut ctx, &mut frame);
 

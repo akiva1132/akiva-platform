@@ -28,13 +28,19 @@ pub mod window_manager;
 
 use std::rc::Rc;
 
-use activity::{ActivityContext, KeyEvent, PointerEvent, SurfaceMetrics};
+use activity::{ActivityContext, KeyEvent, LaunchRequest, PointerEvent, SurfaceMetrics};
 use activity_manager::{ActivityId, ActivityManager, LaunchMode, LifecycleState};
 use compositor::{Compositor, FrameCommands};
 use package_manager::LoadError;
-use shell::ShellActivity;
+use shell::{AppEntry, ShellActivity};
 use storage::Storage;
 use wasm_activity::{WasmActivity, WasmHost};
+
+/// Browser `KeyboardEvent.keyCode` for Escape. Phase 2b.5 uses this as
+/// the universal Back key — if the foreground has something beneath it
+/// on the stack, Escape pops instead of reaching the active activity.
+/// A real key-map lives in the HAL in a later phase.
+const KEY_CODE_BACK: u32 = 27;
 
 /// Summary the kernel prints after `boot` returns. Keeps logging out of
 /// the framework — the framework has no host log binding and we don't
@@ -74,7 +80,7 @@ pub fn boot(
         compositor: Compositor::new(),
         metrics: SurfaceMetrics::default(),
         pointer: None,
-        active: None,
+        stack: Vec::new(),
     };
 
     // Rehydrate installed packages from storage. A corrupt manifest is
@@ -109,55 +115,32 @@ pub fn boot(
         });
     }
 
+    // Build the Shell's launcher entries from whatever user packages we
+    // just rehydrated. Sorted by id for a stable boot-to-boot order.
+    // Skipping the Shell itself so it doesn't offer "launch yourself".
+    let mut launcher: Vec<AppEntry> = fw.packages.list()
+        .filter(|r| r.id != shell::PACKAGE_ID)
+        .map(|r| AppEntry {
+            package_id: r.id.clone(),
+            class: r.entry_class.clone(),
+            name: r.name.clone(),
+        })
+        .collect();
+    launcher.sort_by(|a, b| a.package_id.cmp(&b.package_id));
+
     // Register + launch the system shell. Must come last so a hypothetical
     // user package claiming the shell's id can't shadow it. Failure here
     // is a boot-time bug, not a runtime condition — panic is appropriate.
     fw.activities.register(shell::PACKAGE_ID, shell::ENTRY_CLASS, LaunchMode::SingleTop, move || {
-        Box::new(ShellActivity::new(boot_count))
+        Box::new(ShellActivity::new(boot_count, launcher.clone()))
     });
     let shell_id = fw.activities
         .launch(shell::PACKAGE_ID, shell::ENTRY_CLASS)
         .expect("shell launch");
-    fw.active = Some(shell_id);
+    fw.stack.push(shell_id);
     fw.drive_to_resumed(shell_id, 0.0);
 
-    // Phase 2b.4 smoke test: if any user package is installed, auto-launch
-    // its entry activity on top of the Shell. Picks the lowest package id
-    // for determinism. Replaced in Phase 2b.5 when the Shell grows a task
-    // switcher UI that lets the user pick. The Shell lifecycle is left in
-    // Resumed here because `ActivityManager` doesn't expose a "pause
-    // without destroy" helper yet — the Shell's `on_pause` is a no-op so
-    // the mismatch is cosmetic, and render picks `active` only.
-    if let Some(first) = pick_first_user_package(&fw.packages) {
-        match fw.activities.launch(&first.0, &first.1) {
-            Ok(app_id) => {
-                fw.active = Some(app_id);
-                fw.drive_to_resumed(app_id, 0.0);
-            }
-            Err(_) => {
-                // `.launch()` only fails on unknown-activity or unsupported
-                // launch mode; both would be bugs in the registration loop
-                // above. Fall through to Shell-only.
-            }
-        }
-    }
-
     (fw, report)
-}
-
-/// Return `(package_id, entry_class)` for the alphabetically-first
-/// installed package, or `None` if only the Shell is installed. Skips the
-/// Shell itself so a reboot without user apps keeps showing the Shell
-/// instead of trying to launch it twice.
-fn pick_first_user_package(pm: &package_manager::PackageManager) -> Option<(String, String)> {
-    let mut ids: Vec<&str> = pm.list()
-        .map(|r| r.id.as_str())
-        .filter(|id| *id != shell::PACKAGE_ID)
-        .collect();
-    ids.sort();
-    let id = ids.first().copied()?;
-    let rec = pm.get(id)?;
-    Some((rec.id.clone(), rec.entry_class.clone()))
 }
 
 /// Aggregate handle exposed to the kernel. All cross-subsystem calls go
@@ -173,25 +156,19 @@ pub struct Framework {
     pub compositor: Compositor,
     metrics: SurfaceMetrics,
     pointer: Option<PointerEvent>,
-    /// Currently foreground activity. Phase 2a tracks exactly one; Phase
-    /// 2b replaces this with a proper task-stack-aware pick.
-    active: Option<ActivityId>,
+    /// Foreground task stack, bottom-to-top. The Shell always sits at
+    /// position 0; user apps push on top. Only the top receives input and
+    /// render calls. Activities below the top are `Paused` (not stopped,
+    /// not destroyed), so popping back to them is free.
+    stack: Vec<ActivityId>,
 }
 
 impl Framework {
     pub fn set_metrics(&mut self, m: SurfaceMetrics) {
         self.metrics = m;
-        if let Some(id) = self.active {
-            let metrics = self.metrics;
-            let pointer = self.pointer;
-            let mut finish = false;
-            let mut ctx = ActivityContext {
-                metrics, timestamp_ms: 0.0, pointer,
-                finish_requested: &mut finish,
-            };
-            self.activities.with_instance(id, |a| a.on_resize(&mut ctx, m));
-            if finish { self.finish_active(0.0); }
-        }
+        let Some(id) = self.stack.last().copied() else { return; };
+        let (post, _) = self.with_ctx(id, 0.0, |a, ctx| a.on_resize(ctx, m));
+        self.apply_post(post, 0.0);
     }
 
     /// Dispatch a pointer event to the active activity. The framework
@@ -199,62 +176,108 @@ impl Framework {
     /// see a consistent view.
     pub fn dispatch_pointer(&mut self, ev: PointerEvent, ts: f64) {
         self.pointer = Some(ev);
-        let Some(id) = self.active else { return; };
-        let metrics = self.metrics;
-        let mut finish = false;
-        let mut ctx = ActivityContext {
-            metrics, timestamp_ms: ts, pointer: Some(ev),
-            finish_requested: &mut finish,
-        };
-        self.activities.with_instance(id, |a| a.on_pointer(&mut ctx, ev));
-        if finish { self.finish_active(ts); }
+        let Some(id) = self.stack.last().copied() else { return; };
+        let (post, _) = self.with_ctx(id, ts, |a, ctx| a.on_pointer(ctx, ev));
+        self.apply_post(post, ts);
     }
 
     pub fn dispatch_key(&mut self, ev: KeyEvent, ts: f64) {
-        let Some(id) = self.active else { return; };
-        let metrics = self.metrics;
-        let pointer = self.pointer;
-        let mut finish = false;
-        let mut ctx = ActivityContext {
-            metrics, timestamp_ms: ts, pointer,
-            finish_requested: &mut finish,
-        };
-        self.activities.with_instance(id, |a| a.on_key(&mut ctx, ev));
-        if finish { self.finish_active(ts); }
+        // Back key short-circuit: when something sits above the Shell,
+        // Escape pops instead of reaching the app. This matches the
+        // Android convention of a global Back button and spares each
+        // app from having to implement "close me" themselves. Only
+        // `Down` triggers so a held-down Escape doesn't rapid-fire.
+        if ev.code == KEY_CODE_BACK
+            && matches!(ev.phase, activity::KeyPhase::Down)
+            && self.stack.len() > 1
+        {
+            self.finish_top(ts);
+            return;
+        }
+        let Some(id) = self.stack.last().copied() else { return; };
+        let (post, _) = self.with_ctx(id, ts, |a, ctx| a.on_key(ctx, ev));
+        self.apply_post(post, ts);
     }
 
     /// Ask the active activity to paint one frame. Returns the freshly
     /// populated FrameCommands, which the kernel flushes to the HAL.
     pub fn render_frame(&mut self, ts: f64) -> &FrameCommands {
         self.compositor.begin_frame();
-        if let Some(id) = self.active {
+        if let Some(id) = self.stack.last().copied() {
             let metrics = self.metrics;
             let pointer = self.pointer;
             let mut finish = false;
+            let mut launch: Option<LaunchRequest> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
+                launch_requested: &mut launch,
             };
             // Explicit split so the compiler sees `compositor` and
             // `activities` as disjoint mut borrows of self.
             let activities = &mut self.activities;
             let target = self.compositor.paint_target();
             activities.with_instance(id, |a| a.render(&mut ctx, target));
-            if finish { self.finish_active(ts); }
+            self.apply_post(PostCallback { finish, launch }, ts);
         }
         self.compositor.finish_frame()
     }
 
     // ── Internals ─────────────────────────────────────────────────────
 
+    /// Build a fresh `ActivityContext` around `id`, run `f` against the
+    /// live instance, and return what the activity requested via the
+    /// `finish_requested` / `launch_requested` out-params. Having this
+    /// helper keeps every dispatch site on the same shape and makes it
+    /// impossible to forget to drain either request.
+    fn with_ctx<R>(
+        &mut self,
+        id: ActivityId,
+        ts: f64,
+        f: impl FnOnce(&mut dyn activity::Activity, &mut ActivityContext<'_>) -> R,
+    ) -> (PostCallback, Option<R>) {
+        let metrics = self.metrics;
+        let pointer = self.pointer;
+        let mut finish = false;
+        let mut launch: Option<LaunchRequest> = None;
+        let mut result: Option<R> = None;
+        {
+            let mut ctx = ActivityContext {
+                metrics, timestamp_ms: ts, pointer,
+                finish_requested: &mut finish,
+                launch_requested: &mut launch,
+            };
+            self.activities.with_instance(id, |a| {
+                result = Some(f(a, &mut ctx));
+            });
+        }
+        (PostCallback { finish, launch }, result)
+    }
+
+    /// Consume the activity's post-callback requests in a deterministic
+    /// order: launches first (so the requester is paused before it sees
+    /// any further input), then finish. If an activity sets both in one
+    /// callback, launch wins — finishing a just-paused activity would
+    /// require a Paused→Destroyed edge with no Stopped step, which we
+    /// don't exercise yet.
+    fn apply_post(&mut self, post: PostCallback, ts: f64) {
+        if let Some(req) = post.launch {
+            self.launch_app(&req.package_id, &req.class, ts);
+        } else if post.finish {
+            self.finish_top(ts);
+        }
+    }
+
     fn drive_to_resumed(&mut self, id: ActivityId, ts: f64) {
         let metrics = self.metrics;
         let pointer = self.pointer;
         self.activities.resume(id, |a, new_state| {
             let mut finish = false;
+            let mut launch: Option<LaunchRequest> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
+                launch_requested: &mut launch,
             };
             match new_state {
                 LifecycleState::Created => a.on_create(&mut ctx),
@@ -262,20 +285,63 @@ impl Framework {
                 LifecycleState::Resumed => a.on_resume(&mut ctx),
                 _ => {}
             }
-            // `finish` during bring-up is ignored — an activity that wants
-            // out has to wait until it's fully alive to say so.
+            // `finish`/`launch` during bring-up are ignored — an activity
+            // that wants to redirect has to wait until it's fully alive.
         });
     }
 
-    fn finish_active(&mut self, ts: f64) {
-        let Some(id) = self.active.take() else { return; };
+    fn drive_to_paused(&mut self, id: ActivityId, ts: f64) {
         let metrics = self.metrics;
         let pointer = self.pointer;
-        self.activities.destroy(id, |a, new_state| {
-            let mut finish = false; // ignored during teardown
+        self.activities.pause(id, |a, new_state| {
+            let mut finish = false;
+            let mut launch: Option<LaunchRequest> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
+                launch_requested: &mut launch,
+            };
+            if matches!(new_state, LifecycleState::Paused) {
+                a.on_pause(&mut ctx);
+            }
+        });
+    }
+
+    /// Push a new activity on top of the stack. The previous top is paused
+    /// (but kept in memory) so popping back to it is free. Registration
+    /// failures here indicate a buggy Shell handing us a stale entry — we
+    /// log nothing (no log binding in framework) and swallow so the Shell
+    /// survives the miss.
+    fn launch_app(&mut self, package_id: &str, class: &str, ts: f64) {
+        let new_id = match self.activities.launch(package_id, class) {
+            Ok(id) => id,
+            Err(_) => return,
+        };
+        // Reusing a SingleTop top is a no-op: the launched id equals the
+        // current top, so don't pause it and don't stack it twice.
+        if Some(new_id) == self.stack.last().copied() { return; }
+        if let Some(prev) = self.stack.last().copied() {
+            self.drive_to_paused(prev, ts);
+        }
+        self.stack.push(new_id);
+        self.drive_to_resumed(new_id, ts);
+    }
+
+    /// Finish the top of the stack and resume whatever it was covering.
+    /// If the stack is already down to its last entry (the Shell), this
+    /// is a no-op — we never destroy the home-screen.
+    fn finish_top(&mut self, ts: f64) {
+        if self.stack.len() <= 1 { return; }
+        let id = self.stack.pop().expect("checked len > 1");
+        let metrics = self.metrics;
+        let pointer = self.pointer;
+        self.activities.destroy(id, |a, new_state| {
+            let mut finish = false;
+            let mut launch: Option<LaunchRequest> = None;
+            let mut ctx = ActivityContext {
+                metrics, timestamp_ms: ts, pointer,
+                finish_requested: &mut finish,
+                launch_requested: &mut launch,
             };
             match new_state {
                 LifecycleState::Paused => a.on_pause(&mut ctx),
@@ -284,5 +350,16 @@ impl Framework {
                 _ => {}
             }
         });
+        if let Some(new_top) = self.stack.last().copied() {
+            self.drive_to_resumed(new_top, ts);
+        }
     }
+}
+
+/// What an activity's callback asked the framework to do next. Collected
+/// before we re-enter activity code so the borrow on `self` from the
+/// dispatch closure is fully released before we mutate the stack.
+struct PostCallback {
+    finish: bool,
+    launch: Option<LaunchRequest>,
 }

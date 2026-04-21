@@ -25,6 +25,18 @@
 
 use crate::compositor::FrameCommands;
 
+/// An activity's request to bring another activity to the foreground. The
+/// framework consumes this after each callback returns and drives the
+/// launch before the next dispatch. This is the simplest stand-in for a
+/// full Intent-based launcher — the Shell uses it to start apps, and any
+/// in-kernel activity can use it to hand off. User-land (wasm) activities
+/// will get the richer `Intent` surface later.
+#[derive(Debug, Clone)]
+pub struct LaunchRequest {
+    pub package_id: String,
+    pub class: String,
+}
+
 /// Display metrics mirrored from the kernel's DisplayManager. Copied into
 /// the context so activities never need to reach into the kernel directly.
 #[derive(Debug, Default, Clone, Copy)]
@@ -68,6 +80,11 @@ pub struct ActivityContext<'a> {
     /// framework will call `on_pause → on_stop → on_destroy` on the next
     /// frame boundary.
     pub finish_requested: &'a mut bool,
+    /// Set by the activity to request launching another activity on top
+    /// of it. The framework consumes this after the callback returns: it
+    /// pauses the requester and brings up the new activity as the new
+    /// foreground top. `None` means no launch requested this tick.
+    pub launch_requested: &'a mut Option<LaunchRequest>,
 }
 
 /// In-kernel activity trait. Every method has a default no-op except

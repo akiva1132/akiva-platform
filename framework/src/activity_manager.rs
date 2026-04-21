@@ -199,7 +199,12 @@ impl ActivityManager {
     // between `records` and `instances`.
 
     /// Drive an activity up to `Resumed`. Fires every missing callback in
-    /// order. No-op if already at `Resumed`.
+    /// order — works equally well from `Initial` (bring-up chain) and from
+    /// `Paused` (just the single `Paused → Resumed` edge). No-op if already
+    /// at `Resumed`. A `None` from `advance_to` means "that edge isn't
+    /// legal from the current state", so we skip to the next target rather
+    /// than bail — otherwise calling `resume()` on a paused activity would
+    /// stop at the first illegal `Paused → Created` check.
     pub fn resume(
         &mut self,
         id: ActivityId,
@@ -210,8 +215,20 @@ impl ActivityManager {
             LifecycleState::Started,
             LifecycleState::Resumed,
         ] {
-            if self.advance_to(id, target, &mut cb).is_none() { break; }
+            let _ = self.advance_to(id, target, &mut cb);
         }
+    }
+
+    /// Drive an activity down to `Paused` only. Used when a new activity
+    /// is foregrounded on top of this one — the underlying activity must
+    /// pause (so it stops receiving input) but must *not* be destroyed.
+    /// No-op if already at or past `Paused`.
+    pub fn pause(
+        &mut self,
+        id: ActivityId,
+        mut cb: impl FnMut(&mut dyn Activity, LifecycleState),
+    ) {
+        let _ = self.advance_to(id, LifecycleState::Paused, &mut cb);
     }
 
     /// Drive an activity down to `Destroyed`. Fires pause → stop →
