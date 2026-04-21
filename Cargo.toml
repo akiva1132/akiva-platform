@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "framework",
+    "sdk-rust",
+    "cli",
+]
+# Apps are excluded from the workspace: each app is built independently
+# (potentially with cargo-component targeting wasm32-wasip2), and must not
+# share the kernel's dependency graph.
+exclude = ["apps"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Akiva Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/akiva-platform/akiva"
+
+[workspace.dependencies]
+akiva-framework = { path = "framework" }
+akiva-sdk = { path = "sdk-rust" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package."*"]
+opt-level = "z"
+
+[profile.dev]
+opt-level = 1
+debug = true
+panic = "abort"

@@ -1,0 +1,16 @@
+[package]
+name = "akiva-framework"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Akiva Platform framework: activity manager, package manager, window manager, widgets, layout, compositor"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+
+[package.metadata.akiva]
+role = "framework"

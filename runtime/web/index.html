@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Akiva</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      color: #eee;
+      font-family: system-ui, -apple-system, sans-serif;
+      overflow: hidden;
+    }
+    /* The canvas fills the viewport. All rendering happens on it — no DOM UI. */
+    #akiva-surface {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      touch-action: none;
+      outline: none;
+    }
+    /* Boot banner shown until the kernel posts its first frame. Then hidden. */
+    #akiva-boot {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #888;
+      font-size: 14px;
+      pointer-events: none;
+    }
+    #akiva-boot.hidden { display: none; }
+    /* Accessibility overlay for E2E tests — data-akiva-widget-* nodes live
+       here so Playwright can hit-test without canvas OCR. See docs/testing.md. */
+    #akiva-a11y {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="akiva-surface" tabindex="0"></canvas>
+  <div id="akiva-boot">Akiva booting…</div>
+  <div id="akiva-a11y" aria-hidden="false"></div>
+  <script type="module" src="./tab.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Kernel and framework crates default-target wasm32-unknown-unknown via their
+# own package-level config. This file is intentionally minimal so that native
+# crates (cli, sdk-rust host-side tests) build for the host by default.
+
+[alias]
+# Build just the kernel wasm for the runtime to load.
+build-kernel = "build -p akiva-kernel --release --target wasm32-unknown-unknown"
+# Build the cli natively.
+build-cli = "build -p akiva --release"

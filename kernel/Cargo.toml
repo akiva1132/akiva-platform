@@ -1,0 +1,18 @@
+[package]
+name = "akiva-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Akiva Platform kernel: runs in a Dedicated Worker, hosts framework + apps"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+akiva-framework = { workspace = true }
+
+[package.metadata.akiva]
+role = "kernel"
+host-abi-version = "0.1.0"

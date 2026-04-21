@@ -1,0 +1,17 @@
+[package]
+name = "akiva"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Akiva CLI: new / build / run / install / devserver"
+
+[[bin]]
+name = "akiva"
+path = "src/main.rs"
+
+[dependencies]
+
+[package.metadata.akiva]
+role = "cli"

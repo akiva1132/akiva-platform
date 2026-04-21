@@ -1,0 +1,151 @@
+// Akiva app ABI — WebAssembly Component Model / WIT.
+//
+// This is the user-facing contract between the runtime and an app.
+// Apps import the types and interfaces they need; the runtime wires up
+// implementations at instantiation time based on granted permissions
+// (capability-via-imports, ARCHITECTURE.md §8).
+//
+// Kernel ↔ JS HAL has its own internal ABI (see kernel/src/host.rs);
+// that is NOT described here. This file describes app ↔ runtime only.
+
+package akiva:app@0.1.0;
+
+interface types {
+    // Monotonic wall-clock in milliseconds.
+    type timestamp-ms = f64;
+    type activity-id = u64;
+    type display-id = u32;
+
+    record size {
+        width: u32,
+        height: u32,
+    }
+
+    record rect {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    }
+
+    record color {
+        r: u8, g: u8, b: u8, a: u8,
+    }
+
+    enum lifecycle-state {
+        created, started, resumed, paused, stopped, destroyed,
+    }
+}
+
+interface log {
+    enum level { trace, debug, info, warn, error }
+    emit: func(level: level, msg: string);
+}
+
+interface storage {
+    // Scoped to the calling package; runtime prefixes {package-id}/.
+    variant error {
+        not-found,
+        bad-key,
+        quota,
+        io,
+    }
+    read:   func(key: string) -> result<list<u8>, error>;
+    write:  func(key: string, value: list<u8>) -> result<_, error>;
+    delete: func(key: string) -> result<_, error>;
+}
+
+interface resources {
+    use types.{color};
+    resolve-string:   func(key: string) -> option<string>;
+    resolve-dimen:    func(key: string) -> option<f32>;
+    resolve-color:    func(key: string) -> option<color>;
+    resolve-drawable: func(key: string) -> option<list<u8>>;
+}
+
+interface intent {
+    use types.{activity-id};
+
+    variant value {
+        null,
+        %bool(bool),
+        %int(s64),
+        %float(f64),
+        %string(string),
+        bytes(list<u8>),
+    }
+
+    record outgoing {
+        action: string,
+        categories: list<string>,
+        data-uri: option<string>,
+        mime-type: option<string>,
+        extras: list<tuple<string, value>>,
+        target-package: option<string>,
+        target-class:   option<string>,
+    }
+
+    variant resolve-error {
+        no-match,
+        ambiguous(list<tuple<string, string>>),
+    }
+
+    send: func(i: outgoing) -> result<activity-id, resolve-error>;
+}
+
+interface lifecycle {
+    use types.{activity-id, lifecycle-state};
+
+    // Runtime → app: notify of a lifecycle transition. App returns once
+    // the transition is complete. Blocking calls are budgeted per frame.
+    on-state-change: func(id: activity-id, new-state: lifecycle-state);
+
+    // UI-state snapshot. Budget: 64 KiB. Larger state belongs in storage.
+    on-save-state:    func(id: activity-id) -> list<u8>;
+    on-restore-state: func(id: activity-id, bytes: list<u8>);
+
+    on-config-changed: func(id: activity-id);
+    on-low-memory:     func();
+}
+
+interface events {
+    use types.{timestamp-ms};
+
+    record pointer {
+        x: f32, y: f32, button: u8, phase: pointer-phase,
+    }
+    enum pointer-phase { down, move, up, cancel }
+
+    record key {
+        code: u32, modifiers: u8, phase: key-phase,
+    }
+    enum key-phase { down, repeat, up }
+
+    on-pointer: func(ts: timestamp-ms, ev: pointer);
+    on-key:     func(ts: timestamp-ms, ev: key);
+}
+
+interface widget {
+    use types.{rect, color};
+
+    resource paint-target {
+        fill-rect: func(r: rect, c: color);
+        draw-text: func(x: f32, y: f32, size-px: f32, c: color, text: string);
+        push-clip: func(r: rect);
+        pop-clip:  func();
+    }
+
+    // Runtime → app: draw a frame. App fills the paint target.
+    on-paint: func(target: borrow<paint-target>);
+}
+
+world app {
+    import log;
+    import storage;
+    import resources;
+    import intent;
+
+    export lifecycle;
+    export events;
+    export widget;
+}

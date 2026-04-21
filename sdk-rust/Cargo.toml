@@ -1,0 +1,22 @@
+[package]
+name = "akiva-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Akiva SDK for Rust apps. Provides the #[akiva::app] macro, Activity trait, Resource helpers, Intent builders, and safe wrappers over the WIT bindings generated from wit/akiva.wit."
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = []
+# Enable to expose raw WIT bindings. Off by default so app code stays on
+# the stable high-level API.
+bindings = []
+
+[dependencies]
+
+[package.metadata.akiva]
+role = "sdk"
