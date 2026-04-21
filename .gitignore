@@ -11,6 +11,9 @@ Cargo.lock.bak
 # The kernel wasm is built into target/ and copied here by the dev workflow;
 # never commit the copy.
 runtime/web/akiva-kernel.wasm
+# Dev-mode app bundles are rebuilt on demand and copied in by the dev workflow.
+runtime/web/dev-apps/*/app.wasm
+runtime/web/dev-apps/*/manifest.toml
 
 # wit-bindgen generated (kept in tree if committed; ignore if regenerated)
 # bindings/generated/

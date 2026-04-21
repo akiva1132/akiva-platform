@@ -120,7 +120,44 @@ pub fn boot(
         .expect("shell launch");
     fw.active = Some(shell_id);
     fw.drive_to_resumed(shell_id, 0.0);
+
+    // Phase 2b.4 smoke test: if any user package is installed, auto-launch
+    // its entry activity on top of the Shell. Picks the lowest package id
+    // for determinism. Replaced in Phase 2b.5 when the Shell grows a task
+    // switcher UI that lets the user pick. The Shell lifecycle is left in
+    // Resumed here because `ActivityManager` doesn't expose a "pause
+    // without destroy" helper yet — the Shell's `on_pause` is a no-op so
+    // the mismatch is cosmetic, and render picks `active` only.
+    if let Some(first) = pick_first_user_package(&fw.packages) {
+        match fw.activities.launch(&first.0, &first.1) {
+            Ok(app_id) => {
+                fw.active = Some(app_id);
+                fw.drive_to_resumed(app_id, 0.0);
+            }
+            Err(_) => {
+                // `.launch()` only fails on unknown-activity or unsupported
+                // launch mode; both would be bugs in the registration loop
+                // above. Fall through to Shell-only.
+            }
+        }
+    }
+
     (fw, report)
+}
+
+/// Return `(package_id, entry_class)` for the alphabetically-first
+/// installed package, or `None` if only the Shell is installed. Skips the
+/// Shell itself so a reboot without user apps keeps showing the Shell
+/// instead of trying to launch it twice.
+fn pick_first_user_package(pm: &package_manager::PackageManager) -> Option<(String, String)> {
+    let mut ids: Vec<&str> = pm.list()
+        .map(|r| r.id.as_str())
+        .filter(|id| *id != shell::PACKAGE_ID)
+        .collect();
+    ids.sort();
+    let id = ids.first().copied()?;
+    let rec = pm.get(id)?;
+    Some((rec.id.clone(), rec.entry_class.clone()))
 }
 
 /// Aggregate handle exposed to the kernel. All cross-subsystem calls go

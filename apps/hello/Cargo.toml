@@ -1,0 +1,25 @@
+[package]
+name = "akiva-app-hello"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Akiva Team"]
+license = "MIT OR Apache-2.0"
+description = "First-party smoke-test app: draws a frame counter and reacts to the pointer."
+
+# The workspace excludes `apps/`, so this is a standalone crate. It still
+# pulls `akiva-sdk` by path — we accept the tight coupling in the dev
+# loop; a real registry path (akiva-sdk = \"0.1\") lands when there's a
+# registry to pull from.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+akiva-sdk = { path = "../../sdk-rust" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

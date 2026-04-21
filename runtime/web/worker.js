@@ -75,6 +75,11 @@ async function bootKernel(kernelUrl, _tabId) {
   // but every subsequent kernel-visible operation is synchronous.
   await storage.load((level, text) => self.postMessage({ type: "log", level: levelCode(level), text }));
 
+  // Dev-mode: pull any apps staged under runtime/web/dev-apps/ into
+  // storage so PackageManager rehydrates them during `akiva_boot`. Safe
+  // to run on every boot — already-installed packages are skipped.
+  await installDevApps((level, text) => self.postMessage({ type: "log", level: levelCode(level), text }));
+
   const resp = await fetch(kernelUrl);
   if (!resp.ok) throw new Error(`fetch ${kernelUrl}: ${resp.status}`);
   const bytes = await resp.arrayBuffer();
@@ -90,6 +95,73 @@ async function bootKernel(kernelUrl, _tabId) {
 
   // Kick the frame loop once we have a display.
   if (primary) startFrameLoop();
+}
+
+// ── Dev-mode app installation ────────────────────────────────────────────
+//
+// Phase 2b.4 bootstrap before we have a real registry or CLI install path.
+// For each name in DEV_APPS, fetches `dev-apps/{name}/manifest.toml` and
+// `dev-apps/{name}/app.wasm`, and if the package isn't already in the
+// index, writes the three storage keys the PackageManager expects. A
+// missing or 404ing app is logged and skipped — not every dev checkout
+// will have built every app.
+
+const DEV_APPS = ["hello"];
+
+async function installDevApps(log) {
+  for (const name of DEV_APPS) {
+    try {
+      await installOneDevApp(name, log);
+    } catch (err) {
+      log("warn", `dev install '${name}': ${err?.message ?? err}`);
+    }
+  }
+}
+
+async function installOneDevApp(name, log) {
+  const manifestResp = await fetch(`./dev-apps/${name}/manifest.toml`);
+  if (!manifestResp.ok) {
+    // Not fatal — app simply isn't staged. `apps/${name}/build.sh` fixes that.
+    if (manifestResp.status !== 404) {
+      log("warn", `dev-apps/${name}/manifest.toml: ${manifestResp.status}`);
+    }
+    return;
+  }
+  const manifestText = await manifestResp.text();
+
+  // Crude TOML field extraction — we don't have a parser in the worker,
+  // and pulling one in just to read the id is overkill. The kernel-side
+  // manifest parser will reject anything malformed at load-time anyway.
+  const idMatch = manifestText.match(/^\s*id\s*=\s*"([^"]+)"/m);
+  if (!idMatch) {
+    log("warn", `dev-apps/${name}/manifest.toml: no [app].id`);
+    return;
+  }
+  const packageId = idMatch[1];
+
+  // Already installed? Skip the fetch + write.
+  const enc = new TextEncoder();
+  const dec = new TextDecoder("utf-8");
+  const existing = storage.get("sys/packages/index");
+  const ids = existing
+    ? dec.decode(existing).split("\n").filter((s) => s.length > 0)
+    : [];
+  if (ids.includes(packageId)) return;
+
+  const wasmResp = await fetch(`./dev-apps/${name}/app.wasm`);
+  if (!wasmResp.ok) {
+    log("warn", `dev-apps/${name}/app.wasm: ${wasmResp.status} (did you run apps/${name}/build.sh?)`);
+    return;
+  }
+  const wasmBytes = new Uint8Array(await wasmResp.arrayBuffer());
+
+  storage.set(`packages/${packageId}/manifest.toml`, enc.encode(manifestText));
+  storage.set(`packages/${packageId}/app.wasm`, wasmBytes);
+
+  ids.push(packageId);
+  ids.sort();
+  storage.set("sys/packages/index", enc.encode(ids.join("\n")));
+  log("info", `dev install: ${packageId} (${wasmBytes.byteLength} bytes)`);
 }
 
 function attachDisplay(msg) {
