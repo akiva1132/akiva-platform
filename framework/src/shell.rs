@@ -12,8 +12,7 @@
 //! the Shell again.
 
 use crate::activity::{Activity, ActivityContext, KeyEvent, LaunchRequest, PointerEvent, PointerPhase, SurfaceMetrics};
-use crate::compositor::FrameCommands;
-use crate::widgets::PaintTarget;
+use crate::compositor::{FrameCommands, PaintTarget};
 
 pub const PACKAGE_ID: &str = "sys.shell";
 pub const ENTRY_CLASS: &str = "ShellActivity";

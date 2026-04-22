@@ -1,9 +1,19 @@
 //! Akiva framework.
 //!
 //! Analogous to the AOSP system_server: sits on top of the kernel and
-//! implements all the user-visible services — activity lifecycle, package
+//! implements the user-visible services — activity lifecycle, package
 //! installation, window stacking, resource resolution, intent routing,
-//! permission enforcement, AKML layout, widget tree, compositor.
+//! permission enforcement, and the paint-op compositor that flushes each
+//! frame to the HAL.
+//!
+//! **What the framework does *not* own:** widget trees, layout math, and
+//! AKML parsing. Those live in the SDK ([`sdk-rust/src/ui`] and
+//! [`sdk-rust/src/akml`]) and are linked into each app's wasm binary.
+//! The framework only speaks `PaintOp` across the ABI boundary — apps
+//! build their widget tree, measure and place it, emit paint ops, and
+//! hand them to the framework. Keeping widgets app-side preserves a
+//! narrow, stable ABI and lets apps evolve their UI independently of
+//! the framework version.
 //!
 //! Every subsystem is its own module with a clearly-scoped API. The kernel
 //! is the only legitimate caller into the framework at the top level;
@@ -12,10 +22,8 @@
 
 pub mod activity;
 pub mod activity_manager;
-pub mod akml;
 pub mod compositor;
 pub mod intent;
-pub mod layout;
 pub mod manifest;
 pub mod package_manager;
 pub mod permissions;
@@ -23,7 +31,6 @@ pub mod resource_manager;
 pub mod shell;
 pub mod storage;
 pub mod wasm_activity;
-pub mod widgets;
 pub mod window_manager;
 
 use std::rc::Rc;

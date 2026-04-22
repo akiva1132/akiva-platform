@@ -4,7 +4,15 @@
 //! and produces the `FrameCommands` buffer the renderer backend consumes.
 //! See ARCHITECTURE.md §10-11 for the renderer/surface model.
 
-use crate::widgets::PaintTarget;
+/// Abstract target for paint output. `FrameCommands` is the in-framework
+/// implementation; activities that want to paint by method rather than by
+/// pushing `PaintOp`s directly take `&mut dyn PaintTarget`.
+pub trait PaintTarget {
+    fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: u32);
+    fn draw_text(&mut self, x: f32, y: f32, size: f32, rgba: u32, text: &str);
+    fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32);
+    fn pop_clip(&mut self);
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct FrameCommands {
