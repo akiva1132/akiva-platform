@@ -24,13 +24,23 @@
 //! (divide-by-zero, non-finite results) latch until the user presses `C`.
 
 use akiva_sdk::prelude::*;
+use akiva_sdk::akml::{self, Bindings};
+
+/// The whole UI, declared in AKML. Embedded via `include_str!` so the
+/// layout ships *inside* the wasm binary — no resource loader, no I/O
+/// path. When Phase 4 adds `res/` with qualifiers, this constant will
+/// become a `ResourceManager::layout("main")` lookup, but the source
+/// file (`res/layout/main.akml`) keeps its current location.
+const LAYOUT: &str = include_str!("../res/layout/main.akml");
 
 // ── Palette ───────────────────────────────────────────────────────────
 
 const COL_BG:          u32 = 0xff15172a;
 const COL_DISPLAY_FG:  u32 = 0xfff8faff;
 const COL_ERROR_FG:    u32 = 0xffff7b7b;
-const COL_HINT_FG:     u32 = 0xff7a8398;
+// Hint colour now lives in res/layout/main.akml as a literal — the
+// Rust code no longer references it since the widget tree comes from
+// AKML rather than being built imperatively.
 
 // ── Calculator logic ──────────────────────────────────────────────────
 
@@ -246,53 +256,28 @@ impl Activity for CalculatorMain {
 
     fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
         c.clear(COL_BG);
-        let mut ui = Ui::new(&mut self.ui, ctx, c);
 
-        // ── Display ──
-        // Right-aligned big number. We put it inside an HStack with
-        // main=End + cross=Center so the text hugs the right edge
-        // regardless of how wide the surface is.
+        // Dynamic values the layout's `{name}` references will consume.
+        // Building a fresh Bindings per frame is intentional — it keeps
+        // lifetimes local and the allocation cost is rounding error
+        // next to paint-op serialization.
         let hint = self.calc.pending_op().map(Op::glyph).unwrap_or(" ");
-        let hint_node = ui.text(hint).size(22.0).color(COL_HINT_FG).build();
-        let display_node = ui.text(self.calc.display())
-            .size(48.0)
-            .color(if self.calc.is_error() { COL_ERROR_FG } else { COL_DISPLAY_FG })
-            .build();
-        let display_row = ui.h_stack(&[hint_node, display_node])
-            .gap(12.0)
-            .main(MainAxis::End)
-            .cross(CrossAxis::Center)
-            .padding_trbl(12.0, 16.0, 12.0, 16.0)
-            .build();
+        let display_color = if self.calc.is_error() { COL_ERROR_FG } else { COL_DISPLAY_FG };
+        let bindings = Bindings::new()
+            .text("hint", hint)
+            .text("display", self.calc.display())
+            .color("display_color", display_color);
 
-        // ── Keypad ──
-        //
-        // 5 rows × 4 columns. Every button uses grow=1 so they all share
-        // the available space equally; every row uses grow=1 so each row
-        // gets the same height. Pressing any cell rebuilds the tree and
-        // re-lays-out — the toolkit is immediate-mode, so nothing to
-        // diff across frames.
-        let row1 = keypad_row(&mut ui, &[("clr", "C"), ("sign", "±"), ("pct", "%"), ("div", "÷")]);
-        let row2 = keypad_row(&mut ui, &[("7", "7"), ("8", "8"), ("9", "9"), ("mul", "×")]);
-        let row3 = keypad_row(&mut ui, &[("4", "4"), ("5", "5"), ("6", "6"), ("sub", "−")]);
-        let row4 = keypad_row(&mut ui, &[("1", "1"), ("2", "2"), ("3", "3"), ("add", "+")]);
-        let row5 = keypad_row(&mut ui, &[("0", "0"), ("dot", "."), ("back", "⌫"), ("eq", "=")]);
-
-        let keypad = ui.v_stack(&[row1, row2, row3, row4, row5])
-            .gap(8.0)
-            .cross(CrossAxis::Stretch)
-            .grow(1.0)
-            .build();
-
-        let root = ui.v_stack(&[display_row, keypad])
-            .gap(8.0)
-            .padding(16.0)
-            .cross(CrossAxis::Stretch)
-            .build();
-
+        let mut ui = Ui::new(&mut self.ui, ctx, c);
+        let root = akml::inflate_str_with(&mut ui, LAYOUT, &bindings)
+            .expect("calculator layout is statically valid — inflate failure is a build bug");
         ui.present(root);
 
         // ── Dispatch clicks ──
+        // The AKML assigns stable string ids to every `<Button>` (e.g.
+        // `id="eq"`), and the Phase 3a toolkit resolves pointer-down
+        // events against those ids. So click handling stays identical
+        // whether the tree came from AKML or from imperative Rust.
         for d in 0u8..=9 {
             let label = (b'0' + d) as char;
             let mut buf = [0u8; 4];
@@ -313,23 +298,6 @@ impl Activity for CalculatorMain {
         if ui.was_clicked("pct")  { self.calc.percent(); }
         if ui.was_clicked("back") { self.calc.backspace(); }
     }
-}
-
-/// Build one keypad row: four grow=1 buttons inside a cross=Stretch
-/// HStack that itself grows so all five rows split the keypad height
-/// evenly. Buttons carry stable string ids so `was_clicked` can
-/// correlate a tap back to the action regardless of label rendering.
-fn keypad_row(ui: &mut Ui<'_, '_, '_>, cells: &[(&str, &str)]) -> akiva_sdk::ui::node::NodeId {
-    let ids: Vec<_> = cells.iter().map(|(id, label)| {
-        let b = ui.button(*id, *label);
-        ui.grow(b, 1.0);
-        b
-    }).collect();
-    ui.h_stack(&ids)
-        .gap(8.0)
-        .cross(CrossAxis::Stretch)
-        .grow(1.0)
-        .build()
 }
 
 akiva_sdk::akiva_app!(CalculatorMain);

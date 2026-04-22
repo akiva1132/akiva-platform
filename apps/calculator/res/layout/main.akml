@@ -1,0 +1,61 @@
+<?akml version="1.0"?>
+<!--
+    Calculator main layout.
+
+    Dynamic pieces are pulled from bindings at inflate time:
+      - {hint}            — the pending operator glyph, or " " when none.
+      - {display}         — the number or "Error" string.
+      - {display_color}   — typed colour that flips to red in error state.
+
+    Everything else is static literal. Button ids double as click
+    identifiers (`ui.was_clicked("eq")` etc.) — don't rename them without
+    updating the Rust dispatch in src/lib.rs.
+-->
+<VStack padding="16" gap="8" cross="stretch">
+
+    <!-- Display row: right-aligned big number with a small pending-op hint to its left. -->
+    <HStack gap="12" main="end" cross="center" padding="12 16">
+        <Text text="{hint}"    size="22" color="#ff7a8398" />
+        <Text text="{display}" size="48" color="{display_color}" />
+    </HStack>
+
+    <!-- Keypad: 5 rows × 4 columns, every cell grow=1 inside a Stretch HStack. -->
+    <VStack flex="1" gap="8" cross="stretch">
+
+        <HStack flex="1" gap="8" cross="stretch">
+            <Button id="clr"  label="C" flex="1" />
+            <Button id="sign" label="±" flex="1" />
+            <Button id="pct"  label="%" flex="1" />
+            <Button id="div"  label="÷" flex="1" />
+        </HStack>
+
+        <HStack flex="1" gap="8" cross="stretch">
+            <Button id="7"   label="7" flex="1" />
+            <Button id="8"   label="8" flex="1" />
+            <Button id="9"   label="9" flex="1" />
+            <Button id="mul" label="×" flex="1" />
+        </HStack>
+
+        <HStack flex="1" gap="8" cross="stretch">
+            <Button id="4"   label="4" flex="1" />
+            <Button id="5"   label="5" flex="1" />
+            <Button id="6"   label="6" flex="1" />
+            <Button id="sub" label="−" flex="1" />
+        </HStack>
+
+        <HStack flex="1" gap="8" cross="stretch">
+            <Button id="1"   label="1" flex="1" />
+            <Button id="2"   label="2" flex="1" />
+            <Button id="3"   label="3" flex="1" />
+            <Button id="add" label="+" flex="1" />
+        </HStack>
+
+        <HStack flex="1" gap="8" cross="stretch">
+            <Button id="0"    label="0" flex="1" />
+            <Button id="dot"  label="." flex="1" />
+            <Button id="back" label="⌫" flex="1" />
+            <Button id="eq"   label="=" flex="1" />
+        </HStack>
+
+    </VStack>
+</VStack>
