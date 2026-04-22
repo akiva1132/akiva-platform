@@ -395,6 +395,99 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
             ));
         }
     }
+
+    // ── Stone 9.5 ─────────────────────────────────────────────────────────
+
+    fn drain_start_for_result(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+    ) -> Option<(Vec<u8>, u32)> {
+        // Same two-phase buffer dance as `drain_intent` — the payload is
+        // `Intent::encode` bytes only; the `request_code` comes back via
+        // `rc_out`. 512-byte initial guess covers the common explicit
+        // intent plus a small action string.
+        let mut buf = vec![0u8; 512];
+        let mut rc_out: u32 = 0;
+        let needed = unsafe {
+            host::hal_app_drain_start_for_result(
+                handle.get(), buf.as_mut_ptr(), buf.len() as u32, &mut rc_out,
+            )
+        } as usize;
+        if needed == 0 {
+            return None;
+        }
+        if needed > buf.len() {
+            buf = vec![0u8; needed];
+            let got = unsafe {
+                host::hal_app_drain_start_for_result(
+                    handle.get(), buf.as_mut_ptr(), buf.len() as u32, &mut rc_out,
+                )
+            } as usize;
+            if got == 0 {
+                log::warn(&format!(
+                    "app {}: drain_start_for_result lost payload on retry",
+                    handle.get()
+                ));
+                return None;
+            }
+            buf.truncate(got.min(buf.len()));
+        } else {
+            buf.truncate(needed);
+        }
+        Some((buf, rc_out))
+    }
+
+    fn drain_set_result(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+    ) -> Option<Vec<u8>> {
+        // Two-phase drain. 128 bytes is a generous first guess — a
+        // typical result is a code + a short number/string.
+        let mut buf = vec![0u8; 128];
+        let needed = unsafe {
+            host::hal_app_drain_set_result(handle.get(), buf.as_mut_ptr(), buf.len() as u32)
+        } as usize;
+        if needed == 0 {
+            return None;
+        }
+        if needed > buf.len() {
+            buf = vec![0u8; needed];
+            let got = unsafe {
+                host::hal_app_drain_set_result(handle.get(), buf.as_mut_ptr(), buf.len() as u32)
+            } as usize;
+            if got == 0 {
+                log::warn(&format!(
+                    "app {}: drain_set_result lost payload on retry",
+                    handle.get()
+                ));
+                return None;
+            }
+            buf.truncate(got.min(buf.len()));
+        } else {
+            buf.truncate(needed);
+        }
+        Some(buf)
+    }
+
+    fn activity_result(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        request_code: u32,
+        bytes: &[u8],
+    ) {
+        if bytes.is_empty() { return; }
+        let rc = unsafe {
+            host::hal_app_activity_result(
+                handle.get(), request_code, bytes.as_ptr(), bytes.len() as u32,
+            )
+        };
+        if rc != 0 {
+            log::warn(&format!(
+                "app {}: activity_result returned {} (handle miss or host copy failed)",
+                handle.get(), rc
+            ));
+        }
+    }
 }
 
 /// Exercises the storage HAL end-to-end: read a u32 counter under

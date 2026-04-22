@@ -66,6 +66,7 @@ function makeFakeProc(opts = {}) {
     akiva_app_save_state: vi.fn(),
     akiva_app_restore_state: vi.fn(),
     akiva_app_new_intent: vi.fn(),
+    akiva_app_activity_result: vi.fn(),
     akiva_app_abi_version: vi.fn(() => 0),
   };
 
@@ -481,5 +482,93 @@ describe("_copyKernelSlice — detach-safe copy", () => {
     // might detach the buffer via Memory.grow.
     new Uint8Array(kernelMemory.buffer, 0, 3).set([9, 9, 9]);
     expect(Array.from(copy)).toEqual([1, 2, 3]);
+  });
+});
+
+// ── Stone 9.5: start_activity_for_result + set_result plumbing ────────
+
+describe("drainStartForResult — single-shot for-result launch", () => {
+  it("returns null when nothing pending", () => {
+    const { registry } = makeRegistry();
+    expect(registry.drainStartForResult(1)).toBe(null);
+  });
+
+  it("returns the staged {bytes, requestCode} until _consumeStartForResult", () => {
+    const { registry } = makeRegistry();
+    const bytes = new Uint8Array([10, 20, 30]);
+    registry._pendingStartForResult.set(1, { bytes, requestCode: 7 });
+
+    const first = registry.drainStartForResult(1);
+    expect(first.bytes).toBe(bytes);
+    expect(first.requestCode).toBe(7);
+
+    // Still armed for a retry (kernel may probe for size first).
+    expect(registry.drainStartForResult(1)).not.toBe(null);
+
+    registry._consumeStartForResult(1);
+    expect(registry.drainStartForResult(1)).toBe(null);
+  });
+
+  it("is wiped on unregister alongside the other pending maps", () => {
+    const fake = makeFakeProc();
+    const { registry } = makeRegistry({ fakeProc: fake });
+    const handle = seedHandle(registry);
+    registry._pendingStartForResult.set(handle, { bytes: new Uint8Array([1]), requestCode: 0 });
+    registry._pendingSetResult.set(handle, new Uint8Array([2]));
+
+    registry.unregister(handle);
+
+    expect(registry._pendingStartForResult.has(handle)).toBe(false);
+    expect(registry._pendingSetResult.has(handle)).toBe(false);
+  });
+});
+
+describe("drainSetResult — stashed result bytes", () => {
+  it("returns null when nothing stashed", () => {
+    const { registry } = makeRegistry();
+    expect(registry.drainSetResult(1)).toBe(null);
+  });
+
+  it("last set_result call wins (overwrite semantics)", () => {
+    // The host import stashes by `set()`; multiple calls in one lifetime
+    // collapse to the last. This test pins that policy via direct map
+    // writes, then via the drain path — same behaviour both routes.
+    const { registry } = makeRegistry();
+    registry._pendingSetResult.set(1, new Uint8Array([0xAA]));
+    registry._pendingSetResult.set(1, new Uint8Array([0xBB, 0xCC]));
+    const drained = registry.drainSetResult(1);
+    expect(Array.from(drained)).toEqual([0xBB, 0xCC]);
+  });
+});
+
+describe("activityResult — deliver result blob to caller app", () => {
+  it("returns 1 (handle miss) when the caller handle isn't registered", () => {
+    const { registry } = makeRegistry();
+    expect(registry.activityResult(999, 7, 0, 0)).toBe(1);
+  });
+
+  it("invokes akiva_app_activity_result with the request_code and copied bytes", () => {
+    const fake = makeFakeProc();
+    const { registry, kernelMemory } = makeRegistry({ fakeProc: fake });
+    const handle = seedHandle(registry);
+    // Stage bytes in the kernel buffer; activityResult copies them
+    // into the app's memory via _callAppWithBytes.
+    const payload = [0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0xDE, 0xAD];
+    new Uint8Array(kernelMemory.buffer, 0, payload.length).set(payload);
+
+    const rc = registry.activityResult(handle, 42, 0, payload.length);
+    expect(rc).toBe(0);
+
+    expect(fake.exports.akiva_app_activity_result).toHaveBeenCalledTimes(1);
+    const [calledHandle, calledRc, appPtr, appLen] =
+      fake.exports.akiva_app_activity_result.mock.calls[0];
+    expect(calledHandle).toBe(handle);
+    expect(calledRc).toBe(42);
+    expect(appLen).toBe(payload.length);
+    // The bytes at appPtr in the app's memory must match what the
+    // kernel handed us (`_callAppWithBytes` copies through
+    // `akiva_app_alloc` first, then populates the slice).
+    const appBytes = new Uint8Array(fake.memory.buffer, appPtr, appLen);
+    expect(Array.from(appBytes)).toEqual(payload);
   });
 });

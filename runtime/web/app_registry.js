@@ -63,6 +63,23 @@ export class AppRegistry {
      */
     this._pendingIntent = new Map();
     /**
+     * Stone 9.5 — handles with a pending
+     * `start_activity_for_result(intent, request_code)` request. Same
+     * single-slot semantics as `_pendingIntent`; the tuple keeps the
+     * caller-supplied `request_code` paired with the encoded Intent
+     * bytes so the HAL drain can hand back both in one call.
+     * @type {Map<number, { bytes: Uint8Array, requestCode: number }>}
+     */
+    this._pendingStartForResult = new Map();
+    /**
+     * Stone 9.5 — bytes an activity stashed via `akiva_host_set_result`.
+     * Drained on the destroy-path of the activity, not per callback —
+     * set_result is allowed to be called multiple times in one lifetime,
+     * and only the last one is delivered. Last call wins.
+     * @type {Map<number, Uint8Array>}
+     */
+    this._pendingSetResult = new Map();
+    /**
      * Enabled debug categories. Empty Set = quiet (every `_debug` call
      * short-circuits). Populated via `setDebugCategories` from the main
      * thread's URL/query parser (e.g. `?debug=lifecycle,intent`). The
@@ -152,6 +169,8 @@ export class AppRegistry {
     // would be harmless — still, belt-and-braces.
     this._pendingFinish.delete(handle);
     this._pendingIntent.delete(handle);
+    this._pendingStartForResult.delete(handle);
+    this._pendingSetResult.delete(handle);
     // The process is kept alive even when no slots reference it. A future
     // GC pass could retire idle processes; for MVP the cost is one
     // `WebAssembly.Instance` per installed package, which is cheap.
@@ -201,6 +220,53 @@ export class AppRegistry {
     const bytes = this._copyKernelSlice(bytesPtr, bytesLen);
     return this._callAppWithBytes(handle, "new_intent", bytes,
       (proc, appPtr, len) => proc.instance.exports.akiva_app_new_intent(handle, appPtr, len));
+  }
+
+  /**
+   * Stone 9.5 — read the pending `start_activity_for_result` entry for
+   * `handle`. Returns `{ bytes, requestCode }` or `null`. Does NOT
+   * clear; clearing happens in `_consumeStartForResult` once the HAL
+   * has successfully copied the bytes into kernel memory (same
+   * two-phase contract as `drainIntent`).
+   */
+  drainStartForResult(handle) {
+    const entry = this._pendingStartForResult.get(handle);
+    if (entry) {
+      this._dbg("intent", `drain_start_for_result[handle=${handle}] → ${entry.bytes.length} bytes, rc=${entry.requestCode}`);
+    }
+    return entry ?? null;
+  }
+  _consumeStartForResult(handle) {
+    this._pendingStartForResult.delete(handle);
+  }
+
+  /**
+   * Stone 9.5 — read the pending set_result bytes for `handle`. Returns
+   * a `Uint8Array` or `null`. Does NOT clear; see `_consumeSetResult`.
+   */
+  drainSetResult(handle) {
+    const bytes = this._pendingSetResult.get(handle);
+    if (bytes) {
+      this._dbg("intent", `drain_set_result[handle=${handle}] → ${bytes.length} bytes`);
+    }
+    return bytes ?? null;
+  }
+  _consumeSetResult(handle) {
+    this._pendingSetResult.delete(handle);
+  }
+
+  /**
+   * Stone 9.5 — deliver an `ActivityResult` blob to the caller activity.
+   * Fires `akiva_app_activity_result(handle, request_code, ptr, len)`.
+   * Same rc convention as `newIntent` / `restoreState`.
+   */
+  activityResult(handle, requestCode, bytesPtr, bytesLen) {
+    if (bytesLen === 0) return this._lookup(handle) ? 0 : 1;
+    const bytes = this._copyKernelSlice(bytesPtr, bytesLen);
+    return this._callAppWithBytes(handle, "activity_result", bytes,
+      (proc, appPtr, len) => proc.instance.exports.akiva_app_activity_result(
+        handle, requestCode, appPtr, len,
+      ));
   }
 
   lifecycle(handle, transition) {
@@ -479,6 +545,30 @@ export class AppRegistry {
           copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
           self._pendingIntent.set(handle, copy);
         },
+
+        // Stone 9.5 — app-initiated start_activity_for_result. Same
+        // copy-out-immediately discipline as `akiva_host_start_activity`,
+        // but the extra `requestCode` is stored alongside the bytes so
+        // the two-phase HAL drain (`hal_app_drain_start_for_result`)
+        // can return both in one round-trip.
+        akiva_host_start_activity_for_result: (handle, ptr, len, requestCode) => {
+          const proc = self._processes.get(packageId);
+          if (!proc?.memory || len === 0) return;
+          const copy = new Uint8Array(len);
+          copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
+          self._pendingStartForResult.set(handle, { bytes: copy, requestCode });
+        },
+
+        // Stone 9.5 — app stashes the result it wants to deliver to
+        // whoever launched it. Not drained until the activity's destroy
+        // path — store as-is, last call wins.
+        akiva_host_set_result: (handle, ptr, len) => {
+          const proc = self._processes.get(packageId);
+          if (!proc?.memory || len === 0) return;
+          const copy = new Uint8Array(len);
+          copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
+          self._pendingSetResult.set(handle, copy);
+        },
       },
     };
   }
@@ -636,6 +726,7 @@ const REQUIRED_EXPORTS = [
   "akiva_app_save_state",
   "akiva_app_restore_state",
   "akiva_app_new_intent",
+  "akiva_app_activity_result",
 ];
 
 // Loud-and-obvious placeholder when an `@color/` ref is undefined.

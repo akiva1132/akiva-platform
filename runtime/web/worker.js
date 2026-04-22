@@ -327,6 +327,14 @@ function buildImports() {
     // — fires the app's `akiva_app_new_intent` export. Symmetric with
     // `hal_app_restore_state`: returns 0 on success.
     hal_app_new_intent: (handle, bytesPtr, bytesLen) => apps.newIntent(handle, bytesPtr, bytesLen),
+
+    // Stone 9.5 — two-phase drains for the for-result flow.
+    hal_app_drain_start_for_result: (handle, outPtr, outCap, rcOut) =>
+      halAppDrainStartForResult(handle, outPtr, outCap, rcOut),
+    hal_app_drain_set_result: (handle, outPtr, outCap) =>
+      halAppDrainSetResult(handle, outPtr, outCap),
+    hal_app_activity_result: (handle, requestCode, bytesPtr, bytesLen) =>
+      apps.activityResult(handle, requestCode, bytesPtr, bytesLen),
   };
   return { env };
 }
@@ -341,6 +349,29 @@ function halAppDrainIntent(handle, outPtr, outCap) {
   }
   new Uint8Array(memory.buffer, outPtr, bytes.length).set(bytes);
   apps._consumeIntent(handle);
+  return bytes.length;
+}
+
+function halAppDrainStartForResult(handle, outPtr, outCap, rcOut) {
+  const entry = apps.drainStartForResult(handle);
+  if (!entry) return 0;
+  const { bytes, requestCode } = entry;
+  // rcOut is always written, regardless of whether the buffer fits —
+  // so a retry (which also hits this function) sees a consistent
+  // request_code on both calls.
+  new DataView(memory.buffer).setUint32(rcOut, requestCode, true);
+  if (bytes.length > outCap) return bytes.length;
+  new Uint8Array(memory.buffer, outPtr, bytes.length).set(bytes);
+  apps._consumeStartForResult(handle);
+  return bytes.length;
+}
+
+function halAppDrainSetResult(handle, outPtr, outCap) {
+  const bytes = apps.drainSetResult(handle);
+  if (!bytes || bytes.length === 0) return 0;
+  if (bytes.length > outCap) return bytes.length;
+  new Uint8Array(memory.buffer, outPtr, bytes.length).set(bytes);
+  apps._consumeSetResult(handle);
   return bytes.length;
 }
 

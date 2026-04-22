@@ -168,6 +168,43 @@ extern "C" {
         bytes_ptr: *const u8,
         bytes_len: u32,
     ) -> u32;
+
+    // ── Activity result (Stone 9.5) ───────────────────────────────────────
+    //
+    // Three primitives, same shapes as their Stone 9.4 counterparts:
+    //
+    //   `hal_app_drain_start_for_result` — two-phase drain of a pending
+    //   `start_activity_for_result` request. Returns total payload size
+    //   (`intent.encode` bytes + trailing `u32` request_code, so at least
+    //   21 bytes when present); writes `request_code` into `*rc_out` on
+    //   a successful copy. Zero return = nothing pending.
+    //
+    //   `hal_app_drain_set_result` — two-phase drain of whatever bytes
+    //   the app stashed via `akiva_host_set_result`. Payload is an
+    //   encoded `ActivityResult` (i32 code + u32 data_len + data).
+    //   Zero return = nothing stashed.
+    //
+    //   `hal_app_activity_result` — fires the app's
+    //   `akiva_app_activity_result` export with the caller-chosen
+    //   `request_code` and the encoded `ActivityResult` bytes. 0 on
+    //   success, non-zero on handle-miss or host-copy failure.
+    pub fn hal_app_drain_start_for_result(
+        handle: u32,
+        out_ptr: *mut u8,
+        out_cap: u32,
+        rc_out: *mut u32,
+    ) -> u32;
+    pub fn hal_app_drain_set_result(
+        handle: u32,
+        out_ptr: *mut u8,
+        out_cap: u32,
+    ) -> u32;
+    pub fn hal_app_activity_result(
+        handle: u32,
+        request_code: u32,
+        bytes_ptr: *const u8,
+        bytes_len: u32,
+    ) -> u32;
 }
 
 /// Safe wrapper for hal_log that never panics.
