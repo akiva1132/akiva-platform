@@ -404,7 +404,7 @@ fn legal_transition(from: LifecycleState, to: LifecycleState) -> bool {
         | (Stopped, Started)    // onRestart → onStart
         | (Stopped, Destroyed)
         | (Paused, Destroyed)   // allowed when activity finishes from Paused
-        | (Created, Destroyed)  // finish() called from on_create — skip Start/Resume entirely, Android parity (research-android-lifecycle.md §1)
+        | (Created, Destroyed)  // finish() called from on_create — skip Start/Resume entirely, Android parity
     )
 }
 
@@ -443,8 +443,8 @@ mod tests {
     #[test]
     fn created_to_destroyed_shortcut_is_legal() {
         // Stone 9.3 — added to match Android's finish()-in-on_create
-        // behaviour (research-android-lifecycle.md §1). Lock this edge
-        // in so a future matrix cleanup doesn't quietly drop it.
+        // behaviour. Lock this edge in so a future matrix cleanup
+        // doesn't quietly drop it.
         assert!(legal_transition(LifecycleState::Created, LifecycleState::Destroyed));
     }
 
@@ -862,11 +862,11 @@ mod tests {
         fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut FrameCommands) {}
     }
 
-    // ── Audit regressions (v0.2-review Task 1) ───────────────────────────
+    // ── Audit regressions ────────────────────────────────────────────────
     //
-    // These tests pin down the edges the audit turned up: out-of-order
-    // driver calls, destroyed-id reuse, and the two guards added to keep
-    // the state machine self-consistent.
+    // These tests pin down edges the post-9.1 state-machine audit turned
+    // up: out-of-order driver calls, destroyed-id reuse, and the two
+    // guards added to keep the state machine self-consistent.
 
     #[test]
     fn destroy_from_initial_is_full_noop() {

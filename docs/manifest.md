@@ -227,4 +227,4 @@ required = [
 - Bundled assets variants per locale/density
 - Feature requirements (`<uses-feature>` באנדרואיד) — דרישה של WebGPU, לדוגמה
 - Split APKs (code splitting) — נוסף ב-v0.3+
-- Task-management attributes — `allow_task_reparenting`, `clear_task_on_launch` (Android-parity, niche). דורשים multi-task orchestration שמתוכנן ל-Phase 11+; ראה [research-android-lifecycle.md §5](research-android-lifecycle.md). לא שמורים בנאמ-space כרגע.
+- Task-management attributes — `allow_task_reparenting`, `clear_task_on_launch` (Android-parity, niche). דורשים multi-task orchestration שמתוכנן ל-Phase 11+. לא שמורים בנאמ-space כרגע.

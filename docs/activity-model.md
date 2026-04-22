@@ -84,7 +84,7 @@
 | SDK trait — `on_create/start/resume/pause/stop/destroy` with no-op defaults | ✅ | [`sdk-rust/src/activity.rs`](../sdk-rust/src/activity.rs) |
 | `save_state_bytes` / `restore_state_bytes` wired through Create→restore→Start | ✅ | framework `launch_app`, SDK runtime |
 | `onRestart` as a distinct callback | ❌ by design | Stopped→Started re-fires `on_start` — apps that need "first start vs restart" distinction gate on internal flags |
-| `finish()` inside `on_create` short-circuit (Created→Destroyed) | ✅ Stone 9.3 | `legal_transition` gains the edge; `advance_through_create` returns whether finish was raised; `launch_app` calls `destroy_shortcut` (fires only `on_destroy`) + pops the stack entry instead of continuing to Start/Resume. Android parity — see [research-android-lifecycle.md §1](research-android-lifecycle.md) |
+| `finish()` inside `on_create` short-circuit (Created→Destroyed) | ✅ Stone 9.3 | `legal_transition` gains the edge; `advance_through_create` returns whether finish was raised; `launch_app` calls `destroy_shortcut` (fires only `on_destroy`) + pops the stack entry instead of continuing to Start/Resume. Android parity: AOSP skips `onStart`/`onResume` (and may skip `onPause`/`onStop`) when `finish()` is called synchronously in `onCreate`; `onSaveInstanceState` is explicitly not called on this path |
 | Wasm apps can call `ctx.finish()` | ✅ Stone 9.3 | SDK `Context::finish()` → `akiva_host_finish(handle)` import → worker sets per-handle flag → kernel drains via `hal_app_drain_finish` at the end of every ctx-bearing callback → framework flips `ActivityContext.finish_requested`. Matches in-kernel activities (Shell) that set the flag directly |
 | `on_new_intent` on SingleTop reuse | ✅ Stone 9.4 | `Framework::launch_app` detects `new_id == current top` → `deliver_new_intent` runs the callback, no bring-up chain, no stack churn. Framework-level test: `singletop_reuse_fires_on_new_intent_instead_of_bring_up` |
 | Wasm apps can call `ctx.start_activity(&intent)` | ✅ Stone 9.4 | SDK `Context::start_activity` → `akiva_host_start_activity(handle, ptr, len)` import with [`Intent::encode`](../sdk-rust/src/intent.rs) → worker stashes on `_pendingIntent` → kernel drains via `hal_app_drain_intent` after each ctx-bearing callback → `ActivityContext.launch_requested` → `IntentRouter::resolve` → `launch_app`. Symmetric wire codec pinned in [docs/abi.md §2.5.1](abi.md) |
@@ -94,9 +94,7 @@
 
 Bug caught by the Phase 9.1 test sweep: `destroy()` used to `break` on the first illegal edge, so destroying a Paused or Stopped activity silently skipped `on_stop`/`on_destroy`. Fixed to ignore-and-continue, matching `resume`'s shape.
 
-Bug caught by the Task 1 state-machine audit ([v0.2-review.md](v0.2-review.md)): `destroy()` called from `Initial` silently dropped the instance and rewrote the stack even though no lifecycle callback fired. Guard added so cleanup only runs once the record actually reached `Destroyed`.
-
-External research backing the above table lives in [research-android-lifecycle.md](research-android-lifecycle.md) — five AOSP edges audited, decisions documented.
+Bug caught by the post-9.1 state-machine audit: `destroy()` called from `Initial` silently dropped the instance and rewrote the stack even though no lifecycle callback fired. Guard added so cleanup only runs once the record actually reached `Destroyed`.
 
 ## 3. Saved State
 

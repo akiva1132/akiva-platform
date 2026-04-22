@@ -485,8 +485,8 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - ⏭️ **SingleInstance dedicated-task isolation** — Stone 9.6.
 
 ### 9.3 Back stack + `Context::finish()`
-- ✅ **SDK `Context::finish()` plumbing** — `akiva_host_finish(handle)` import → worker per-handle flag table → kernel drains via `hal_app_drain_finish` → `WasmActivity.drain_post` קובע `ActivityContext.finish_requested = true`. סוגר את ה-gap מ-[`research-activity-boundary.md`](docs/research-activity-boundary.md).
-- ✅ **Created→Destroyed shortcut** — `(Created, Destroyed)` ב-`legal_transition`; `advance_through_create` מחזיר אם finish הופעל; `launch_app` קורא ל-`destroy_shortcut` (on_destroy בלבד) ו-pop של ה-stack. parity עם Android — ראה [`research-android-lifecycle.md §1`](docs/research-android-lifecycle.md).
+- ✅ **SDK `Context::finish()` plumbing** — `akiva_host_finish(handle)` import → worker per-handle flag table → kernel drains via `hal_app_drain_finish` → `WasmActivity.drain_post` קובע `ActivityContext.finish_requested = true`.
+- ✅ **Created→Destroyed shortcut** — `(Created, Destroyed)` ב-`legal_transition`; `advance_through_create` מחזיר אם finish הופעל; `launch_app` קורא ל-`destroy_shortcut` (on_destroy בלבד) ו-pop של ה-stack. parity עם Android.
 - ✅ **Integration test (test-coverage.md §4)** — כוסה ב-Stone 9.4: `framework::tests::standard_launch_stacks_and_finish_unwinds` בודק Shell→App→(Esc back)→Shell end-to-end דרך `dispatch_pointer`+`dispatch_key`, מאמת את ה-lifecycle sequence המלא של ה-App (pause/stop/destroy) וחזרה ל-`Resumed` של ה-Shell.
 - ⏭️ **`Context::back()` + `akiva_host_back` import** — Shell policy / gesture mapping. כרגע ה-framework קוצר על Esc מ-key events; אין app שצריך להפעיל Back ישירות. נדחה עד שיש use case.
 - ⏭️ **Gesture engine** — v0.2: קיצור מקלדת fixed בלבד, אין gesture. נשמר כ-feature של Phase 11+.
@@ -497,8 +497,8 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - ✅ **`on_new_intent` על SingleTop reuse** — `Framework::launch_app` מעביר את ה-`Intent` המלא ל-reuse branch; `deliver_new_intent` קורא ל-`Activity::on_new_intent(ctx, &intent)`, `apply_post` רקורסיבי אם ה-handler עצמו ביקש עוד משהו. test: `singletop_reuse_fires_on_new_intent_instead_of_bring_up`.
 - ✅ **`akiva_app_new_intent` export + `hal_app_new_intent`** — נדרש ב-`REQUIRED_EXPORTS` ב-worker, מחובר דרך `akiva_app!` macro; framework `WasmHost::new_intent` (kernel impl + MockHost) משלים את הצד השני.
 - ✅ **Framework-level back-stack unwind test** — `standard_launch_stacks_and_finish_unwinds` מכסה Shell→App→(Esc)→Shell על pointers אמיתיים; פותר גם את ה-Integration test שמוזכר ב-9.3 (Rust-side עם Mock). החבורה של "A פותח B, B פותח C, back×3" נשארת בעיקר ה-path שבדוק ע"י שני ה-tests האלה — הרחבה ל-3 רמות היא שכפול של אותו code path.
-- ⏭️ **`on_new_intent` על SingleTask/SingleInstance reuse** — ה-`deliver_new_intent` path מוכן; מימוש ה-reuse עצמו ב-`ActivityManager::launch` עדיין ב-Stone 9.2.
-- **Doc cleanup (🗑️):** בסיום ה-stone למחוק `docs/v0.2-review.md`, `docs/research-android-lifecycle.md`, `docs/research-activity-boundary.md`. ל-fold כל תוכן שעדיין רלוונטי ל-`activity-model.md` / `abi.md`. לעדכן את 6 ה-cross-links שמפנים אליהם. `research-component-model.md` ו-`test-coverage.md` נשארים.
+- ✅ **`on_new_intent` על SingleTask/SingleInstance reuse** — נחת ב-Stone 9.2.
+- ✅ **Doc cleanup** — `v0.2-review.md`, `research-android-lifecycle.md`, `research-activity-boundary.md` נמחקו; תוכן רלוונטי מקופל ב-`activity-model.md`; 9 cross-links עודכנו. `research-component-model.md` ו-`test-coverage.md` נשארים.
 
 ### 9.5 `start_activity_for_result` + `on_activity_result`
 - שני imports חדשים: `activity.start_activity_for_result(intent_blob, request_code)` ו-`activity.set_result(result_blob)`

@@ -1,10 +1,10 @@
 # WebAssembly Component Model — migration research
 
-> **Research output for [v0.2-review.md](v0.2-review.md) Task 4.** Our ABI
-> v0 is raw `extern "C"`; [`docs/abi.md §3`](abi.md) already sketches
-> v1 as a Component Model target. The question is *when* to flip, not
-> *whether* — but "when" is load-bearing because a premature cut costs
-> far more than a deferred one.
+> **Why this doc.** Our ABI v0 is raw `extern "C"`;
+> [`docs/abi.md §3`](abi.md) already sketches v1 as a Component Model
+> target. The question is *when* to flip, not *whether* — but "when" is
+> load-bearing because a premature cut costs far more than a deferred
+> one. Tracked as a deferred concern in [`docs/risks.md §2`](risks.md).
 
 Sources:
 - [Component Model introduction](https://component-model.bytecodealliance.org/) — Bytecode Alliance.

@@ -534,8 +534,7 @@ impl Framework {
         // Android parity: if the activity called `finish()` from inside
         // `on_create`, skip restore + Start + Resume and jump straight
         // to on_destroy via the `Created → Destroyed` shortcut. Then pop
-        // the stack entry and resume whatever we just paused. See
-        // docs/research-android-lifecycle.md §1.
+        // the stack entry and resume whatever we just paused.
         if self.advance_through_create(outcome.id, ts) {
             self.destroy_shortcut(outcome.id, ts);
             self.stack.pop();

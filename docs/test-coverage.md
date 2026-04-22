@@ -1,4 +1,4 @@
-# Test-coverage audit (v0.2-review Task 6)
+# Test-coverage audit
 
 > **Baseline:** 274 passing tests across the workspace. Framework 71, CLI
 > 68, SDK 135, kernel/runtime 0. Zero JS tests anywhere (`worker.js`,
