@@ -1,4 +1,4 @@
-//! `.akiva` archive format (AKPK v1).
+//! `.akv` archive format (AKPK v1).
 //!
 //! The wire format and rationale live in [`docs/archive-format.md`]. This
 //! module is stdlib-only by design — the CLI doesn't pull in `zip` just to
@@ -11,7 +11,7 @@
 //!   entry: path_len u16 | path UTF-8 | data_len u32 | data bytes
 //!
 //! All integers little-endian. Paths use `/` separators and are validated
-//! against traversal on decode — an `.akiva` archive cannot name a file
+//! against traversal on decode — an `.akv` archive cannot name a file
 //! outside its own tree.
 
 // Stone 8.1 lands the format + tests; `akiva package` / `akiva install`
@@ -46,7 +46,7 @@ pub struct Entry {
     pub data: Vec<u8>,
 }
 
-/// In-memory representation of an `.akiva` archive. Built by
+/// In-memory representation of an `.akv` archive. Built by
 /// repeatedly calling [`add`][Self::add], then serialised via
 /// [`encode`][Self::encode]; or decoded from bytes with
 /// [`decode`][Self::decode].

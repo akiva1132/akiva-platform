@@ -1,6 +1,6 @@
 # Akiva Manifest
 
-> **סטטוס מימוש (אפריל 2026):** parser + validation מלאים, install/uninstall/rehydrate מ-OPFS פעילים. פורמט `.akiva` archive וה-CLI commands `akiva package`/`install`/`uninstall` מיושמים ב-**Phase 8 של v0.2**. `permissions.required` מוצהר ב-manifest אבל לא נאכף עדיין — נסגר ב-**Phase 10 של v0.2**. ראה [v0.2-design.md](v0.2-design.md).
+> **סטטוס מימוש (אפריל 2026):** parser + validation מלאים, install/uninstall/rehydrate מ-OPFS פעילים. פורמט `.akv` archive וה-CLI commands `akiva package`/`install`/`uninstall` מיושמים ב-**Phase 8 של v0.2**. `permissions.required` מוצהר ב-manifest אבל לא נאכף עדיין — נסגר ב-**Phase 10 של v0.2**. ראה [v0.2-design.md](v0.2-design.md).
 
 ## 1. מטרה
 
@@ -182,7 +182,7 @@ calculator/
         └── icon.svg
 ```
 
-בעתיד — package זה ייארז כ-`.akiva` archive (ZIP with manifest).
+בעתיד — package זה ייארז כ-`.akv` archive (AKPK format). ראה [archive-format.md](archive-format.md).
 
 ## 8. דוגמה: Shell manifest
 

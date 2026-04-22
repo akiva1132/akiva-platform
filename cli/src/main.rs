@@ -3,7 +3,7 @@
 //! Subcommands:
 //!   akiva new <name>       — scaffold a new app
 //!   akiva build             — build the workspace (kernel → wasm, cli → native)
-//!   akiva package <app>     — build an app + emit a .akiva archive
+//!   akiva package <app>     — build an app + emit a .akv archive
 //!   akiva install <archive> — install an app into the local runtime
 //!   akiva run               — build + launch the devserver
 //!   akiva devserver         — serve runtime/web/ with the cross-origin
@@ -45,7 +45,7 @@ fn print_help() {
     println!("COMMANDS:");
     println!("  new <name>          Scaffold a new app crate");
     println!("  build               Build the workspace");
-    println!("  package <app>       Build an app and emit a .akiva archive");
+    println!("  package <app>       Build an app and emit a .akv archive");
     println!("  install <archive>   Install an app into the local runtime");
     println!("  run                 Build + launch the devserver");
     println!("  devserver           Serve runtime/web with hot reload");
@@ -65,7 +65,7 @@ fn cmd_package(args: &[String]) -> ExitCode {
     let Some(app) = args.first() else {
         eprintln!("akiva package: missing <app>"); return ExitCode::from(2);
     };
-    println!("[stub] would package apps/{app}/ into {app}.akiva");
+    println!("[stub] would package apps/{app}/ into {app}.akv");
     ExitCode::SUCCESS
 }
 

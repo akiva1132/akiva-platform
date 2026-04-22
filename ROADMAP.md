@@ -422,7 +422,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 
 **רכיבים שנבנים:**
 
-### 8.1 פורמט `.akiva` archive
+### 8.1 פורמט `.akv` archive
 - תיעוד ב-`docs/archive-format.md` (חדש)
 - ZIP עם layout קבוע: `manifest.toml` + `app.wasm` + `res/` + `signature.sig` (עתידי, placeholder בלבד)
 - בחירת crate: `zip` (stdlib-friendly, ללא dependency-hell) או מימוש פנימי אם ה-crate דורש תלות כבדה
@@ -430,8 +430,8 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 
 ### 8.2 `akiva package <app>`
 - ב-[`cli/src/package.rs`](cli/src/package.rs) (חדש)
-- שלבים: ודא build קיים (או `akiva build <app>` ראשון), קרא wasm מ-`runtime/web/dev-apps/<app>/` או ישירות מ-`apps/<app>/target/...`, קרא manifest, קרא `res/`, ארוז → `<app>.akiva`
-- Flag: `--out <path>` (ברירת מחדל: `<app>.akiva` ב-cwd)
+- שלבים: ודא build קיים (או `akiva build <app>` ראשון), קרא wasm מ-`runtime/web/dev-apps/<app>/` או ישירות מ-`apps/<app>/target/...`, קרא manifest, קרא `res/`, ארוז → `<app>.akv`
+- Flag: `--out <path>` (ברירת מחדל: `<app>.akv` ב-cwd)
 
 ### 8.3 `akiva install <archive>`
 - ב-[`cli/src/install.rs`](cli/src/install.rs) (חדש)
@@ -450,7 +450,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - `version_code` זהה או נמוך יותר בהתקנה → dismissal עם הודעה ברורה
 
 **Exit criteria:**
-- [ ] `akiva package calculator && akiva install calculator.akiva` עובד end-to-end
+- [ ] `akiva package calculator && akiva install calculator.akv` עובד end-to-end
 - [ ] `runtime/web/worker.js` לא מכיל שום שם של אפליקציה ספציפית
 - [ ] התקנת archive חדש, ה-Shell מציגה את האפליקציה בלי שינוי קוד
 - [ ] upgrade + uninstall עובדים (unit tests ב-`framework/src/package_manager.rs`)
@@ -566,7 +566,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 
 **סה"כ זמן:** ~7-10 שבועות. בסיום v0.2 יש לנו:
 
-- פורמט `.akiva` מתועד ותפעולי, CLI מלא סביב התקנה
+- פורמט `.akv` מתועד ותפעולי, CLI מלא סביב התקנה
 - מחזור חיים מלא, כל launch modes, cross-activity intents עם תוצאות
 - Permission model עובד עם אכיפה ב-instantiation, grants persist
 
@@ -632,7 +632,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - ✅ **`akiva build [names...]`** (commit `13fd1fb`) — wasm build pipeline המחליף את ה-build.sh הפזורים. אוטו-גילוי `apps/*/Cargo.toml`, staging ל-`runtime/web/dev-apps/`, עדכון `res/values/` נקי.
 - ✅ **`akiva run`** (commit `eb3eff4`) — kernel build + copy + כל האפליקציות + devserver בפקודה אחת. `--no-build` ל-skip, `--debug` ל-dev profile.
 - ✅ **`akiva new <name>`** (commit `8e61a5a`) — scaffolding עם Cargo.toml + manifest.toml + src/lib.rs + .gitignore. שם נורמליזציה ל-kebab-case, Activity class ו-package_id נגזרים אוטומטית. `--force` לoverwrite.
-- `akiva package` / `akiva install` — **יטופלו ב-Phase 8 (v0.2)**. פורמט `.akiva` יתועד ב-`docs/archive-format.md`.
+- `akiva package` / `akiva install` — **יטופלו ב-Phase 8 (v0.2)**. פורמט `.akv` יתועד ב-`docs/archive-format.md`.
 
 ה-backlog הזה **לא** בלוקר ל-MVP; כל פריט הוא תוספת שמתלבשת על המבנה הקיים בלי rewrite. אם נרצה לסגור את Phase 2 פורמלית, הפריטים של Phase 2 הם מה שצריך להשלים.
 
@@ -645,7 +645,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - ❌ Animations (רק transitions מיידיים)
 - ❌ Multi-window / split screen (activity אחד display אחד)
 - ❌ Intent chooser UI (אם יש matches מרובים — קחי את הראשון)
-- ❌ App store / distribution — ב-v0.2 מגיע פורמט `.akiva` + CLI install, אבל לא store מרוכז (Phase 8)
+- ❌ App store / distribution — ב-v0.2 מגיע פורמט `.akv` + CLI install, אבל לא store מרוכז (Phase 8)
 - ❌ Network APIs (לא נחשף ל-apps עדיין)
 - ❌ Accessibility (ה-ארכיטקטורה מוכנה; מימוש דחוי ל-v0.3+)
 - ❌ Themes (צבעים בלבד, לא styles)
@@ -668,7 +668,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 
 v0.2 ממקד ב-**חוזה המערכת עם אפליקציות**, לא ב-UI. ראה [`docs/v0.2-design.md`](docs/v0.2-design.md) למלאי.
 
-- ✅ פורמט הפצה `.akiva` + `akiva package`/`install`/`uninstall` (Phase 8)
+- ✅ פורמט הפצה `.akv` + `akiva package`/`install`/`uninstall` (Phase 8)
 - ✅ מחזור חיים מלא של Activity + SingleTask/SingleInstance + back navigation (Phase 9)
 - ✅ `start_activity` / `start_activity_for_result` / `on_new_intent` / `on_activity_result` (Phase 9)
 - ✅ Permission model (Capability-via-Imports, install-time grants, persistence) (Phase 10)

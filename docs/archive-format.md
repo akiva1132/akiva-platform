@@ -1,4 +1,4 @@
-# `.akiva` Archive Format (AKPK v1)
+# `.akv` Archive Format (AKPK v1)
 
 > **סטטוס מימוש:** Phase 8.1 — פורמט + encode/decode + unit tests פעילים ב-[cli/src/archive.rs](../cli/src/archive.rs). `akiva package` + `akiva install` (Phase 8.2–8.3) יושבים על גבי זה.
 
@@ -8,7 +8,7 @@
 
 חסרונות של ZIP לטובת המקרה שלנו:
 - הוא גדול — ZIP parser מלא טומן טיפול ב-EOCD record, central directory, multi-disk, data descriptors, encryption, 0x05054b50 ו-ZIP64.
-- יתרונותיו (random access, tools מוכרים) לא קריטיים: Akiva תמיד טוענת את כל ה-archive ל-RAM ב-install; ה-`.akiva` לא נועד לעריכה ידנית.
+- יתרונותיו (random access, tools מוכרים) לא קריטיים: Akiva תמיד טוענת את כל ה-archive ל-RAM ב-install; ה-`.akv` לא נועד לעריכה ידנית.
 
 AKPK הוא ~200 שורות Rust כולל tests, ו-0 תלויות. אם יום אחד נרצה compression או random access נעבור ל-ZIP דרך bump של version byte — הפורמט תומך בזה.
 
@@ -131,7 +131,7 @@ Binary layout (schematically):
 
 | Variant | משמעות |
 |---|---|
-| `BadMagic` | ארבעת הבתים הראשונים לא `AKPK` — הקובץ אינו `.akiva` |
+| `BadMagic` | ארבעת הבתים הראשונים לא `AKPK` — הקובץ אינו `.akv` |
 | `UnsupportedVersion(n)` | Version byte לא 1 — archive חדש מדי או פגום |
 | `Truncated` | ה-header מציין עוד נתונים אבל הגענו לסוף הבאפר |
 | `TrailingBytes` | בתים אחרי ה-entry האחרון — פגום |
