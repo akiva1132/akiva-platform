@@ -115,7 +115,13 @@ async function discoverDevApps(log) {
   try {
     const resp = await fetch("./dev-apps/index.json");
     if (!resp.ok) {
-      if (resp.status !== 404) {
+      // 404 is production (no devserver, no dev-apps tree) — stay
+      // quiet. Anything else means the devserver is up but the
+      // endpoint is misbehaving (stale binary from before Stone 8.4,
+      // say). Surface it so the dev loop isn't a silent mystery.
+      if (resp.status === 404) {
+        log("info", "dev-apps/index.json: 404 (production boot or stale devserver — no dev apps to install)");
+      } else {
         log("warn", `dev-apps/index.json: ${resp.status}`);
       }
       return [];
@@ -125,6 +131,7 @@ async function discoverDevApps(log) {
       log("warn", "dev-apps/index.json: malformed (expected {\"dirs\":[...]})");
       return [];
     }
+    log("info", `dev-apps discovered: ${body.dirs.length === 0 ? "(empty)" : body.dirs.join(", ")}`);
     return body.dirs;
   } catch (err) {
     log("warn", `dev-apps/index.json: ${err?.message ?? err}`);
