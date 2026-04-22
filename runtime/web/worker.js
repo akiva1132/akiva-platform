@@ -99,17 +99,42 @@ async function bootKernel(kernelUrl, _tabId) {
 
 // ── Dev-mode app installation ────────────────────────────────────────────
 //
-// Phase 2b.4 bootstrap before we have a real registry or CLI install path.
-// For each name in DEV_APPS, fetches `dev-apps/{name}/manifest.toml` and
-// `dev-apps/{name}/app.wasm`, and if the package isn't already in the
-// index, writes the three storage keys the PackageManager expects. A
-// missing or 404ing app is logged and skipped — not every dev checkout
-// will have built every app.
+// Dev-loop bootstrap: for each directory staged under `runtime/web/dev-apps/`
+// (by `akiva build` or `akiva install`), fetch its `manifest.toml` and
+// `app.wasm` and write them into OPFS at the keys PackageManager expects.
+// Already-installed packages get their wasm refreshed but are not duplicated
+// in the index. A missing or 404ing app is logged and skipped — not every
+// dev checkout has every app staged.
+//
+// The directory list comes from the devserver's dynamic
+// `./dev-apps/index.json` endpoint (Stone 8.4) — no hardcoded names live
+// here anymore. Production boots (no devserver, OPFS-resident packages)
+// skip this path entirely: the fetch 404s and discoverDevApps returns [].
 
-const DEV_APPS = ["hello", "calculator", "tic-tac-toe"];
+async function discoverDevApps(log) {
+  try {
+    const resp = await fetch("./dev-apps/index.json");
+    if (!resp.ok) {
+      if (resp.status !== 404) {
+        log("warn", `dev-apps/index.json: ${resp.status}`);
+      }
+      return [];
+    }
+    const body = await resp.json();
+    if (!Array.isArray(body?.dirs)) {
+      log("warn", "dev-apps/index.json: malformed (expected {\"dirs\":[...]})");
+      return [];
+    }
+    return body.dirs;
+  } catch (err) {
+    log("warn", `dev-apps/index.json: ${err?.message ?? err}`);
+    return [];
+  }
+}
 
 async function installDevApps(log) {
-  for (const name of DEV_APPS) {
+  const names = await discoverDevApps(log);
+  for (const name of names) {
     try {
       await installOneDevApp(name, log);
     } catch (err) {

@@ -114,6 +114,17 @@ fn handle(mut stream: TcpStream, web_root: &Path) -> io::Result<()> {
             return Ok(());
         }
     };
+    // Dynamic endpoints take precedence over the static tree: the worker
+    // boots by fetching `./dev-apps/index.json` to discover which apps
+    // were staged by `akiva build` or `akiva install`, and there's no
+    // file on disk for it — we generate the listing from the dir. Any
+    // dynamic route that returns `Some` short-circuits the static path.
+    if let Some((body, content_type)) = dynamic_response(&relative, web_root) {
+        write_status(&mut stream, 200, "OK", &body, content_type, head_only)?;
+        log(method, target, 200);
+        return Ok(());
+    }
+
     let abs = web_root.join(&relative);
     // Canonicalise to collapse ".." and symlinks, then re-check it's
     // still under web_root. If the file doesn't exist the canonicalize
@@ -231,6 +242,71 @@ fn log(method: &str, target: &str, status: u16) {
     eprintln!("{status} {method} {target}");
 }
 
+/// Dynamic routes that generate their body on the fly rather than
+/// reading a file. Returns `Some((body, content_type))` when the
+/// relative path matches a handled route, otherwise `None` to let the
+/// static-file path take over. Keep this tiny — the devserver is not
+/// meant to grow into a framework.
+fn dynamic_response(relative: &Path, web_root: &Path) -> Option<(Vec<u8>, &'static str)> {
+    if relative == Path::new("dev-apps/index.json") {
+        return Some((list_dev_apps_json(web_root), "application/json"));
+    }
+    None
+}
+
+/// Enumerate subdirectories of `runtime/web/dev-apps/` and emit them as
+/// `{"dirs":["calculator","hello",...]}`. Replaces the hardcoded
+/// `DEV_APPS` array the worker used to carry (Stone 8.4) — whatever
+/// `akiva build` or `akiva install` has staged shows up here on the
+/// next page load, with no list to maintain.
+///
+/// Absent `dev-apps/` is equivalent to empty: a checkout with no apps
+/// built yet should boot cleanly (the Shell just shows zero launcher
+/// entries), not 500.
+fn list_dev_apps_json(web_root: &Path) -> Vec<u8> {
+    let dir = web_root.join("dev-apps");
+    let mut names: Vec<String> = match std::fs::read_dir(&dir) {
+        Ok(iter) => iter
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().ok().is_some_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            // Skip hidden / tooling dirs (`.cache`, `.git`) — they're
+            // not apps and the worker would just log a warning when it
+            // failed to fetch manifest.toml from them.
+            .filter(|n| !n.starts_with('.'))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+
+    // Stdlib-only JSON encoder: just the shape we need. Dir names are
+    // bounded by what the filesystem tolerates, but escape defensively
+    // so a pathological name (shouldn't happen for apps/ dirs, but a
+    // developer might experiment) doesn't produce invalid JSON.
+    let mut out = String::from("{\"dirs\":[");
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('"');
+        for ch in n.chars() {
+            match ch {
+                '"' | '\\' => { out.push('\\'); out.push(ch); }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    // Control char — six-byte \u escape keeps the payload
+                    // JSON-valid without dragging in a crate.
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+    out.push_str("]}");
+    out.into_bytes()
+}
+
 /// CLI entry point. Parses `--port N` / `--addr HOST:PORT`; everything
 /// else falls back to [`DEFAULT_ADDR`]. Kept in this module (rather
 /// than `main.rs`) so the parser lives next to the thing it configures.
@@ -323,5 +399,61 @@ mod tests {
         assert_eq!(mime_for(Path::new("a.wasm")), "application/wasm");
         assert_eq!(mime_for(Path::new("a.toml")), "text/plain; charset=utf-8");
         assert_eq!(mime_for(Path::new("unknown.xyz")), "application/octet-stream");
+    }
+
+    fn scratch_web(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("akiva-devserver-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn dev_apps_index_lists_subdirs_sorted() {
+        let web = scratch_web("list");
+        std::fs::create_dir_all(web.join("dev-apps/calculator")).unwrap();
+        std::fs::create_dir_all(web.join("dev-apps/hello")).unwrap();
+        std::fs::create_dir_all(web.join("dev-apps/tic-tac-toe")).unwrap();
+        let body = list_dev_apps_json(&web);
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            r#"{"dirs":["calculator","hello","tic-tac-toe"]}"#,
+        );
+        let _ = std::fs::remove_dir_all(&web);
+    }
+
+    #[test]
+    fn dev_apps_index_on_missing_dir_is_empty() {
+        // Fresh checkout with no builds yet must not 500 the boot.
+        let web = scratch_web("missing");
+        // Deliberately do NOT create dev-apps/.
+        let body = list_dev_apps_json(&web);
+        assert_eq!(std::str::from_utf8(&body).unwrap(), r#"{"dirs":[]}"#);
+        let _ = std::fs::remove_dir_all(&web);
+    }
+
+    #[test]
+    fn dev_apps_index_skips_files_and_dotted_dirs() {
+        // Only subdirectories qualify as apps; regular files (stray
+        // `.akv` archives, README) and dot-prefixed dirs (`.cache`)
+        // should not appear in the listing.
+        let web = scratch_web("filter");
+        std::fs::create_dir_all(web.join("dev-apps/real-app")).unwrap();
+        std::fs::create_dir_all(web.join("dev-apps/.cache")).unwrap();
+        std::fs::write(web.join("dev-apps/README.md"), b"hi").unwrap();
+        std::fs::write(web.join("dev-apps/calculator.akv"), b"x").unwrap();
+        let body = list_dev_apps_json(&web);
+        assert_eq!(std::str::from_utf8(&body).unwrap(), r#"{"dirs":["real-app"]}"#);
+        let _ = std::fs::remove_dir_all(&web);
+    }
+
+    #[test]
+    fn dynamic_response_matches_index_json_only() {
+        // Other paths under dev-apps/ must fall through to the static
+        // file handler — we're not turning this into a routing table.
+        let web = std::env::temp_dir();
+        assert!(dynamic_response(Path::new("dev-apps/index.json"), &web).is_some());
+        assert!(dynamic_response(Path::new("dev-apps/calculator/app.wasm"), &web).is_none());
+        assert!(dynamic_response(Path::new("index.html"), &web).is_none());
     }
 }
