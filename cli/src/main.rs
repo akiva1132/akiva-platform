@@ -9,6 +9,7 @@
 //!   akiva devserver         — serve runtime/web/ with the cross-origin
 //!                             isolation headers OPFS + threads need
 
+mod archive;
 mod build;
 mod devserver;
 mod new;
