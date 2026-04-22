@@ -78,7 +78,15 @@ impl PackageRecord {
 pub enum InstallError {
     Manifest(ManifestError),
     AbiMismatch { required: String, runtime: String },
-    DuplicateId(String),
+    /// Package with this id is already installed and the offered
+    /// `version_code` is lower than what's on record. Matches Android's
+    /// posture of never silently downgrading.
+    DowngradeRejected { id: String, installed: u64, offered: u64 },
+    /// Package with this id is already installed and the offered
+    /// `version_code` matches exactly. Distinct from downgrade so the
+    /// caller can tell "stale archive" from "forgot to bump the code".
+    /// Upgrades (strictly greater `version_code`) succeed silently.
+    SameVersionRejected { id: String, version_code: u64 },
     Storage(StorageError),
 }
 
@@ -89,7 +97,12 @@ impl core::fmt::Display for InstallError {
             InstallError::AbiMismatch { required, runtime } => {
                 write!(f, "ABI mismatch: package needs >= {required}, runtime is {runtime}")
             }
-            InstallError::DuplicateId(id) => write!(f, "package already installed: {id}"),
+            InstallError::DowngradeRejected { id, installed, offered } => {
+                write!(f, "downgrade rejected for {id}: installed version_code={installed}, offered={offered}")
+            }
+            InstallError::SameVersionRejected { id, version_code } => {
+                write!(f, "same version already installed for {id}: version_code={version_code} (bump version_code to upgrade)")
+            }
             InstallError::Storage(e) => write!(f, "storage error: {e:?}"),
         }
     }
@@ -210,12 +223,29 @@ impl PackageManager {
         out
     }
 
-    /// Install a package. Parses + validates the manifest, checks ABI
-    /// compatibility, then atomically-ish writes manifest + wasm + updated
-    /// index. "Atomically-ish" because we don't have transactions; a crash
-    /// mid-write can leave the index out of sync with the per-package
-    /// keys, but `load_installed` tolerates that (orphan keys are benign,
-    /// orphan index entries are reported via `on_error`).
+    /// Install or upgrade a package. Parses + validates the manifest,
+    /// checks ABI compatibility, then atomically-ish writes manifest +
+    /// wasm + updated index. "Atomically-ish" because we don't have
+    /// transactions; a crash mid-write can leave the index out of sync
+    /// with the per-package keys, but `load_installed` tolerates that
+    /// (orphan keys are benign, orphan index entries are reported via
+    /// `on_error`).
+    ///
+    /// Upgrade semantics: a second install for an id already on file is
+    /// accepted only if the new `version_code` is strictly greater than
+    /// the installed one. Equal and lower are rejected with distinct
+    /// errors so the caller can tell "stale archive" from "forgot to
+    /// bump." On MAJOR-version bumps (`app.version`), persisted
+    /// activity `saved_state` blobs are wiped — a breaking version
+    /// change is the developer saying "the old state may no longer be
+    /// meaningful." Minor/patch bumps keep saved_state intact so an
+    /// upgrade is seamless for the user.
+    ///
+    /// Resources (`res/values/*.toml`) are not rewritten here — the
+    /// caller performing the install (CLI or dev bootstrap in
+    /// worker.js) owns resource deployment, and writing fresh resource
+    /// bytes alongside the manifest is enough for the next boot's
+    /// `read_resource_tables` to pick them up.
     pub fn install(
         &mut self,
         storage: &mut dyn Storage,
@@ -226,10 +256,40 @@ impl PackageManager {
         check_abi(&manifest.app.min_abi_version)?;
 
         let id = manifest.app.id.clone();
-        if self.packages.contains_key(&id) {
-            return Err(InstallError::DuplicateId(id));
+        let offered_code = manifest.app.version_code;
+
+        if let Some(existing) = self.packages.get(&id) {
+            if offered_code < existing.version_code {
+                return Err(InstallError::DowngradeRejected {
+                    id,
+                    installed: existing.version_code,
+                    offered: offered_code,
+                });
+            }
+            if offered_code == existing.version_code {
+                return Err(InstallError::SameVersionRejected { id, version_code: offered_code });
+            }
+            // Strict upgrade. On a MAJOR-version change, sweep the
+            // old manifest's activity saved_state keys so the freshly
+            // upgraded app doesn't inherit blobs whose encoding it
+            // may no longer understand. Minor/patch upgrades keep the
+            // blobs — the ABI between them is the developer's promise.
+            let same_major = major_of(&existing.manifest.app.version) == major_of(&manifest.app.version);
+            if !same_major {
+                for activity in &existing.manifest.activities {
+                    // Ignore NotFound — best-effort, matches uninstall().
+                    let _ = storage.delete(&key_saved_state(&id, &activity.class));
+                }
+            }
+
+            storage.write(&key_manifest(&id), manifest_toml.as_bytes())?;
+            storage.write(&key_wasm(&id), wasm_bytes)?;
+            // Index already contains this id — no update needed.
+            self.packages.insert(id.clone(), PackageRecord::from_manifest(manifest));
+            return Ok(id);
         }
 
+        // First install for this id.
         storage.write(&key_manifest(&id), manifest_toml.as_bytes())?;
         storage.write(&key_wasm(&id), wasm_bytes)?;
 
@@ -340,6 +400,17 @@ fn check_abi(required: &str) -> Result<(), InstallError> {
     }
 }
 
+/// Extract the MAJOR component of a semver-shaped `app.version`. Used
+/// by `install` to decide whether an upgrade wipes activity
+/// `saved_state`. The manifest validator has already asserted the
+/// overall shape (`MAJOR.MINOR.PATCH[-pre]`), so we don't need to
+/// reject garbage here — a string that makes it past parse and can't
+/// yield a MAJOR returns `None` and is treated as a mismatch by the
+/// caller, which is conservative (wipes state on ambiguity).
+fn major_of(version: &str) -> Option<u32> {
+    parse_triple(version).map(|(major, _, _)| major)
+}
+
 fn parse_triple(s: &str) -> Option<(u32, u32, u32)> {
     let core = s.split_once('-').map(|(c, _)| c).unwrap_or(s);
     let mut it = core.split('.');
@@ -411,12 +482,90 @@ entry = true
     }
 
     #[test]
-    fn duplicate_install_rejected() {
+    fn same_version_install_rejected() {
+        // Same id + same version_code is the "forgot to bump" case.
+        // Distinct error so a CLI can suggest the fix.
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
         pm.install(&mut store, HELLO, b"x").unwrap();
         let err = pm.install(&mut store, HELLO, b"x").unwrap_err();
-        assert!(matches!(err, InstallError::DuplicateId(_)));
+        assert!(matches!(
+            err,
+            InstallError::SameVersionRejected { version_code: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn downgrade_rejected() {
+        // Installing version_code=1 after version_code=2 is blocked.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        let v2 = HELLO.replace("version_code = 1", "version_code = 2");
+        pm.install(&mut store, &v2, b"new").unwrap();
+        let err = pm.install(&mut store, HELLO, b"old").unwrap_err();
+        assert!(matches!(
+            err,
+            InstallError::DowngradeRejected { installed: 2, offered: 1, .. }
+        ));
+        // Storage still carries the v2 wasm — downgrade must not have
+        // overwritten anything.
+        assert_eq!(store.read(&key_wasm("com.akiva.hello")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn upgrade_replaces_wasm_and_record() {
+        // Minor bump: new wasm lands, old wasm is gone, record
+        // reflects the new version_code.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        pm.install(&mut store, HELLO, b"v1-wasm").unwrap();
+        // Only bump `version`, not `min_abi_version` — a naive string
+        // replace would match both and trip AbiMismatch.
+        let v2 = HELLO
+            .replace("version_code = 1", "version_code = 2")
+            .replacen("version = \"0.1.0\"", "version = \"0.2.0\"", 1);
+        pm.install(&mut store, &v2, b"v2-wasm").unwrap();
+
+        assert_eq!(pm.count(), 1);
+        assert_eq!(pm.get("com.akiva.hello").unwrap().version_code, 2);
+        assert_eq!(store.read(&key_wasm("com.akiva.hello")).unwrap(), b"v2-wasm");
+    }
+
+    #[test]
+    fn upgrade_minor_preserves_saved_state() {
+        // Installing 0.1.0 → 0.2.0 (same major) must keep the blob
+        // an activity persisted via onSaveInstanceState.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        pm.install(&mut store, HELLO, b"v1-wasm").unwrap();
+        let state_key = key_saved_state("com.akiva.hello", "HelloMain");
+        store.write(&state_key, b"persisted blob").unwrap();
+
+        // Only bump `version`, not `min_abi_version` — a naive string
+        // replace would match both and trip AbiMismatch.
+        let v2 = HELLO
+            .replace("version_code = 1", "version_code = 2")
+            .replacen("version = \"0.1.0\"", "version = \"0.2.0\"", 1);
+        pm.install(&mut store, &v2, b"v2-wasm").unwrap();
+        assert_eq!(store.read(&state_key).unwrap(), b"persisted blob");
+    }
+
+    #[test]
+    fn upgrade_major_clears_saved_state() {
+        // 0.1.0 → 1.0.0 is a breaking version bump. Any state blob
+        // persisted for an activity on the old major must be wiped so
+        // the new code doesn't decode incompatible bytes.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        pm.install(&mut store, HELLO, b"v0-wasm").unwrap();
+        let state_key = key_saved_state("com.akiva.hello", "HelloMain");
+        store.write(&state_key, b"legacy blob").unwrap();
+
+        let v1 = HELLO
+            .replace("version_code = 1", "version_code = 2")
+            .replacen("version = \"0.1.0\"", "version = \"1.0.0\"", 1);
+        pm.install(&mut store, &v1, b"v1-wasm").unwrap();
+        assert!(matches!(store.read(&state_key), Err(StorageError::NotFound)));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //!   akiva build             — build the workspace (kernel → wasm, cli → native)
 //!   akiva package <app>     — build an app + emit a .akv archive
 //!   akiva install <archive> — install an app into the local runtime
+//!   akiva uninstall <id>    — remove a staged app from the local runtime
 //!   akiva run               — build + launch the devserver
 //!   akiva devserver         — serve runtime/web/ with the cross-origin
 //!                             isolation headers OPFS + threads need
@@ -16,6 +17,7 @@ mod install;
 mod new;
 mod package;
 mod run;
+mod uninstall;
 mod workspace;
 
 use std::process::ExitCode;
@@ -32,6 +34,7 @@ fn main() -> ExitCode {
         Some("build") => cmd_build(&args[1..]),
         Some("package") => cmd_package(&args[1..]),
         Some("install") => cmd_install(&args[1..]),
+        Some("uninstall") => cmd_uninstall(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("devserver") => cmd_devserver(&args[1..]),
         Some(other) => {
@@ -49,6 +52,7 @@ fn print_help() {
     println!("  build               Build the workspace");
     println!("  package <app>       Build an app and emit a .akv archive");
     println!("  install <archive>   Install an app into the local runtime");
+    println!("  uninstall <id>      Remove a staged app from runtime/web/dev-apps/");
     println!("  run                 Build + launch the devserver");
     println!("  devserver           Serve runtime/web with hot reload");
     println!("  version             Print the CLI version");
@@ -69,6 +73,10 @@ fn cmd_package(args: &[String]) -> ExitCode {
 
 fn cmd_install(args: &[String]) -> ExitCode {
     install::run(args)
+}
+
+fn cmd_uninstall(args: &[String]) -> ExitCode {
+    uninstall::run(args)
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
