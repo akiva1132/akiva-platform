@@ -35,9 +35,10 @@ pub mod window_manager;
 
 use std::rc::Rc;
 
-use activity::{ActivityContext, KeyEvent, LaunchRequest, PointerEvent, SurfaceMetrics};
+use activity::{ActivityContext, KeyEvent, PointerEvent, SurfaceMetrics};
 use activity_manager::{ActivityId, ActivityManager, LaunchMode, LifecycleState};
 use compositor::{Compositor, FrameCommands};
+use intent::{Intent, IntentFilter};
 use package_manager::LoadError;
 use shell::{AppEntry, ShellActivity};
 use storage::Storage;
@@ -122,6 +123,28 @@ pub fn boot(
         });
     }
 
+    // Register every installed package's manifest-declared intent filters
+    // with the router. This is the table the Shell hits when it says
+    // "launch MAIN+LAUNCHER of package X" — without these entries, the
+    // Shell would click into NoMatch and nothing would happen.
+    let intent_entries: Vec<(String, String, manifest::IntentFilterDecl)> = fw.packages.list()
+        .flat_map(|r| r.manifest.activities.iter().flat_map(|a| {
+            let pkg = r.id.clone();
+            let class = a.class.clone();
+            a.intent_filters.iter().cloned().map(move |f| (pkg.clone(), class.clone(), f))
+        }))
+        .collect();
+    for (pkg, class, f) in intent_entries {
+        fw.intents.register_filter(IntentFilter {
+            package_id: pkg,
+            activity_class: class,
+            actions: f.actions,
+            categories: f.categories,
+            data_schemes: Vec::new(),
+            mime_types: Vec::new(),
+        });
+    }
+
     // Build the Shell's launcher entries from whatever user packages we
     // just rehydrated. Sorted by id for a stable boot-to-boot order.
     // Skipping the Shell itself so it doesn't offer "launch yourself".
@@ -141,8 +164,25 @@ pub fn boot(
     fw.activities.register(shell::PACKAGE_ID, shell::ENTRY_CLASS, LaunchMode::SingleTop, move || {
         Box::new(ShellActivity::new(boot_count, launcher.clone()))
     });
+    // Shell has no manifest (it's built in), so synthesise its intent
+    // filter alongside the others. MAIN+HOME is what we resolve against
+    // below; MAIN+LAUNCHER is so a future diagnostics path could list
+    // "all launcher activities" and find the home screen too.
+    fw.intents.register_filter(IntentFilter {
+        package_id: shell::PACKAGE_ID.into(),
+        activity_class: shell::ENTRY_CLASS.into(),
+        actions: vec![intent::action::MAIN.into()],
+        categories: vec![intent::category::HOME.into(), intent::category::LAUNCHER.into()],
+        data_schemes: Vec::new(),
+        mime_types: Vec::new(),
+    });
+    // Resolve MAIN+HOME through the router instead of hardcoding the
+    // entry class — exercises the full intent path at boot and means
+    // swapping the home screen later becomes a router-level concern.
+    let home = Intent::new(intent::action::MAIN).with_category(intent::category::HOME);
+    let (shell_pkg, shell_class) = fw.intents.resolve(&home).expect("HOME resolves");
     let shell_id = fw.activities
-        .launch(shell::PACKAGE_ID, shell::ENTRY_CLASS)
+        .launch(&shell_pkg, &shell_class)
         .expect("shell launch");
     fw.stack.push(shell_id);
     fw.drive_to_resumed(shell_id, 0.0);
@@ -214,7 +254,7 @@ impl Framework {
             let metrics = self.metrics;
             let pointer = self.pointer;
             let mut finish = false;
-            let mut launch: Option<LaunchRequest> = None;
+            let mut launch: Option<Intent> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
@@ -246,7 +286,7 @@ impl Framework {
         let metrics = self.metrics;
         let pointer = self.pointer;
         let mut finish = false;
-        let mut launch: Option<LaunchRequest> = None;
+        let mut launch: Option<Intent> = None;
         let mut result: Option<R> = None;
         {
             let mut ctx = ActivityContext {
@@ -267,9 +307,16 @@ impl Framework {
     /// callback, launch wins — finishing a just-paused activity would
     /// require a Paused→Destroyed edge with no Stopped step, which we
     /// don't exercise yet.
+    ///
+    /// Unresolvable intents (NoMatch / AmbiguousMatch) are silently
+    /// dropped — no log binding in framework, and a buggy app shouldn't
+    /// crash the OS. When we get observability wiring the failures will
+    /// become visible; for now they surface as "the click did nothing".
     fn apply_post(&mut self, post: PostCallback, ts: f64) {
-        if let Some(req) = post.launch {
-            self.launch_app(&req.package_id, &req.class, ts);
+        if let Some(intent) = post.launch {
+            if let Ok((pkg, class)) = self.intents.resolve(&intent) {
+                self.launch_app(&pkg, &class, ts);
+            }
         } else if post.finish {
             self.finish_top(ts);
         }
@@ -280,7 +327,7 @@ impl Framework {
         let pointer = self.pointer;
         self.activities.resume(id, |a, new_state| {
             let mut finish = false;
-            let mut launch: Option<LaunchRequest> = None;
+            let mut launch: Option<Intent> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
@@ -302,7 +349,7 @@ impl Framework {
         let pointer = self.pointer;
         self.activities.pause(id, |a, new_state| {
             let mut finish = false;
-            let mut launch: Option<LaunchRequest> = None;
+            let mut launch: Option<Intent> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
@@ -344,7 +391,7 @@ impl Framework {
         let pointer = self.pointer;
         self.activities.destroy(id, |a, new_state| {
             let mut finish = false;
-            let mut launch: Option<LaunchRequest> = None;
+            let mut launch: Option<Intent> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
@@ -368,5 +415,5 @@ impl Framework {
 /// dispatch closure is fully released before we mutate the stack.
 struct PostCallback {
     finish: bool,
-    launch: Option<LaunchRequest>,
+    launch: Option<Intent>,
 }

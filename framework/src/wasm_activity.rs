@@ -368,7 +368,7 @@ mod tests {
 
     fn make_ctx<'a>(
         finish: &'a mut bool,
-        launch: &'a mut Option<crate::activity::LaunchRequest>,
+        launch: &'a mut Option<crate::intent::Intent>,
     ) -> ActivityContext<'a> {
         ActivityContext {
             metrics: SurfaceMetrics { width_px: 800, height_px: 600, density: 1.0 },

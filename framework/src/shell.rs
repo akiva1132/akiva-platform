@@ -11,8 +11,9 @@
 //! while pushing the Shell into Paused. Escape pops the app and resumes
 //! the Shell again.
 
-use crate::activity::{Activity, ActivityContext, KeyEvent, LaunchRequest, PointerEvent, PointerPhase, SurfaceMetrics};
+use crate::activity::{Activity, ActivityContext, KeyEvent, PointerEvent, PointerPhase, SurfaceMetrics};
 use crate::compositor::{FrameCommands, PaintTarget};
+use crate::intent::{self, Intent};
 
 pub const PACKAGE_ID: &str = "sys.shell";
 pub const ENTRY_CLASS: &str = "ShellActivity";
@@ -119,10 +120,18 @@ impl Activity for ShellActivity {
                 if let Some(row) = self.pressed_row.take() {
                     if self.hit_row(ev.x, ev.y, surface_w) == Some(row) {
                         if let Some(entry) = self.apps.get(row) {
-                            *ctx.launch_requested = Some(LaunchRequest {
-                                package_id: entry.package_id.clone(),
-                                class: entry.class.clone(),
-                            });
+                            // The Shell knows which package to launch but
+                            // leaves the activity-class choice to the
+                            // router: MAIN+LAUNCHER narrowed to this
+                            // package. If a package ever exposes multiple
+                            // MAIN+LAUNCHER activities the router will
+                            // report AmbiguousMatch — intentional, since
+                            // the Shell has no UI for choosing.
+                            *ctx.launch_requested = Some(
+                                Intent::new(intent::action::MAIN)
+                                    .with_category(intent::category::LAUNCHER)
+                                    .with_target_package(entry.package_id.clone()),
+                            );
                         }
                     }
                 }
