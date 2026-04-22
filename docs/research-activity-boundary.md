@@ -1,5 +1,7 @@
 # Activity boundary — Framework vs SDK
 
+> **🗑️ Cleanup marker:** למחיקה אחרי Stone 9.4. הצורה של ה-5 imports + 2 exports כבר ב-`abi.md §2.3` עם stone numbers. `Context::finish()` plumbing יהיה בקוד אחרי Stone 9.3. אחרי שהקוד יהיה source of truth, המסמך הזה הופך archeology.
+
 > **Research output for [v0.2-review.md](v0.2-review.md) Task 2.** Phase 9
 > will add four context-facing APIs (`finish`, `start_activity`,
 > `start_activity_for_result`, `on_new_intent`, `on_activity_result`). This

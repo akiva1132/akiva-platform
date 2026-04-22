@@ -1,5 +1,7 @@
 # Android Lifecycle — edge cases relevant to Akiva
 
+> **🗑️ Cleanup marker:** למחיקה אחרי Stone 9.4. 5 ה-findings (finish()-in-on_create, on_new_intent, SingleTask teardown) יהיו מקופלים ל-`activity-model.md` + `ROADMAP` Stone 9.3/9.4. הציטוטים מ-AOSP ישארו כ-PR description / commit message של ה-stone הרלוונטי.
+
 > **Research output for [v0.2-review.md](v0.2-review.md) Task 3.** The point was
 > not to encyclopedically document Android — it was to find state-machine edges
 > we haven't handled yet and decide whether to copy them before committing to

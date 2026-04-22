@@ -491,6 +491,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - IntentRouter מפסירס את ה-blob, פותר activity, מפעיל `ActivityManager::launch` עם stack נכון
 - SingleTop/SingleTask שמוצאים instance קיים מפעילים export חדש `akiva_app_new_intent(intent_blob)` — הוסף ל-ABI
 - unit test: A פותח B, B פותח C, back → back → back → Shell
+- **Doc cleanup (🗑️):** בסיום ה-stone למחוק `docs/v0.2-review.md`, `docs/research-android-lifecycle.md`, `docs/research-activity-boundary.md`. ל-fold כל תוכן שעדיין רלוונטי ל-`activity-model.md` / `abi.md`. לעדכן את 6 ה-cross-links שמפנים אליהם. `research-component-model.md` ו-`test-coverage.md` נשארים.
 
 ### 9.5 `start_activity_for_result` + `on_activity_result`
 - שני imports חדשים: `activity.start_activity_for_result(intent_blob, request_code)` ו-`activity.set_result(result_blob)`
