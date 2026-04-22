@@ -119,5 +119,21 @@ macro_rules! akiva_app {
         ) -> *const u8 {
             $crate::runtime::on_render(handle, ts_ms, out_len_ptr)
         }
+
+        // ── Saved state ────────────────────────────────────────────────
+        // Same buffer-lives-until-next-call contract as `akiva_app_render`;
+        // see the wire format in [sdk-rust/src/activity.rs].
+        #[no_mangle]
+        pub extern "C" fn akiva_app_save_state(
+            handle: u32, out_len_ptr: *mut u32,
+        ) -> *const u8 {
+            $crate::runtime::on_save_state(handle, out_len_ptr)
+        }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_restore_state(
+            handle: u32, bytes_ptr: *const u8, bytes_len: u32,
+        ) {
+            $crate::runtime::on_restore_state(handle, bytes_ptr, bytes_len)
+        }
     };
 }

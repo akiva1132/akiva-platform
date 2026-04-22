@@ -20,7 +20,7 @@
 use std::alloc::{alloc as std_alloc, dealloc as std_dealloc, Layout};
 use std::collections::HashMap;
 
-use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase};
+use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState};
 
 // Host-provided imports. Matches `AppRegistry._buildAppImports` in
 // runtime/web/app_registry.js. Gated on wasm32 so non-wasm builds
@@ -61,6 +61,12 @@ const INITIAL_PAINT_CAP: usize = 4 * 1024;
 struct Slot {
     activity: Box<dyn Activity>,
     paint_buf: Vec<u8>,
+    /// Separate buffer for `on_save_state` output. Kept per-slot (like
+    /// `paint_buf`) so the pointer we return to the host stays valid
+    /// until the next `akiva_app_save_state` for this handle — same
+    /// lifetime rule as render, and it spares us from juggling a
+    /// shared scratch space across handles.
+    save_buf: Vec<u8>,
     metrics: Metrics,
     last_pointer: Option<PointerEvent>,
 }
@@ -132,6 +138,7 @@ pub fn on_create<T: Activity + Default>(handle: u32, class_ptr: *const u8, class
     slots().insert(handle, Slot {
         activity,
         paint_buf: Vec::with_capacity(INITIAL_PAINT_CAP),
+        save_buf: Vec::new(),
         metrics: Metrics::default(),
         last_pointer: None,
     });
@@ -217,6 +224,49 @@ pub fn on_resize(handle: u32, width_px: u32, height_px: u32, density: f32) {
 }
 
 // ── Render ────────────────────────────────────────────────────────────
+
+// ── Saved state ───────────────────────────────────────────────────────
+//
+// Symmetric with `on_render`: the app gives the host a pointer + length
+// and guarantees the pointer stays valid until the next call to
+// `akiva_app_save_state` for the same handle. The host copies the bytes
+// into kernel memory, which in turn persists them through the framework.
+
+pub fn on_save_state(handle: u32, out_len_ptr: *mut u32) -> *const u8 {
+    let Some(slot) = slots().get_mut(&handle) else {
+        // SAFETY: host always passes a writable pointer in its own
+        // memory plane; for handle-misses we write 0 and return null so
+        // the host can short-circuit the persistence path.
+        unsafe { *out_len_ptr = 0; }
+        return core::ptr::null();
+    };
+    let mut state = SavedState::default();
+    slot.activity.on_save_state(&mut state);
+    slot.save_buf = state.encode();
+    let len = slot.save_buf.len() as u32;
+    let ptr = slot.save_buf.as_ptr();
+    // SAFETY: same caller contract as render — `out_len_ptr` is a valid
+    // u32 slot in the host-agreed memory.
+    unsafe { *out_len_ptr = len; }
+    ptr
+}
+
+pub fn on_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32) {
+    let Some(slot) = slots().get_mut(&handle) else { return; };
+    if bytes_ptr.is_null() || bytes_len == 0 { return; }
+    // SAFETY: host guarantees [bytes_ptr, bytes_ptr + bytes_len) is a
+    // valid readable region in app memory (allocated via akiva_app_alloc
+    // before the host copied the saved bytes in).
+    let slice = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len as usize) };
+    match SavedState::decode(slice) {
+        Ok(state) => slot.activity.on_restore_state(&state),
+        // A malformed blob is effectively "no saved state" — the app
+        // keeps its default-constructed state. Silently dropping is
+        // deliberate: panicking here would trap the wasm and take the
+        // whole app down on launch, which is worse than starting fresh.
+        Err(_) => {}
+    }
+}
 
 pub fn on_render(handle: u32, ts_ms: f64, out_len_ptr: *mut u32) -> *const u8 {
     let Some(slot) = slots().get_mut(&handle) else {
