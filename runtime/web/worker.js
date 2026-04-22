@@ -106,7 +106,7 @@ async function bootKernel(kernelUrl, _tabId) {
 // missing or 404ing app is logged and skipped — not every dev checkout
 // will have built every app.
 
-const DEV_APPS = ["hello", "calculator"];
+const DEV_APPS = ["hello", "calculator", "tic-tac-toe"];
 
 async function installDevApps(log) {
   for (const name of DEV_APPS) {

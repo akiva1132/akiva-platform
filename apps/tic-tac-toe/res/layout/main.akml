@@ -1,0 +1,46 @@
+<?akml version="1.0"?>
+<!--
+    Tic-tac-toe main layout.
+
+    Dynamic pieces are pulled from bindings at inflate time:
+      - {status}   — "X's turn" / "O's turn" / "X wins!" / "Draw"
+      - {c0}..{c8} — cell labels: "X", "O", or " " (space) for empty.
+
+    Each cell Button fires `onClick="cell_N"`; the reset button fires
+    `onClick="reset"`. Rust dispatch keys on those action strings, so
+    the button ids below are free to be renamed for a11y without
+    touching src/lib.rs.
+-->
+<VStack padding="16" gap="12" cross="stretch">
+
+    <!--
+        Status banner: one line that flips between "X's turn",
+        "O's turn", a win message, or "Draw". No panel background —
+        a full-width text reads cleaner here than framing it like a
+        display would.
+    -->
+    <Text text="{status}" size="28" color="@color/status_fg" />
+
+    <!--
+        Board: 3 columns × 3 rows, every cell the same size.
+        Children are row-major, top-left first:
+            row 0: c0 c1 c2
+            row 1: c3 c4 c5
+            row 2: c6 c7 c8
+        `flex=1` hands the Grid the rest of the vertical space below
+        the status line and above the reset button.
+    -->
+    <Grid cols="3" rows="3" gap="8" flex="1">
+        <Button id="cell0" label="{c0}" onClick="cell_0" />
+        <Button id="cell1" label="{c1}" onClick="cell_1" />
+        <Button id="cell2" label="{c2}" onClick="cell_2" />
+        <Button id="cell3" label="{c3}" onClick="cell_3" />
+        <Button id="cell4" label="{c4}" onClick="cell_4" />
+        <Button id="cell5" label="{c5}" onClick="cell_5" />
+        <Button id="cell6" label="{c6}" onClick="cell_6" />
+        <Button id="cell7" label="{c7}" onClick="cell_7" />
+        <Button id="cell8" label="{c8}" onClick="cell_8" />
+    </Grid>
+
+    <Button id="reset" label="New Game" onClick="reset" />
+</VStack>

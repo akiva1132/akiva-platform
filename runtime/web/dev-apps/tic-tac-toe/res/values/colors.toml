@@ -1,0 +1,12 @@
+# Tic-tac-toe palette.
+#
+# Consumed by res/layout/main.akml via `@color/name` and by src/lib.rs
+# via `akiva_sdk::res::color("name")`. The framework parses this file
+# at boot; keeping colours out of the Rust code means the two render
+# paths stay in lock-step.
+
+# Window background — everything renders against this.
+bg_window   = "#ff15172a"
+
+# Status line above the board.
+status_fg   = "#fff8faff"

@@ -1,0 +1,23 @@
+[package]
+name = "akiva-app-tic-tac-toe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+description = "Tic Tac Toe — Akiva app."
+
+# The workspace excludes apps/, so this is a standalone crate. It still
+# pulls akiva-sdk by path — that's the dev-loop shape; a registry path
+# (akiva-sdk = "0.1") lands when there's a registry to pull from.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+akiva-sdk = { path = "../../sdk-rust" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
