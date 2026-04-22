@@ -1,5 +1,7 @@
 # Intent System & Package Manager
 
+> **סטטוס מימוש (אפריל 2026):** IntentRouter wired, filter registry פעיל, resolve של explicit + implicit intents עובד. חסרים: `start_activity` מתוך app, `start_activity_for_result`, `on_new_intent`, chooser UI — כולם ב-**Phase 9 של v0.2**. PackageManager `install`/`uninstall` פעילים אבל ה-flow עובר דרך `DEV_APPS` hack ב-worker.js; פורמט `.akiva` archive + CLI install מיושמים ב-**Phase 8 של v0.2**. PendingIntent + Broadcast receivers (§13-14) — v0.3+.
+
 ## 1. מטרה
 
 Intent = "I intend to do X" — מסר מובנה שאפליקציה שולחת למערכת. המערכת מנתבת אותו לאפליקציה שמכריזה שהיא יודעת לטפל ב-X. זה המנגנון המרכזי של IPC באנדרואיד, ואצלנו.

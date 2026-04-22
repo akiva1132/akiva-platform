@@ -1,5 +1,7 @@
 # Akiva Manifest
 
+> **סטטוס מימוש (אפריל 2026):** parser + validation מלאים, install/uninstall/rehydrate מ-OPFS פעילים. פורמט `.akiva` archive וה-CLI commands `akiva package`/`install`/`uninstall` מיושמים ב-**Phase 8 של v0.2**. `permissions.required` מוצהר ב-manifest אבל לא נאכף עדיין — נסגר ב-**Phase 10 של v0.2**. ראה [v0.2-design.md](v0.2-design.md).
+
 ## 1. מטרה
 
 כל אפליקציית Akiva מגיעה עם `manifest.toml` בשורש. ה-manifest מצהיר על זהות האפליקציה, ה-activities שלה, הרשאות, intent filters, ומטא-דאטה. ה-PackageManager מפרסר את המניפסט ברגע ה-install ובכל boot.

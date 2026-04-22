@@ -1,5 +1,7 @@
 # Activity Model — מודל תהליכים ו-Activities
 
+> **סטטוס מימוש (אפריל 2026):** lifecycle state machine ו-launch modes `Standard`/`SingleTop` פעילים ב-[framework/src/activity_manager.rs](../framework/src/activity_manager.rs). `SingleTask`/`SingleInstance`, back navigation, `start_activity_for_result`, ו-`on_new_intent` מיושמים ב-**Phase 9 של v0.2**. ראה [v0.2-design.md §4 (עמוד 2)](v0.2-design.md) ל-gap map מלא ו-[ROADMAP.md שלב 9](../ROADMAP.md) לסטונים.
+
 ## 1. מושגים יסודיים
 
 **App (אפליקציה):** יחידת הפצה. חבילה עם `manifest.toml`, קובץ `wasm`, ו-`res/`. מזוהה ב-`package_id` ייחודי (למשל `com.akiva.calculator`).

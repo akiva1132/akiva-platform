@@ -11,7 +11,8 @@
 ### נקודות התחלה
 - [vision.md](vision.md) — **החזון ברמה המושגית** (גרסה 0.2)
 - [ARCHITECTURE.md](ARCHITECTURE.md) — **ארכיטקטורה טכנית** של כל המערכת
-- [ROADMAP.md](ROADMAP.md) — **תוכנית פיתוח** שלב-אחר-שלב
+- [ROADMAP.md](ROADMAP.md) — **תוכנית פיתוח** שלב-אחר-שלב (כולל v0.1 MVP ו-v0.2)
+- [docs/v0.2-design.md](docs/v0.2-design.md) — **תכנון v0.2**: מעבר מ-POC לשלד OS אמיתי
 
 ### מפרטי תתי-המערכות (עמוק)
 - [docs/activity-model.md](docs/activity-model.md) — מודל Activity, lifecycle, task stack, launch modes, state layering
@@ -87,20 +88,29 @@ akiva-platform/
 
 ## מצב נוכחי
 
-**גרסה 0.0.1 — Phase 1a + 1b (core) הושלמו**
+**v0.1 MVP הושלם (אפריל 2026).** ה-POC הוכיח ש-Akiva יכולה לרוץ; ה-v0.2 הבא הופך אותה למערכת הפעלה אמיתית. ראה [docs/v0.2-design.md](docs/v0.2-design.md).
 
-- ✅ תכנון מלא של כל תתי-המערכות
-- ✅ Cargo workspace (kernel, framework, sdk-rust, cli)
-- ✅ Kernel wasm רץ ב-Dedicated Worker
-- ✅ Leader election + multi-tab + failover (Web Locks + BroadcastChannel)
+**מה עובד היום:**
+
+- ✅ Kernel wasm רץ ב-Dedicated Worker עם leader election + multi-tab + failover (Web Locks + BroadcastChannel)
 - ✅ Event pipeline end-to-end (DOM → Worker → Kernel → Canvas)
-- ✅ Storage: OPFS + SyncAccessHandle, ‏`kernel::storage` KV סינכרוני. ראה [docs/storage.md](docs/storage.md)
-- ✅ Framework seed (Phase 2a): Activity lifecycle state machine, Shell system activity, render pipeline compositor→HAL. ראה [framework/src/activity_manager.rs](framework/src/activity_manager.rs)
-- ✅ PackageManager persistence (Phase 2b.1): manifest parser מלא, OPFS-backed install/uninstall/rehydrate, Storage trait שמפריד framework מ-kernel. ראה [framework/src/manifest.rs](framework/src/manifest.rs), [framework/src/package_manager.rs](framework/src/package_manager.rs)
-- 🟡 Phase 1b שלם חלקית: cross-tab rendering עדיין לא מומש (follower displays רק נרשמים)
-- ⏳ Phase 2b המשך: App ABI + host-side wasm loader + apps/hello אמיתית
+- ✅ Storage: OPFS + SyncAccessHandle, KV סינכרוני. ראה [docs/storage.md](docs/storage.md)
+- ✅ Framework: Activity lifecycle state machine, PackageManager (install/uninstall/rehydrate), IntentRouter, ResourceManager (strings + colors)
+- ✅ SavedState: TLV codec, persistence ל-OPFS, חזרה אחרי process kill
+- ✅ Rendering pipeline: AKML (XML-ish declarative UI) + layout engine + Canvas2D backend
+- ✅ Widget toolkit: VStack/HStack/Frame/Grid/Text/Button/Rect/Spacer + `@color/`/`@string/` resource refs
+- ✅ CLI מלא: `akiva new/build/run/devserver`
+- ✅ שתי אפליקציות אמיתיות: calculator + tic-tac-toe
 
-ראה [ROADMAP.md](ROADMAP.md) לפירוט סטטוס ו-[docs/runtime-web.md](docs/runtime-web.md) לתיעוד מלא של ה-HAL.
+**מה לא עובד עדיין (מועמדי v0.2):**
+
+- ❌ פורמט הפצה אמיתי — היום `DEV_APPS` hardcoded ב-`worker.js`; `akiva package`/`install` הם stubs
+- ❌ SingleTask/SingleInstance launch modes, back navigation, cross-activity intents
+- ❌ Permissions enforcement — `PermissionController` הוא shell; כל app מקבל את כל ה-imports
+
+**דחוי ל-v0.3+:** Window manager, notifications, Image/Input widgets, animations, network API, עברית/RTL.
+
+ראה [ROADMAP.md](ROADMAP.md) לפירוט מלא של פאזות וסטטוס.
 
 ---
 

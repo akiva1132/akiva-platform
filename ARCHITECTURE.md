@@ -379,6 +379,8 @@ ctx.start_activity(intent);
 
 ## 8. Permission Model (Capability-via-Imports)
 
+> **סטטוס מימוש (אפריל 2026):** [framework/src/permissions.rs](framework/src/permissions.rs) מכיל את הסוגים (`ProtectionLevel`, `PermissionDecl`, `grant`/`revoke`/`check`) אבל **לא אוכף כלום** — `manifest.permissions.required` לא נקרא ב-install, ה-wasm loader לא בונה import map לפי grants. כל המנגנון המתואר למטה מיושם ב-**Phase 10 של v0.2**. ראה [docs/v0.2-design.md §4 (עמוד 3)](docs/v0.2-design.md).
+
 **עיקרון:** אפליקציה יכולה לקרוא רק לפונקציות ש-ה-runtime ייבאה ל-wasm instance שלה. Permission denied = import חסר. אין runtime check. זה ה-model הטבעי של wasm/WASI ו-ה-Component Model.
 
 ### סוגי permissions

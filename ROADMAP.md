@@ -406,6 +406,174 @@
 
 ---
 
+# v0.2 — מ-POC למערכת הפעלה
+
+v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, CLI מלא, SavedState. v0.2 הופך את השלד הזה למערכת הפעלה אמיתית — חוזה ברור בין המערכת לאפליקציות, בלי hacks דמויי-פיגום.
+
+**היקף ומטרה:** ראה [`docs/v0.2-design.md`](docs/v0.2-design.md) למפרט המלא, כולל gap map מפורט לכל עמוד, definition of done, ורציונל הסדר.
+
+**שלוש phases, סדר חובה (1 → 2 → 3):**
+
+---
+
+## שלב 8 — Package Manager אמיתי
+
+**מטרה:** פורמט הפצה אמיתי, install/uninstall דרך CLI, מחיקת ה-`DEV_APPS` hack.
+
+**רכיבים שנבנים:**
+
+### 8.1 פורמט `.akiva` archive
+- תיעוד ב-`docs/archive-format.md` (חדש)
+- ZIP עם layout קבוע: `manifest.toml` + `app.wasm` + `res/` + `signature.sig` (עתידי, placeholder בלבד)
+- בחירת crate: `zip` (stdlib-friendly, ללא dependency-hell) או מימוש פנימי אם ה-crate דורש תלות כבדה
+- CLI utility פנימי: `Archive::create(app_dir) -> bytes`, `Archive::extract(bytes) -> {manifest, wasm, res}`
+
+### 8.2 `akiva package <app>`
+- ב-[`cli/src/package.rs`](cli/src/package.rs) (חדש)
+- שלבים: ודא build קיים (או `akiva build <app>` ראשון), קרא wasm מ-`runtime/web/dev-apps/<app>/` או ישירות מ-`apps/<app>/target/...`, קרא manifest, קרא `res/`, ארוז → `<app>.akiva`
+- Flag: `--out <path>` (ברירת מחדל: `<app>.akiva` ב-cwd)
+
+### 8.3 `akiva install <archive>`
+- ב-[`cli/src/install.rs`](cli/src/install.rs) (חדש)
+- זה CLI-side install לא browser-side — כדי לעבוד בלי browser פתוח, ה-CLI יעתיק את ה-archive ל-`runtime/web/dev-apps/<id>/` (או לשים אותו במקום שה-worker יודע להרים ב-boot הבא)
+- v0.2 stone 1: ה-CLI עדיין מפעיל את הזרימה הישנה (פרישה ל-`dev-apps/`), אבל *דרך* קריאה ל-`PackageManager::install` של ה-framework ב-unit שרץ build-time — לאמת שה-API עובד
+- v0.2 stone 2: worker.js מוחק את `installDevApps` לטובת סריקת `runtime/web/installed/` או פקודה ב-zerver שמדחיפה `PackageManager::install` בקרנל
+
+### 8.4 Shell discovery מהאינדקס
+- [`runtime/web/worker.js`](runtime/web/worker.js): מחיקת `const DEV_APPS = [...]` ו-`installDevApps`
+- Shell קוראת `PackageManager::list()` ומציגה כל מה שמותקן (ללא תיקונים נוספים)
+- המבחן: התקנת archive חדש מה-CLI → refresh דפדפן → האפליקציה מופיעה ב-Shell בלי לגעת ב-JS
+
+### 8.5 Upgrade + uninstall
+- `PackageManager::install` מזהה `version_code` חדש, מחליף in-place (כולל resources ו-saved_state של activities — או שמור `saved_state` אם אותה major version, ראה `manifest.md §6`)
+- `akiva uninstall <package_id>` — CLI command חדש; קורא ל-`PackageManager::uninstall` + מוחק גם grants (כשעמוד 3 ינחת)
+- `version_code` זהה או נמוך יותר בהתקנה → dismissal עם הודעה ברורה
+
+**Exit criteria:**
+- [ ] `akiva package calculator && akiva install calculator.akiva` עובד end-to-end
+- [ ] `runtime/web/worker.js` לא מכיל שום שם של אפליקציה ספציפית
+- [ ] התקנת archive חדש, ה-Shell מציגה את האפליקציה בלי שינוי קוד
+- [ ] upgrade + uninstall עובדים (unit tests ב-`framework/src/package_manager.rs`)
+
+**הערכת זמן:** 2-3 שבועות.
+
+---
+
+## שלב 9 — Process / Activity model מלא
+
+**מטרה:** מחזור חיים מלא, כל launch modes, back navigation, cross-activity intents עם תוצאות.
+
+**תלוי ב:** שלב 8 (אפשר להתחיל stones 9.1 ו-9.2 במקביל לסוף של 8, אבל 9.3+ דורשים install אמיתי כי בלעדיו אי אפשר לבדוק cross-package intents באמת).
+
+**רכיבים שנבנים:**
+
+### 9.1 מחזור חיים מלא
+- לוודא ש-`WasmActivity` משדרת **כל** ה-5 callbacks (onCreate/onStart/onResume/onPause/onStop/onDestroy) דרך wasm exports
+- `akiva_app_start` / `_pause` / `_stop` / `_destroy` — אם לא קיימים ב-ABI, מוסיפים
+- Unit tests ב-`framework/src/activity_manager.rs` על מעבר כל edge; calculator מוסיפה log לכל callback וזה מאומת ידנית
+- עדכון [`docs/activity-model.md §9`](docs/activity-model.md) עם טבלת "Implementation" כמו ב-`manifest.md`
+
+### 9.2 Launch modes: SingleTask + SingleInstance
+- `ActivityManager::launch` מסיר את ה-`Unsupported` ומיישם:
+  - **SingleTask:** אם instance כבר קיים ב-task (לאו דווקא top) — pop כל מה שמעליו → resume אותו. אם לא ב-task — יוצר instance חדש.
+  - **SingleInstance:** יש task נפרד משלו; `launch` לפני שהוא קיים יוצר task חדש, בתחום אחר activities; פעולות נוספות באותו package פותחות ב-task הקודם שלהן.
+- Unit tests לכל תרחיש ב-[`activity-model.md §4`](docs/activity-model.md)
+
+### 9.3 Back stack + `system.back()`
+- Import חדש `system.back()` ב-ABI: אפליקציה יכולה להפעיל בעצמה, אבל במיוחד — הפלטפורמה תשתמש בזה על mapping של keyboard/gesture (v0.2: קיצור מקלדת fixed, אין gesture engine)
+- ב-framework: `ActivityManager::back()` → pop top → שולח destroy → מביא את הקודם ל-Resumed
+- ה-Shell משתמשת ב-`system.back()` כ-mechanism העיקרי למעבר בין tasks
+
+### 9.4 `start_activity` מתוך app + `on_new_intent`
+- Import חדש `activity.start_activity(intent_blob: bytes)` (grant: `LAUNCH_ANY_APP` ל-Shell, או target-package-matches-self ל-self-launch)
+- IntentRouter מפסירס את ה-blob, פותר activity, מפעיל `ActivityManager::launch` עם stack נכון
+- SingleTop/SingleTask שמוצאים instance קיים מפעילים export חדש `akiva_app_new_intent(intent_blob)` — הוסף ל-ABI
+- unit test: A פותח B, B פותח C, back → back → back → Shell
+
+### 9.5 `start_activity_for_result` + `on_activity_result`
+- שני imports חדשים: `activity.start_activity_for_result(intent_blob, request_code)` ו-`activity.set_result(result_blob)`
+- ה-framework מתעד ב-stack את ה-`request_code` של ה-caller, וכש-B קוראת `set_result` + מסיימת, callback `akiva_app_activity_result(request_code, result_blob)` נקרא ל-A
+- Demo: hello פותחת calculator "ל-pick" מספר, calculator מחזירה value
+
+### 9.6 Multiple tasks לפי affinity
+- `ActivityManager` כבר מחזיק `tasks: HashMap<TaskId, Task>` ו-`Task.affinity` — חסרה ההחלטה של foreground
+- הוסף `bring_task_to_front(task_id)`; Shell יכולה לעבור בין tasks כשמשתמש בוחר app שכבר רץ
+- Unit test: A ב-task 1, B ב-task 2 (affinity שונה), swap ביניהם שומר על ה-stack של כל אחד
+
+**Exit criteria:**
+- [ ] כל ארבעת ה-launch modes עוברים acceptance tests שמותווים ב-[`activity-model.md §4`](docs/activity-model.md)
+- [ ] 5 ה-lifecycle callbacks כולם נקראים ב-apps (מאומת ידנית + unit tests)
+- [ ] `start_activity_for_result` demo (hello ↔ calculator) עובד end-to-end
+- [ ] back navigation עובד ב-stack של לפחות 3 activities
+- [ ] tasks מרובים עם affinity שונה — יש unit test המדגים swap
+
+**הערכת זמן:** 3-4 שבועות.
+
+---
+
+## שלב 10 — Permissions (Capability-via-Imports)
+
+**מטרה:** אפליקציה רואה רק את ה-imports שהמניפסט שלה הצהיר עליהם, ה-PackageManager שומר grants, הקישור נכשל אם אפליקציה מנסה לקרוא להרשאה שאין לה.
+
+**תלוי ב:** שלב 8 (install flow שקורא permissions), שלב 9 (imports ספציפיים-להרשאה כמו `LAUNCH_ANY_APP` קיימים רק אחרי 9.4-9.5).
+
+**רכיבים שנבנים:**
+
+### 10.1 System permission registry
+- ב-framework boot: `PermissionController::declare` לכל אחת מההרשאות בטבלה ב-[`ARCHITECTURE.md §8`](ARCHITECTURE.md):
+  `STORAGE_SANDBOX`, `QUERY_PACKAGES`, `LAUNCH_ANY_APP`, `NOTIFICATIONS`, `NETWORK`, `CAMERA`
+- כל הצהרה כוללת `ProtectionLevel`; ב-v0.2 כולן `Normal` (auto-granted install-time)
+
+### 10.2 Install-time grant
+- `PackageManager::install` קוראת לאחר parse ל-`grant_requested_permissions(manifest)`
+- כל הרשאה ב-`permissions.required` → check שהיא מוצהרת במערכת → `PermissionController::grant`
+- הרשאה לא מוכרת → `InstallError::UnknownPermission(name)`
+- Persistence: grants נכתבים ל-`sys/permissions/{package_id}` (LF-separated); ב-`load_installed` הם נטענים בחזרה
+
+### 10.3 Import map לפי capabilities
+- [`framework/src/wasm_activity.rs`](framework/src/wasm_activity.rs) — בקישור הקרנל↔wasm, לפני instantiation:
+  1. קבל את רשימת ה-grants של האפליקציה
+  2. בנה import map שמכיל רק את ה-imports שהטבלה ב-`ARCHITECTURE.md §8` מתאימה להם
+  3. אפליקציה שקוראת לפונקציה שלא ב-map → link error ב-instantiation, לא runtime panic
+- unit test: app שמנסה לקרוא `activity_start_activity` בלי `LAUNCH_ANY_APP` — instantiation נכשל עם הודעה ברורה
+
+### 10.4 תיעוד ABI לפי capability
+- עדכון [`docs/abi.md`](docs/abi.md) — סעיף חדש "Imports by Capability" שמצטט את ה-mapping
+- כל import מסומן עם ה-capability שמקנה אותו (או `auto` אם always-granted)
+
+### 10.5 Uninstall cleanup
+- `PackageManager::uninstall` מוחק גם את `sys/permissions/{id}`
+- `PermissionController` מעדכן את in-memory state
+
+### 10.6 calculator + tic-tac-toe מצהירות permissions
+- calculator: `[permissions] required = ["akiva.permission.STORAGE_SANDBOX"]` (לשמירת saved_state — auto-granted)
+- tic-tac-toe: אותו דבר
+- Shell: `["akiva.permission.QUERY_ALL_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"]`
+- hello: אין required permissions — מוודא ש-import map ריק מ-optionals פועל
+
+**Exit criteria:**
+- [ ] אפליקציה שמצהירה `STORAGE_SANDBOX` מקבלת גישה; אפליקציה בלי ההצהרה — הקריאה `storage.put` לא קיימת ב-imports
+- [ ] Shell מצהירה ומקבלת `QUERY_ALL_PACKAGES` ו-`LAUNCH_ANY_APP`; calculator שתנסה לקרוא `query_packages` — fails instantiation
+- [ ] grants persist בין boots — התקנה → reboot → grants עדיין שם
+- [ ] uninstall מוחק גם את ה-grants (unit test)
+- [ ] `docs/abi.md` מסמל capability פר import
+
+**הערכת זמן:** 2-3 שבועות.
+
+---
+
+## סיכום v0.2
+
+**סה"כ זמן:** ~7-10 שבועות. בסיום v0.2 יש לנו:
+
+- פורמט `.akiva` מתועד ותפעולי, CLI מלא סביב התקנה
+- מחזור חיים מלא, כל launch modes, cross-activity intents עם תוצאות
+- Permission model עובד עם אכיפה ב-instantiation, grants persist
+
+ה-Shell עדיין מינימלית, Window manager עדיין stub, אין Notifications. אלה v0.3. אבל בסוף v0.2, **אפשר להגיד בכנות שזו מערכת הפעלה, לא POC**. אפליקציה מותקנת כמו app. רצה כמו app. נסגרת כמו app. מבקשת הרשאות כמו app. ה-chain הקיומי הזה סגור.
+
+---
+
 ## סיכום זמנים
 
 | שלב | תיאור | זמן |
@@ -436,8 +604,8 @@
 **מ-Phase 2 (Framework):**
 - ✅ **IntentRouter wired** (אפריל 2026, commit `c8f18b6`) — כל manifest intent_filter נרשם ב-`framework::boot`, כולל filter סינתטי ל-Shell (MAIN+HOME+LAUNCHER); ה-Shell שולח `Intent::new(MAIN).with_category(LAUNCHER).with_target_package(id)` וה-framework מפעיל `IntentRouter::resolve` לפני `ActivityManager::launch`. ה-boot הראשוני של ה-Shell נפתר כעת דרך `resolve(MAIN+HOME)` במקום hard-code של class. 6 unit tests חדשים כיסוי explicit, implicit, target_package filtering, ambiguity.
 - ✅ **ResourceManager wired** (אפריל 2026, 4 stones, commits `a5648d5` → `9c3ecd6`) — MVP scope: strings + colors, default `values/` בלבד (ללא qualifiers). [framework/src/resources.rs](framework/src/resources.rs) מחזיק `ResourceTable` per package; PackageManager קורא את `res/values/{strings,colors}.toml` מ-OPFS ב-boot; 4 host imports חדשים (`akiva_host_resource_color`/`_string`/`_has_color`/`_has_string`) מתועדים ב-[docs/abi.md §2.3](docs/abi.md); ה-SDK חושף `res::color(name) -> u32` ו-`res::string(name) -> String` עם magenta/`⟨missing:NAME⟩` fallbacks; AKML inflater פותר `@color/name` ו-`@string/name` אוטומטית. Calculator עברה להשתמש — כל הצבעים חיים ב-[apps/calculator/res/values/colors.toml](apps/calculator/res/values/colors.toml). 10 unit tests חדשים (7 framework, 4 SDK) + הכל עובד end-to-end בדפדפן.
-- **PermissionController is a stub** — [framework/src/permissions.rs](framework/src/permissions.rs) לא אוכף שום דבר.
-- **WindowManager is a stub** — [framework/src/window_manager.rs](framework/src/window_manager.rs) לא מנתב בפועל.
+- **PermissionController is a stub** — [framework/src/permissions.rs](framework/src/permissions.rs) לא אוכף שום דבר. → **יטופל ב-Phase 10 (v0.2)**.
+- **WindowManager is a stub** — [framework/src/window_manager.rs](framework/src/window_manager.rs) לא מנתב בפועל. → **דחוי ל-v0.3+**.
 
 **מ-Phase 3 (AKML):**
 - ✅ **Grid widget** (אפריל 2026, 3 stones, commits `0fc6d86` → `51d88c9` + calculator migration) — fixed cols×rows row-major container (Android GridLayout style, no auto-wrap/span). Cells split slot evenly minus gaps+padding, `<Grid cols="N" rows="M" gap="G" flex="F">` ב-AKML, ה-calculator עבר מ-VStack של 5×HStack ל-`<Grid cols="4" rows="5">` אחד. 8 layout tests + 6 inflater tests, total 143 SDK tests (was 129).
@@ -464,7 +632,7 @@
 - ✅ **`akiva build [names...]`** (commit `13fd1fb`) — wasm build pipeline המחליף את ה-build.sh הפזורים. אוטו-גילוי `apps/*/Cargo.toml`, staging ל-`runtime/web/dev-apps/`, עדכון `res/values/` נקי.
 - ✅ **`akiva run`** (commit `eb3eff4`) — kernel build + copy + כל האפליקציות + devserver בפקודה אחת. `--no-build` ל-skip, `--debug` ל-dev profile.
 - ✅ **`akiva new <name>`** (commit `8e61a5a`) — scaffolding עם Cargo.toml + manifest.toml + src/lib.rs + .gitignore. שם נורמליזציה ל-kebab-case, Activity class ו-package_id נגזרים אוטומטית. `--force` לoverwrite.
-- `akiva package` / `akiva install` — דחויים post-MVP (distribution format עוד לא הוגדר).
+- `akiva package` / `akiva install` — **יטופלו ב-Phase 8 (v0.2)**. פורמט `.akiva` יתועד ב-`docs/archive-format.md`.
 
 ה-backlog הזה **לא** בלוקר ל-MVP; כל פריט הוא תוספת שמתלבשת על המבנה הקיים בלי rewrite. אם נרצה לסגור את Phase 2 פורמלית, הפריטים של Phase 2 הם מה שצריך להשלים.
 
@@ -477,9 +645,9 @@
 - ❌ Animations (רק transitions מיידיים)
 - ❌ Multi-window / split screen (activity אחד display אחד)
 - ❌ Intent chooser UI (אם יש matches מרובים — קחי את הראשון)
-- ❌ App store / distribution (קבצים לוקליים בלבד)
+- ❌ App store / distribution — ב-v0.2 מגיע פורמט `.akiva` + CLI install, אבל לא store מרוכז (Phase 8)
 - ❌ Network APIs (לא נחשף ל-apps עדיין)
-- ❌ Accessibility (יוסף ב-v0.2, אבל הארכיטקטורה מוכנה)
+- ❌ Accessibility (ה-ארכיטקטורה מוכנה; מימוש דחוי ל-v0.3+)
 - ❌ Themes (צבעים בלבד, לא styles)
 - ❌ Sophisticated layouts (רק VStack/HStack/Grid)
 - ❌ SVG / JPG drawables (PNG בלבד — ראה `docs/resources.md §8`)
@@ -495,6 +663,28 @@
 - ❌ SDKs ל-non-Rust (Kotlin/Dart/Go post-MVP — ראה "מפת דרכים ל-SDKs" למטה)
 
 **כל אחד מאלה יכול להתווסף ב-v0.2+ בלי לשכתב מהבסיס.**
+
+### מה נכלל ב-v0.2 (ולא ב-v0.1/MVP)
+
+v0.2 ממקד ב-**חוזה המערכת עם אפליקציות**, לא ב-UI. ראה [`docs/v0.2-design.md`](docs/v0.2-design.md) למלאי.
+
+- ✅ פורמט הפצה `.akiva` + `akiva package`/`install`/`uninstall` (Phase 8)
+- ✅ מחזור חיים מלא של Activity + SingleTask/SingleInstance + back navigation (Phase 9)
+- ✅ `start_activity` / `start_activity_for_result` / `on_new_intent` / `on_activity_result` (Phase 9)
+- ✅ Permission model (Capability-via-Imports, install-time grants, persistence) (Phase 10)
+
+**מחוץ ל-v0.2, עדיין דחוי ל-v0.3+:**
+
+- ❌ Window manager אמיתי (multi-surface, z-order, focus)
+- ❌ System services (notifications, clipboard, location)
+- ❌ Runtime permission prompts (dangerous perms — camera/microphone)
+- ❌ PendingIntent + Broadcast receivers
+- ❌ Image/Input/ScrollView widgets
+- ❌ Animations, themes, sophisticated layouts
+- ❌ Network API, keyboard input, IME
+- ❌ Code signing, hot reload, debugger/inspector
+- ❌ SDKs ל-non-Rust, multi-threading, inter-app storage sharing
+- ❌ עברית / RTL / BiDi
 
 ---
 
