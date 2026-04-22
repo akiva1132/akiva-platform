@@ -188,8 +188,29 @@
 
 ## שלב 3 — Rendering Pipeline: AKML + Layout + Compositor
 
+> **החלטה ארכיטקטונית (אפריל 2026):** ה-widget toolkit, layout engine, ו-AKML inflater חיים ב-**SDK** (`sdk-rust/src/ui` + `sdk-rust/src/akml`), לא ב-framework. ה-ABI נשאר `PaintOp` בלבד. ראה [ARCHITECTURE.md §2.1](ARCHITECTURE.md#21-abi-boundary--למה-widgets-ו-akml-חיים-ב-sdk-ולא-ב-framework) לרציונל המלא. ה-"§3.3 Widget types" ו-"§3.4 LayoutEngine" למטה מתארים מה קרה — רק שהמיקום הפיזי שונה ממה שמופיע ב-"רכיבים שנבנים".
+
 **סטטוס (אפריל 2026):**
-- 🟢 **Phase 3a** הושלם: widget toolkit app-side ב-SDK. [sdk-rust/src/ui/](sdk-rust/src/ui/) מחזיק `UiState` (app-owned, שומר hit rects + pending clicks בין frames), `Ui` builder עם `.text()/.rect()/.spacer()/.button()/.v_stack()/.h_stack()` וצ'יינינג `.size()/.color()/.gap()/.padding()/.build()`, שני-pass layout (measure bottom-up + place top-down), paint emitter שמפיק canvas ops בסדר document, וclick detection דרך `was_clicked(id)`. **Text metrics** מגיעים מ-host דרך import חדש `akiva_host_text_width` (OffscreenCanvas `measureText` ב-worker), עם fallback ל-`chars × 0.55 × size` ב-cargo test. **C1 — יישור צירים**: `MainAxis::{Start, Center, End, SpaceBetween}` ו-`CrossAxis::{Start, Center, End, Stretch}` דרך `.main()/.cross()` על `StackBuilder`; ברירת מחדל `Start/Start` זהה ביט-לביט לפני-C1. **C2 — Grow לכל ילד**: `.grow(factor)` על כל builder + `Ui::grow(id, factor)` post-hoc לכפתורים; חלוקת leftover בסגנון flexbox (`base + leftover × grow/total_grow`), grow על stack מקונן מתפשט כ-stretch לילד. העיצוב: widgets הם SDK concern — ה-ABI נשאר paint-ops, הframework לא יודע כלום. [apps/hello](apps/hello) משתמש ב-widgets (כפתורי `−1 / +1 / Reset` עם counter). **44 unit tests** מכסים measure/place/alignment/grow/click-detection. Phase 3b יוסיף AKML parser + inflater שיבנו את אותם `UiState` מ-XML.
+- 🟢 **Phase 3a** הושלם: widget toolkit app-side ב-SDK. [sdk-rust/src/ui/](sdk-rust/src/ui/) מחזיק `UiState` (app-owned, שומר hit rects + pending clicks בין frames), `Ui` builder עם `.text()/.rect()/.spacer()/.button()/.v_stack()/.h_stack()` וצ'יינינג `.size()/.color()/.gap()/.padding()/.build()`, שני-pass layout (measure bottom-up + place top-down), paint emitter שמפיק canvas ops בסדר document, וclick detection דרך `was_clicked(id)`. **Text metrics** מגיעים מ-host דרך import חדש `akiva_host_text_width` (OffscreenCanvas `measureText` ב-worker), עם fallback ל-`chars × 0.55 × size` ב-cargo test. **C1 — יישור צירים**: `MainAxis::{Start, Center, End, SpaceBetween}` ו-`CrossAxis::{Start, Center, End, Stretch}` דרך `.main()/.cross()` על `StackBuilder`; ברירת מחדל `Start/Start` זהה ביט-לביט לפני-C1. **C2 — Grow לכל ילד**: `.grow(factor)` על כל builder + `Ui::grow(id, factor)` post-hoc לכפתורים; חלוקת leftover בסגנון flexbox (`base + leftover × grow/total_grow`), grow על stack מקונן מתפשט כ-stretch לילד. העיצוב: widgets הם SDK concern — ה-ABI נשאר paint-ops, הframework לא יודע כלום. [apps/hello](apps/hello) משתמש ב-widgets (כפתורי `−1 / +1 / Reset` עם counter). **44 unit tests** מכסים measure/place/alignment/grow/click-detection.
+
+- 🟢 **Phase 3b stone 1** הושלם: **AKML parser + inflater** ([sdk-rust/src/akml/parser.rs](sdk-rust/src/akml/parser.rs), [sdk-rust/src/akml/inflate.rs](sdk-rust/src/akml/inflate.rs)). tokenizer XML-ish משלנו (`<VStack>`, `<Button label="…" onClick="…">`, self-closing, comments), `Element` AST עם `Loc { line, col }` להודעות שגיאה, ו-inflater שהופך AST ל-`Ui` node ids. תומך ב-`VStack`, `HStack`, `Frame`, `Text`, `Button`, `Rect`, `Spacer` עם attributes `id`, `gap`, `padding` (`all` / `v h` / `top right bottom left`), `main`, `cross`, `flex`, `size`, `color` (`#RGB`/`#RRGGBB`/`#AARRGGBB`/`0xAARRGGBB`), `text`, `label`, `min_width`, `min_height`, `onClick`.
+
+- 🟢 **Phase 3b stone 2** הושלם: **bindings** (`{name}` substitution). [sdk-rust/src/akml/bindings.rs](sdk-rust/src/akml/bindings.rs) חושף `Bindings::new().text("name", val).color("name", u32)`, וה-inflater מבצע substitution בזמן attribute parse. בעיית UTF-8 ב-attribute parser נתפסה ותוקנה (commit `bb9a626`).
+
+- 🟢 **Phase 3b stone 3** הושלם: [apps/calculator](apps/calculator) עבר כולו ל-AKML ([apps/calculator/res/layout/main.akml](apps/calculator/res/layout/main.akml)). ה-Rust מחזיק רק את ה-state machine + dispatch; ה-layout הוא קובץ נפרד embedded ב-`include_str!`.
+
+- 🟢 **Phase 3b stone 4 (Frame widget)** הושלם: `<Frame>` — z-stack widget שמוריש את ה-inner rect שלו לכל הילדים (stretch בשני הצירים). [sdk-rust/src/ui/node.rs](sdk-rust/src/ui/node.rs), layout + paint ב-[sdk-rust/src/ui/layout.rs](sdk-rust/src/ui/layout.rs) + [sdk-rust/src/ui/paint.rs](sdk-rust/src/ui/paint.rs). 5 layout tests + 2 inflater tests. שימוש ב-[apps/calculator](apps/calculator): display panel עם `<Rect>` ברקע + `<HStack>` של טקסט מעליו.
+
+- 🟢 **Phase 3b stone 5 (onClick / was_triggered)** הושלם: decoupling של widget ids מ-semantic actions. `<Button onClick="equals">` + `ui.was_triggered("equals")` — פרוטוקול pull-based, לא closure registry. שלוש סיבות: (1) closures מעל `&mut self` מעלים borrow checker errors; (2) drain-after-present טריוויאלית בטוחה ב-Rust; (3) מאפשר renaming של id ל-"eq"/"equal_btn" בלי לגעת ב-Rust. 4 unit tests + 2 inflater tests.
+
+- 🟢 **תיקון Platform** הושלם (commit `24d320e`): שני באגים שחשפו פערים מתחת ל-Phase 3b. (1) [framework/src/wasm_activity.rs](framework/src/wasm_activity.rs) היה מעביר `Create` lifecycle לפני שה-surface metrics התעדכנו — `on_create` של ה-app ראה `Metrics::default()` (0x0), שהתייצבה רק עם window resize. תוקן: `WasmActivity::on_create` יורה resize מיד אחרי Create. (2) [runtime/web/worker.js](runtime/web/worker.js) `postEvent` היה מקבל events בזמן async `bootKernel` לפני שה-wasm instance קיים → `TypeError`. תוקן: guard `if (!booted || !instance) return;`.
+
+**מה עדיין דחוי מ-Phase 3** (לא טופל ב-stones 1–5):
+- Grid widget, Image widget, Input widget
+- Attributes: `margin`, `background`, `visible`, `textAlign`, `fontWeight`, `tag`
+- `dp`/`sp`/`%` suffixes, `match_parent`/`wrap_content`
+- Resource references (`@string/`, `@color/`, `@dimen/`, `@style/`, `@drawable/`) — דורש ResourceManager wired
+- RTL direction (מוחרג מפורש מ-MVP)
 
 **מטרה:** מערכת הרנדור המלאה. נותנים widget tree → יוצא draw commands. AKML לפיענוח.
 
@@ -240,11 +261,16 @@
 
 ---
 
-## שלב 4 — ABI (WIT) + SDK + First Real App
+## שלב 4 — ABI + SDK + First Real App
 
-**מטרה:** אפליקציה אמיתית (Rust → wasm component) נטענת ע"י ה-runtime, מציגה layout, מגיבה לקליק.
+**סטטוס (אפריל 2026):**
+- 🟢 **App ABI v0 (raw exports)** הושלם במקום WIT — ראה [docs/abi.md §2](docs/abi.md). ה-app חושפת 14 `#[no_mangle] extern "C"` exports (`akiva_app_create`/`_resize`/`_pointer`/`_key`/`_render`/`_start`/`_resume`/`_pause`/`_stop`/`_destroy`/`_alloc`/`_free`), ה-host מייבא דרך `akiva_host_log` + `akiva_host_text_width`. [framework/src/wasm_activity.rs](framework/src/wasm_activity.rs) מציג `WasmHost` trait ו-`WasmActivity` proxy; [kernel/src/host.rs](kernel/src/host.rs) + [runtime/web/app_registry.js](runtime/web/app_registry.js) מחברים את זה ל-JS. ה-SDK מקבל [sdk-rust/src/activity.rs](sdk-rust/src/activity.rs) עם `Activity` trait מלא, `Canvas` encoder, log macros, ומאקרו `akiva_app!(Type)` שמייצר את כל ה-14 wrappers. אפליקציית [apps/hello](apps/hello) רצה end-to-end.
 
-**רכיבים שנבנים:**
+> **WIT / Component Model — דחוי ל-post-MVP:** התכנית המקורית הייתה לייצר `wit/akiva.wit` ולהשתמש ב-`wit-bindgen` ל-host + SDK. בפועל בחרנו raw exports כי (1) תמיכת Component Model ב-browser עדיין לא בשלה ב-2026 (jco / wasm-tools component polyfills נדרשים, מסובך ב-build), (2) MVP הוא Rust-only ממילא — WIT הייתה קונה אותנו polyglot SDKs שאינם יעד של MVP, (3) raw exports פשוטים יותר לצפייה ו-debug. מעבר ל-WIT יהיה breaking ABI change שיבוצע כש-Kotlin/Go/Python SDKs ייכנסו לתמונה (ראה "מפת דרכים ל-SDKs" למטה).
+
+**מטרה (post-MVP):** אפליקציה אמיתית (Rust → wasm component) נטענת ע"י ה-runtime, מציגה layout, מגיבה לקליק.
+
+**רכיבים שנבנים (post-MVP):**
 
 ### 4.1 WIT definitions
 - `wit/akiva.wit` — מימוש של כל ה-interfaces שב-[docs/abi.md](docs/abi.md): lifecycle, events, widget, resources, intent, activity-api, storage, log, system
@@ -285,7 +311,12 @@
 
 ## שלב 5 — Shell App
 
-**מטרה:** אפליקציית בית שמציגה אפליקציות מותקנות ומאפשרת לפתוח אותן.
+**סטטוס (אפריל 2026):**
+- 🟡 **Shell כ-built-in של framework** (לא `apps/shell/`) — [framework/src/shell.rs](framework/src/shell.rs) מממש `ShellActivity` שנרשם ב-`framework::boot` עם `package_id = "sys.shell"`. ה-UI מרונדר ידנית על `PaintTarget` (לא דרך AKML) ומציג header + רשימת כפתורי launcher לכל package. לחיצה → `ctx.launch_requested = Some(LaunchRequest { package_id, class })` → framework דוחף את ה-app על ה-stack ו-pause את Shell. Escape בראש stack של יותר מ-1 → pop + resume Shell.
+
+> **הימרה של MVP — לא apps/shell:** ROADMAP מייעד את Shell כ-app רגיל עם `intent_filter: category=HOME`. בחרנו לממש אותו built-in כי (1) זה פותר bootstrap (אין דילמה של "מי מפעיל את ה-shell לפני שה-PackageManager מזהה את ה-shell"), (2) אין עדיין IntentRouter wired (intent resolution לא נקרא ב-launch path — ראה Phase 2 deferred), (3) AKML לא היה קיים כשה-Shell נכתב. הוצאה ל-`apps/shell/` כ-wasm package דוחה ל-post-MVP — אחרי ש-IntentRouter מחובר בפועל וה-Shell יכולה להשתמש ב-AKML כמו כל app אחרת.
+
+**מטרה (post-MVP):** אפליקציית בית שמציגה אפליקציות מותקנות ומאפשרת לפתוח אותן.
 
 **רכיבים שנבנים:**
 
@@ -392,6 +423,44 @@
 **סה"כ MVP: ~5-7 חודשים** עבודה ממוקדת של מפתח יחיד.
 
 לא מהיר. אבל ב-סוף השלב הזה יש לנו **OS אמיתית עם אפליקציה אמיתית**, לא demo. זה משהו שאפשר להראות, להסביר, ולהרחיב.
+
+---
+
+## פריטי MVP פתוחים — maintenance backlog
+
+פריטים מהפאזות הסגורות-ברובן שעדיין לא הושלמו. מכונס כדי שלא נאבד אותם:
+
+**מ-Phase 1b:**
+- Follower rendering — tab שהוא follower לא מצייר כלום. דוחה ל-Phase 2 לפי ה-ROADMAP המקורי, מאז לא חזרנו.
+
+**מ-Phase 2 (Framework):**
+- **IntentRouter not wired** — [framework/src/intent.rs](framework/src/intent.rs) מגדיר `IntentRouter` עם `resolve()` מלא, אבל אף נתיב launch לא קורא לו. Shell משתמש ב-`activity_class` ישירות.
+- **ResourceManager not populated** — [framework/src/resource_manager.rs](framework/src/resource_manager.rs) הוא struct שמחזיק `HashMap`s ריקים. אין code path שטוען strings/colors/dimens/drawables מ-manifest או מ-`res/`.
+- **PermissionController is a stub** — [framework/src/permissions.rs](framework/src/permissions.rs) לא אוכף שום דבר.
+- **WindowManager is a stub** — [framework/src/window_manager.rs](framework/src/window_manager.rs) לא מנתב בפועל.
+
+**מ-Phase 3 (AKML):**
+- Grid widget, Image widget, Input widget
+- Attributes: `margin`, `background`, `visible`, `textAlign`, `fontWeight`, `tag`
+- יחידות `dp`/`sp`/`%`; `match_parent`/`wrap_content`
+- Resource references — תלוי ב-ResourceManager wired
+
+**מ-Phase 4 (ABI):**
+- WIT / Component Model migration — ראה דחייה מתועדת למעלה.
+
+**מ-Phase 5 (Shell):**
+- הוצאה ל-`apps/shell/` כ-wasm package — תלוי ב-IntentRouter.
+
+**מ-Phase 6 (Calculator):**
+- `res/values/strings.toml` + `res/values/colors.toml` — תלוי ב-ResourceManager
+- `res/layout-land/main.akml` — תלוי ב-qualifier matching
+- `on_save_state` / restore — דורש SDK API + kernel side
+- `values-he` — **מוחרג מ-MVP** (user preference: MVP-first, skip i18n)
+
+**מ-Phase 7 (CLI):**
+- `akiva new`, `akiva build`, `akiva package`, `akiva install` — stubs בלבד. `akiva run`/`devserver` פעילים.
+
+ה-backlog הזה **לא** בלוקר ל-MVP; כל פריט הוא תוספת שמתלבשת על המבנה הקיים בלי rewrite. אם נרצה לסגור את Phase 2 פורמלית, הפריטים של Phase 2 הם מה שצריך להשלים.
 
 ---
 
