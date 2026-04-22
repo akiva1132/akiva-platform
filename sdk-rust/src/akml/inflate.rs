@@ -83,6 +83,7 @@ pub fn inflate_with(
     let id = match root.tag.as_str() {
         "VStack" | "HStack" => inflate_stack(ui, root, bindings)?,
         "Frame"   => inflate_frame(ui, root, bindings)?,
+        "Grid"    => inflate_grid(ui, root, bindings)?,
         "Text"    => inflate_text(ui, root, bindings)?,
         "Button"  => inflate_button(ui, root, bindings)?,
         "Rect"    => inflate_rect(ui, root, bindings)?,
@@ -133,6 +134,39 @@ fn inflate_frame(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> 
     let padding = attr_padding(el, bindings)?.unwrap_or((0.0, 0.0, 0.0, 0.0));
     let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
     let mut b = ui.frame(&child_ids)
+        .padding_trbl(padding.0, padding.1, padding.2, padding.3);
+    if flex > 0.0 { b = b.grow(flex); }
+    Ok(b.build())
+}
+
+fn inflate_grid(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> Result<NodeId, InflateError> {
+    let mut child_ids = Vec::with_capacity(el.children.len());
+    for child in &el.children {
+        child_ids.push(inflate_with(ui, child, bindings)?);
+    }
+    // `cols` and `rows` are required — a grid with neither is
+    // indistinguishable from a Frame, and guessing one from the other
+    // obscures intent more than it helps. A missing value is a layout
+    // bug, not a silent default.
+    let cols = attr_u32(el, bindings, "cols", "columns")?.ok_or_else(|| InflateError {
+        message: "<Grid> requires a `cols` attribute".into(),
+        loc: el.loc,
+    })?;
+    let rows = attr_u32(el, bindings, "rows", "rowCount")?.ok_or_else(|| InflateError {
+        message: "<Grid> requires a `rows` attribute".into(),
+        loc: el.loc,
+    })?;
+    // `gap` is uniform; per-axis `gapX` / `gapY` override it when an
+    // author wants asymmetric spacing (denser rows of compact chips,
+    // e.g.). Defaults to 0 on whichever axis wasn't overridden.
+    let gap_all = attr_f32(el, bindings, "gap", "spacing")?.unwrap_or(0.0);
+    let gap_x = attr_f32(el, bindings, "gapX", "colGap")?.unwrap_or(gap_all);
+    let gap_y = attr_f32(el, bindings, "gapY", "rowGap")?.unwrap_or(gap_all);
+    let padding = attr_padding(el, bindings)?.unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
+
+    let mut b = ui.grid(&child_ids, cols, rows)
+        .gap_xy(gap_x, gap_y)
         .padding_trbl(padding.0, padding.1, padding.2, padding.3);
     if flex > 0.0 { b = b.grow(flex); }
     Ok(b.build())
@@ -209,6 +243,31 @@ fn inflate_spacer(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) ->
 /// If the attribute's value is a `{name}` binding reference, the value
 /// comes from `bindings`; a missing binding is an error. Else the value
 /// is parsed as a literal number.
+/// Integer variant of [`attr_f32`] for attributes that must be whole
+/// numbers (grid cols / rows, maybe span counts later). Accepts a
+/// `{binding}` reference only if the bound number has no fractional
+/// part — otherwise falls out as a parse error with the offending name,
+/// which is more helpful than silently truncating.
+fn attr_u32(el: &Element, bindings: &Bindings, a: &str, b: &str) -> Result<Option<u32>, InflateError> {
+    for name in [a, b] {
+        if let Some(raw) = el.attr(name) {
+            let n = if let Some(bname) = Bindings::binding_name(raw) {
+                bindings.get_number(bname).ok_or_else(|| unresolved(el.loc, bname, name))?
+            } else {
+                parse_f32(raw, el.loc, name)?
+            };
+            if n < 0.0 || n.fract() != 0.0 {
+                return Err(InflateError {
+                    message: format!("attribute `{name}` expects a non-negative integer, got {n}"),
+                    loc: el.loc,
+                });
+            }
+            return Ok(Some(n as u32));
+        }
+    }
+    Ok(None)
+}
+
 fn attr_f32(el: &Element, bindings: &Bindings, a: &str, b: &str) -> Result<Option<f32>, InflateError> {
     for name in [a, b] {
         if let Some(raw) = el.attr(name) {
@@ -819,6 +878,99 @@ mod tests {
             let err = inflate_str(ui, src).unwrap_err();
             assert!(err.message.contains("color") || err.message.contains("hex"),
                 "msg: {}", err.message);
+        });
+    }
+
+    // ── Grid ─────────────────────────────────────────────────────────
+    //
+    // Grid gets its own test cluster because its attribute surface is
+    // larger than any other container (`cols`, `rows`, `gap`, `gapX`,
+    // `gapY`, `padding`, `flex`) and because the `cols`/`rows` parsing
+    // goes through the new `attr_u32` helper.
+
+    #[test]
+    fn inflates_grid_with_cols_rows_gap() {
+        with_ui(|ui| {
+            let src = r##"
+                <Grid cols="2" rows="2" gap="4">
+                    <Rect color="#ff111111" />
+                    <Rect color="#ff222222" />
+                    <Rect color="#ff333333" />
+                    <Rect color="#ff444444" />
+                </Grid>
+            "##;
+            let root = inflate_str(ui, src).unwrap();
+            // Four rects + the grid itself = id 4.
+            assert_eq!(root, 4);
+        });
+    }
+
+    #[test]
+    fn grid_missing_cols_is_an_error() {
+        with_ui(|ui| {
+            let src = r##"<Grid rows="2"><Rect color="#ff000000" /></Grid>"##;
+            let err = inflate_str(ui, src).unwrap_err();
+            assert!(err.message.contains("cols"), "msg: {}", err.message);
+        });
+    }
+
+    #[test]
+    fn grid_missing_rows_is_an_error() {
+        with_ui(|ui| {
+            let src = r##"<Grid cols="2"><Rect color="#ff000000" /></Grid>"##;
+            let err = inflate_str(ui, src).unwrap_err();
+            assert!(err.message.contains("rows"), "msg: {}", err.message);
+        });
+    }
+
+    #[test]
+    fn grid_rejects_fractional_cols() {
+        // Non-integer cols is always a typo — a grid with 2.5 columns
+        // is undefined. Surface it as a parse error, not a silent
+        // truncation.
+        with_ui(|ui| {
+            let src = r##"<Grid cols="2.5" rows="2"><Rect color="#ff000000" /></Grid>"##;
+            let err = inflate_str(ui, src).unwrap_err();
+            assert!(err.message.contains("integer"), "msg: {}", err.message);
+        });
+    }
+
+    #[test]
+    fn grid_accepts_camelcase_gapx_and_gapy_aliases() {
+        // Asymmetric gap via per-axis attributes; ensure the uniform
+        // `gap` default (0) doesn't override them.
+        with_ui(|ui| {
+            let src = r##"
+                <Grid cols="2" rows="2" gapX="6" gapY="10">
+                    <Rect color="#ff000000" />
+                    <Rect color="#ff000000" />
+                    <Rect color="#ff000000" />
+                    <Rect color="#ff000000" />
+                </Grid>
+            "##;
+            // Just needs to parse + inflate cleanly — the layout pass
+            // elsewhere has the tests for what gap values actually
+            // produce on the wire.
+            assert!(inflate_str(ui, src).is_ok());
+        });
+    }
+
+    #[test]
+    fn grid_with_flex_grows_in_parent_stack() {
+        // `flex` on a Grid should feed the SDK's grow attr so a VStack
+        // parent hands the grid its leftover main-axis space — the
+        // calculator-keypad pattern.
+        with_ui(|ui| {
+            let src = r##"
+                <VStack>
+                    <Text text="header" size="16" />
+                    <Grid cols="2" rows="1" flex="1">
+                        <Rect color="#ff000000" />
+                        <Rect color="#ff000000" />
+                    </Grid>
+                </VStack>
+            "##;
+            assert!(inflate_str(ui, src).is_ok());
         });
     }
 }
