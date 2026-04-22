@@ -262,6 +262,8 @@ function buildImports() {
     hal_app_key:        (handle, code, mods, phase, ts) => apps.key(handle, code, mods, phase, ts),
     hal_app_resize:     (handle, w, h, density) => apps.resize(handle, w, h, density),
     hal_app_render:     (handle, ts, outPtr, outCap) => apps.render(handle, ts, outPtr, outCap),
+    hal_app_save_state: (handle, outPtr, outCap) => apps.saveState(handle, outPtr, outCap),
+    hal_app_restore_state: (handle, bytesPtr, bytesLen) => apps.restoreState(handle, bytesPtr, bytesLen),
   };
   return { env };
 }

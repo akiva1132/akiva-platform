@@ -67,6 +67,28 @@ pub trait WasmHost {
     /// fetching the app's encoded paint-op bytes and appending the
     /// decoded ops to `out`.
     fn render(&self, handle: AppHandle, ts_ms: f64, out: &mut FrameCommands);
+
+    /// Ask the app to serialise its per-activity UI state for a possible
+    /// process kill. Returned bytes are in the SDK's `SavedState` wire
+    /// format — the framework treats them as opaque. An empty vec means
+    /// "nothing to save" and the framework will skip the storage write.
+    ///
+    /// Default returns empty so in-process activities (e.g. Shell) can
+    /// keep ignoring the hook.
+    fn save_state(&self, handle: AppHandle) -> Vec<u8> {
+        let _ = handle;
+        Vec::new()
+    }
+
+    /// Hand previously-saved bytes back to the app. Called after
+    /// `lifecycle(Create)` and before `lifecycle(Start)` so the app sees
+    /// its restored state in `on_start`/`on_resume` just like a fresh
+    /// launch. Empty bytes = "no saved state", skipped by the framework.
+    ///
+    /// Default is a no-op for the same reason as `save_state`.
+    fn restore_state(&self, handle: AppHandle, bytes: &[u8]) {
+        let _ = (handle, bytes);
+    }
 }
 
 // ── Proxy activity ───────────────────────────────────────────────────────

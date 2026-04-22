@@ -81,6 +81,14 @@ extern "C" fn akiva_app_resize(
 // Render — מחזיר את הכתובת של buffer paint-ops ב-memory של ה-app.
 // ה-host קורא את האורך מ-*out_len_ptr, מעתיק, וממשיך.
 extern "C" fn akiva_app_render(handle: u32, ts_ms: f64, out_len_ptr: *mut u32) -> *const u8;
+
+// Saved state — סימטרי ל-render. ה-app מסדר את ה-UI state שלו לפי
+// הפורמט של `SavedState` ([sdk-rust/src/activity.rs]) ומחזיר pointer
+// ל-buffer app-owned שתקף עד הקריאה הבאה ל-save_state עם אותו handle.
+// ב-restore, ה-host מעתיק bytes שמורים פנימה (דרך akiva_app_alloc) וקורא
+// ל-restore_state; ה-app מפענח ומעדכן את ה-state שלו בפנים.
+extern "C" fn akiva_app_save_state(handle: u32, out_len_ptr: *mut u32) -> *const u8;
+extern "C" fn akiva_app_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32);
 ```
 
 ה-buffer שמוחזר מ-`akiva_app_render` הוא app-owned: ה-app חייב להחזיק אותו בחיים לפחות עד הקריאה הבאה ל-`akiva_app_render` עם אותו handle. ה-convention הוא buffer per-handle שנמחזר כל frame — מקצה פעם אחת, מנקה עם `clear()`, ומחזיר את הכתובת שוב.
@@ -145,6 +153,12 @@ fn hal_app_resize(handle: u32, width_px: u32, height_px: u32, density: f32);
 fn hal_app_render(handle: u32, ts_ms: f64, out_ptr: *mut u8, out_cap: u32) -> u32;
 // ^ returns total bytes produced by the app. If > out_cap the kernel's
 //   buffer was truncated; kernel should retry with a larger allocation.
+
+fn hal_app_save_state(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
+// ^ same two-phase buffer contract as render: returns total bytes the
+//   app produced. Truncated blobs trigger a retry with a larger buffer.
+fn hal_app_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32) -> u32;
+// ^ 0 on success, non-zero on handle miss / alloc failure / host error.
 ```
 
 ### 2.5 Paint-op wire format
@@ -174,7 +188,6 @@ fn hal_app_render(handle: u32, ts_ms: f64, out_ptr: *mut u8, out_cap: u32) -> u3
 ### 2.7 מה לא כלול ב-v0
 
 - **Imports מלאים** — רק `akiva_host_log` זמין ב-Phase 2b.3. `finish`, `start_activity`, `storage`, notifications — כל אלה ידרשו PR נפרד ויעברו את מבחני §1.2.
-- **State save/restore** — `on_save_state` נכנס בפאזה מאוחרת יותר.
 - **Intents** — routing בין apps מופעל ב-Phase 3.
 - **Permissions** — ה-host טוען כל wasm עם ה-imports הבסיסיים בלבד. PermissionController נכנס ב-v1 כשה-imports נהיים conditional.
 

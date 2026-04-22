@@ -300,6 +300,43 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
             log::warn(&format!("app {}: paint decode failed: {:?}", handle.get(), e));
         }
     }
+
+    fn save_state(&self, handle: akiva_framework::wasm_activity::AppHandle) -> Vec<u8> {
+        // Start at the typical UI-state size. The framework caps the wire
+        // size at `SavedState::MAX_BYTES` (64 KiB); if the app returns more
+        // we truncate on the way to storage rather than allocating more.
+        let mut buf = vec![0u8; 4 * 1024];
+        let needed = unsafe {
+            host::hal_app_save_state(handle.get(), buf.as_mut_ptr(), buf.len() as u32)
+        } as usize;
+        if needed > buf.len() {
+            buf = vec![0u8; needed];
+            let got = unsafe {
+                host::hal_app_save_state(handle.get(), buf.as_mut_ptr(), buf.len() as u32)
+            } as usize;
+            buf.truncate(got.min(buf.len()));
+        } else {
+            buf.truncate(needed);
+        }
+        buf
+    }
+
+    fn restore_state(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        bytes: &[u8],
+    ) {
+        if bytes.is_empty() { return; }
+        let rc = unsafe {
+            host::hal_app_restore_state(handle.get(), bytes.as_ptr(), bytes.len() as u32)
+        };
+        if rc != 0 {
+            log::warn(&format!(
+                "app {}: restore_state returned {} (handle miss or host copy failed)",
+                handle.get(), rc
+            ));
+        }
+    }
 }
 
 /// Exercises the storage HAL end-to-end: read a u32 counter under

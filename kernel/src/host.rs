@@ -107,6 +107,29 @@ extern "C" {
         out_ptr: *mut u8,
         out_cap: u32,
     ) -> u32;
+
+    // ── Saved state (Phase 6) ─────────────────────────────────────────────
+    //
+    // Symmetric with `hal_app_render`: the app encodes its `SavedState` into
+    // its own wire buffer, the host copies up to `out_cap` bytes into
+    // `out_ptr`, and returns the total length the app produced. If the
+    // return value exceeds `out_cap` the kernel reallocates and retries.
+    //
+    // `hal_app_restore_state` goes the other direction: the kernel hands
+    // previously-persisted bytes back, the host copies them into the app's
+    // memory via `akiva_app_alloc`, and the app decodes inside
+    // `akiva_app_restore_state`. Returns 0 on success, non-zero if the
+    // handle is unknown or the host-side copy failed.
+    pub fn hal_app_save_state(
+        handle: u32,
+        out_ptr: *mut u8,
+        out_cap: u32,
+    ) -> u32;
+    pub fn hal_app_restore_state(
+        handle: u32,
+        bytes_ptr: *const u8,
+        bytes_len: u32,
+    ) -> u32;
 }
 
 /// Safe wrapper for hal_log that never panics.

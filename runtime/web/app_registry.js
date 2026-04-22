@@ -180,6 +180,89 @@ export class AppRegistry {
     return len;
   }
 
+  /**
+   * Ask the app to serialise its UI state. Same two-phase buffer contract
+   * as `render`: returns the number of bytes the app produced. If the
+   * return value exceeds `outCap` the kernel retries with a larger buffer
+   * and we copy nothing on this call.
+   */
+  saveState(handle, outPtr, outCap) {
+    const ctx = this._lookup(handle);
+    if (!ctx) return 0;
+    const { slot, proc } = ctx;
+
+    let len, srcPtr;
+    try {
+      const lenPtr = proc.instance.exports.akiva_app_alloc(4);
+      if (lenPtr === 0) {
+        this._log("warn", `app ${slot.packageId}: alloc(4) for save_state len returned null`);
+        return 0;
+      }
+      try {
+        srcPtr = proc.instance.exports.akiva_app_save_state(handle, lenPtr);
+        len = new DataView(proc.memory.buffer).getUint32(lenPtr, true);
+      } finally {
+        proc.instance.exports.akiva_app_dealloc(lenPtr, 4);
+      }
+    } catch (err) {
+      this._log("error", `app ${slot.packageId}.save_state: ${err?.message ?? err}`);
+      return 0;
+    }
+
+    if (len === 0 || srcPtr === 0) return 0;
+    if (len > outCap) return len;
+
+    const src = new Uint8Array(proc.memory.buffer, srcPtr, len);
+    const kernelBuf = this._kernelMemory().buffer;
+    new Uint8Array(kernelBuf, outPtr, len).set(src);
+    return len;
+  }
+
+  /**
+   * Hand previously-persisted bytes back to the app. The kernel passes a
+   * pointer into its own memory; we read those bytes, allocate a matching
+   * region inside the app's memory via `akiva_app_alloc`, copy, and hand
+   * the app pointer to `akiva_app_restore_state`. The app is responsible
+   * for decoding. Returns 0 on success, non-zero on handle miss / alloc
+   * failure.
+   */
+  restoreState(handle, bytesPtr, bytesLen) {
+    const ctx = this._lookup(handle);
+    if (!ctx) return 1;
+    const { slot, proc } = ctx;
+    if (bytesLen === 0) return 0;
+
+    // Pull the bytes out of kernel memory first — the kernel buffer is
+    // detached by `WebAssembly.Memory.grow` on either side, so we take
+    // an owned copy before hopping memories.
+    const kernelBuf = this._kernelMemory().buffer;
+    const srcCopy = new Uint8Array(bytesLen);
+    srcCopy.set(new Uint8Array(kernelBuf, bytesPtr, bytesLen));
+
+    let appPtr;
+    try {
+      appPtr = proc.instance.exports.akiva_app_alloc(bytesLen);
+      if (appPtr === 0) {
+        this._log("warn", `app ${slot.packageId}: alloc(${bytesLen}) for restore_state returned null`);
+        return 2;
+      }
+      new Uint8Array(proc.memory.buffer, appPtr, bytesLen).set(srcCopy);
+      proc.instance.exports.akiva_app_restore_state(handle, appPtr, bytesLen);
+    } catch (err) {
+      this._log("error", `app ${slot.packageId}.restore_state: ${err?.message ?? err}`);
+      return 3;
+    } finally {
+      // App is done with the buffer the instant `restore_state` returns
+      // — the app has already decoded everything it cares about into its
+      // own owned structures.
+      if (appPtr) {
+        try { proc.instance.exports.akiva_app_dealloc(appPtr, bytesLen); }
+        catch (_) { /* best effort */ }
+      }
+    }
+    return 0;
+  }
+
   // ── Internals ───────────────────────────────────────────────────────────
 
   _instantiateProcess(packageId) {
@@ -392,6 +475,8 @@ const REQUIRED_EXPORTS = [
   "akiva_app_key",
   "akiva_app_resize",
   "akiva_app_render",
+  "akiva_app_save_state",
+  "akiva_app_restore_state",
 ];
 
 // Loud-and-obvious placeholder when an `@color/` ref is undefined.
