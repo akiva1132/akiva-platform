@@ -162,8 +162,14 @@ fn inflate_button(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) ->
         .or(attr_text(el, bindings, "text")?)
         .unwrap_or_else(|| id.to_string());
     let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
+    // `onClick` is AKML's spec spelling for the semantic action name;
+    // `action` is the shorter Rust-builder equivalent. Pick whichever
+    // the author used — either attaches the same `action` on the node.
+    let action = attr_text(el, bindings, "onClick")?
+        .or(attr_text(el, bindings, "action")?);
     let node = ui.button(id, label);
     if flex > 0.0 { ui.grow(node, flex); }
+    if let Some(a) = action { ui.action(node, a); }
     Ok(node)
 }
 
@@ -492,6 +498,37 @@ mod tests {
             // 6 nodes in doc order: Rect, Text, Text, HStack, Frame.
             // Root id = 4 (0..=4 indices).
             assert_eq!(root, 4);
+        });
+    }
+
+    #[test]
+    fn button_onclick_attribute_attaches_semantic_action() {
+        // Smoke: `onClick="name"` in AKML must propagate through the
+        // inflater so `was_triggered("name")` fires on click. We can't
+        // fake a click through the public API without a ctx+state
+        // dance, so the assertion is: a non-panicking inflate plus a
+        // registered hit rect on the button's id. The deeper click-→-
+        // action round trip is pinned by the Ui-level tests in
+        // ui/mod.rs — this test only guards the AKML wiring.
+        with_ui(|ui| {
+            let src = r#"<Button id="b" label="B" onClick="do_thing" />"#;
+            let id = inflate_str(ui, src).unwrap();
+            ui.present(id);
+            assert!(ui.has_hit_rect("b"));
+            // No click was injected, so `was_triggered` is still false
+            // — but the action *is* on the node, ready to fire.
+            assert!(!ui.was_triggered("do_thing"));
+        });
+    }
+
+    #[test]
+    fn button_accepts_action_alias_for_onclick() {
+        // Rust-builder authors may write `action="…"` (matching the
+        // `Ui::action` setter) instead of the spec's `onClick="…"`.
+        // Both must reach the same attach point.
+        with_ui(|ui| {
+            let src = r#"<Button id="b" label="B" action="do_thing" />"#;
+            let _ = inflate_str(ui, src).unwrap();
         });
     }
 

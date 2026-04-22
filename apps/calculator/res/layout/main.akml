@@ -7,9 +7,12 @@
       - {display}         — the number or "Error" string.
       - {display_color}   — typed colour that flips to red in error state.
 
-    Everything else is static literal. Button ids double as click
-    identifiers (`ui.was_clicked("eq")` etc.) — don't rename them without
-    updating the Rust dispatch in src/lib.rs.
+    Each <Button> carries an `onClick="…"` naming the semantic action
+    the Activity should run when the button fires. Rust dispatch keys
+    on those action strings (e.g. `ui.was_triggered("equals")`), not on
+    `id`, so the ids are free to be renamed for layout/a11y reasons
+    without touching src/lib.rs. The action names are the contract —
+    keep them stable (or update both sides together).
 -->
 <VStack padding="16" gap="8" cross="stretch">
 
@@ -32,38 +35,38 @@
     <VStack flex="1" gap="8" cross="stretch">
 
         <HStack flex="1" gap="8" cross="stretch">
-            <Button id="clr"  label="C" flex="1" />
-            <Button id="sign" label="±" flex="1" />
-            <Button id="pct"  label="%" flex="1" />
-            <Button id="div"  label="÷" flex="1" />
+            <Button id="clr"  label="C" flex="1" onClick="clear" />
+            <Button id="sign" label="±" flex="1" onClick="toggle_sign" />
+            <Button id="pct"  label="%" flex="1" onClick="percent" />
+            <Button id="div"  label="÷" flex="1" onClick="apply_div" />
         </HStack>
 
         <HStack flex="1" gap="8" cross="stretch">
-            <Button id="7"   label="7" flex="1" />
-            <Button id="8"   label="8" flex="1" />
-            <Button id="9"   label="9" flex="1" />
-            <Button id="mul" label="×" flex="1" />
+            <Button id="d7"  label="7" flex="1" onClick="digit_7" />
+            <Button id="d8"  label="8" flex="1" onClick="digit_8" />
+            <Button id="d9"  label="9" flex="1" onClick="digit_9" />
+            <Button id="mul" label="×" flex="1" onClick="apply_mul" />
         </HStack>
 
         <HStack flex="1" gap="8" cross="stretch">
-            <Button id="4"   label="4" flex="1" />
-            <Button id="5"   label="5" flex="1" />
-            <Button id="6"   label="6" flex="1" />
-            <Button id="sub" label="−" flex="1" />
+            <Button id="d4"  label="4" flex="1" onClick="digit_4" />
+            <Button id="d5"  label="5" flex="1" onClick="digit_5" />
+            <Button id="d6"  label="6" flex="1" onClick="digit_6" />
+            <Button id="sub" label="−" flex="1" onClick="apply_sub" />
         </HStack>
 
         <HStack flex="1" gap="8" cross="stretch">
-            <Button id="1"   label="1" flex="1" />
-            <Button id="2"   label="2" flex="1" />
-            <Button id="3"   label="3" flex="1" />
-            <Button id="add" label="+" flex="1" />
+            <Button id="d1"  label="1" flex="1" onClick="digit_1" />
+            <Button id="d2"  label="2" flex="1" onClick="digit_2" />
+            <Button id="d3"  label="3" flex="1" onClick="digit_3" />
+            <Button id="add" label="+" flex="1" onClick="apply_add" />
         </HStack>
 
         <HStack flex="1" gap="8" cross="stretch">
-            <Button id="0"    label="0" flex="1" />
-            <Button id="dot"  label="." flex="1" />
-            <Button id="back" label="⌫" flex="1" />
-            <Button id="eq"   label="=" flex="1" />
+            <Button id="d0"   label="0" flex="1" onClick="digit_0" />
+            <Button id="dot"  label="." flex="1" onClick="input_dot" />
+            <Button id="back" label="⌫" flex="1" onClick="backspace" />
+            <Button id="eq"   label="=" flex="1" onClick="equals" />
         </HStack>
 
     </VStack>

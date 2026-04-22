@@ -274,29 +274,36 @@ impl Activity for CalculatorMain {
         ui.present(root);
 
         // ── Dispatch clicks ──
-        // The AKML assigns stable string ids to every `<Button>` (e.g.
-        // `id="eq"`), and the Phase 3a toolkit resolves pointer-down
-        // events against those ids. So click handling stays identical
-        // whether the tree came from AKML or from imperative Rust.
-        for d in 0u8..=9 {
-            let label = (b'0' + d) as char;
-            let mut buf = [0u8; 4];
-            let id = label.encode_utf8(&mut buf);
-            if ui.was_clicked(id) {
-                self.calc.input_digit(d);
+        // Each `<Button>` in the AKML carries an `onClick="…"` naming a
+        // semantic action; the toolkit resolves pointer-down events to
+        // those action strings. The Activity only knows these action
+        // names — not widget ids — so AKML can rename `id="eq"` to
+        // `id="equal_btn"` or split one button into two without
+        // touching any code here.
+        // Digit actions are `digit_0` .. `digit_9`. Hard-coded table
+        // beats a runtime `format!` (no alloc per frame) and beats an
+        // unsafe `from_utf8_unchecked` roll-your-own (ten short strings
+        // aren't worth bypassing std's checks).
+        const DIGIT_ACTIONS: [&str; 10] = [
+            "digit_0", "digit_1", "digit_2", "digit_3", "digit_4",
+            "digit_5", "digit_6", "digit_7", "digit_8", "digit_9",
+        ];
+        for (d, action) in DIGIT_ACTIONS.iter().enumerate() {
+            if ui.was_triggered(action) {
+                self.calc.input_digit(d as u8);
                 log_debug!("digit {} → {}", d, self.calc.display());
             }
         }
-        if ui.was_clicked("dot")  { self.calc.input_dot(); }
-        if ui.was_clicked("add")  { self.calc.apply_op(Op::Add); }
-        if ui.was_clicked("sub")  { self.calc.apply_op(Op::Sub); }
-        if ui.was_clicked("mul")  { self.calc.apply_op(Op::Mul); }
-        if ui.was_clicked("div")  { self.calc.apply_op(Op::Div); }
-        if ui.was_clicked("eq")   { self.calc.equals(); log_debug!("= → {}", self.calc.display()); }
-        if ui.was_clicked("clr")  { self.calc.clear(); }
-        if ui.was_clicked("sign") { self.calc.toggle_sign(); }
-        if ui.was_clicked("pct")  { self.calc.percent(); }
-        if ui.was_clicked("back") { self.calc.backspace(); }
+        if ui.was_triggered("input_dot")     { self.calc.input_dot(); }
+        if ui.was_triggered("apply_add")     { self.calc.apply_op(Op::Add); }
+        if ui.was_triggered("apply_sub")     { self.calc.apply_op(Op::Sub); }
+        if ui.was_triggered("apply_mul")     { self.calc.apply_op(Op::Mul); }
+        if ui.was_triggered("apply_div")     { self.calc.apply_op(Op::Div); }
+        if ui.was_triggered("equals")        { self.calc.equals(); log_debug!("= → {}", self.calc.display()); }
+        if ui.was_triggered("clear")         { self.calc.clear(); }
+        if ui.was_triggered("toggle_sign")   { self.calc.toggle_sign(); }
+        if ui.was_triggered("percent")       { self.calc.percent(); }
+        if ui.was_triggered("backspace")     { self.calc.backspace(); }
     }
 }
 

@@ -12,10 +12,10 @@
 //! | area               | supported now                        | deferred |
 //! |--------------------|--------------------------------------|----------|
 //! | elements           | `VStack`, `HStack`, `Frame`, `Text`, `Button`, `Rect`, `Spacer` | `Grid`, `Image`, `Input` |
-//! | attributes         | `id`, `gap`, `padding`, `main`, `cross`, `flex`, `size`, `color`, `text`, `label`, `min_width`, `min_height` | `margin`, `background`, `visible`, `textAlign`, `fontWeight`, `onClick`+`tag` |
+//! | attributes         | `id`, `gap`, `padding`, `main`, `cross`, `flex`, `size`, `color`, `text`, `label`, `min_width`, `min_height`, `onClick` | `margin`, `background`, `visible`, `textAlign`, `fontWeight`, `tag` |
 //! | attribute values   | literal numbers, `#RGB` / `#RRGGBB` / `#AARRGGBB` / `0xAARRGGBB` colours, enum strings | `dp`/`sp`/`%` suffixes, `match_parent`/`wrap_content` |
 //! | resources          | none — literals only                 | `@string/*`, `@color/*`, `@dimen/*`, `@style/*` |
-//! | click correlation  | `id="eq"` on `<Button>` → `ui.was_clicked("eq")` (no callback registry) | `onClick="fn_name" tag="val"` with a real registry |
+//! | click correlation  | `id="eq"` → `ui.was_clicked("eq")`, or `onClick="equals"` → `ui.was_triggered("equals")` — pull-based, no closure registry | `tag="val"` payload threaded through the same hook |
 //! | bindings           | none — the AKML is static for now    | `{name}` interpolation with per-frame substitutions |
 //!
 //! Every deferred row is a Phase-4 or later concern. This module will

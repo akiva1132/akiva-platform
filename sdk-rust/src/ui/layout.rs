@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn button_includes_padding_around_label() {
         let nodes = vec![Node::Button {
-            id: "b".into(), label: "ok".into(), label_size: 10.0,
+            id: "b".into(), action: None, label: "ok".into(), label_size: 10.0,
             bg: 0, bg_pressed: 0, fg: 0, pad: (8.0, 4.0),
         }];
         let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0, &estimate_text_width);

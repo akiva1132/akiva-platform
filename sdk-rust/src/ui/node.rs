@@ -55,6 +55,14 @@ pub enum Node {
     },
     Button {
         id: String,
+        /// Semantic action fired on click, separate from `id`. When set,
+        /// `Ui::was_triggered(action)` returns true on the frame a click
+        /// landed inside this button. The split lets AKML rename, split,
+        /// or merge buttons without touching Rust dispatch: `id` stays
+        /// the layout/hit-test name; `action` is the stable contract the
+        /// Activity reads. `None` means the button only responds to
+        /// `was_clicked(id)` (the pre-Phase 3b polish API).
+        action: Option<String>,
         label: String,
         label_size: f32,
         bg: u32,

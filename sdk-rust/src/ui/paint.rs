@@ -45,7 +45,7 @@ fn paint_node(
             canvas.fill_rect(rect.x, rect.y, rect.w, rect.h, *color);
         }
         Node::Spacer { .. } => {}
-        Node::Button { id: btn_id, label, label_size, bg, bg_pressed, fg, pad } => {
+        Node::Button { id: btn_id, label, label_size, bg, bg_pressed, fg, pad, .. } => {
             let is_pressed = clicked_ids.iter().any(|s| s == btn_id);
             let bg_color = if is_pressed { *bg_pressed } else { *bg };
             canvas.fill_rect(rect.x, rect.y, rect.w, rect.h, bg_color);

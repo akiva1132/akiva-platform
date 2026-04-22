@@ -45,6 +45,12 @@
 //! frame N (same-frame response) because `on_pointer` fires before
 //! `on_render` in the host's dispatch order.
 //!
+//! Buttons can additionally carry a semantic [`action`][Ui::action]
+//! (surfaced as `onClick="…"` in AKML). After `present`, the Activity
+//! queries those via [`was_triggered`][Ui::was_triggered] instead of
+//! `was_clicked` — the action name is the stable contract, so renaming
+//! or reshuffling buttons in AKML doesn't break Rust dispatch.
+//!
 //! ## Layout model
 //!
 //! Two-pass: bottom-up `measure` to get intrinsic sizes, top-down `layout`
@@ -153,13 +159,25 @@ pub struct UiState {
     /// Hit rects from the most recent `present()`, keyed by the caller's
     /// widget id. Populated on paint; consulted on `was_clicked`.
     hit_rects: HashMap<String, Rect>,
+    /// `id → action` for buttons that declared one via [`Ui::action`]
+    /// (or `onClick=` in AKML). Latched during `present()` alongside
+    /// `hit_rects`; consulted when resolving clicks to the frame's
+    /// `current_actions` list. Buttons without an action never land
+    /// here, so absence = "no action" with no extra cost per lookup.
+    hit_actions: HashMap<String, String>,
     /// Pointer-down positions queued up since the last `present()`. A
     /// single press may fire in the middle of a long frame; we batch
     /// them until the next present consumes them.
     pending_clicks: Vec<(f32, f32)>,
-    /// Hit rects latched during `present()` — used by same-frame
-    /// `was_clicked` calls after present has run.
+    /// Widget ids whose hit rect caught a click this frame. Read by
+    /// `was_clicked(id)`.
     current_clicks: Vec<String>,
+    /// Semantic action names fired this frame (the `action` attribute
+    /// of any clicked button). Read by `was_triggered(action)`. A
+    /// single click may contribute both to `current_clicks` (via id)
+    /// and `current_actions` (via action) — that's intended, so apps
+    /// can mix the two dispatch styles during migration.
+    current_actions: Vec<String>,
 }
 
 impl UiState {
@@ -197,10 +215,13 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         ctx: &Context<'_>,
         canvas: &'c mut Canvas<'b>,
     ) -> Self {
-        // Reset per-frame derived state up front. Hit rects will be
-        // repopulated by `present()`; clicks are consumed then too.
+        // Reset per-frame derived state up front. Hit rects / actions
+        // will be repopulated by `present()`; clicks / actions consumed
+        // then too.
         state.hit_rects.clear();
+        state.hit_actions.clear();
         state.current_clicks.clear();
+        state.current_actions.clear();
         Self {
             state,
             canvas,
@@ -276,6 +297,7 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         // Akiva dark theme and anything else.
         self.push(Node::Button {
             id: id.into(),
+            action: None,
             label: label.into(),
             label_size: 14.0,
             bg: 0xff2a3a50,
@@ -283,6 +305,19 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             fg: 0xfff0f4fa,
             pad: (16.0, 10.0),
         })
+    }
+
+    /// Attach a semantic action name to an already-pushed button. After
+    /// `present`, `Ui::was_triggered(action)` returns true for the frame
+    /// a click landed on this button. Mirrors [`Ui::grow`] in taking the
+    /// node id post-hoc — buttons are built without a builder, so this
+    /// is the attach point for optional attributes. Silent no-op on a
+    /// non-button or stale id so a stray call from AKML inflate can't
+    /// panic the whole frame.
+    pub fn action(&mut self, id: NodeId, action: impl Into<String>) {
+        if let Some(Node::Button { action: slot, .. }) = self.nodes.get_mut(id) {
+            *slot = Some(action.into());
+        }
     }
 
     pub fn v_stack(&mut self, children: &[NodeId]) -> node::StackBuilder<'_, 's, 'c, 'b> {
@@ -327,22 +362,30 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             &sizes, &mut rects,
         );
 
-        // Record hit rects for buttons before paint, so `was_clicked`
-        // queries that come after `present()` see them.
+        // Record hit rects + actions for buttons before paint, so
+        // `was_clicked` / `was_triggered` queries that come after
+        // `present()` see them.
         for (node_id, rect) in &rects {
-            if let Node::Button { id, .. } = &self.nodes[*node_id] {
+            if let Node::Button { id, action, .. } = &self.nodes[*node_id] {
                 self.state.hit_rects.insert(id.clone(), *rect);
+                if let Some(a) = action {
+                    self.state.hit_actions.insert(id.clone(), a.clone());
+                }
             }
         }
 
-        // Resolve clicks against the just-latched hit rects: an `id`
-        // is considered clicked this frame if any pending click point
-        // falls inside its rect. Pending clicks are drained (a click
-        // should fire once).
+        // Resolve clicks against the just-latched hit rects. A pending
+        // click point falling inside a button's rect contributes the
+        // button's `id` to `current_clicks` and — if the button had an
+        // `action` — the action string to `current_actions`. Pending
+        // clicks are drained so a single press fires once.
         for (x, y) in self.state.pending_clicks.drain(..) {
             for (id, rect) in &self.state.hit_rects {
                 if rect.contains(x, y) {
                     self.state.current_clicks.push(id.clone());
+                    if let Some(action) = self.state.hit_actions.get(id) {
+                        self.state.current_actions.push(action.clone());
+                    }
                 }
             }
         }
@@ -355,6 +398,16 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
     /// multiple times — returns the same answer until next frame.
     pub fn was_clicked(&self, id: &str) -> bool {
         self.state.current_clicks.iter().any(|s| s == id)
+    }
+
+    /// True if any button whose `action` attribute equals `action` was
+    /// pressed this frame. Call *after* `present()`. Unlike
+    /// [`Ui::was_clicked`], this is keyed on the *semantic* action name
+    /// (the `onClick=` attribute in AKML), not the widget id — so AKML
+    /// can rename a button's `id` or add/remove buttons sharing one
+    /// action without the Activity's dispatch code noticing.
+    pub fn was_triggered(&self, action: &str) -> bool {
+        self.state.current_actions.iter().any(|s| s == action)
     }
 }
 
@@ -441,6 +494,112 @@ mod tests {
         let btn = ui.button("go", "Go");
         ui.present(btn);
         assert!(!ui.was_clicked("go"));
+    }
+
+    #[test]
+    fn was_triggered_fires_when_button_with_matching_action_is_clicked() {
+        // A button with action="eat" clicked inside its rect should
+        // surface through `was_triggered("eat")`, not `was_triggered`
+        // for any other string.
+        let mut state = UiState::new();
+        state.feed_pointer(pointer(10.0, 10.0, PointerPhase::Down));
+
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let btn = ui.button("b", "B");
+        ui.action(btn, "eat");
+        ui.present(btn);
+        assert!(ui.was_triggered("eat"));
+        assert!(!ui.was_triggered("other"));
+        // The click still registers under the original id, too — the
+        // two dispatch styles coexist during migration.
+        assert!(ui.was_clicked("b"));
+    }
+
+    #[test]
+    fn was_triggered_is_false_for_buttons_without_an_action() {
+        // A vanilla button (no `.action(...)`) must not accidentally
+        // trigger *any* action query — the absence is the "no action"
+        // signal, and we want was_triggered("") in particular to be
+        // false (empty-string convention shouldn't leak through).
+        let mut state = UiState::new();
+        state.feed_pointer(pointer(10.0, 10.0, PointerPhase::Down));
+
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let btn = ui.button("b", "B");
+        ui.present(btn);
+        assert!(ui.was_clicked("b"));
+        assert!(!ui.was_triggered(""));
+        assert!(!ui.was_triggered("b"));
+        assert!(!ui.was_triggered("anything"));
+    }
+
+    #[test]
+    fn two_buttons_sharing_an_action_both_trigger_the_same_query() {
+        // The headline value of `was_triggered` vs `was_clicked`:
+        // AKML can split one semantic button into two (e.g. a primary
+        // and a keyboard-shortcut variant) sharing one onClick, and the
+        // Rust dispatch doesn't need to know. Click either → same
+        // action fires.
+        let mut state = UiState::new();
+        let c = ctx("t");
+
+        // First pass: figure out where button B sits, feed a click
+        // there, then rebuild the tree and present.
+        let rect_b;
+        {
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let a = ui.button("a1", "A1");
+            ui.action(a, "go");
+            let b = ui.button("a2", "A2");
+            ui.action(b, "go");
+            let row = ui.h_stack(&[a, b]).gap(4.0).build();
+            ui.present(row);
+            rect_b = *state.hit_rects.get("a2").expect("a2 rect");
+        }
+        state.feed_pointer(pointer(
+            rect_b.x + rect_b.w / 2.0,
+            rect_b.y + rect_b.h / 2.0,
+            PointerPhase::Down,
+        ));
+
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let a = ui.button("a1", "A1");
+        ui.action(a, "go");
+        let b = ui.button("a2", "A2");
+        ui.action(b, "go");
+        let row = ui.h_stack(&[a, b]).gap(4.0).build();
+        ui.present(row);
+        assert!(ui.was_triggered("go"));
+        assert!(ui.was_clicked("a2"));
+        assert!(!ui.was_clicked("a1"));
+    }
+
+    #[test]
+    fn ui_action_on_non_button_is_a_noop() {
+        // Defensive: calling `action` on a Text or Rect id shouldn't
+        // panic or mislabel anything. Subsequent was_triggered queries
+        // must stay false.
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let txt = ui.text("hello").size(10.0).build();
+        ui.action(txt, "ignored");
+        ui.action(9999, "stale"); // out-of-range id
+        ui.present(txt);
+        assert!(!ui.was_triggered("ignored"));
+        assert!(!ui.was_triggered("stale"));
     }
 
     #[test]
