@@ -157,6 +157,13 @@ impl Activity for WasmActivity {
     fn render(&mut self, ctx: &mut ActivityContext<'_>, out: &mut FrameCommands) {
         self.host.render(self.handle, ctx.timestamp_ms, out);
     }
+
+    fn save_state_bytes(&self) -> Vec<u8> {
+        self.host.save_state(self.handle)
+    }
+    fn restore_state_bytes(&mut self, bytes: &[u8]) {
+        self.host.restore_state(self.handle, bytes);
+    }
 }
 
 // ── Paint-op wire codec ──────────────────────────────────────────────────
@@ -337,6 +344,8 @@ mod tests {
         Key(u32, u32, f64),
         Resize(u32, u32, u32),
         Render(u32, f64),
+        SaveState(u32),
+        RestoreState(u32, Vec<u8>),
     }
 
     /// Mock that records every call and lets tests pre-seed encoded paint
@@ -345,6 +354,7 @@ mod tests {
         calls: RefCell<Vec<Call>>,
         next_handle: RefCell<u32>,
         paint_bytes: RefCell<Vec<u8>>,
+        save_bytes: RefCell<Vec<u8>>,
     }
 
     impl MockHost {
@@ -353,10 +363,12 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 next_handle: RefCell::new(1),
                 paint_bytes: RefCell::new(Vec::new()),
+                save_bytes: RefCell::new(Vec::new()),
             }
         }
         fn take_calls(&self) -> Vec<Call> { core::mem::take(&mut *self.calls.borrow_mut()) }
         fn set_paint_bytes(&self, bytes: Vec<u8>) { *self.paint_bytes.borrow_mut() = bytes; }
+        fn set_save_bytes(&self, bytes: Vec<u8>) { *self.save_bytes.borrow_mut() = bytes; }
     }
 
     impl WasmHost for MockHost {
@@ -385,6 +397,13 @@ mod tests {
             self.calls.borrow_mut().push(Call::Render(handle.get(), ts));
             let bytes = self.paint_bytes.borrow();
             decode_frame(&bytes, out).expect("mock paint bytes decoded");
+        }
+        fn save_state(&self, handle: AppHandle) -> Vec<u8> {
+            self.calls.borrow_mut().push(Call::SaveState(handle.get()));
+            self.save_bytes.borrow().clone()
+        }
+        fn restore_state(&self, handle: AppHandle, bytes: &[u8]) {
+            self.calls.borrow_mut().push(Call::RestoreState(handle.get(), bytes.to_vec()));
         }
     }
 
@@ -528,5 +547,30 @@ mod tests {
     #[test]
     fn app_handle_is_niche_packed() {
         assert_eq!(core::mem::size_of::<Option<AppHandle>>(), core::mem::size_of::<u32>());
+    }
+
+    #[test]
+    fn save_state_bytes_delegates_to_host() {
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        host.take_calls();
+        host.set_save_bytes(vec![1, 2, 3, 4]);
+        let act = WasmActivity::new(handle, host.clone());
+        let bytes = act.save_state_bytes();
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+        assert_eq!(host.take_calls(), vec![Call::SaveState(handle.get())]);
+    }
+
+    #[test]
+    fn restore_state_bytes_forwards_slice_to_host() {
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        host.take_calls();
+        let mut act = WasmActivity::new(handle, host.clone());
+        act.restore_state_bytes(&[9, 8, 7]);
+        assert_eq!(
+            host.take_calls(),
+            vec![Call::RestoreState(handle.get(), vec![9, 8, 7])],
+        );
     }
 }

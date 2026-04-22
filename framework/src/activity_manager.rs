@@ -219,6 +219,19 @@ impl ActivityManager {
         }
     }
 
+    /// Single-step advance. Exposed so the framework can pause the state
+    /// machine partway through bring-up — e.g. to inject a saved-state
+    /// restore between `Created` and `Started`. Returns `Some(prev)` if
+    /// the edge fired, `None` if the transition wasn't legal.
+    pub fn advance(
+        &mut self,
+        id: ActivityId,
+        target: LifecycleState,
+        mut cb: impl FnMut(&mut dyn Activity, LifecycleState),
+    ) -> Option<LifecycleState> {
+        self.advance_to(id, target, &mut cb)
+    }
+
     /// Drive an activity down to `Paused` only. Used when a new activity
     /// is foregrounded on top of this one — the underlying activity must
     /// pause (so it stops receiving input) but must *not* be destroyed.

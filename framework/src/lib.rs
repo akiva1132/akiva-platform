@@ -81,7 +81,7 @@ pub struct BootReport {
 /// touches app memory directly.
 pub fn boot(
     boot_count: u32,
-    storage: &mut dyn Storage,
+    mut storage: Box<dyn Storage>,
     host: Rc<dyn WasmHost>,
 ) -> (Framework, BootReport) {
     let mut fw = Framework {
@@ -95,12 +95,13 @@ pub fn boot(
         metrics: SurfaceMetrics::default(),
         pointer: None,
         stack: Vec::new(),
+        storage: None,  // populated at the end once we finish using `storage` locally
     };
 
     // Rehydrate installed packages from storage. A corrupt manifest is
     // reported but not fatal — the Shell and healthy apps stay usable.
     let mut package_errors: Vec<(String, String)> = Vec::new();
-    let packages_loaded = fw.packages.load_installed(storage, |id, e: LoadError| {
+    let packages_loaded = fw.packages.load_installed(storage.as_mut(), |id, e: LoadError| {
         package_errors.push((id.to_string(), format!("{e:?}")));
     });
 
@@ -109,7 +110,7 @@ pub fn boot(
     // separately — a broken values file doesn't stop a package from
     // running, it just means its @ref lookups fall back to placeholders.
     let mut resource_errors: Vec<(String, String)> = Vec::new();
-    let tables = fw.packages.read_resource_tables(storage, |id, e| {
+    let tables = fw.packages.read_resource_tables(storage.as_mut(), |id, e| {
         resource_errors.push((id.to_string(), e.to_string()));
     });
     for (id, table) in tables {
@@ -204,7 +205,15 @@ pub fn boot(
         .launch(&shell_pkg, &shell_class)
         .expect("shell launch");
     fw.stack.push(shell_id);
+    // Shell has no saved state to restore — it's built-in and stateless
+    // from the framework's perspective (boot counter + package list are
+    // always recomputed from scratch).
     fw.drive_to_resumed(shell_id, 0.0);
+
+    // Stash the storage handle for post-boot writes (saved-state
+    // persistence on Stop / rehydration on Create). We're done using it
+    // locally above — the `Box` can now live on the framework.
+    fw.storage = Some(storage);
 
     (fw, report)
 }
@@ -227,6 +236,12 @@ pub struct Framework {
     /// render calls. Activities below the top are `Paused` (not stopped,
     /// not destroyed), so popping back to them is free.
     stack: Vec<ActivityId>,
+    /// Persistent backing store the framework uses post-boot (saved-state
+    /// persistence, future activity-manager checkpoints). Wrapped in an
+    /// `Option` only because boot fills it in after the borrow it needs
+    /// for package rehydration is released; it's always `Some` by the
+    /// time any dispatch method runs.
+    storage: Option<Box<dyn Storage>>,
 }
 
 impl Framework {
@@ -342,6 +357,39 @@ impl Framework {
     }
 
     fn drive_to_resumed(&mut self, id: ActivityId, ts: f64) {
+        // Preserved end-to-end path: Create → Start → Resumed in one
+        // shot. Callers that need to inject restore_state_bytes between
+        // Create and Start use `advance_through_create` +
+        // `drive_start_to_resumed` instead; this short-hand stays for
+        // bring-up sites that have nothing to restore (the Shell).
+        self.advance_through_create(id, ts);
+        self.drive_start_to_resumed(id, ts);
+    }
+
+    /// Fire `on_create` only. Split from the full resume driver so a
+    /// restore hook can land between Created and Started (see
+    /// `launch_app`). Idempotent: calling on an already-past-Created
+    /// activity is a no-op.
+    fn advance_through_create(&mut self, id: ActivityId, ts: f64) {
+        let metrics = self.metrics;
+        let pointer = self.pointer;
+        self.activities.advance(id, LifecycleState::Created, |a, new_state| {
+            let mut finish = false;
+            let mut launch: Option<Intent> = None;
+            let mut ctx = ActivityContext {
+                metrics, timestamp_ms: ts, pointer,
+                finish_requested: &mut finish,
+                launch_requested: &mut launch,
+            };
+            if matches!(new_state, LifecycleState::Created) {
+                a.on_create(&mut ctx);
+            }
+        });
+    }
+
+    /// Continue bring-up from Created (or Paused, for the resume-after-
+    /// pause case) up to Resumed.
+    fn drive_start_to_resumed(&mut self, id: ActivityId, ts: f64) {
         let metrics = self.metrics;
         let pointer = self.pointer;
         self.activities.resume(id, |a, new_state| {
@@ -353,13 +401,14 @@ impl Framework {
                 launch_requested: &mut launch,
             };
             match new_state {
-                LifecycleState::Created => a.on_create(&mut ctx),
+                // Created was fired (or was already past) by
+                // `advance_through_create`; silently skip so we don't
+                // double-fire.
+                LifecycleState::Created => {}
                 LifecycleState::Started => a.on_start(&mut ctx),
                 LifecycleState::Resumed => a.on_resume(&mut ctx),
                 _ => {}
             }
-            // `finish`/`launch` during bring-up are ignored — an activity
-            // that wants to redirect has to wait until it's fully alive.
         });
     }
 
@@ -397,7 +446,14 @@ impl Framework {
             self.drive_to_paused(prev, ts);
         }
         self.stack.push(new_id);
-        self.drive_to_resumed(new_id, ts);
+        // Drive Create first so the activity exists, then hand it any
+        // saved-state blob we persisted on a previous run. Only after
+        // that do we let it proceed to Start → Resumed. This matches the
+        // "on_create then on_restore_state" ordering in
+        // docs/activity-model.md §3.
+        self.advance_through_create(new_id, ts);
+        self.try_restore_state(new_id, package_id, class);
+        self.drive_start_to_resumed(new_id, ts);
     }
 
     /// Finish the top of the stack and resume whatever it was covering.
@@ -406,8 +462,24 @@ impl Framework {
     fn finish_top(&mut self, ts: f64) {
         if self.stack.len() <= 1 { return; }
         let id = self.stack.pop().expect("checked len > 1");
+
+        // Capture the save-state blob on the Pause→Stopped edge. The
+        // activity has already seen `on_pause` by this point (driven
+        // below), so its internal state is whatever it wants persisted.
+        // We pull the bytes out *before* Stop fires because Android's
+        // contract — mirrored in docs/activity-model.md §3 — is that
+        // on_save_state precedes on_stop, and the app is allowed to
+        // assume its state is frozen by the time it sees on_stop.
+        //
+        // Collect (package_id, class) first so the later storage.write
+        // call doesn't need to reach through the (still-borrowed)
+        // activity manager.
+        let meta = self.activities.record(id)
+            .map(|r| (r.package_id.clone(), r.class.clone()));
+
         let metrics = self.metrics;
         let pointer = self.pointer;
+        let mut save_bytes: Option<Vec<u8>> = None;
         self.activities.destroy(id, |a, new_state| {
             let mut finish = false;
             let mut launch: Option<Intent> = None;
@@ -418,14 +490,52 @@ impl Framework {
             };
             match new_state {
                 LifecycleState::Paused => a.on_pause(&mut ctx),
-                LifecycleState::Stopped => a.on_stop(&mut ctx),
+                LifecycleState::Stopped => {
+                    // Pull the blob first, then deliver the Stop edge.
+                    save_bytes = Some(a.save_state_bytes());
+                    a.on_stop(&mut ctx);
+                }
                 LifecycleState::Destroyed => a.on_destroy(&mut ctx),
                 _ => {}
             }
         });
+        if let (Some((pkg, class)), Some(bytes)) = (meta, save_bytes) {
+            self.persist_saved_state(&pkg, &class, &bytes);
+        }
         if let Some(new_top) = self.stack.last().copied() {
             self.drive_to_resumed(new_top, ts);
         }
+    }
+
+    /// Write a saved-state blob to persistent storage, or delete any
+    /// existing blob if the activity produced zero bytes (common path
+    /// for activities that don't override save_state). Failures log
+    /// nothing (no framework log binding) but also don't propagate —
+    /// missing saved state is survivable, a crashed storage write is
+    /// not.
+    fn persist_saved_state(&mut self, package_id: &str, class: &str, bytes: &[u8]) {
+        let Some(storage) = self.storage.as_deref_mut() else { return; };
+        let key = package_manager::key_saved_state(package_id, class);
+        let _ = if bytes.is_empty() {
+            storage.delete(&key)
+        } else {
+            storage.write(&key, bytes)
+        };
+    }
+
+    /// Load a saved-state blob from storage and hand it to the activity
+    /// if present. Run between Create and Start on each fresh launch, so
+    /// the app sees restored state before it's asked to do anything else.
+    fn try_restore_state(&mut self, id: ActivityId, package_id: &str, class: &str) {
+        let Some(storage) = self.storage.as_deref_mut() else { return; };
+        let key = package_manager::key_saved_state(package_id, class);
+        let bytes = match storage.read(&key) {
+            Ok(b) if !b.is_empty() => b,
+            // NotFound / empty is the common case — no prior state. Any
+            // other error is treated the same way: the app boots fresh.
+            _ => return,
+        };
+        self.activities.with_instance(id, |a| a.restore_state_bytes(&bytes));
     }
 }
 

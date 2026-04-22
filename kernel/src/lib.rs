@@ -143,10 +143,10 @@ pub extern "C" fn akiva_boot() {
     k.display.init();
 
     let boot_count = bump_boot_counter();
-    let mut kstore = KernelStorage;
+    let kstore: Box<dyn akiva_framework::storage::Storage> = Box::new(KernelStorage);
     let host: std::rc::Rc<dyn akiva_framework::wasm_activity::WasmHost> =
         std::rc::Rc::new(KernelWasmHost);
-    let (mut fw, report) = framework::boot(boot_count, &mut kstore, host);
+    let (mut fw, report) = framework::boot(boot_count, kstore, host);
     log::info(&format!("packages: {} loaded", report.packages_loaded));
     for (id, err) in &report.package_errors {
         log::warn(&format!("package '{id}' failed to load: {err}"));

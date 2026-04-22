@@ -104,4 +104,19 @@ pub trait Activity: 'static {
     /// Produce paint commands for the current frame. Called only while the
     /// activity is in `Resumed` state.
     fn render(&mut self, ctx: &mut ActivityContext<'_>, out: &mut FrameCommands);
+
+    /// Hand back an opaque blob the framework will persist before the
+    /// activity is stopped. The wire format lives in the SDK — the
+    /// framework treats the bytes as opaque and never inspects them.
+    ///
+    /// Default returns empty, which the framework reads as "nothing to
+    /// save" and skips the storage write. That keeps in-kernel activities
+    /// (Shell, system settings) ignorant of the mechanism while
+    /// `WasmActivity` opts in by delegating to its wasm host.
+    fn save_state_bytes(&self) -> Vec<u8> { Vec::new() }
+
+    /// Restore previously-persisted bytes. Called after `on_create` and
+    /// before `on_start` if the framework found bytes in storage keyed to
+    /// this activity's `(package_id, class)`. Default is a no-op.
+    fn restore_state_bytes(&mut self, bytes: &[u8]) { let _ = bytes; }
 }

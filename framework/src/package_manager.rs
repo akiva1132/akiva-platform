@@ -109,6 +109,13 @@ fn key_wasm(id: &str) -> String { format!("packages/{id}/app.wasm") }
 fn key_values_strings(id: &str) -> String { format!("packages/{id}/res/values/strings.toml") }
 fn key_values_colors(id: &str) -> String { format!("packages/{id}/res/values/colors.toml") }
 
+/// Storage key for an activity's persisted saved-state blob. Scoped to
+/// `(package, class)` so two activity classes in the same app keep their
+/// state independent, matching Android's onSaveInstanceState model.
+pub fn key_saved_state(package_id: &str, class: &str) -> String {
+    format!("packages/{package_id}/activities/{class}/saved_state.bin")
+}
+
 pub struct PackageManager {
     packages: HashMap<String, PackageRecord>,
 }
@@ -562,5 +569,19 @@ entry = true
             store.read("packages/com.akiva.hello/res/values/strings.toml"),
             Err(StorageError::NotFound),
         ));
+    }
+
+    #[test]
+    fn saved_state_key_scopes_by_package_and_class() {
+        assert_eq!(
+            key_saved_state("com.akiva.calc", "CalcMain"),
+            "packages/com.akiva.calc/activities/CalcMain/saved_state.bin",
+        );
+        // Two classes in the same package stay distinct — matches
+        // Android's per-activity saved-instance contract.
+        assert_ne!(
+            key_saved_state("com.akiva.app", "Main"),
+            key_saved_state("com.akiva.app", "Settings"),
+        );
     }
 }
