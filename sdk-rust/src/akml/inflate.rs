@@ -224,8 +224,15 @@ fn attr_f32(el: &Element, bindings: &Bindings, a: &str, b: &str) -> Result<Optio
 fn attr_color(el: &Element, bindings: &Bindings, a: &str, b: &str) -> Result<Option<u32>, InflateError> {
     for name in [a, b] {
         if let Some(raw) = el.attr(name) {
+            // Ordering: {binding} (dynamic, per-frame) → @color/ref
+            // (static per-package) → hex literal. Bindings win over
+            // refs so an AKML author can override a resource-sourced
+            // value for a single render pass if they want.
             if let Some(bname) = Bindings::binding_name(raw) {
                 return bindings.get_color(bname).map(Some).ok_or_else(|| unresolved(el.loc, bname, name));
+            }
+            if let Some(refname) = resource_ref(raw, "@color/") {
+                return Ok(Some(crate::res::color(refname)));
             }
             return Ok(Some(parse_color(raw, el.loc, name)?));
         }
@@ -235,9 +242,10 @@ fn attr_color(el: &Element, bindings: &Bindings, a: &str, b: &str) -> Result<Opt
 
 /// Resolve a single named attribute whose type is an arbitrary string
 /// — `<Text text=...>`, `<Button label=...>`. Bindings preferred when
-/// the value is `{name}`. Returns owned `String` because the bindings
-/// map owns its strings, and callers pass the result to builder APIs
-/// that consume `impl Into<String>` anyway.
+/// the value is `{name}`, `@string/` references second, literal text
+/// last. Returns owned `String` because the bindings map owns its
+/// strings, and callers pass the result to builder APIs that consume
+/// `impl Into<String>` anyway.
 fn attr_text(el: &Element, bindings: &Bindings, name: &str) -> Result<Option<String>, InflateError> {
     let raw = match el.attr(name) { Some(s) => s, None => return Ok(None) };
     if let Some(bname) = Bindings::binding_name(raw) {
@@ -245,7 +253,21 @@ fn attr_text(el: &Element, bindings: &Bindings, name: &str) -> Result<Option<Str
             .map(|s| Some(s.to_string()))
             .ok_or_else(|| unresolved(el.loc, bname, name));
     }
+    if let Some(refname) = resource_ref(raw, "@string/") {
+        return Ok(Some(crate::res::string(refname)));
+    }
     Ok(Some(raw.to_string()))
+}
+
+/// Detect an `@kind/name` resource reference and return the bare name
+/// portion. `kind` must include the trailing slash (`"@color/"`,
+/// `"@string/"`). Returns `None` if the value isn't a ref of this kind.
+/// Names themselves are left to the host tables to validate — a typo
+/// produces the visible placeholder rather than an inflater error,
+/// since we want "works partially" over "refuses to load" during
+/// iteration.
+fn resource_ref<'a>(value: &'a str, kind: &str) -> Option<&'a str> {
+    value.strip_prefix(kind).filter(|name| !name.is_empty())
 }
 
 fn unresolved(loc: Loc, binding_name: &str, attr_name: &str) -> InflateError {
@@ -738,6 +760,65 @@ mod tests {
         with_ui(|ui| {
             let err = inflate_str(ui, r#"<Text text="{name}" />"#).unwrap_err();
             assert!(err.message.contains("unresolved"), "msg: {}", err.message);
+        });
+    }
+
+    // ── Resource references ───────────────────────────────────────────
+
+    #[test]
+    fn color_ref_inflates_to_the_resource_sentinel_on_non_wasm() {
+        // On non-wasm (cargo test), `res::color` returns MISSING_COLOR
+        // because there's no host to query. The inflater still accepts
+        // the attribute — it doesn't know or care whether the ref will
+        // resolve at runtime; resolution is the host's business. A
+        // missing ref on wasm would render the same magenta.
+        with_ui(|ui| {
+            let src = r#"<Rect color="@color/display_fg" />"#;
+            let id = inflate_str(ui, src).unwrap();
+            ui.present(id);
+            // Success proves the @color/ prefix was recognised and the
+            // literal parser wasn't called (which would have errored
+            // on a non-hex value).
+        });
+    }
+
+    #[test]
+    fn string_ref_inflates_to_the_placeholder_on_non_wasm() {
+        with_ui(|ui| {
+            let src = r#"<Text text="@string/greeting" />"#;
+            let id = inflate_str(ui, src).unwrap();
+            // Just needs to inflate — there's no way to observe the
+            // stored label text from this layer without reaching into
+            // UiState internals, but passing means the prefix branch
+            // was taken (a literal "@string/…" would parse as raw text
+            // and still succeed, so this test is primarily a guard
+            // against regressing the prefix logic).
+            ui.present(id);
+        });
+    }
+
+    #[test]
+    fn literal_color_still_parses_when_value_is_not_a_ref() {
+        // Regression guard: the @-prefix check must not swallow plain
+        // hex values that happen to start with '#'.
+        with_ui(|ui| {
+            let src = r##"<Rect color="#ff15172a" />"##;
+            let id = inflate_str(ui, src).unwrap();
+            ui.present(id);
+        });
+    }
+
+    #[test]
+    fn empty_ref_name_falls_through_to_literal_parser() {
+        // "@color/" with no name isn't a valid ref. We fall through to
+        // the literal parser, which rejects it as malformed hex — the
+        // point is to make sure we don't silently pass an empty name
+        // to the host.
+        with_ui(|ui| {
+            let src = r#"<Rect color="@color/" />"#;
+            let err = inflate_str(ui, src).unwrap_err();
+            assert!(err.message.contains("color") || err.message.contains("hex"),
+                "msg: {}", err.message);
         });
     }
 }

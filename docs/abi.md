@@ -100,6 +100,28 @@ extern "C" fn akiva_host_log(level: u32, ptr: *const u8, len: u32);
 // deterministic from `size` (line-height ratio), so the host only
 // returns width; the SDK computes height locally.
 extern "C" fn akiva_host_text_width(ptr: *const u8, len: u32, size: f32) -> f32;
+
+// Resolve @color/name for the calling package. Returns 0xAARRGGBB.
+// Undefined names return 0xFFFF00FF (magenta) and log a host-side
+// warning — missing refs surface visually, not silently.
+extern "C" fn akiva_host_resource_color(name_ptr: *const u8, name_len: u32) -> u32;
+
+// Resolve @string/name for the calling package. Writes UTF-8 bytes into
+// [out_ptr, out_ptr + out_cap) and returns the *actual* length. If the
+// returned length exceeds out_cap, nothing was written — caller
+// reallocates to that size and calls again. Undefined names write
+// "⟨missing:NAME⟩" and return its length.
+extern "C" fn akiva_host_resource_string(
+    name_ptr: *const u8, name_len: u32,
+    out_ptr: *mut u8, out_cap: u32,
+) -> u32;
+
+// Probes: 1 if the ref is registered, 0 otherwise. Used by call sites
+// that need to distinguish "undefined" from "happens to equal the
+// placeholder". Optional for most apps — the AKML inflater doesn't
+// probe; it just renders the placeholder when a ref misses.
+extern "C" fn akiva_host_resource_has_color(name_ptr: *const u8, name_len: u32) -> u32;
+extern "C" fn akiva_host_resource_has_string(name_ptr: *const u8, name_len: u32) -> u32;
 ```
 
 כל app מקבל את ה-set הבסיסי הזה אוטומטית ללא הצהרה. הרחבות נוספות (finish, start_activity, storage read/write, intent dispatch) תיכנסנה כשאפליקציות אמיתיות יצטרכו אותן, ובכפוף למבחני §1.2 — כל הרחבה דורשת use case מוכח ו-mapping ל-WIT interface ב-§5.

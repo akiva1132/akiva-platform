@@ -32,8 +32,18 @@ export class AppRegistry {
     this._slots = new Map();
     /** @type {Map<string, {module: WebAssembly.Module, instance: WebAssembly.Instance, memory: WebAssembly.Memory}>} */
     this._processes = new Map();
+    /**
+     * Per-package `@string/` and `@color/` resource tables. Populated
+     * when a package's wasm is instantiated and served from the
+     * `akiva_host_resource_*` imports without a round-trip through the
+     * kernel. The framework parses the same TOML on its side
+     * independently, so both caches stay in lock-step with OPFS.
+     * @type {Map<string, {strings: Map<string, string>, colors: Map<string, number>}>}
+     */
+    this._resources = new Map();
     this._nextHandle = 1;
     this._decoder = new TextDecoder("utf-8");
+    this._encoder = new TextEncoder();
 
     // Dedicated 1×1 context used only for `measureText`. Sharing the
     // renderer's main context would work but ties measurement to display
@@ -217,7 +227,40 @@ export class AppRegistry {
     proc.module = module;
     proc.instance = instance;
     proc.memory = exports.memory;
+
+    // Load this package's value tables once, before any host import
+    // can fire. If either file is absent the corresponding map is
+    // empty; parse failures are logged but don't block instantiation
+    // — a broken colors.toml just means `@color/` refs return magenta.
+    this._loadResources(packageId);
+
     return proc;
+  }
+
+  _loadResources(packageId) {
+    const strings = new Map();
+    const colors = new Map();
+    const tryParse = (leaf, parseFn, target) => {
+      const key = `packages/${packageId}/res/values/${leaf}.toml`;
+      const bytes = this._storage.get(key);
+      if (!bytes) return;
+      let text;
+      try {
+        text = this._decoder.decode(bytes);
+      } catch (err) {
+        this._log("warn", `[${packageId}] ${leaf}.toml: not valid UTF-8`);
+        return;
+      }
+      try {
+        parseFn(text, target, (key, reason) =>
+          this._log("warn", `[${packageId}] ${leaf}.toml: '${key}' ${reason}`));
+      } catch (err) {
+        this._log("warn", `[${packageId}] ${leaf}.toml: ${err?.message ?? err}`);
+      }
+    };
+    tryParse("strings", parseStringsToml, strings);
+    tryParse("colors", parseColorsToml, colors);
+    this._resources.set(packageId, { strings, colors });
   }
 
   _buildAppImports(packageId) {
@@ -225,6 +268,11 @@ export class AppRegistry {
     // automatically. Memory is resolved lazily because it isn't bound
     // until after `new WebAssembly.Instance` returns.
     const self = this;
+    const readName = (ptr, len) => {
+      const proc = self._processes.get(packageId);
+      if (len === 0 || !proc?.memory) return null;
+      return self._decoder.decode(new Uint8Array(proc.memory.buffer, ptr, len));
+    };
     return {
       env: {
         akiva_host_log: (level, ptr, len) => {
@@ -241,6 +289,46 @@ export class AppRegistry {
           if (!proc?.memory) return 0;
           const text = self._decoder.decode(new Uint8Array(proc.memory.buffer, ptr, len));
           return self.measureTextWidth(text, size);
+        },
+        akiva_host_resource_color: (ptr, len) => {
+          const name = readName(ptr, len);
+          if (name === null) return MISSING_COLOR;
+          const table = self._resources.get(packageId);
+          const value = table?.colors.get(name);
+          if (value === undefined) {
+            self._log("warn", `[${packageId}] @color/${name}: undefined (using magenta placeholder)`);
+            return MISSING_COLOR;
+          }
+          return value >>> 0;  // force unsigned so WASI u32 round-trip is clean
+        },
+        akiva_host_resource_string: (ptr, len, outPtr, outCap) => {
+          const proc = self._processes.get(packageId);
+          if (!proc?.memory) return 0;
+          const name = readName(ptr, len);
+          if (name === null) return 0;
+          const table = self._resources.get(packageId);
+          let value = table?.strings.get(name);
+          if (value === undefined) {
+            self._log("warn", `[${packageId}] @string/${name}: undefined (using placeholder)`);
+            value = `⟨missing:${name}⟩`;
+          }
+          const bytes = self._encoder.encode(value);
+          // Contract: if the caller's buffer is too small, write
+          // nothing and return the required length so they can
+          // realloc and try again. The SDK wrapper handles this.
+          if (bytes.length > outCap) return bytes.length;
+          new Uint8Array(proc.memory.buffer, outPtr, bytes.length).set(bytes);
+          return bytes.length;
+        },
+        akiva_host_resource_has_color: (ptr, len) => {
+          const name = readName(ptr, len);
+          if (name === null) return 0;
+          return self._resources.get(packageId)?.colors.has(name) ? 1 : 0;
+        },
+        akiva_host_resource_has_string: (ptr, len) => {
+          const name = readName(ptr, len);
+          if (name === null) return 0;
+          return self._resources.get(packageId)?.strings.has(name) ? 1 : 0;
         },
       },
     };
@@ -305,3 +393,75 @@ const REQUIRED_EXPORTS = [
   "akiva_app_resize",
   "akiva_app_render",
 ];
+
+// Loud-and-obvious placeholder when an `@color/` ref is undefined.
+// Mirrors `akiva_sdk::res::MISSING_COLOR`. Packed 0xAARRGGBB.
+const MISSING_COLOR = 0xFFFF00FF;
+
+// ── Tiny TOML parsers for values files ──────────────────────────────────
+//
+// The values files are deliberately trivial — flat `key = "value"` pairs,
+// `#` comments, nothing else. A real TOML parser on the worker side would
+// pull in ~10 KB of JS for a grammar we never exercise. The framework
+// (Rust side) uses the full `toml` crate, which catches anything our
+// hand rolled parser misses and reports via `BootReport.resource_errors`.
+
+/** Iterate non-comment, non-blank lines. Strips leading/trailing
+ * whitespace so callers only see meaningful content. */
+function* valuesLines(src) {
+  for (let raw of src.split(/\r?\n/)) {
+    const hash = raw.indexOf("#");
+    if (hash >= 0) raw = raw.slice(0, hash);
+    raw = raw.trim();
+    if (raw.length > 0) yield raw;
+  }
+}
+
+/** Parse `key = "value"` lines into `target`. `onBad(key, reason)` runs
+ * for malformed rows instead of throwing — one bad line shouldn't mask
+ * the rest of the file. */
+function parseStringsToml(src, target, onBad) {
+  for (const line of valuesLines(src)) {
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/);
+    if (!m) { onBad(line, `doesn't match key = "value"`); continue; }
+    // Strings values only need to unescape the pair we emit ourselves;
+    // the framework-side full parser validates anything more exotic.
+    const value = m[2].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    target.set(m[1], value);
+  }
+}
+
+function parseColorsToml(src, target, onBad) {
+  for (const line of valuesLines(src)) {
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]+)"\s*$/);
+    if (!m) { onBad(line, `doesn't match key = "value"`); continue; }
+    const argb = parseColorLiteral(m[2]);
+    if (argb === null) {
+      onBad(m[1], `'${m[2]}' isn't a valid color`);
+      continue;
+    }
+    target.set(m[1], argb);
+  }
+}
+
+/** Parse `#RGB`, `#RRGGBB`, `#AARRGGBB`, or `0xAARRGGBB` to a 32-bit
+ * ARGB integer. Mirrors `framework::resources::parse_color_literal`. */
+function parseColorLiteral(s) {
+  const trimmed = s.trim();
+  let hex;
+  if (trimmed.startsWith("0x")) {
+    hex = trimmed.slice(2);
+  } else if (trimmed.startsWith("#")) {
+    hex = trimmed.slice(1);
+  } else {
+    return null;
+  }
+  if (!/^[0-9a-fA-F]+$/.test(hex)) return null;
+  if (hex.length === 3) {
+    const r = parseInt(hex[0], 16), g = parseInt(hex[1], 16), b = parseInt(hex[2], 16);
+    return (0xff << 24) | ((r * 0x11) << 16) | ((g * 0x11) << 8) | (b * 0x11);
+  }
+  if (hex.length === 6) return (0xff000000 | parseInt(hex, 16)) >>> 0;
+  if (hex.length === 8) return parseInt(hex, 16) >>> 0;
+  return null;
+}

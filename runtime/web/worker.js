@@ -155,6 +155,20 @@ async function installOneDevApp(name, log) {
   storage.set(`packages/${packageId}/manifest.toml`, enc.encode(manifestText));
   storage.set(`packages/${packageId}/app.wasm`, wasmBytes);
 
+  // Resource values files are optional. If the dev-apps stage dir has
+  // them, copy into OPFS alongside the manifest so the framework's
+  // ResourceManager picks them up at boot. Either file may be absent;
+  // the 404 path is a quiet no-op.
+  for (const leaf of ["strings", "colors"]) {
+    const resp = await fetch(`./dev-apps/${name}/res/values/${leaf}.toml`);
+    if (resp.ok) {
+      const text = await resp.text();
+      storage.set(`packages/${packageId}/res/values/${leaf}.toml`, enc.encode(text));
+    } else if (resp.status !== 404) {
+      log("warn", `dev-apps/${name}/res/values/${leaf}.toml: ${resp.status}`);
+    }
+  }
+
   const existing = storage.get("sys/packages/index");
   const ids = existing
     ? dec.decode(existing).split("\n").filter((s) => s.length > 0)

@@ -34,4 +34,20 @@ fi
 mkdir -p "$DEST_DIR"
 cp "$WASM_PATH" "$DEST_DIR/app.wasm"
 cp "$APP_DIR/manifest.toml" "$DEST_DIR/manifest.toml"
+
+# Stage res/values/ if the app ships it. Each file is refreshed
+# individually so deleting `res/values/strings.toml` in the source tree
+# also drops it from the stage dir on the next build — no stale
+# resource fallbacks.
+if [[ -d "$APP_DIR/res/values" ]]; then
+  mkdir -p "$DEST_DIR/res/values"
+  rm -f "$DEST_DIR/res/values/strings.toml" "$DEST_DIR/res/values/colors.toml"
+  for leaf in strings colors; do
+    src="$APP_DIR/res/values/$leaf.toml"
+    if [[ -f "$src" ]]; then
+      cp "$src" "$DEST_DIR/res/values/$leaf.toml"
+    fi
+  done
+fi
+
 echo "[calculator] staged $DEST_DIR/app.wasm ($(wc -c < "$DEST_DIR/app.wasm") bytes)"
