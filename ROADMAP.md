@@ -1,5 +1,7 @@
 # תוכנית פיתוח — Akiva Platform
 
+> **Deferred concerns:** דאגות ארכיטקטוניות שאינן stones בפועל אבל חיוניות לתעד — sandboxing/crash-recovery, ABI v0→v1, web interop, text/input — נמצאות ב-[`docs/risks.md`](docs/risks.md). אם אחת מהן מקבלת trigger, היא עוברת ל-ROADMAP ונמחקת משם.
+
 ## פילוסופיה
 
 **שלד רזה, אבל שלד אמיתי.** כל תת-מערכת של OS חייבת להתקיים. אף אחת מהן לא יכולה להיות mock או simulation. מותר להן להיות מצומצמות — חובה שיהיו ממשיות.
@@ -478,19 +480,22 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
   - **SingleTask:** אם instance כבר קיים ב-task (לאו דווקא top) — pop כל מה שמעליו → resume אותו. אם לא ב-task — יוצר instance חדש.
   - **SingleInstance:** יש task נפרד משלו; `launch` לפני שהוא קיים יוצר task חדש, בתחום אחר activities; פעולות נוספות באותו package פותחות ב-task הקודם שלהן.
 - Unit tests לכל תרחיש ב-[`activity-model.md §4`](docs/activity-model.md)
+- **הערה (אחרי 9.4):** ה-`on_new_intent` delivery path (`Framework::deliver_new_intent`) כבר מוכן וחותך ב-`launch_app` ברגע שה-reuse branch מזהה `new_id == top`. כש-9.2 ננחת, ה-semantics של "SingleTask reuse" צריכה רק להחזיר את ה-id הקיים מ-`ActivityManager::launch` ו-`launch_app` יפעיל את on_new_intent אוטומטית. עבור SingleTask שמוצא instance עמוק ב-stack (לא top), צריך גם להרים אותו מעל — שם תוספת קטנה של pop-above-then-reuse תידרש.
 
 ### 9.3 Back stack + `Context::finish()`
 - ✅ **SDK `Context::finish()` plumbing** — `akiva_host_finish(handle)` import → worker per-handle flag table → kernel drains via `hal_app_drain_finish` → `WasmActivity.drain_post` קובע `ActivityContext.finish_requested = true`. סוגר את ה-gap מ-[`research-activity-boundary.md`](docs/research-activity-boundary.md).
 - ✅ **Created→Destroyed shortcut** — `(Created, Destroyed)` ב-`legal_transition`; `advance_through_create` מחזיר אם finish הופעל; `launch_app` קורא ל-`destroy_shortcut` (on_destroy בלבד) ו-pop של ה-stack. parity עם Android — ראה [`research-android-lifecycle.md §1`](docs/research-android-lifecycle.md).
-- ⏭️ **Integration test (test-coverage.md §4)** — Rust-side end-to-end עם MockWasmHost שמדמה `akiva_host_finish`, בודק bring-up→finish→resume-prev. מושאר ל-Stone 9.3 follow-up או לאחר 9.4.
+- ✅ **Integration test (test-coverage.md §4)** — כוסה ב-Stone 9.4: `framework::tests::standard_launch_stacks_and_finish_unwinds` בודק Shell→App→(Esc back)→Shell end-to-end דרך `dispatch_pointer`+`dispatch_key`, מאמת את ה-lifecycle sequence המלא של ה-App (pause/stop/destroy) וחזרה ל-`Resumed` של ה-Shell.
 - ⏭️ **`Context::back()` + `akiva_host_back` import** — Shell policy / gesture mapping. כרגע ה-framework קוצר על Esc מ-key events; אין app שצריך להפעיל Back ישירות. נדחה עד שיש use case.
 - ⏭️ **Gesture engine** — v0.2: קיצור מקלדת fixed בלבד, אין gesture. נשמר כ-feature של Phase 11+.
 
 ### 9.4 `start_activity` מתוך app + `on_new_intent`
-- Import חדש `activity.start_activity(intent_blob: bytes)` (grant: `LAUNCH_ANY_APP` ל-Shell, או target-package-matches-self ל-self-launch)
-- IntentRouter מפסירס את ה-blob, פותר activity, מפעיל `ActivityManager::launch` עם stack נכון
-- SingleTop/SingleTask שמוצאים instance קיים מפעילים export חדש `akiva_app_new_intent(intent_blob)` — הוסף ל-ABI
-- unit test: A פותח B, B פותח C, back → back → back → Shell
+- ✅ **Intent wire codec** — `Intent::encode`/`decode` ב-framework ובמקבילה ב-SDK. Byte-for-byte symmetric, 16 KiB cap, `extras_count=0` reserved ל-Stone 9.5. פורמט נעול ב-[`docs/abi.md §2.5.1`](docs/abi.md).
+- ✅ **`akiva_host_start_activity` + `hal_app_drain_intent` plumbing** — SDK `Context::start_activity(&intent)` → worker per-handle `_pendingIntent` map → kernel `KernelWasmHost::drain_intent` (two-phase buffer, retries on ≤512-byte guess) → framework `WasmActivity::drain_post` מעביר ל-`ctx.launch_requested` → `apply_post` פותר דרך `IntentRouter` ומעביר ל-`launch_app`.
+- ✅ **`on_new_intent` על SingleTop reuse** — `Framework::launch_app` מעביר את ה-`Intent` המלא ל-reuse branch; `deliver_new_intent` קורא ל-`Activity::on_new_intent(ctx, &intent)`, `apply_post` רקורסיבי אם ה-handler עצמו ביקש עוד משהו. test: `singletop_reuse_fires_on_new_intent_instead_of_bring_up`.
+- ✅ **`akiva_app_new_intent` export + `hal_app_new_intent`** — נדרש ב-`REQUIRED_EXPORTS` ב-worker, מחובר דרך `akiva_app!` macro; framework `WasmHost::new_intent` (kernel impl + MockHost) משלים את הצד השני.
+- ✅ **Framework-level back-stack unwind test** — `standard_launch_stacks_and_finish_unwinds` מכסה Shell→App→(Esc)→Shell על pointers אמיתיים; פותר גם את ה-Integration test שמוזכר ב-9.3 (Rust-side עם Mock). החבורה של "A פותח B, B פותח C, back×3" נשארת בעיקר ה-path שבדוק ע"י שני ה-tests האלה — הרחבה ל-3 רמות היא שכפול של אותו code path.
+- ⏭️ **`on_new_intent` על SingleTask/SingleInstance reuse** — ה-`deliver_new_intent` path מוכן; מימוש ה-reuse עצמו ב-`ActivityManager::launch` עדיין ב-Stone 9.2.
 - **Doc cleanup (🗑️):** בסיום ה-stone למחוק `docs/v0.2-review.md`, `docs/research-android-lifecycle.md`, `docs/research-activity-boundary.md`. ל-fold כל תוכן שעדיין רלוונטי ל-`activity-model.md` / `abi.md`. לעדכן את 6 ה-cross-links שמפנים אליהם. `research-component-model.md` ו-`test-coverage.md` נשארים.
 
 ### 9.5 `start_activity_for_result` + `on_activity_result`

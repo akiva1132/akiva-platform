@@ -1,6 +1,6 @@
 # Intent System & Package Manager
 
-> **סטטוס מימוש (אפריל 2026):** IntentRouter wired, filter registry פעיל, resolve של explicit + implicit intents עובד. Phase 8 סגור — `.akv` archive + `akiva package`/`install`/`uninstall` פעילים, ה-worker מגלה dev-apps דרך dynamic endpoint `/dev-apps/index.json` (אין יותר hardcoded `DEV_APPS`). חסרים: `start_activity` מתוך app, `start_activity_for_result`, `on_new_intent`, chooser UI — כולם ב-**Phase 9 של v0.2**. PendingIntent + Broadcast receivers (§13-14) — v0.3+.
+> **סטטוס מימוש (אפריל 2026):** IntentRouter wired, filter registry פעיל, resolve של explicit + implicit intents עובד. Phase 8 סגור — `.akv` archive + `akiva package`/`install`/`uninstall` פעילים, ה-worker מגלה dev-apps דרך dynamic endpoint `/dev-apps/index.json` (אין יותר hardcoded `DEV_APPS`). **Stone 9.4 נסגר:** `ctx.start_activity(&intent)` מתוך wasm app + `on_new_intent` על SingleTop reuse — פעיל end-to-end (`akiva_host_start_activity` + `hal_app_drain_intent` + `akiva_app_new_intent`, עם wire codec ב-`Intent::encode`/`decode`). חסרים: `start_activity_for_result` (Stone 9.5), chooser UI, SingleTask/SingleInstance reuse path (Stone 9.2 — יקבל את ה-on_new_intent plumbing בחינם כשהוא ננחת). PendingIntent + Broadcast receivers (§13-14) — v0.3+.
 
 ## 1. מטרה
 
@@ -259,9 +259,11 @@ impl IntentRouter {
 | `Intent` struct + Explicit/Implicit targets | ✅ | [`framework/src/intent.rs`](../framework/src/intent.rs) |
 | Standard action/category constants | ✅ | `intent::action::*`, `intent::category::*` |
 | Intent filter registry + resolve (first-match) | ✅ | `IntentRouter` — `NoMatch` / `AmbiguousMatch` ב-error enum |
-| Data/mime matching (scheme/host/mime) | ⏳ Phase 9.4 | `IntentFilter.data_schemes`/`mime_types` קיימים כ-fields אבל `resolve` לא משתמש בהם |
-| `start_activity` מתוך wasm app (import חדש) | ❌ Phase 9.4 | היום רק ה-Shell framework-side קורא ל-`IntentRouter::resolve` |
-| `on_new_intent` על SingleTop/SingleTask reuse | ❌ Phase 9.4 | ראה [`research-android-lifecycle.md §3`](research-android-lifecycle.md) |
+| Intent wire codec (framework ⇄ sdk) | ✅ Stone 9.4 | `Intent::encode` / `Intent::decode` משני הצדדים — byte-for-byte symmetric, 16 KiB cap, `extras_count=0` reserved ל-9.5 |
+| `ctx.start_activity(&intent)` מתוך wasm app | ✅ Stone 9.4 | `akiva_host_start_activity` → worker `_pendingIntent` → kernel `hal_app_drain_intent` → framework `ctx.launch_requested` → `IntentRouter::resolve` |
+| `on_new_intent` על SingleTop reuse | ✅ Stone 9.4 | `Framework::launch_app` מזהה reuse (top id matches), קורא ל-`deliver_new_intent` במקום bring-up; SDK export `akiva_app_new_intent`; framework test `singletop_reuse_fires_on_new_intent_instead_of_bring_up` |
+| `on_new_intent` על SingleTask/SingleInstance reuse | ⏳ Stone 9.2 | ה-plumbing של on_new_intent מוכן; חסר מימוש reuse ב-`ActivityManager::launch` למודים האלה |
+| Data/mime matching (scheme/host/mime) | ⏳ Stone 9.5+ | `IntentFilter.data_schemes`/`mime_types` קיימים כ-fields אבל `resolve` לא משתמש בהם |
 | `start_activity_for_result` + `on_activity_result` | ❌ Phase 9.5 | |
 | Chooser UI (אם `resolve` מחזיר Ambiguous) | ❌ Phase 9.4 | היום AmbiguousMatch הוא error שמושתק ב-`apply_post` |
 | `PackageManager::install` / `uninstall` (archive-based) | ✅ Phase 8 | כולל same-version/downgrade rejection + major-version saved-state wipe |

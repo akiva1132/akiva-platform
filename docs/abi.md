@@ -134,7 +134,7 @@ extern "C" fn akiva_host_resource_has_string(name_ptr: *const u8, name_len: u32)
 
 כל app מקבל את ה-set הבסיסי הזה אוטומטית ללא הצהרה. הרחבות נוספות (finish, start_activity, storage read/write, intent dispatch) תיכנסנה כשאפליקציות אמיתיות יצטרכו אותן, ובכפוף למבחני §1.2 — כל הרחבה דורשת use case מוכח ו-mapping ל-WIT interface ב-§5.
 
-**Stone 9.3 — מיושם:**
+**Stone 9.3 + 9.4 — מיושם:**
 
 ```rust
 // אפליקציה מסיימת את עצמה (מקביל ל-Android Activity.finish()).
@@ -142,6 +142,14 @@ extern "C" fn akiva_host_resource_has_string(name_ptr: *const u8, name_len: u32)
 // משתמש בו היום. handle מזהה את ה-activity; קריאה מ-on_create תגרום
 // ל-Created→Destroyed shortcut (skip על Start/Resume/Pause/Stop).
 extern "C" fn akiva_host_finish(handle: u32);
+
+// Stone 9.4 — app-initiated start_activity. intent_ptr/len מצביעים
+// ל-blob ב-memory של ה-app שנוצר ע"י `Intent::encode` (ראה §2.6).
+// ה-host מעתיק מייד החוצה, ה-framework מוציא אותו דרך
+// `hal_app_drain_intent` בסוף ה-callback, ה-IntentRouter פותר.
+// קריאות מרובות באותו dispatch — האחרון מנצח (single slot, מתאים
+// ל-`ctx.launch_requested` הבודד בצד ה-framework).
+extern "C" fn akiva_host_start_activity(handle: u32, intent_ptr: *const u8, intent_len: u32);
 ```
 
 **מתוכננות ל-Phase 9+** (לא מיושמות עדיין):
@@ -153,10 +161,6 @@ extern "C" fn akiva_host_finish(handle: u32);
 // כבר קוצר על Esc מ-key events, אין קריאה מ-app שצריכה זאת.
 extern "C" fn akiva_host_back();
 
-// Stone 9.4 — פתיחת activity אחרת. intent_ptr/len מצביעים ל-blob ב-memory
-// של ה-app; ה-host decodes ל-`framework::Intent` ומפעיל IntentRouter.
-extern "C" fn akiva_host_start_activity(intent_ptr: *const u8, intent_len: u32);
-
 // Stone 9.5 — אותו דבר עם request code שה-framework יזכור וימסור חזרה
 // דרך akiva_app_activity_result.
 extern "C" fn akiva_host_start_activity_for_result(
@@ -165,12 +169,20 @@ extern "C" fn akiva_host_start_activity_for_result(
 extern "C" fn akiva_host_set_result(result_ptr: *const u8, result_len: u32);
 ```
 
-וההפך — exports חדשים בצד ה-app שה-host יקרא להם:
+Exports חדשים בצד ה-app שה-host קורא להם (מיושמים):
 
 ```rust
-// Stone 9.4 — SingleTop/SingleTask reuse fires this with the new intent.
+// Stone 9.4 — SingleTop (ו-Phase 9.2 SingleTask/SingleInstance) reuse
+// fires this with the fresh intent. handle מזהה את ה-activity הקיימת;
+// ptr/len — blob של `Intent::encode` שה-host מעתיק לתוך app memory לפני
+// הקריאה (symmetric עם `akiva_app_restore_state`). ה-activity נשארת
+// `Resumed` ולא עוברת דרך on_create/on_start/on_resume.
 extern "C" fn akiva_app_new_intent(handle: u32, ptr: *const u8, len: u32);
+```
 
+ועוד exports מתוכננים:
+
+```rust
 // Stone 9.5 — result hand-off ל-caller.
 extern "C" fn akiva_app_activity_result(
     handle: u32, request_code: u32, ptr: *const u8, len: u32,
@@ -208,6 +220,22 @@ fn hal_app_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32) -> u
 // end of every ctx-bearing callback; return 1 flips
 // `ActivityContext.finish_requested = true` in the active dispatch.
 fn hal_app_drain_finish(handle: u32) -> u32;
+
+// Stone 9.4 — read + clear the per-handle pending intent blob staged
+// via `akiva_host_start_activity`. Two-phase buffer: the return value
+// is the total encoded size; if it exceeds `out_cap` nothing is copied
+// and the blob stays armed so the kernel can retry with a larger
+// buffer (same shape as `hal_app_render` / `hal_app_save_state`).
+// Zero means "nothing pending" — distinct from "empty intent" (which
+// can't happen; the encoder's minimum is 17 bytes).
+fn hal_app_drain_intent(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
+
+// Deliver an already-resolved intent to a live activity handle (fires
+// the app's `akiva_app_new_intent` export). Symmetric with
+// `hal_app_restore_state`: host copies bytes into app memory via
+// `akiva_app_alloc`, calls the export, frees after return. Returns 0
+// on success; non-zero on handle miss / alloc failure / app trap.
+fn hal_app_new_intent(handle: u32, bytes_ptr: *const u8, bytes_len: u32) -> u32;
 ```
 
 ### 2.5 Paint-op wire format
@@ -225,6 +253,28 @@ fn hal_app_drain_finish(handle: u32) -> u32;
 | `0x06` | `PopTransform`  | —                                                             |
 
 הקודק המלא ב-[framework/src/wasm_activity.rs](../framework/src/wasm_activity.rs) — `encode_op` / `decode_frame`. תוספות (additive) יקבלו opcodes חדשים ב-continuation של הרצף; ה-decoder דוחה opcodes לא מוכרים כ-error (אי אפשר לדעת את אורך ה-payload כדי לדלג).
+
+### 2.5.1 Intent wire format (Stone 9.4)
+
+פורמט שטוח שה-SDK מ-encode עם `Intent::encode` וה-framework מ-decode עם `Intent::decode`. ה-blob נוסע ב-שני הכיוונים — app→kernel דרך `akiva_host_start_activity` + `hal_app_drain_intent`, ו-kernel→app דרך `hal_app_new_intent` + `akiva_app_new_intent`.
+
+```
+u32  action_len + <action_len> UTF-8 bytes
+u32  category_count
+  for each:  u32 len + <len> UTF-8 bytes
+u8   has_data_uri       (0/1) + if 1: u32 len + bytes
+u8   has_mime_type      (0/1) + if 1: u32 len + bytes
+u8   has_target_package (0/1) + if 1: u32 len + bytes
+u8   has_target_class   (0/1) + if 1: u32 len + bytes
+u32  extras_count       (v0.2: חייב להיות 0 — reserved ל-Stone 9.5)
+```
+
+- **Max size:** 16 KiB (`Intent::MAX_WIRE_BYTES`) — בודק בשני הצדדים; blob גדול יותר → `IntentDecodeError::TooLarge`.
+- **Min size:** 17 bytes (action של 0 bytes + 4 × flag=0 + extras_count=0). לכן `drain_intent` מחזיר `0` ⇒ "אין pending" באופן חד-משמעי — כל intent ממשי יהיה ≥ 17.
+- **Extensibility:** `extras_count=0` הוא checkpoint. Stone 9.5 יוסיף payload של (`u32 key_len` + bytes + `u8 tag` + payload לפי tag). reader של גרסה ישנה שיפגוש `extras_count > 0` ידחה עם `ExtrasNotSupported` במקום להתבלבל על ה-offsets.
+- **Identical encode on both sides:** `framework::intent::Intent::encode` ו-`sdk-rust::intent::Intent::encode` חייבים להישאר byte-for-byte symmetric — כמו ה-paint codec, כל שינוי הוא breaking event שעובר מבחני §1.2.
+
+הקודק המלא ב-[framework/src/intent.rs](../framework/src/intent.rs) ומקבילו ב-[sdk-rust/src/intent.rs](../sdk-rust/src/intent.rs).
 
 ### 2.6 שכבת הביניים ב-framework
 
