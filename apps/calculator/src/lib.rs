@@ -25,22 +25,20 @@
 
 use akiva_sdk::prelude::*;
 use akiva_sdk::akml::{self, Bindings};
+use akiva_sdk::res;
 
 /// The whole UI, declared in AKML. Embedded via `include_str!` so the
-/// layout ships *inside* the wasm binary — no resource loader, no I/O
-/// path. When Phase 4 adds `res/` with qualifiers, this constant will
-/// become a `ResourceManager::layout("main")` lookup, but the source
-/// file (`res/layout/main.akml`) keeps its current location.
+/// layout ships *inside* the wasm binary — no layout loader, no I/O
+/// path. When Phase 4 adds qualifier-aware layouts (`layout-land/`
+/// etc.), this constant becomes a lookup against the resource manager,
+/// but the source file (`res/layout/main.akml`) keeps its current
+/// location.
+///
+/// Colours used by the layout live in [`res/values/colors.toml`],
+/// referenced from AKML as `@color/name` and from this file as
+/// `res::color("name")`. Keeping every palette entry there means the
+/// two rendering paths (AKML-driven and imperative) can't drift.
 const LAYOUT: &str = include_str!("../res/layout/main.akml");
-
-// ── Palette ───────────────────────────────────────────────────────────
-
-const COL_BG:          u32 = 0xff15172a;
-const COL_DISPLAY_FG:  u32 = 0xfff8faff;
-const COL_ERROR_FG:    u32 = 0xffff7b7b;
-// Hint colour now lives in res/layout/main.akml as a literal — the
-// Rust code no longer references it since the widget tree comes from
-// AKML rather than being built imperatively.
 
 // ── Calculator logic ──────────────────────────────────────────────────
 
@@ -255,14 +253,24 @@ impl Activity for CalculatorMain {
     }
 
     fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
-        c.clear(COL_BG);
+        c.clear(res::color("bg_window"));
 
         // Dynamic values the layout's `{name}` references will consume.
         // Building a fresh Bindings per frame is intentional — it keeps
         // lifetimes local and the allocation cost is rounding error
         // next to paint-op serialization.
+        //
+        // The display colour is data-driven (flips on error), so it
+        // goes through the per-frame bindings layer rather than an
+        // `@color/` ref. `display_fg` / `display_fg_error` still live
+        // in colors.toml as the source of truth; we just pick between
+        // them here.
         let hint = self.calc.pending_op().map(Op::glyph).unwrap_or(" ");
-        let display_color = if self.calc.is_error() { COL_ERROR_FG } else { COL_DISPLAY_FG };
+        let display_color = if self.calc.is_error() {
+            res::color("display_fg_error")
+        } else {
+            res::color("display_fg")
+        };
         let bindings = Bindings::new()
             .text("hint", hint)
             .text("display", self.calc.display())

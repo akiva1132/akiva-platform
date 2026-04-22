@@ -24,9 +24,9 @@
         itself follows the HStack's intrinsic height + padding).
     -->
     <Frame>
-        <Rect color="#ff2d3460" />
+        <Rect color="@color/display_panel_bg" />
         <HStack gap="12" main="end" cross="center" padding="12 16">
-            <Text text="{hint}"    size="22" color="#ff7a8398" />
+            <Text text="{hint}"    size="22" color="@color/hint_fg" />
             <Text text="{display}" size="48" color="{display_color}" />
         </HStack>
     </Frame>

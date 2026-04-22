@@ -1,0 +1,19 @@
+# Calculator palette.
+#
+# Consumed by res/layout/main.akml via `@color/name` refs and by
+# src/lib.rs via `akiva_sdk::res::color("name")`. The framework parses
+# this file at boot; the worker.js runtime parses the same bytes for
+# the host-import side. Both stay in lock-step because they derive
+# from one OPFS file.
+
+# Window background — everything renders against this.
+bg_window         = "#ff15172a"
+
+# Display panel: the framed area up top that shows the current number.
+display_panel_bg  = "#ff2d3460"
+display_fg        = "#fff8faff"
+display_fg_error  = "#ffff7b7b"
+
+# Small glyph next to the number that shows the pending operator
+# (+ / − / × / ÷), dimmer so it doesn't fight the number for attention.
+hint_fg           = "#ff7a8398"
