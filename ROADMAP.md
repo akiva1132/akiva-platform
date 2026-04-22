@@ -435,7 +435,7 @@
 
 **מ-Phase 2 (Framework):**
 - ✅ **IntentRouter wired** (אפריל 2026, commit `c8f18b6`) — כל manifest intent_filter נרשם ב-`framework::boot`, כולל filter סינתטי ל-Shell (MAIN+HOME+LAUNCHER); ה-Shell שולח `Intent::new(MAIN).with_category(LAUNCHER).with_target_package(id)` וה-framework מפעיל `IntentRouter::resolve` לפני `ActivityManager::launch`. ה-boot הראשוני של ה-Shell נפתר כעת דרך `resolve(MAIN+HOME)` במקום hard-code של class. 6 unit tests חדשים כיסוי explicit, implicit, target_package filtering, ambiguity.
-- **ResourceManager not populated** — [framework/src/resource_manager.rs](framework/src/resource_manager.rs) הוא struct שמחזיק `HashMap`s ריקים. אין code path שטוען strings/colors/dimens/drawables מ-manifest או מ-`res/`.
+- ✅ **ResourceManager wired** (אפריל 2026, 4 stones, commits `a5648d5` → `9c3ecd6`) — MVP scope: strings + colors, default `values/` בלבד (ללא qualifiers). [framework/src/resources.rs](framework/src/resources.rs) מחזיק `ResourceTable` per package; PackageManager קורא את `res/values/{strings,colors}.toml` מ-OPFS ב-boot; 4 host imports חדשים (`akiva_host_resource_color`/`_string`/`_has_color`/`_has_string`) מתועדים ב-[docs/abi.md §2.3](docs/abi.md); ה-SDK חושף `res::color(name) -> u32` ו-`res::string(name) -> String` עם magenta/`⟨missing:NAME⟩` fallbacks; AKML inflater פותר `@color/name` ו-`@string/name` אוטומטית. Calculator עברה להשתמש — כל הצבעים חיים ב-[apps/calculator/res/values/colors.toml](apps/calculator/res/values/colors.toml). 10 unit tests חדשים (7 framework, 4 SDK) + הכל עובד end-to-end בדפדפן.
 - **PermissionController is a stub** — [framework/src/permissions.rs](framework/src/permissions.rs) לא אוכף שום דבר.
 - **WindowManager is a stub** — [framework/src/window_manager.rs](framework/src/window_manager.rs) לא מנתב בפועל.
 
@@ -452,8 +452,9 @@
 - הוצאה ל-`apps/shell/` כ-wasm package — תלוי ב-IntentRouter.
 
 **מ-Phase 6 (Calculator):**
-- `res/values/strings.toml` + `res/values/colors.toml` — תלוי ב-ResourceManager
-- `res/layout-land/main.akml` — תלוי ב-qualifier matching
+- ✅ `res/values/colors.toml` — כל ה-palette הועבר (commit `9c3ecd6`)
+- `res/values/strings.toml` — נדחה; אין כרגע טקסט סטטי UI משמעותי במחשבון (הלייבלים של הכפתורים הם glyphs של תו אחד)
+- `res/layout-land/main.akml` — תלוי ב-qualifier matching (post-MVP)
 - `on_save_state` / restore — דורש SDK API + kernel side
 - `values-he` — **מוחרג מ-MVP** (user preference: MVP-first, skip i18n)
 
