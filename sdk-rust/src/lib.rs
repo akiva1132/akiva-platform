@@ -17,6 +17,7 @@ pub mod canvas;
 pub mod intent;
 pub mod log;
 pub mod res;
+pub mod result;
 pub mod runtime;
 pub mod storage;
 pub mod ui;
@@ -25,12 +26,14 @@ pub use activity::{Activity, ActivityContext, Context, KeyEvent, KeyPhase, Metri
 pub use app::{App, AppContext};
 pub use canvas::Canvas;
 pub use intent::{Intent, IntentBuilder};
+pub use result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
 
 /// Everything a minimal app needs with one `use`.
 pub mod prelude {
     pub use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState};
     pub use crate::canvas::Canvas;
     pub use crate::intent::{Intent, IntentBuilder};
+    pub use crate::result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
     pub use crate::ui::{CrossAxis, MainAxis, Ui, UiState};
     pub use crate::{log_debug, log_error, log_info, log_trace, log_warn};
 }
@@ -146,6 +149,20 @@ macro_rules! akiva_app {
             handle: u32, bytes_ptr: *const u8, bytes_len: u32,
         ) {
             $crate::runtime::on_new_intent(handle, bytes_ptr, bytes_len)
+        }
+
+        // ── Activity result delivery (Stone 9.5) ────────────────────────
+        // Fires on the caller when the callee it launched via
+        // start_activity_for_result finishes. `request_code` is what the
+        // caller passed in; the bytes encode an `ActivityResult` (i32
+        // code + optional data blob). If the callee finishes without
+        // calling set_result, the framework synthesises a CANCELED
+        // result with empty data.
+        #[no_mangle]
+        pub extern "C" fn akiva_app_activity_result(
+            handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
+        ) {
+            $crate::runtime::on_activity_result(handle, request_code, bytes_ptr, bytes_len)
         }
     };
 }

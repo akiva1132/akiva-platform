@@ -27,6 +27,7 @@ use core::num::NonZeroU32;
 use crate::activity::{Activity, ActivityContext, KeyEvent, PointerEvent, PointerPhase, KeyPhase, SurfaceMetrics};
 use crate::compositor::{FrameCommands, PaintOp};
 use crate::intent::Intent;
+use crate::result::ActivityResult;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -129,6 +130,38 @@ pub trait WasmHost {
     fn new_intent(&self, handle: AppHandle, bytes: &[u8]) {
         let _ = (handle, bytes);
     }
+
+    /// Stone 9.5 — pop any pending `(intent_bytes, request_code)` the app
+    /// raised via `akiva_host_start_activity_for_result`. Same
+    /// drain-at-callback-end semantic as `drain_intent`. `intent_bytes`
+    /// is the SDK's encoded `Intent`; the caller decodes. Default `None`
+    /// keeps in-kernel activities opt-out.
+    fn drain_start_for_result(&self, handle: AppHandle) -> Option<(Vec<u8>, u32)> {
+        let _ = handle;
+        None
+    }
+
+    /// Stone 9.5 — pop any bytes the app stashed via
+    /// `akiva_host_set_result`. Drained on the destroy-path of the
+    /// callee (not every callback) — more like a pull than a signal.
+    /// Bytes are the SDK's encoded [`ActivityResult`]. Default `None`.
+    fn drain_set_result(&self, handle: AppHandle) -> Option<Vec<u8>> {
+        let _ = handle;
+        None
+    }
+
+    /// Stone 9.5 — deliver an `ActivityResult` to the caller activity.
+    /// Fires `akiva_app_activity_result(handle, request_code, ptr, len)`
+    /// on the real host. Default no-op for activities that don't launch
+    /// for-result.
+    fn activity_result(
+        &self,
+        handle: AppHandle,
+        request_code: u32,
+        bytes: &[u8],
+    ) {
+        let _ = (handle, request_code, bytes);
+    }
 }
 
 // ── Proxy activity ───────────────────────────────────────────────────────
@@ -171,6 +204,16 @@ impl WasmActivity {
         if let Some(bytes) = self.host.drain_intent(self.handle) {
             if let Ok(intent) = Intent::decode(&bytes) {
                 *ctx.launch_requested = Some(intent);
+            }
+        }
+        if let Some((bytes, request_code)) = self.host.drain_start_for_result(self.handle) {
+            if let Ok(intent) = Intent::decode(&bytes) {
+                *ctx.start_for_result_requested = Some((intent, request_code));
+            }
+        }
+        if let Some(bytes) = self.host.drain_set_result(self.handle) {
+            if let Ok(result) = ActivityResult::decode(&bytes) {
+                *ctx.set_result_requested = Some(result);
             }
         }
     }
@@ -246,6 +289,21 @@ impl Activity for WasmActivity {
         // decoded `Intent`, wasm side receives an encoded blob.
         let bytes = intent.encode();
         self.host.new_intent(self.handle, &bytes);
+        self.drain_post(ctx);
+    }
+
+    fn on_activity_result(
+        &mut self,
+        ctx: &mut ActivityContext<'_>,
+        request_code: u32,
+        result: &ActivityResult,
+    ) {
+        // Same symmetry point as `on_new_intent`: framework decodes,
+        // re-encodes for the wasm boundary. The app's on_activity_result
+        // could itself ask to launch/finish further — drain after the
+        // call so those post-callback requests reach apply_post.
+        let bytes = result.encode();
+        self.host.activity_result(self.handle, request_code, &bytes);
         self.drain_post(ctx);
     }
 }
@@ -431,6 +489,7 @@ mod tests {
         SaveState(u32),
         RestoreState(u32, Vec<u8>),
         NewIntent(u32, Vec<u8>),
+        ActivityResult(u32, u32, Vec<u8>),
     }
 
     /// Mock that records every call and lets tests pre-seed encoded paint
@@ -447,6 +506,11 @@ mod tests {
         /// Stone 9.4 — pending intent blob. Read-and-clear, matching
         /// `AppRegistry.drainIntent` semantics.
         pending_intent: RefCell<Option<Vec<u8>>>,
+        /// Stone 9.5 — pending `(intent_bytes, request_code)` for
+        /// `start_activity_for_result`. Read-and-clear.
+        pending_start_for_result: RefCell<Option<(Vec<u8>, u32)>>,
+        /// Stone 9.5 — pending set_result blob. Read-and-clear.
+        pending_set_result: RefCell<Option<Vec<u8>>>,
     }
 
     impl MockHost {
@@ -458,6 +522,8 @@ mod tests {
                 save_bytes: RefCell::new(Vec::new()),
                 pending_finish: RefCell::new(false),
                 pending_intent: RefCell::new(None),
+                pending_start_for_result: RefCell::new(None),
+                pending_set_result: RefCell::new(None),
             }
         }
         fn take_calls(&self) -> Vec<Call> { core::mem::take(&mut *self.calls.borrow_mut()) }
@@ -465,6 +531,12 @@ mod tests {
         fn set_save_bytes(&self, bytes: Vec<u8>) { *self.save_bytes.borrow_mut() = bytes; }
         fn arm_finish(&self) { *self.pending_finish.borrow_mut() = true; }
         fn arm_intent(&self, bytes: Vec<u8>) { *self.pending_intent.borrow_mut() = Some(bytes); }
+        fn arm_start_for_result(&self, bytes: Vec<u8>, request_code: u32) {
+            *self.pending_start_for_result.borrow_mut() = Some((bytes, request_code));
+        }
+        fn arm_set_result(&self, bytes: Vec<u8>) {
+            *self.pending_set_result.borrow_mut() = Some(bytes);
+        }
     }
 
     impl WasmHost for MockHost {
@@ -514,18 +586,41 @@ mod tests {
         fn new_intent(&self, handle: AppHandle, bytes: &[u8]) {
             self.calls.borrow_mut().push(Call::NewIntent(handle.get(), bytes.to_vec()));
         }
+        fn drain_start_for_result(&self, _handle: AppHandle) -> Option<(Vec<u8>, u32)> {
+            self.pending_start_for_result.borrow_mut().take()
+        }
+        fn drain_set_result(&self, _handle: AppHandle) -> Option<Vec<u8>> {
+            self.pending_set_result.borrow_mut().take()
+        }
+        fn activity_result(&self, handle: AppHandle, request_code: u32, bytes: &[u8]) {
+            self.calls.borrow_mut().push(
+                Call::ActivityResult(handle.get(), request_code, bytes.to_vec()),
+            );
+        }
     }
 
-    fn make_ctx<'a>(
-        finish: &'a mut bool,
-        launch: &'a mut Option<crate::intent::Intent>,
-    ) -> ActivityContext<'a> {
-        ActivityContext {
-            metrics: SurfaceMetrics { width_px: 800, height_px: 600, density: 1.0 },
-            timestamp_ms: 1234.0,
-            pointer: None,
-            finish_requested: finish,
-            launch_requested: launch,
+    /// Owning wrapper for the four ctx out-params so each test only needs
+    /// one local, not four. The old `make_ctx(&mut finish, &mut launch)`
+    /// shape worked with two borrows but wouldn't extend cleanly to the
+    /// 9.5 additions (the `&mut None` temporaries die at statement end).
+    #[derive(Default)]
+    struct CtxVars {
+        finish: bool,
+        launch: Option<crate::intent::Intent>,
+        launch_for_result: Option<(crate::intent::Intent, u32)>,
+        set_result: Option<ActivityResult>,
+    }
+    impl CtxVars {
+        fn ctx(&mut self) -> ActivityContext<'_> {
+            ActivityContext {
+                metrics: SurfaceMetrics { width_px: 800, height_px: 600, density: 1.0 },
+                timestamp_ms: 1234.0,
+                pointer: None,
+                finish_requested: &mut self.finish,
+                launch_requested: &mut self.launch,
+                start_for_result_requested: &mut self.launch_for_result,
+                set_result_requested: &mut self.set_result,
+            }
         }
     }
 
@@ -535,9 +630,8 @@ mod tests {
         let handle = host.register("com.test", "Main").unwrap();
         host.take_calls(); // drop register
         let mut act = WasmActivity::new(handle, host.clone());
-        let mut finish = false;
-        let mut launch = None;
-        let mut ctx = make_ctx(&mut finish, &mut launch);
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
         act.on_create(&mut ctx);
         act.on_start(&mut ctx);
         act.on_resume(&mut ctx);
@@ -567,9 +661,8 @@ mod tests {
         let handle = host.register("p", "c").unwrap();
         host.take_calls();
         let mut act = WasmActivity::new(handle, host.clone());
-        let mut finish = false;
-        let mut launch = None;
-        let mut ctx = make_ctx(&mut finish, &mut launch);
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
         ctx.timestamp_ms = 42.5;
         act.on_pointer(&mut ctx, PointerEvent { x: 10.0, y: 20.0, button: 0, phase: PointerPhase::Down });
         assert_eq!(host.take_calls(), vec![Call::Pointer(handle.get(), 10.0, 20.0, 42.5)]);
@@ -589,9 +682,8 @@ mod tests {
         host.set_paint_bytes(wire);
 
         let mut act = WasmActivity::new(handle, host.clone());
-        let mut finish = false;
-        let mut launch = None;
-        let mut ctx = make_ctx(&mut finish, &mut launch);
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
         let mut frame = FrameCommands::new();
         act.render(&mut ctx, &mut frame);
 
@@ -697,18 +789,16 @@ mod tests {
         let mut act = WasmActivity::new(handle, host.clone());
         host.arm_finish();
 
-        let mut finish = false;
-        let mut launch = None;
-        let mut ctx = make_ctx(&mut finish, &mut launch);
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
         act.on_resume(&mut ctx);
-        assert!(finish, "armed finish must surface to ctx");
+        assert!(vars.finish, "armed finish must surface to ctx");
 
         // Second callback with no re-arm: flag stays false.
-        let mut finish2 = false;
-        let mut launch2 = None;
-        let mut ctx2 = make_ctx(&mut finish2, &mut launch2);
+        let mut vars2 = CtxVars::default();
+        let mut ctx2 = vars2.ctx();
         act.on_resume(&mut ctx2);
-        assert!(!finish2, "finish must not sticky");
+        assert!(!vars2.finish, "finish must not sticky");
     }
 
     // ── Stone 9.4: drain_intent + on_new_intent ─────────────────────────
@@ -724,20 +814,18 @@ mod tests {
         let intent = Intent::explicit("com.example.target", "Main");
         host.arm_intent(intent.encode());
 
-        let mut finish = false;
-        let mut launch: Option<Intent> = None;
-        let mut ctx = make_ctx(&mut finish, &mut launch);
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
         act.on_resume(&mut ctx);
-        let got = launch.expect("armed intent must surface to ctx");
+        let got = vars.launch.expect("armed intent must surface to ctx");
         assert_eq!(got.target_package.as_deref(), Some("com.example.target"));
         assert_eq!(got.target_class.as_deref(), Some("Main"));
 
         // Second callback without re-arm: no launch resurfaces.
-        let mut finish2 = false;
-        let mut launch2: Option<Intent> = None;
-        let mut ctx2 = make_ctx(&mut finish2, &mut launch2);
+        let mut vars2 = CtxVars::default();
+        let mut ctx2 = vars2.ctx();
         act.on_resume(&mut ctx2);
-        assert!(launch2.is_none(), "intent must not sticky");
+        assert!(vars2.launch.is_none(), "intent must not sticky");
     }
 
     #[test]
@@ -750,12 +838,11 @@ mod tests {
         let mut act = WasmActivity::new(handle, host.clone());
         host.arm_intent(vec![0xff; 3]);  // too short for even the action_len header
 
-        let mut finish = false;
-        let mut launch: Option<Intent> = None;
-        let mut ctx = make_ctx(&mut finish, &mut launch);
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
         act.on_resume(&mut ctx);
-        assert!(launch.is_none());
-        assert!(!finish);
+        assert!(vars.launch.is_none());
+        assert!(!vars.finish);
     }
 
     #[test]
@@ -767,9 +854,8 @@ mod tests {
 
         let intent = Intent::new(crate::intent::action::VIEW)
             .with_category(crate::intent::category::DEFAULT);
-        let mut finish = false;
-        let mut launch: Option<Intent> = None;
-        let mut ctx = make_ctx(&mut finish, &mut launch);
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
         act.on_new_intent(&mut ctx, &intent);
 
         let calls = host.take_calls();
@@ -799,14 +885,95 @@ mod tests {
         let mut act = WasmActivity::new(handle, host.clone());
         host.arm_finish();
 
-        let mut finish = false;
-        let mut launch = None;
-        let mut ctx = make_ctx(&mut finish, &mut launch);
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
         act.on_destroy(&mut ctx);
         // The armed flag stays armed (never drained) and the context's
         // flag was never touched.
-        assert!(!finish);
+        assert!(!vars.finish);
         assert!(*host.pending_finish.borrow(),
             "destroy must not drain the host flag");
+    }
+
+    // ── Stone 9.5: start_activity_for_result / set_result plumbing ───────
+
+    #[test]
+    fn drain_start_for_result_sets_launch_for_result_on_next_callback() {
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        let mut act = WasmActivity::new(handle, host.clone());
+        let intent = Intent::explicit("com.example.picker", "Main");
+        host.arm_start_for_result(intent.encode(), 42);
+
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
+        act.on_resume(&mut ctx);
+        let (got, rc) = vars.launch_for_result.expect("armed start_for_result must surface");
+        assert_eq!(rc, 42);
+        assert_eq!(got.target_package.as_deref(), Some("com.example.picker"));
+        assert_eq!(got.target_class.as_deref(), Some("Main"));
+
+        // Second callback without re-arm: no request resurfaces.
+        let mut vars2 = CtxVars::default();
+        let mut ctx2 = vars2.ctx();
+        act.on_resume(&mut ctx2);
+        assert!(vars2.launch_for_result.is_none(),
+            "start_for_result must be single-shot like drain_intent");
+    }
+
+    #[test]
+    fn drain_set_result_surfaces_encoded_activity_result() {
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        let mut act = WasmActivity::new(handle, host.clone());
+        let result = ActivityResult { code: 0, data: b"picked=7".to_vec() };
+        host.arm_set_result(result.encode());
+
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
+        act.on_pause(&mut ctx);  // drain runs on any ctx-bearing callback
+        let got = vars.set_result.expect("armed set_result must surface");
+        assert_eq!(got, result);
+    }
+
+    #[test]
+    fn malformed_start_for_result_blob_is_silently_dropped() {
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        let mut act = WasmActivity::new(handle, host.clone());
+        // Too short to decode as an Intent.
+        host.arm_start_for_result(vec![0xff; 3], 1);
+
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
+        act.on_resume(&mut ctx);
+        assert!(vars.launch_for_result.is_none(),
+            "malformed intent blob must not surface a garbage launch_for_result");
+    }
+
+    #[test]
+    fn on_activity_result_forwards_encoded_bytes_to_host() {
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        host.take_calls();
+        let mut act = WasmActivity::new(handle, host.clone());
+        let result = ActivityResult { code: 0, data: vec![1, 2, 3] };
+
+        let mut vars = CtxVars::default();
+        let mut ctx = vars.ctx();
+        act.on_activity_result(&mut ctx, 99, &result);
+
+        let calls = host.take_calls();
+        assert!(matches!(calls.first(), Some(Call::ActivityResult(_, 99, _))),
+            "first call must be ActivityResult with the provided request_code");
+        match &calls[0] {
+            Call::ActivityResult(h, rc, bytes) => {
+                assert_eq!(*h, handle.get());
+                assert_eq!(*rc, 99);
+                let round = ActivityResult::decode(bytes).expect("host got decodable bytes");
+                assert_eq!(round, result);
+            }
+            _ => unreachable!(),
+        }
     }
 }

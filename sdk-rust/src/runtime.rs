@@ -22,6 +22,7 @@ use std::collections::HashMap;
 
 use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState};
 use crate::intent::Intent;
+use crate::result::ActivityResult;
 
 // Host-provided imports. Matches `AppRegistry._buildAppImports` in
 // runtime/web/app_registry.js. Gated on wasm32 so non-wasm builds
@@ -43,6 +44,20 @@ extern "C" {
     /// framework calls its `hal_app_drain_intent` HAL bridge to read
     /// back the blob. See docs/abi.md §2.3.
     pub fn akiva_host_start_activity(handle: u32, ptr: *const u8, len: u32);
+    /// Stone 9.5 — launch another activity and keep the door open for a
+    /// result. `request_code` is an app-chosen u32 that identifies the
+    /// call site; the framework threads it back through
+    /// `akiva_app_activity_result` so the caller can disambiguate. Same
+    /// drain-at-callback-end flow as `akiva_host_start_activity`.
+    pub fn akiva_host_start_activity_for_result(
+        handle: u32, ptr: *const u8, len: u32, request_code: u32,
+    );
+    /// Stone 9.5 — stash the bytes this activity wants to return to its
+    /// caller. Only meaningful when the activity was launched via
+    /// `start_activity_for_result`. Repeatable (last call wins). The
+    /// framework drains via `hal_app_drain_set_result` when this activity
+    /// is about to be destroyed.
+    pub fn akiva_host_set_result(handle: u32, ptr: *const u8, len: u32);
 }
 
 /// Request the framework finish this activity. Safe to call from any
@@ -69,6 +84,40 @@ pub fn host_start_activity(handle: u32, intent: &Intent) {
     #[cfg(target_arch = "wasm32")]
     unsafe {
         akiva_host_start_activity(handle, bytes.as_ptr(), bytes.len() as u32);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (handle, bytes);
+    }
+}
+
+/// Request the framework launch `intent` and record that this activity
+/// expects a result back with `request_code`. Same lifetime rules as
+/// `host_start_activity` (host copies bytes synchronously).
+pub fn host_start_activity_for_result(handle: u32, intent: &Intent, request_code: u32) {
+    let bytes = intent.encode();
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        akiva_host_start_activity_for_result(
+            handle, bytes.as_ptr(), bytes.len() as u32, request_code,
+        );
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (handle, bytes, request_code);
+    }
+}
+
+/// Stash a result the framework will deliver back to whoever launched
+/// this activity via `start_activity_for_result`. Callable multiple
+/// times in the activity's lifetime; only the last call's bytes are
+/// delivered. If this activity was not launched for a result, the
+/// framework silently drops the stashed bytes.
+pub fn host_set_result(handle: u32, result: &ActivityResult) {
+    let bytes = result.encode();
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        akiva_host_set_result(handle, bytes.as_ptr(), bytes.len() as u32);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -326,6 +375,33 @@ pub fn on_new_intent(handle: u32, bytes_ptr: *const u8, bytes_len: u32) {
         handle,
     };
     slot.activity.on_new_intent(&mut ctx, &intent);
+}
+
+/// Deliver an ActivityResult to the caller. Fired by the framework after
+/// the callee (the one this activity launched via
+/// `start_activity_for_result`) finishes. A malformed blob is treated
+/// as "no result" — silently dropped, same policy as `on_new_intent` and
+/// `on_restore_state`.
+pub fn on_activity_result(
+    handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
+) {
+    let Some(slot) = slots().get_mut(&handle) else { return; };
+    if bytes_ptr.is_null() || bytes_len == 0 { return; }
+    // SAFETY: host guarantees [bytes_ptr, bytes_ptr + bytes_len) is a
+    // valid readable region it copied into app memory.
+    let slice = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len as usize) };
+    let result = match ActivityResult::decode(slice) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut ctx = Context {
+        metrics: slot.metrics,
+        timestamp_ms: 0.0,
+        pointer: slot.last_pointer,
+        class: "",
+        handle,
+    };
+    slot.activity.on_activity_result(&mut ctx, request_code, &result);
 }
 
 pub fn on_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32) {

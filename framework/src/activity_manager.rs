@@ -487,12 +487,16 @@ mod tests {
     fn fire(activity: &mut dyn Activity, state: LifecycleState) {
         let mut finish = false;
         let mut launch: Option<crate::intent::Intent> = None;
+        let mut launch_for_result: Option<(crate::intent::Intent, u32)> = None;
+        let mut set_result: Option<crate::result::ActivityResult> = None;
         let mut ctx = ActivityContext {
             metrics: SurfaceMetrics::default(),
             timestamp_ms: 0.0,
             pointer: None::<PointerEvent>,
             finish_requested: &mut finish,
             launch_requested: &mut launch,
+            start_for_result_requested: &mut launch_for_result,
+            set_result_requested: &mut set_result,
         };
         match state {
             LifecycleState::Created  => activity.on_create(&mut ctx),

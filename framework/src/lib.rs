@@ -28,11 +28,13 @@ pub mod manifest;
 pub mod package_manager;
 pub mod permissions;
 pub mod resources;
+pub mod result;
 pub mod shell;
 pub mod storage;
 pub mod wasm_activity;
 pub mod window_manager;
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use activity::{ActivityContext, KeyEvent, PointerEvent, SurfaceMetrics};
@@ -96,6 +98,8 @@ pub fn boot(
         pointer: None,
         stack: Vec::new(),
         storage: None,  // populated at the end once we finish using `storage` locally
+        pending_result_for: HashMap::new(),
+        pending_result: HashMap::new(),
     };
 
     // Rehydrate installed packages from storage. A corrupt manifest is
@@ -243,6 +247,18 @@ pub struct Framework {
     /// for package rehydration is released; it's always `Some` by the
     /// time any dispatch method runs.
     storage: Option<Box<dyn Storage>>,
+    /// Stone 9.5 — for every activity launched via
+    /// `start_activity_for_result`, record the (caller_id, request_code)
+    /// so we can deliver `on_activity_result` to the caller when the
+    /// callee finishes. Keyed by callee id so destroy-paths only need
+    /// one map lookup.
+    pending_result_for: HashMap<ActivityId, (ActivityId, u32)>,
+    /// Stone 9.5 — bytes an activity stashed via `set_result`, keyed by
+    /// its own id. Drained in `finish_top` / `destroy_with_persist`
+    /// just before the activity is destroyed. Absent means the callee
+    /// finished without producing a result, and the framework
+    /// synthesises `ActivityResult::canceled()` on delivery.
+    pending_result: HashMap<ActivityId, result::ActivityResult>,
 }
 
 impl Framework {
@@ -250,7 +266,7 @@ impl Framework {
         self.metrics = m;
         let Some(id) = self.stack.last().copied() else { return; };
         let (post, _) = self.with_ctx(id, 0.0, |a, ctx| a.on_resize(ctx, m));
-        self.apply_post(post, 0.0);
+        self.apply_post(post, id, 0.0);
     }
 
     /// Dispatch a pointer event to the active activity. The framework
@@ -260,7 +276,7 @@ impl Framework {
         self.pointer = Some(ev);
         let Some(id) = self.stack.last().copied() else { return; };
         let (post, _) = self.with_ctx(id, ts, |a, ctx| a.on_pointer(ctx, ev));
-        self.apply_post(post, ts);
+        self.apply_post(post, id, ts);
     }
 
     pub fn dispatch_key(&mut self, ev: KeyEvent, ts: f64) {
@@ -278,7 +294,7 @@ impl Framework {
         }
         let Some(id) = self.stack.last().copied() else { return; };
         let (post, _) = self.with_ctx(id, ts, |a, ctx| a.on_key(ctx, ev));
-        self.apply_post(post, ts);
+        self.apply_post(post, id, ts);
     }
 
     /// Ask the active activity to paint one frame. Returns the freshly
@@ -290,17 +306,21 @@ impl Framework {
             let pointer = self.pointer;
             let mut finish = false;
             let mut launch: Option<Intent> = None;
+            let mut launch_for_result: Option<(Intent, u32)> = None;
+            let mut set_result: Option<result::ActivityResult> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
                 launch_requested: &mut launch,
+                start_for_result_requested: &mut launch_for_result,
+                set_result_requested: &mut set_result,
             };
             // Explicit split so the compiler sees `compositor` and
             // `activities` as disjoint mut borrows of self.
             let activities = &mut self.activities;
             let target = self.compositor.paint_target();
             activities.with_instance(id, |a| a.render(&mut ctx, target));
-            self.apply_post(PostCallback { finish, launch }, ts);
+            self.apply_post(PostCallback { finish, launch, launch_for_result, set_result }, id, ts);
         }
         self.compositor.finish_frame()
     }
@@ -322,33 +342,48 @@ impl Framework {
         let pointer = self.pointer;
         let mut finish = false;
         let mut launch: Option<Intent> = None;
+        let mut launch_for_result: Option<(Intent, u32)> = None;
+        let mut set_result: Option<result::ActivityResult> = None;
         let mut result: Option<R> = None;
         {
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
                 launch_requested: &mut launch,
+                start_for_result_requested: &mut launch_for_result,
+                set_result_requested: &mut set_result,
             };
             self.activities.with_instance(id, |a| {
                 result = Some(f(a, &mut ctx));
             });
         }
-        (PostCallback { finish, launch }, result)
+        (PostCallback { finish, launch, launch_for_result, set_result }, result)
     }
 
     /// Consume the activity's post-callback requests in a deterministic
-    /// order: launches first (so the requester is paused before it sees
-    /// any further input), then finish. If an activity sets both in one
-    /// callback, launch wins — finishing a just-paused activity would
-    /// require a Paused→Destroyed edge with no Stopped step, which we
-    /// don't exercise yet.
+    /// order:
+    ///   1. `set_result` (idempotent side-effect; just stashes bytes) —
+    ///      run first so a callback that both stashes a result AND
+    ///      finishes delivers that result, not a CANCELED synthesis.
+    ///   2. `start_for_result` (richer of the two launch shapes) — wins
+    ///      over plain `launch` if both are set.
+    ///   3. `launch` (plain start_activity).
+    ///   4. `finish` — last so a callback that launches-and-finishes
+    ///      doesn't tear itself down before the new top is paused-over it.
     ///
     /// Unresolvable intents (NoMatch / AmbiguousMatch) are silently
     /// dropped — no log binding in framework, and a buggy app shouldn't
     /// crash the OS. When we get observability wiring the failures will
     /// become visible; for now they surface as "the click did nothing".
-    fn apply_post(&mut self, post: PostCallback, ts: f64) {
-        if let Some(intent) = post.launch {
+    fn apply_post(&mut self, post: PostCallback, caller_id: ActivityId, ts: f64) {
+        if let Some(result) = post.set_result {
+            self.pending_result.insert(caller_id, result);
+        }
+        if let Some((intent, request_code)) = post.launch_for_result {
+            if let Ok((pkg, class)) = self.intents.resolve(&intent) {
+                self.launch_app_for_result(&intent, &pkg, &class, caller_id, request_code, ts);
+            }
+        } else if let Some(intent) = post.launch {
             if let Ok((pkg, class)) = self.intents.resolve(&intent) {
                 self.launch_app(&intent, &pkg, &class, ts);
             }
@@ -388,10 +423,14 @@ impl Framework {
         self.activities.destroy(id, |a, new_state| {
             let mut finish = false;
             let mut launch: Option<Intent> = None;
+            let mut launch_for_result: Option<(Intent, u32)> = None;
+            let mut set_result: Option<result::ActivityResult> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
                 launch_requested: &mut launch,
+                start_for_result_requested: &mut launch_for_result,
+                set_result_requested: &mut set_result,
             };
             if matches!(new_state, LifecycleState::Destroyed) {
                 a.on_destroy(&mut ctx);
@@ -414,11 +453,15 @@ impl Framework {
         let pointer = self.pointer;
         let mut finish = false;
         let mut launch: Option<Intent> = None;
+        let mut launch_for_result: Option<(Intent, u32)> = None;
+        let mut set_result: Option<result::ActivityResult> = None;
         self.activities.advance(id, LifecycleState::Created, |a, new_state| {
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
                 launch_requested: &mut launch,
+                start_for_result_requested: &mut launch_for_result,
+                set_result_requested: &mut set_result,
             };
             if matches!(new_state, LifecycleState::Created) {
                 a.on_create(&mut ctx);
@@ -426,10 +469,12 @@ impl Framework {
         });
         // `launch` raised from within on_create is currently a no-op:
         // the activity hasn't reached Resumed yet so there's nowhere
-        // coherent to stack a new top on. Drop it silently rather than
-        // let it fire out of order. Apps that want this behaviour can
-        // set launch from on_resume instead.
-        let _ = launch;
+        // coherent to stack a new top on. Same with
+        // `launch_for_result` / `set_result` (9.5) — all three are
+        // discarded here since on_create fires before the activity has
+        // reached Resumed. Apps that want these behaviours must set
+        // them from `on_resume` (or later) instead.
+        let _ = (launch, launch_for_result, set_result);
         finish
     }
 
@@ -441,10 +486,14 @@ impl Framework {
         self.activities.resume(id, |a, new_state| {
             let mut finish = false;
             let mut launch: Option<Intent> = None;
+            let mut launch_for_result: Option<(Intent, u32)> = None;
+            let mut set_result: Option<result::ActivityResult> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
                 launch_requested: &mut launch,
+                start_for_result_requested: &mut launch_for_result,
+                set_result_requested: &mut set_result,
             };
             match new_state {
                 // Created was fired (or was already past) by
@@ -464,10 +513,14 @@ impl Framework {
         self.activities.pause(id, |a, new_state| {
             let mut finish = false;
             let mut launch: Option<Intent> = None;
+            let mut launch_for_result: Option<(Intent, u32)> = None;
+            let mut set_result: Option<result::ActivityResult> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
                 launch_requested: &mut launch,
+                start_for_result_requested: &mut launch_for_result,
+                set_result_requested: &mut set_result,
             };
             if matches!(new_state, LifecycleState::Paused) {
                 a.on_pause(&mut ctx);
@@ -498,8 +551,15 @@ impl Framework {
         // save-state is persisted. Remove from our mirror of the stack
         // as we go — `destroy_with_persist` drops them from the
         // ActivityManager's task.stack via its normal cleanup.
+        //
+        // Stone 9.5: if any popped activity was launched for a result,
+        // synthesise a CANCELED delivery to its caller. Otherwise a
+        // pending `on_activity_result` expectation would silently
+        // disappear when the callee was torn down by a SingleTask
+        // relaunch, leaving the caller in undefined-wait.
         for popped_id in &outcome.popped {
             self.destroy_with_persist(*popped_id, ts);
+            self.deliver_activity_result_for(*popped_id, ts);
             self.stack.retain(|x| *x != *popped_id);
         }
 
@@ -547,6 +607,91 @@ impl Framework {
         self.drive_start_to_resumed(outcome.id, ts);
     }
 
+    /// Stone 9.5 — the for-result variant of `launch_app`. Identical
+    /// plumbing except we record the (caller, request_code) pair against
+    /// the new callee id so `finish_top` can deliver
+    /// `on_activity_result` when the callee eventually finishes.
+    ///
+    /// If the resolver lands on a reuse path (SingleTop / SingleTask /
+    /// SingleInstance), the for-result contract is **silently** dropped:
+    /// `launch_for_result` against an existing live activity is
+    /// ill-defined (the callee never "finishes" in the sense that
+    /// triggers delivery), and we don't want to synthesise a result
+    /// mid-session that the reused activity didn't ask for. This
+    /// matches Android's "RESULT_CANCELED immediately on SingleTask
+    /// target" escape hatch — the caller gets nothing, which is at
+    /// least debuggable via absence of on_activity_result.
+    fn launch_app_for_result(
+        &mut self,
+        intent: &Intent,
+        package_id: &str,
+        class: &str,
+        caller_id: ActivityId,
+        request_code: u32,
+        ts: f64,
+    ) {
+        let outcome = match self.activities.launch(package_id, class) {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        if outcome.reused {
+            // Reuse branch — drop the request_code on the floor. The
+            // caller's `on_activity_result` simply never fires for this
+            // request. See doc comment above.
+            for popped_id in &outcome.popped {
+                self.destroy_with_persist(*popped_id, ts);
+                self.stack.retain(|x| *x != *popped_id);
+            }
+            self.drive_start_to_resumed(outcome.id, ts);
+            self.deliver_new_intent(outcome.id, intent, ts);
+            return;
+        }
+        // Fresh-create — same shape as the fresh-create branch of
+        // launch_app, but record the request-code mapping first so the
+        // finish path sees it even if on_create finishes immediately
+        // via the Created→Destroyed shortcut.
+        self.pending_result_for.insert(outcome.id, (caller_id, request_code));
+        if let Some(prev) = self.stack.last().copied() {
+            self.drive_to_paused(prev, ts);
+        }
+        self.stack.push(outcome.id);
+        if self.advance_through_create(outcome.id, ts) {
+            self.destroy_shortcut(outcome.id, ts);
+            // destroy_shortcut bypasses destroy_with_persist — it fires
+            // on_destroy only, no pause/stop, no save-state. But the
+            // caller still needs a result, so deliver CANCELED explicitly.
+            self.deliver_activity_result_for(outcome.id, ts);
+            self.stack.pop();
+            if let Some(new_top) = self.stack.last().copied() {
+                self.drive_to_resumed(new_top, ts);
+            }
+            return;
+        }
+        self.try_restore_state(outcome.id, package_id, class);
+        self.drive_start_to_resumed(outcome.id, ts);
+    }
+
+    /// If `callee_id` was launched via `start_activity_for_result`,
+    /// deliver `on_activity_result` to the caller now. Drains
+    /// `pending_result[callee_id]` (falling back to CANCELED if absent)
+    /// and clears both pending maps. No-op for activities not launched
+    /// for a result. Called on the destroy-path of the callee, before
+    /// the caller is resumed.
+    fn deliver_activity_result_for(&mut self, callee_id: ActivityId, ts: f64) {
+        let Some((caller_id, request_code)) = self.pending_result_for.remove(&callee_id) else {
+            // Not a for-result launch; but still clear any orphaned
+            // pending_result bytes so they don't leak.
+            self.pending_result.remove(&callee_id);
+            return;
+        };
+        let result = self.pending_result.remove(&callee_id)
+            .unwrap_or_else(result::ActivityResult::canceled);
+        let (post, _) = self.with_ctx(caller_id, ts, |a, ctx| {
+            a.on_activity_result(ctx, request_code, &result);
+        });
+        self.apply_post(post, caller_id, ts);
+    }
+
     /// Fire `on_new_intent` on an already-Resumed activity and drain any
     /// follow-up requests. Split out from `launch_app`'s reuse branch so
     /// a future launch-mode path (e.g. SingleTask finding an instance
@@ -556,16 +701,26 @@ impl Framework {
     /// is honoured, a `ctx.finish` unwinds immediately.
     fn deliver_new_intent(&mut self, id: ActivityId, intent: &Intent, ts: f64) {
         let (post, _) = self.with_ctx(id, ts, |a, ctx| a.on_new_intent(ctx, intent));
-        self.apply_post(post, ts);
+        self.apply_post(post, id, ts);
     }
 
     /// Finish the top of the stack and resume whatever it was covering.
     /// If the stack is already down to its last entry (the Shell), this
     /// is a no-op — we never destroy the home-screen.
+    ///
+    /// Delivery order for a for-result callee (Stone 9.5): destroy the
+    /// callee first (so `on_destroy` fires + save-state persists),
+    /// then `on_activity_result` on the caller while it's still
+    /// `Paused`, then drive the caller up to `Resumed`. This matches
+    /// Android's documented ordering (result before resume) and means
+    /// a caller that acts on the result in `on_activity_result`
+    /// observes its own state-flip from Paused→Resumed afterwards as
+    /// a single coherent sequence.
     fn finish_top(&mut self, ts: f64) {
         if self.stack.len() <= 1 { return; }
         let id = self.stack.pop().expect("checked len > 1");
         self.destroy_with_persist(id, ts);
+        self.deliver_activity_result_for(id, ts);
         if let Some(new_top) = self.stack.last().copied() {
             self.drive_to_resumed(new_top, ts);
         }
@@ -597,10 +752,14 @@ impl Framework {
         self.activities.destroy(id, |a, new_state| {
             let mut finish = false;
             let mut launch: Option<Intent> = None;
+            let mut launch_for_result: Option<(Intent, u32)> = None;
+            let mut set_result: Option<result::ActivityResult> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
                 launch_requested: &mut launch,
+                start_for_result_requested: &mut launch_for_result,
+                set_result_requested: &mut set_result,
             };
             match new_state {
                 LifecycleState::Paused => a.on_pause(&mut ctx),
@@ -655,6 +814,8 @@ impl Framework {
 struct PostCallback {
     finish: bool,
     launch: Option<Intent>,
+    launch_for_result: Option<(Intent, u32)>,
+    set_result: Option<result::ActivityResult>,
 }
 
 #[cfg(test)]
@@ -692,15 +853,39 @@ mod tests {
         name: &'static str,
         log: Rc<RefCell<Vec<String>>>,
         on_pointer_launch: Option<Intent>,
+        on_pointer_set_result: Option<result::ActivityResult>,
+        on_pointer_finish: bool,
     }
 
     impl ScriptedActivity {
         fn new(name: &'static str, log: Rc<RefCell<Vec<String>>>) -> Self {
-            Self { name, log, on_pointer_launch: None }
+            Self {
+                name, log,
+                on_pointer_launch: None,
+                on_pointer_set_result: None,
+                on_pointer_finish: false,
+            }
         }
 
         fn with_pointer_launch(mut self, intent: Intent) -> Self {
             self.on_pointer_launch = Some(intent);
+            self
+        }
+
+        /// Stone 9.5 — on pointer, stash a result and finish. Simulates
+        /// a picker activity where the user taps a value.
+        fn with_pointer_set_result_then_finish(
+            mut self, result: result::ActivityResult,
+        ) -> Self {
+            self.on_pointer_set_result = Some(result);
+            self.on_pointer_finish = true;
+            self
+        }
+
+        /// Stone 9.5 — on pointer, just finish (no set_result). Simulates
+        /// a picker the user dismisses without picking.
+        fn with_pointer_finish(mut self) -> Self {
+            self.on_pointer_finish = true;
             self
         }
 
@@ -719,10 +904,28 @@ mod tests {
         fn on_new_intent(&mut self, _: &mut ActivityContext<'_>, intent: &Intent) {
             self.note(&format!("new_intent:{}", intent.action));
         }
+        fn on_activity_result(
+            &mut self,
+            _: &mut ActivityContext<'_>,
+            request_code: u32,
+            result: &result::ActivityResult,
+        ) {
+            self.note(&format!(
+                "activity_result:{}:code={}:data={}",
+                request_code, result.code,
+                String::from_utf8_lossy(&result.data),
+            ));
+        }
         fn on_pointer(&mut self, ctx: &mut ActivityContext<'_>, _ev: activity::PointerEvent) {
             self.note("pointer");
             if let Some(intent) = self.on_pointer_launch.clone() {
                 *ctx.launch_requested = Some(intent);
+            }
+            if let Some(r) = self.on_pointer_set_result.clone() {
+                *ctx.set_result_requested = Some(r);
+            }
+            if self.on_pointer_finish {
+                *ctx.finish_requested = true;
             }
         }
         fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
@@ -741,6 +944,8 @@ mod tests {
             pointer: None,
             stack: Vec::new(),
             storage: None,
+            pending_result_for: HashMap::new(),
+            pending_result: HashMap::new(),
         }
     }
 
@@ -1061,5 +1266,254 @@ mod tests {
             fw.activities.state_of(task_id),
             Some(activity_manager::LifecycleState::Resumed),
         );
+    }
+
+    // ── Stone 9.5: start_activity_for_result + on_activity_result ────────
+
+    /// Common scaffold for the 9.5 tests: a Shell that launches a
+    /// "picker" activity for a result on pointer, plus a picker factory
+    /// built by the caller. Both shell and picker write to `log` so
+    /// assertions can inspect the whole sequence.
+    fn for_result_harness(
+        log: Rc<RefCell<Vec<String>>>,
+        build_picker: impl Fn() -> ScriptedActivity + 'static,
+    ) -> (Framework, ActivityId) {
+        let mut fw = empty_framework();
+
+        // Shell that launches the picker for-result on pointer. We use a
+        // small custom activity rather than ScriptedActivity so we can
+        // attach a request_code to the launch — ScriptedActivity only
+        // exposes plain start_activity via pointer.
+        struct ShellActivity {
+            log: Rc<RefCell<Vec<String>>>,
+            intent: Intent,
+            request_code: u32,
+        }
+        impl activity::Activity for ShellActivity {
+            fn on_create(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push("shell:create".into());
+            }
+            fn on_start(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push("shell:start".into());
+            }
+            fn on_resume(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push("shell:resume".into());
+            }
+            fn on_pause(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push("shell:pause".into());
+            }
+            fn on_stop(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push("shell:stop".into());
+            }
+            fn on_destroy(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push("shell:destroy".into());
+            }
+            fn on_pointer(&mut self, ctx: &mut ActivityContext<'_>, _: activity::PointerEvent) {
+                self.log.borrow_mut().push("shell:pointer".into());
+                *ctx.start_for_result_requested = Some((self.intent.clone(), self.request_code));
+            }
+            fn on_activity_result(
+                &mut self,
+                _: &mut ActivityContext<'_>,
+                request_code: u32,
+                result: &result::ActivityResult,
+            ) {
+                self.log.borrow_mut().push(format!(
+                    "shell:activity_result:{}:code={}:data={}",
+                    request_code, result.code,
+                    String::from_utf8_lossy(&result.data),
+                ));
+            }
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+        }
+
+        let log_shell = log.clone();
+        let pick_intent = Intent::explicit("test.pkg", "Picker");
+        fw.activities.register("test.shell", "Main", LaunchMode::SingleTop, move || {
+            Box::new(ShellActivity {
+                log: log_shell.clone(),
+                intent: pick_intent.clone(),
+                request_code: 7,
+            })
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.shell".into(),
+            activity_class: "Main".into(),
+            actions: vec![action::MAIN.into()],
+            categories: vec![category::HOME.into()],
+            data_schemes: vec![], mime_types: vec![],
+        });
+
+        // Picker — the caller's factory produces a fresh instance per
+        // launch so tests that exercise destroy-then-relaunch don't
+        // need to re-build the whole harness.
+        fw.activities.register("test.pkg", "Picker", LaunchMode::Standard, move || {
+            Box::new(build_picker())
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.pkg".into(),
+            activity_class: "Picker".into(),
+            actions: vec![action::MAIN.into()],
+            categories: vec![], data_schemes: vec![], mime_types: vec![],
+        });
+
+        let shell_id = fw.activities.launch("test.shell", "Main").unwrap().id;
+        fw.stack.push(shell_id);
+        fw.drive_to_resumed(shell_id, 0.0);
+        log.borrow_mut().clear();
+
+        (fw, shell_id)
+    }
+
+    #[test]
+    fn start_for_result_delivers_picked_value_to_caller() {
+        // Two pointer events drive the flow:
+        //   Click 1 → shell launches picker for-result
+        //   Click 2 → picker stashes result + finishes
+        // Expected sequence:
+        //   shell:pointer, shell:pause
+        //   picker:create, picker:start, picker:resume    ← first click aftermath
+        //   picker:pointer                                ← second click
+        //   picker:pause, picker:stop, picker:destroy     ← finish_top
+        //   shell:activity_result:7:code=0:data=picked=42 ← delivery
+        //   shell:resume                                  ← caller back up
+        let picked = result::ActivityResult {
+            code: result::RESULT_OK,
+            data: b"picked=42".to_vec(),
+        };
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log_for_factory = log.clone();
+        let picked_for_factory = picked.clone();
+        let (mut fw, _shell_id) = for_result_harness(log.clone(), move || {
+            ScriptedActivity::new("picker", log_for_factory.clone())
+                .with_pointer_set_result_then_finish(picked_for_factory.clone())
+        });
+
+        fw.dispatch_pointer(pointer_down(), 1.0);  // shell: launch picker
+        fw.dispatch_pointer(pointer_down(), 2.0);  // picker: pick + finish
+
+        assert_eq!(
+            &*log.borrow(),
+            &[
+                "shell:pointer",
+                "shell:pause",
+                "picker:create",
+                "picker:start",
+                "picker:resume",
+                "picker:pointer",
+                "picker:pause",
+                "picker:stop",
+                "picker:destroy",
+                "shell:activity_result:7:code=0:data=picked=42",
+                "shell:resume",
+            ],
+            "for-result round-trip must deliver picked bytes back to shell",
+        );
+        assert_eq!(fw.stack.len(), 1, "stack must be back to shell-only");
+        assert!(fw.pending_result_for.is_empty(),
+            "pending_result_for must be cleared after delivery");
+        assert!(fw.pending_result.is_empty(),
+            "pending_result must be cleared after delivery");
+    }
+
+    #[test]
+    fn callee_finishing_without_set_result_synthesises_canceled() {
+        // Picker finishes without ever calling set_result. The shell
+        // must still see on_activity_result, with RESULT_CANCELED and
+        // empty data — otherwise the caller would be stuck waiting on
+        // a result that never arrives.
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let log_for_factory = log.clone();
+        let (mut fw, _) = for_result_harness(log.clone(), move || {
+            ScriptedActivity::new("picker", log_for_factory.clone()).with_pointer_finish()
+        });
+
+        fw.dispatch_pointer(pointer_down(), 1.0);  // shell → launch picker
+        fw.dispatch_pointer(pointer_down(), 2.0);  // picker → finish (no result)
+
+        let events = log.borrow().clone();
+        // The tail of the sequence is what we care about: pause/stop/destroy
+        // of picker, CANCELED delivery, shell resume. Check the last
+        // three entries to avoid coupling the test to the full preamble.
+        assert_eq!(
+            &events[events.len() - 3..],
+            &[
+                "picker:destroy".to_string(),
+                "shell:activity_result:7:code=1:data=".to_string(),
+                "shell:resume".to_string(),
+            ],
+            "callee without set_result must synthesise CANCELED (code=1, empty data)",
+        );
+        assert!(fw.pending_result_for.is_empty());
+        assert!(fw.pending_result.is_empty());
+    }
+
+    #[test]
+    fn for_result_reuse_path_drops_request_code_silently() {
+        // start_activity_for_result against a SingleTop reuse target
+        // is ill-defined (the callee never "finishes" in the delivery
+        // sense). The framework deliberately drops the request_code
+        // rather than synthesising a bogus result. This test locks
+        // that decision.
+        let log = Rc::new(RefCell::new(Vec::<String>::new()));
+        let mut fw = empty_framework();
+
+        // Shell that on pointer launches *itself* via
+        // start_for_result. The resolver picks SingleTop reuse →
+        // on_new_intent should fire, but no on_activity_result ever.
+        struct ShellActivity {
+            log: Rc<RefCell<Vec<String>>>,
+            intent: Intent,
+        }
+        impl activity::Activity for ShellActivity {
+            fn on_pause(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push("shell:pause".into());
+            }
+            fn on_resume(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push("shell:resume".into());
+            }
+            fn on_pointer(&mut self, ctx: &mut ActivityContext<'_>, _: activity::PointerEvent) {
+                self.log.borrow_mut().push("shell:pointer".into());
+                *ctx.start_for_result_requested = Some((self.intent.clone(), 99));
+            }
+            fn on_new_intent(&mut self, _: &mut ActivityContext<'_>, _: &Intent) {
+                self.log.borrow_mut().push("shell:new_intent".into());
+            }
+            fn on_activity_result(
+                &mut self, _: &mut ActivityContext<'_>, _: u32, _: &result::ActivityResult,
+            ) {
+                self.log.borrow_mut().push("shell:activity_result".into());
+            }
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+        }
+        let log_shell = log.clone();
+        let self_intent = Intent::explicit("test.shell", "Main");
+        fw.activities.register("test.shell", "Main", LaunchMode::SingleTop, move || {
+            Box::new(ShellActivity { log: log_shell.clone(), intent: self_intent.clone() })
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.shell".into(),
+            activity_class: "Main".into(),
+            actions: vec![action::MAIN.into()],
+            categories: vec![category::HOME.into()],
+            data_schemes: vec![], mime_types: vec![],
+        });
+
+        let shell_id = fw.activities.launch("test.shell", "Main").unwrap().id;
+        fw.stack.push(shell_id);
+        fw.drive_to_resumed(shell_id, 0.0);
+        log.borrow_mut().clear();
+
+        fw.dispatch_pointer(pointer_down(), 1.0);
+
+        // The sequence: pointer → SingleTop reuse → on_new_intent on
+        // the same shell. No on_activity_result in here.
+        let events = log.borrow().clone();
+        assert!(events.contains(&"shell:new_intent".to_string()),
+            "SingleTop reuse must fire on_new_intent");
+        assert!(!events.contains(&"shell:activity_result".to_string()),
+            "for-result against a reuse target must NOT deliver a result");
+        assert!(fw.pending_result_for.is_empty(),
+            "no request_code should persist for the dropped reuse path");
     }
 }

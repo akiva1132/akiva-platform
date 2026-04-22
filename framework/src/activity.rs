@@ -25,6 +25,7 @@
 
 use crate::compositor::FrameCommands;
 use crate::intent::Intent;
+use crate::result::ActivityResult;
 
 /// Display metrics mirrored from the kernel's DisplayManager. Copied into
 /// the context so activities never need to reach into the kernel directly.
@@ -78,6 +79,21 @@ pub struct ActivityContext<'a> {
     /// (`Intent::explicit`) or an implicit one (action + categories +
     /// optional `target_package`) — the matcher handles both.
     pub launch_requested: &'a mut Option<Intent>,
+    /// Stone 9.5 — set by the activity to launch `intent` *for a result*.
+    /// `launch_requested` and this field are mutually exclusive; if both
+    /// are set in the same callback, `start_for_result_requested` wins
+    /// (it's the richer call). On resolution the framework records the
+    /// (caller, request_code) pair against the new callee activity;
+    /// when the callee finishes the caller's `on_activity_result` fires.
+    pub start_for_result_requested: &'a mut Option<(Intent, u32)>,
+    /// Stone 9.5 — set by the activity to stash the bytes it wants to
+    /// deliver back to whoever launched it via
+    /// `start_activity_for_result`. `None` means "no result yet"; the
+    /// framework will synthesise `RESULT_CANCELED` when the callee is
+    /// destroyed without producing one. Calling set_result repeatedly
+    /// in the same lifetime is fine — the last call wins because the
+    /// framework overwrites on each set.
+    pub set_result_requested: &'a mut Option<ActivityResult>,
 }
 
 /// In-kernel activity trait. Every method has a default no-op except
@@ -114,6 +130,22 @@ pub trait Activity: 'static {
     /// [docs/activity-model.md §2](../../docs/activity-model.md).
     fn on_new_intent(&mut self, ctx: &mut ActivityContext<'_>, intent: &Intent) {
         let _ = (ctx, intent);
+    }
+
+    /// Stone 9.5 — called on the caller after the activity it launched
+    /// via `start_activity_for_result` finishes. `request_code` is the
+    /// identifier the caller passed at launch; `result` is the bytes
+    /// the callee stashed via `set_result`, or a synthesised
+    /// `RESULT_CANCELED` if the callee finished without producing one.
+    /// Default is a no-op for in-kernel activities that don't launch
+    /// for results.
+    fn on_activity_result(
+        &mut self,
+        ctx: &mut ActivityContext<'_>,
+        request_code: u32,
+        result: &ActivityResult,
+    ) {
+        let _ = (ctx, request_code, result);
     }
 
     /// Hand back an opaque blob the framework will persist before the

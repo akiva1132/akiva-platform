@@ -97,6 +97,29 @@ impl<'a> Context<'a> {
     pub fn start_activity(&self, intent: &crate::intent::Intent) {
         crate::runtime::host_start_activity(self.handle, intent);
     }
+
+    /// Stone 9.5 — launch `intent` and wait for a result back. When the
+    /// callee finishes (either by calling [`Context::set_result`] +
+    /// [`Context::finish`] or by being closed without a result),
+    /// `on_activity_result(ctx, request_code, result)` fires on this
+    /// activity. Pick a `request_code` per call site — the callee never
+    /// sees it; it's only for the caller to disambiguate which launch
+    /// the arriving result belongs to. See
+    /// [docs/activity-model.md](../../docs/activity-model.md).
+    pub fn start_activity_for_result(
+        &self, intent: &crate::intent::Intent, request_code: u32,
+    ) {
+        crate::runtime::host_start_activity_for_result(self.handle, intent, request_code);
+    }
+
+    /// Stone 9.5 — stash the result this activity wants to hand back.
+    /// Only meaningful if this activity was launched via
+    /// [`Context::start_activity_for_result`]; otherwise the framework
+    /// silently discards the bytes. Can be called more than once in a
+    /// single lifetime — only the final call's payload is delivered.
+    pub fn set_result(&self, result: &crate::result::ActivityResult) {
+        crate::runtime::host_set_result(self.handle, result);
+    }
 }
 
 // ── The trait ─────────────────────────────────────────────────────────
@@ -137,6 +160,22 @@ pub trait Activity: 'static {
     /// don't distinguish reuse from first-launch.
     fn on_new_intent(&mut self, ctx: &mut Context<'_>, intent: &crate::intent::Intent) {
         let _ = (ctx, intent);
+    }
+
+    // ── Activity result (Stone 9.5) ─────────────────────────────────────
+    /// Called on the *caller* after an activity this one launched via
+    /// [`Context::start_activity_for_result`] finishes. `request_code`
+    /// is whatever was passed at launch; `result` is either the payload
+    /// the callee [`Context::set_result`]-ed or a `RESULT_CANCELED`
+    /// synthesis if it finished without producing one. Default no-op
+    /// for apps that don't launch for results.
+    fn on_activity_result(
+        &mut self,
+        ctx: &mut Context<'_>,
+        request_code: u32,
+        result: &crate::result::ActivityResult,
+    ) {
+        let _ = (ctx, request_code, result);
     }
 
     // ── Saved state — forward-compat stubs for Phase 3 ─────────────────
