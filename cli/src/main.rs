@@ -6,10 +6,11 @@
 //!   akiva package <app>     — build an app + emit a .akiva archive
 //!   akiva install <archive> — install an app into the local runtime
 //!   akiva run               — build + launch the devserver
-//!   akiva devserver         — serve runtime/web/ with hot reload
-//!
-//! Phase 1a: arg parsing + help. Each subcommand is a thin stub that
-//! prints what it would do. Phase 2 fleshes them out.
+//!   akiva devserver         — serve runtime/web/ with the cross-origin
+//!                             isolation headers OPFS + threads need
+
+mod devserver;
+mod workspace;
 
 use std::process::ExitCode;
 
@@ -82,8 +83,6 @@ fn cmd_run(_args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_devserver(_args: &[String]) -> ExitCode {
-    println!("[stub] would serve runtime/web/ with COOP/COEP headers for SharedArrayBuffer");
-    println!("        (needed for OPFS SyncAccessHandle + future threads support)");
-    ExitCode::SUCCESS
+fn cmd_devserver(args: &[String]) -> ExitCode {
+    devserver::run(args)
 }
