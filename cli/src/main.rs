@@ -13,6 +13,7 @@ mod archive;
 mod build;
 mod devserver;
 mod new;
+mod package;
 mod run;
 mod workspace;
 
@@ -62,11 +63,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
 }
 
 fn cmd_package(args: &[String]) -> ExitCode {
-    let Some(app) = args.first() else {
-        eprintln!("akiva package: missing <app>"); return ExitCode::from(2);
-    };
-    println!("[stub] would package apps/{app}/ into {app}.akv");
-    ExitCode::SUCCESS
+    package::run(args)
 }
 
 fn cmd_install(args: &[String]) -> ExitCode {

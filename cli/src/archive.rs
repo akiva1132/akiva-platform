@@ -14,11 +14,11 @@
 //! against traversal on decode — an `.akv` archive cannot name a file
 //! outside its own tree.
 
-// Stone 8.1 lands the format + tests; `akiva package` / `akiva install`
-// (Stones 8.2–8.3) are the first consumers. Until then, the API is
-// test-only from `cargo build`'s perspective — suppress the dead-code
-// warnings rather than paper over them with `pub(crate)` noise. Remove
-// this attribute when the first caller wires in.
+// `encode` + `add` + `new` are used by `akiva package` (Stone 8.2); the
+// reader half (`decode`, `entries`, accessors) lands its first caller in
+// Stone 8.3 (`akiva install`). Until then keep them public without the
+// warning noise rather than pollute the API with `pub(crate)` just to
+// suppress a transient signal.
 #![allow(dead_code)]
 
 use std::fmt;
