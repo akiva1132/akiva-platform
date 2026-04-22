@@ -1,6 +1,6 @@
 # Activity Model — מודל תהליכים ו-Activities
 
-> **סטטוס מימוש (אפריל 2026):** lifecycle state machine ו-launch modes `Standard`/`SingleTop` פעילים ב-[framework/src/activity_manager.rs](../framework/src/activity_manager.rs). `SingleTask`/`SingleInstance`, back navigation, `start_activity_for_result`, ו-`on_new_intent` מיושמים ב-**Phase 9 של v0.2**. ראה [v0.2-design.md §4 (עמוד 2)](v0.2-design.md) ל-gap map מלא ו-[ROADMAP.md שלב 9](../ROADMAP.md) לסטונים.
+> **סטטוס מימוש (אפריל 2026):** lifecycle state machine מלא (6 המעברים) + launch modes `Standard`/`SingleTop` פעילים ב-[framework/src/activity_manager.rs](../framework/src/activity_manager.rs), עם test coverage end-to-end (Stone 9.1). `SingleTask`/`SingleInstance`, back navigation, `start_activity_for_result`, ו-`on_new_intent` — stones 9.2–9.6. ראה [v0.2-design.md §4 (עמוד 2)](v0.2-design.md) ל-gap map מלא ו-[ROADMAP.md שלב 9](../ROADMAP.md) לסטונים.
 
 ## 1. מושגים יסודיים
 
@@ -69,6 +69,23 @@
 - `onStop`, `onDestroy`: עד 200ms (לא נראים למשתמש)
 
 אם חורגים — ה-runtime מתריע ב-log ובעתיד יכול להרוג את ה-process.
+
+### Implementation (Phase 2b + Phase 9.1)
+
+| שכבה | מצב | איפה |
+|---|---|---|
+| `LifecycleState` enum — Initial/Created/Started/Resumed/Paused/Stopped/Destroyed | ✅ | [`framework/src/activity_manager.rs`](../framework/src/activity_manager.rs) |
+| Legal-transition matrix (כולל `Stopped → Started` עבור onRestart) | ✅ | `legal_transition` + 2 unit tests |
+| Drivers: `resume`/`pause`/`destroy`/`advance` עם בדיקות per-edge | ✅ Phase 9.1 | 13 unit tests על mock `RecordingActivity` — טופס כל המעבר, idempotency, וקצוות החוזרים (Stopped→destroy, Paused→destroy) |
+| Framework bring-up/tear-down (`drive_to_resumed`, `launch_app`, `finish_top`) | ✅ | [`framework/src/lib.rs`](../framework/src/lib.rs) |
+| Kernel ABI: `hal_app_lifecycle(handle, transition)` | ✅ | [`kernel/src/host.rs`](../kernel/src/host.rs), `KernelWasmHost` |
+| Worker dispatch: `LIFECYCLE_EXPORTS[0..5]` → `akiva_app_{create,start,resume,pause,stop,destroy}` | ✅ | [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) |
+| SDK exports (all 6 `akiva_app_*` extern "C" functions) | ✅ | [`sdk-rust/src/lib.rs`](../sdk-rust/src/lib.rs) `akiva_activity!` macro |
+| SDK trait — `on_create/start/resume/pause/stop/destroy` with no-op defaults | ✅ | [`sdk-rust/src/activity.rs`](../sdk-rust/src/activity.rs) |
+| `save_state_bytes` / `restore_state_bytes` wired through Create→restore→Start | ✅ | framework `launch_app`, SDK runtime |
+| `onRestart` as a distinct callback | ❌ by design | Stopped→Started re-fires `on_start` — apps that need "first start vs restart" distinction gate on internal flags |
+
+Bug caught by the Phase 9.1 test sweep: `destroy()` used to `break` on the first illegal edge, so destroying a Paused or Stopped activity silently skipped `on_stop`/`on_destroy`. Fixed to ignore-and-continue, matching `resume`'s shape.
 
 ## 3. Saved State
 

@@ -245,7 +245,17 @@ impl ActivityManager {
     }
 
     /// Drive an activity down to `Destroyed`. Fires pause → stop →
-    /// destroy in order, skipping any that have already run.
+    /// destroy in order, skipping any edge that isn't currently legal
+    /// from the activity's state (so `destroy` from `Paused` fires
+    /// just stop+destroy; from `Stopped` just destroy).
+    ///
+    /// Implementation note: we intentionally ignore `None` from
+    /// `advance_to` and continue trying the next target, rather than
+    /// breaking out of the loop. The previous behaviour broke out on
+    /// the first rejected edge, which meant destroying a `Paused`
+    /// activity silently skipped `stop` *and* `destroy` because
+    /// `Paused → Paused` isn't a legal self-loop. Same `for _ in …
+    /// { let _ = … }` shape as `resume`.
     pub fn destroy(
         &mut self,
         id: ActivityId,
@@ -256,7 +266,7 @@ impl ActivityManager {
             LifecycleState::Stopped,
             LifecycleState::Destroyed,
         ] {
-            if self.advance_to(id, target, &mut cb).is_none() { break; }
+            let _ = self.advance_to(id, target, &mut cb);
         }
         // Clean up once destroyed.
         self.instances.remove(&id);
@@ -325,6 +335,10 @@ fn legal_transition(from: LifecycleState, to: LifecycleState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activity::{ActivityContext, PointerEvent, SurfaceMetrics};
+    use crate::compositor::FrameCommands;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn legal_path_create_to_destroy() {
@@ -348,5 +362,314 @@ mod tests {
         assert!(!legal_transition(Created, Resumed));
         assert!(!legal_transition(Resumed, Stopped));
         assert!(!legal_transition(Destroyed, Created));
+    }
+
+    // ── Driver tests ─────────────────────────────────────────────────────
+    //
+    // The legality matrix is validated above in isolation; these tests
+    // exercise the `resume` / `pause` / `destroy` drivers end-to-end. The
+    // state machine is cheap to get wrong in subtle ways (silently skipping
+    // an edge, firing the callback before flipping state, double-firing on
+    // idempotent calls), and the framework's bring-up / tear-down paths all
+    // route through these drivers — so a regression here would land in every
+    // running app at once.
+    //
+    // `RecordingActivity` logs every callback it receives, along with the
+    // state label, into a shared `Rc<RefCell<Vec<&'static str>>>`. Tests
+    // assert on the exact sequence rather than just counts so out-of-order
+    // firing (which would still yield the same count) doesn't slip through.
+
+    /// Mock Activity that appends a label to a shared log every time a
+    /// lifecycle callback fires. Cheap to construct and register.
+    struct RecordingActivity {
+        log: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl crate::activity::Activity for RecordingActivity {
+        fn on_create(&mut self, _: &mut ActivityContext<'_>)  { self.log.borrow_mut().push("create"); }
+        fn on_start(&mut self, _: &mut ActivityContext<'_>)   { self.log.borrow_mut().push("start"); }
+        fn on_resume(&mut self, _: &mut ActivityContext<'_>)  { self.log.borrow_mut().push("resume"); }
+        fn on_pause(&mut self, _: &mut ActivityContext<'_>)   { self.log.borrow_mut().push("pause"); }
+        fn on_stop(&mut self, _: &mut ActivityContext<'_>)    { self.log.borrow_mut().push("stop"); }
+        fn on_destroy(&mut self, _: &mut ActivityContext<'_>) { self.log.borrow_mut().push("destroy"); }
+        fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut FrameCommands) {}
+    }
+
+    /// Invoke an [`ActivityManager`] driver with a closure that builds a
+    /// throwaway [`ActivityContext`] and forwards each state to the
+    /// corresponding trait method. This mirrors the dispatch shape used by
+    /// [`crate::Framework`] so a test passing here means a real bring-up
+    /// would see the same callback ordering.
+    fn fire(activity: &mut dyn Activity, state: LifecycleState) {
+        let mut finish = false;
+        let mut launch: Option<crate::intent::Intent> = None;
+        let mut ctx = ActivityContext {
+            metrics: SurfaceMetrics::default(),
+            timestamp_ms: 0.0,
+            pointer: None::<PointerEvent>,
+            finish_requested: &mut finish,
+            launch_requested: &mut launch,
+        };
+        match state {
+            LifecycleState::Created  => activity.on_create(&mut ctx),
+            LifecycleState::Started  => activity.on_start(&mut ctx),
+            LifecycleState::Resumed  => activity.on_resume(&mut ctx),
+            LifecycleState::Paused   => activity.on_pause(&mut ctx),
+            LifecycleState::Stopped  => activity.on_stop(&mut ctx),
+            LifecycleState::Destroyed => activity.on_destroy(&mut ctx),
+            LifecycleState::Initial => {}  // nothing fires for Initial
+        }
+    }
+
+    /// Build an [`ActivityManager`] with a single registered `RecordingActivity`
+    /// and return `(manager, log)` ready for launch.
+    fn harness() -> (ActivityManager, Rc<RefCell<Vec<&'static str>>>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut am = ActivityManager::new();
+        let log_for_factory = log.clone();
+        am.register(
+            "test.pkg",
+            "RecMain",
+            LaunchMode::Standard,
+            move || Box::new(RecordingActivity { log: log_for_factory.clone() }),
+        );
+        (am, log)
+    }
+
+    // ── resume() ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn resume_from_initial_fires_create_start_resume() {
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        assert_eq!(&*log.borrow(), &["create", "start", "resume"]);
+        assert_eq!(am.state_of(id), Some(LifecycleState::Resumed));
+    }
+
+    #[test]
+    fn resume_from_paused_fires_only_resume() {
+        // Paused → Resumed is the "user comes back to the app" edge.
+        // Must not re-fire create/start — that would confuse state apps
+        // that treat on_create as a one-time init.
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        am.pause(id, fire);
+        log.borrow_mut().clear();
+
+        am.resume(id, fire);
+        assert_eq!(&*log.borrow(), &["resume"]);
+        assert_eq!(am.state_of(id), Some(LifecycleState::Resumed));
+    }
+
+    #[test]
+    fn resume_from_stopped_fires_start_then_resume() {
+        // Stopped → Started → Resumed is Android's "onRestart" path.
+        // Our enum doesn't have a distinct Restart state — the state
+        // machine just allows Stopped → Started directly, and the app
+        // sees on_start fire again.
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        am.pause(id, fire);
+        am.advance(id, LifecycleState::Stopped, fire);
+        log.borrow_mut().clear();
+
+        am.resume(id, fire);
+        assert_eq!(&*log.borrow(), &["start", "resume"]);
+        assert_eq!(am.state_of(id), Some(LifecycleState::Resumed));
+    }
+
+    #[test]
+    fn resume_idempotent_when_already_resumed() {
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        log.borrow_mut().clear();
+
+        am.resume(id, fire);
+        assert!(log.borrow().is_empty(), "already-Resumed resume must be a no-op");
+    }
+
+    // ── pause() ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn pause_from_resumed_fires_pause() {
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        log.borrow_mut().clear();
+
+        am.pause(id, fire);
+        assert_eq!(&*log.borrow(), &["pause"]);
+        assert_eq!(am.state_of(id), Some(LifecycleState::Paused));
+    }
+
+    #[test]
+    fn pause_idempotent_when_already_paused() {
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        am.pause(id, fire);
+        log.borrow_mut().clear();
+
+        am.pause(id, fire);
+        assert!(log.borrow().is_empty());
+        assert_eq!(am.state_of(id), Some(LifecycleState::Paused));
+    }
+
+    #[test]
+    fn pause_from_stopped_is_noop() {
+        // Stopped → Paused isn't a legal edge (would be a backwards
+        // transition). The driver must silently do nothing rather than
+        // flip state to Paused and fire on_pause out of order.
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        am.pause(id, fire);
+        am.advance(id, LifecycleState::Stopped, fire);
+        log.borrow_mut().clear();
+
+        am.pause(id, fire);
+        assert!(log.borrow().is_empty());
+        assert_eq!(am.state_of(id), Some(LifecycleState::Stopped));
+    }
+
+    // ── destroy() ────────────────────────────────────────────────────────
+
+    #[test]
+    fn destroy_from_resumed_fires_pause_stop_destroy() {
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        log.borrow_mut().clear();
+
+        am.destroy(id, fire);
+        assert_eq!(&*log.borrow(), &["pause", "stop", "destroy"]);
+        assert_eq!(am.state_of(id), Some(LifecycleState::Destroyed));
+    }
+
+    #[test]
+    fn destroy_from_paused_fires_stop_and_destroy() {
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        am.pause(id, fire);
+        log.borrow_mut().clear();
+
+        am.destroy(id, fire);
+        assert_eq!(&*log.borrow(), &["stop", "destroy"]);
+        assert_eq!(am.state_of(id), Some(LifecycleState::Destroyed));
+    }
+
+    #[test]
+    fn destroy_from_stopped_fires_only_destroy() {
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        am.pause(id, fire);
+        am.advance(id, LifecycleState::Stopped, fire);
+        log.borrow_mut().clear();
+
+        am.destroy(id, fire);
+        assert_eq!(&*log.borrow(), &["destroy"]);
+        assert_eq!(am.state_of(id), Some(LifecycleState::Destroyed));
+    }
+
+    #[test]
+    fn destroy_removes_instance_but_keeps_record() {
+        // The framework keeps the record after Destroyed so observers
+        // (like the Shell's task switcher when it arrives) can see a
+        // just-destroyed activity for one frame. The instance itself is
+        // dropped — no more callbacks.
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        am.destroy(id, fire);
+        assert_eq!(am.state_of(id), Some(LifecycleState::Destroyed));
+        assert!(am.with_instance(id, |_| {}) == false, "instance must be dropped after destroy");
+    }
+
+    // ── advance() ────────────────────────────────────────────────────────
+
+    #[test]
+    fn advance_legal_edge_returns_prev_state() {
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        let prev = am.advance(id, LifecycleState::Created, fire);
+        assert_eq!(prev, Some(LifecycleState::Initial));
+        assert_eq!(&*log.borrow(), &["create"]);
+    }
+
+    #[test]
+    fn advance_illegal_edge_returns_none_and_skips_callback() {
+        // Initial → Resumed isn't legal — must stay Initial and not
+        // fire any callback. Returning None is how callers learn to
+        // retry via an intermediate state.
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        let prev = am.advance(id, LifecycleState::Resumed, fire);
+        assert_eq!(prev, None);
+        assert!(log.borrow().is_empty());
+        assert_eq!(am.state_of(id), Some(LifecycleState::Initial));
+    }
+
+    // ── launch() ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn launch_unknown_activity_errors() {
+        let mut am = ActivityManager::new();
+        let err = am.launch("nope", "Nope").unwrap_err();
+        assert!(matches!(err, LaunchError::UnknownActivity { .. }));
+    }
+
+    #[test]
+    fn launch_standard_creates_fresh_instance_every_time() {
+        // Two Standard launches → two distinct ids, two stacked in the
+        // foreground task. Contrast with SingleTop which reuses below.
+        let (mut am, _log) = harness();
+        let a = am.launch("test.pkg", "RecMain").unwrap();
+        let b = am.launch("test.pkg", "RecMain").unwrap();
+        assert_ne!(a, b);
+        let task = am.foreground_task().expect("task exists");
+        assert_eq!(am.tasks[&task].stack, vec![a, b]);
+    }
+
+    #[test]
+    fn launch_singletop_reuses_top_when_ids_match() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut am = ActivityManager::new();
+        let log_for_factory = log.clone();
+        am.register(
+            "test.pkg",
+            "TopMain",
+            LaunchMode::SingleTop,
+            move || Box::new(RecordingActivity { log: log_for_factory.clone() }),
+        );
+        let first = am.launch("test.pkg", "TopMain").unwrap();
+        let second = am.launch("test.pkg", "TopMain").unwrap();
+        assert_eq!(first, second, "SingleTop must reuse when already on top");
+        // And the task stack hasn't grown.
+        let task = am.foreground_task().expect("task exists");
+        assert_eq!(am.tasks[&task].stack, vec![first]);
+    }
+
+    #[test]
+    fn launch_rejects_singletask_and_singleinstance_until_phase_2b() {
+        // Regression guard: when Phase 9.2 implements these, this test
+        // must fail (forcing an update) so the new behaviour is
+        // explicit. It's also the signal that LaunchError::Unsupported
+        // can be retired from the enum.
+        let mut am = ActivityManager::new();
+        am.register("t", "A", LaunchMode::SingleTask, || Box::new(NullActivity));
+        am.register("t", "B", LaunchMode::SingleInstance, || Box::new(NullActivity));
+        assert!(matches!(am.launch("t", "A"), Err(LaunchError::Unsupported(_))));
+        assert!(matches!(am.launch("t", "B"), Err(LaunchError::Unsupported(_))));
+    }
+
+    struct NullActivity;
+    impl crate::activity::Activity for NullActivity {
+        fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut FrameCommands) {}
     }
 }
