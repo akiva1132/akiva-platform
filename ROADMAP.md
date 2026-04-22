@@ -556,11 +556,9 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - ✅ **Tests** — 6 חדשים ב-`package_manager::tests`: grant-on-install, unknown-permission-rejection (כולל storage clean-state), rehydration round-trip, upgrade revocation, uninstall cleanup (Stone 10.5 tripwire), empty-blob invariant.
 
 ### 10.3 Import map לפי capabilities
-- [`framework/src/wasm_activity.rs`](framework/src/wasm_activity.rs) — בקישור הקרנל↔wasm, לפני instantiation:
-  1. קבל את רשימת ה-grants של האפליקציה
-  2. בנה import map שמכיל רק את ה-imports שהטבלה ב-`ARCHITECTURE.md §8` מתאימה להם
-  3. אפליקציה שקוראת לפונקציה שלא ב-map → link error ב-instantiation, לא runtime panic
-- unit test: app שמנסה לקרוא `activity_start_activity` בלי `LAUNCH_ANY_APP` — instantiation נכשל עם הודעה ברורה
+**מחולק לשני שלבים:**
+- ✅ **10.3a — Rust-side mapping (source of truth)** — [`framework/src/permissions.rs`](framework/src/permissions.rs) מוסיף `AUTO_IMPORTS` (8 שמות ש-app מקבל תמיד: log, text_width, resource_*, finish, set_result), `imports_for_capability(name) -> &'static [&'static str]` (טבלת mapping מ-`ARCHITECTURE.md §8`), ו-`imports_for_grants(&PermissionController, package_id) -> Vec<&'static str>` (auto + gated לפי grants בפועל). כרגע רק `LAUNCH_ANY_APP` ממפה imports (`akiva_host_start_activity` + `_for_result`); `STORAGE_SANDBOX`/`QUERY_PACKAGES`/`NOTIFICATIONS`/`NETWORK`/`CAMERA` ברשימה אבל empty-slot (ה-HAL של storage/notifications/network לא נגיש לאפליקציות עדיין). 4 unit tests.
+- ⏭️ **10.3b — JS-side enforcement (instantiation filter)** — worker.js יצטרך לשאול את ה-kernel לקבל את רשימת ה-imports המותרים per-package, ולמחוק מה-`env` object כל מה שלא ברשימה לפני `WebAssembly.instantiate`. דורש (א) extern חדש בסגנון `hal_host_imports_for_package` עם 2-phase buffer, ו-(ב) או שה-SDK יצטרך לתמוך ב-conditional imports ברמת ה-build (כרגע ה-`akiva_app!` macro מייצא את כל ה-externs הלא-תנאי, אז app בלי `LAUNCH_ANY_APP` שמקמפל עם ה-macro יגרום ל-LinkError — שזה בעצם ההתנהגות הרצויה). נדחה לעבודת SDK build-tooling עתידית.
 
 ### 10.4 תיעוד ABI לפי capability
 - עדכון [`docs/abi.md`](docs/abi.md) — סעיף חדש "Imports by Capability" שמצטט את ה-mapping

@@ -97,6 +97,76 @@ pub const NOTIFICATIONS:   &str = "akiva.permission.NOTIFICATIONS";
 pub const NETWORK:         &str = "akiva.permission.NETWORK";
 pub const CAMERA:          &str = "akiva.permission.CAMERA";
 
+// ── Capability → host-import mapping (Stone 10.3) ─────────────────────
+//
+// ARCHITECTURE.md §8 pins which `akiva_host_*` imports become available
+// to a wasm app based on which capabilities the system granted it. The
+// table below is the canonical source of truth — worker.js's
+// per-package import map will consult `imports_for_grants()` (via a
+// kernel bridge, Stone 10.3b) to decide which functions to provide
+// when instantiating an app.
+//
+// Only *gated* imports are listed. Auto-granted imports (log,
+// resource lookups, text measurement, finish, set_result) land in
+// every app's import map unconditionally and aren't tracked here.
+
+/// Imports every installed app gets regardless of grants. These are
+/// the foundational functions the lifecycle / render / input loop
+/// depend on; gating them would mean the app can't even draw.
+pub const AUTO_IMPORTS: &[&str] = &[
+    "akiva_host_log",
+    "akiva_host_text_width",
+    "akiva_host_resource_color",
+    "akiva_host_resource_string",
+    "akiva_host_resource_has_color",
+    "akiva_host_resource_has_string",
+    "akiva_host_finish",
+    "akiva_host_set_result",
+];
+
+/// Imports gated behind a specific permission. An app that imports one
+/// of these without the matching grant must fail at instantiation
+/// time — the host simply doesn't provide the function, producing a
+/// wasm `LinkError`. Empty-list capabilities (NOTIFICATIONS, NETWORK,
+/// CAMERA) exist in the catalog for future APIs; gating them now means
+/// manifests can already declare them without a mapping regression
+/// later.
+pub fn imports_for_capability(name: &str) -> &'static [&'static str] {
+    match name {
+        LAUNCH_ANY_APP => &[
+            "akiva_host_start_activity",
+            "akiva_host_start_activity_for_result",
+        ],
+        // Storage HAL surface hasn't reached apps yet (framework-side
+        // persistence goes through WasmHost::save/restore on the
+        // kernel side, not app-visible imports). The mapping slot is
+        // reserved for when `akiva_host_storage_*` lands.
+        STORAGE_SANDBOX => &[],
+        QUERY_PACKAGES  => &[],
+        NOTIFICATIONS   => &[],
+        NETWORK         => &[],
+        CAMERA          => &[],
+        _ => &[],
+    }
+}
+
+/// Compute the full set of `akiva_host_*` imports to provide to
+/// `package_id`'s wasm instance. Always includes [`AUTO_IMPORTS`];
+/// adds the gated imports for every capability the controller has
+/// granted. The returned slice is deterministic but unsorted — callers
+/// that need a stable serialization (e.g. the kernel→JS bridge in
+/// Stone 10.3b) should sort before emitting.
+pub fn imports_for_grants(
+    controller: &PermissionController,
+    package_id: &str,
+) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = AUTO_IMPORTS.to_vec();
+    for granted in controller.granted_to(package_id) {
+        out.extend(imports_for_capability(granted));
+    }
+    out
+}
+
 /// Populate `controller` with the MVP permission set. Called once from
 /// `framework::boot` before any package rehydration — `install` later
 /// relies on every required permission being declared here, otherwise
@@ -176,6 +246,62 @@ mod tests {
         // granted_to only returns what was actually granted.
         let granted: Vec<&str> = c.granted_to("test.pkg");
         assert_eq!(granted, vec![NETWORK]);
+    }
+
+    // ── Stone 10.3: capability → import mapping ───────────────────────
+
+    #[test]
+    fn imports_for_grants_always_includes_auto_set() {
+        // An app with zero grants still gets the foundational imports.
+        // Otherwise hello (which requests no permissions) couldn't
+        // even boot.
+        let mut c = PermissionController::new();
+        declare_mvp_permissions(&mut c);
+        let imports = imports_for_grants(&c, "test.pkg");
+        for &name in AUTO_IMPORTS {
+            assert!(imports.contains(&name),
+                "auto import {name} must be in every app's set");
+        }
+    }
+
+    #[test]
+    fn launch_any_app_adds_start_activity_imports() {
+        let mut c = PermissionController::new();
+        declare_mvp_permissions(&mut c);
+        // Without the grant, start_activity is NOT in the import set —
+        // an app that imports it will fail instantiation (Stone 10.3b
+        // JS-side enforcement; the mapping here is the source of
+        // truth it will consult).
+        let before = imports_for_grants(&c, "test.shell");
+        assert!(!before.contains(&"akiva_host_start_activity"));
+        assert!(!before.contains(&"akiva_host_start_activity_for_result"));
+
+        c.grant("test.shell", LAUNCH_ANY_APP);
+        let after = imports_for_grants(&c, "test.shell");
+        assert!(after.contains(&"akiva_host_start_activity"),
+            "LAUNCH_ANY_APP must unlock start_activity");
+        assert!(after.contains(&"akiva_host_start_activity_for_result"),
+            "LAUNCH_ANY_APP must unlock start_activity_for_result");
+    }
+
+    #[test]
+    fn unknown_capability_contributes_no_imports() {
+        // A typo or future-unreleased permission name must not silently
+        // shadow the auto set. `imports_for_capability` returns the
+        // empty slice for anything it doesn't recognise.
+        assert!(imports_for_capability("akiva.permission.TYPO").is_empty());
+        assert!(imports_for_capability("").is_empty());
+    }
+
+    #[test]
+    fn storage_sandbox_reserved_slot_is_currently_empty() {
+        // Reminder to whoever wires `akiva_host_storage_*` into the
+        // app-side HAL: update `imports_for_capability` at the same
+        // time, or this test starts looking like a lie. Not a hard
+        // failure — the mapping is correct today (no storage imports
+        // exist yet), but the assertion pins the current contract.
+        assert!(imports_for_capability(STORAGE_SANDBOX).is_empty(),
+            "STORAGE_SANDBOX still has zero imports — update this test when akiva_host_storage_* lands");
     }
 
     #[test]
