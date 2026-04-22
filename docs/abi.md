@@ -49,7 +49,7 @@ ABI v0 קטן בכוונה — 7 exports app-side ו-7 imports kernel→host. ז
 
 ### 2.2 Exports שה-app חייב לספק
 
-כל app חייב לייצא את הפונקציות הבאות (C ABI):
+כל app חייב לייצא את ה-wasm `memory` (מופעל אוטומטית ע"י rustc ל-`wasm32-unknown-unknown`) ואת הפונקציות הבאות (C ABI). `runtime/web/app_registry.js::REQUIRED_EXPORTS` בודק את הרשימה בזמן טעינה; apps שחסרים משהו נדחים לפני הקריאה הראשונה למחזור חיים.
 
 ```rust
 // Memory — ה-host משתמש בכדי להזריק data ל-app (intents, saved state, ...).

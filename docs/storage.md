@@ -1,5 +1,7 @@
 # Storage
 
+> **סטטוס מימוש (אפריל 2026):** KV API של ה-kernel + HAL מעל OPFS `SyncAccessHandle` פעילים. Whole-file rewrite לכל write, single-file layout (`akiva-store.v1.bin`). Framework מתעד את המפתחות השמורים של המערכת (§4). שכבת SDK per-app (`Store::open`) — ❌ לא קיימת עדיין; apps אמיתיים היום לא עושים storage. Transactions / prefix scan / quota enforcement / encryption — **Phase 2+ / post-MVP**.
+
 מסמך זה מתעד את שכבת ה-storage של Akiva: הממשק שה-kernel חושף, ה-HAL שמממש אותו מעל OPFS, ומה נכון למצב נוכחי מול מה שיגיע בשלבים הבאים.
 
 ## 1. שכבות
@@ -95,6 +97,25 @@ offset  size    content
 | `{app.id}/...` | SDK (per-app sandbox) | storage לאפליקציה |
 
 ב-Phase 2 (PermissionManager) אכיפה תעבור לשכבת ה-SDK/framework: ה-framework ידחה ניסיון של app לקרוא מפתח שלא מתחיל ב-`{own-app-id}/`.
+
+### Implementation (Phase 1b)
+
+| יכולת | סטטוס | איפה |
+|---|---|---|
+| `Storage::read/write/delete` trait (framework-side) + `MemoryStorage` לבדיקות | ✅ | [`framework/src/storage.rs`](../framework/src/storage.rs) |
+| `kernel::storage` API סינכרוני string→bytes | ✅ | [`kernel/src/storage.rs`](../kernel/src/storage.rs) |
+| HAL מעל OPFS `SyncAccessHandle` — single-file, in-memory map | ✅ | [`runtime/web/storage.js`](../runtime/web/storage.js) |
+| Magic `"AKSV"` + version-1 binary format | ✅ | ראה §3.1 |
+| `akiva-store.v1.bin` נטען לפני `akiva_boot` (worker.js::bootKernel) | ✅ | |
+| OPFS unavailable → in-memory fallback + `persistent=false` flag | ✅ | `Storage.persistent` |
+| Leader-only write (exclusive handle) | ✅ | נאכף ע"י OPFS עצמה |
+| Framework saved-state writes (`sys/packages/{id}/{class}/saved_state`) | ✅ | `package_manager::key_saved_state` |
+| Whole-file rewrite ב-write | ⚠ by design | §6 — OK ל-KB, לא ל-MB |
+| SDK per-app `Store::open(app)` עם prefix אוטומטי | ❌ Phase 2+ | apps היום לא עושים storage ישיר |
+| `list_keys` / prefix scan | ❌ | יתווסף כשיידרש |
+| Transactions (atomic multi-write) | ❌ | כנ"ל |
+| Quota per-app + enforcement ע"י MemoryManager | ❌ Phase 10 | |
+| Encryption at rest | ❌ post-MVP | |
 
 ## 5. מבחן עשן אוטומטי
 

@@ -158,9 +158,9 @@ default_locale = "en"
 | ייחודיות `id` של activity באפליקציה | ✅ | `normalize_activities` |
 | `launch_mode` ערך חוקי | ✅ | `normalize_activities` |
 | `intent_filter` עם רשימת `actions` לא ריקה | ✅ | `normalize_activities` |
-| `runtime.wasm` קובץ קיים ומייצא את ה-hooks | ⏳ Phase 2b.2+ | loader side |
-| Resource references (`@string/...`, `@drawable/...`) | ⏳ Phase 3 | ResourceManager |
-| Permission declarations קיימות ב-system | ⏳ Post-MVP | PermissionController |
+| `runtime.wasm` קובץ קיים ומייצא את ה-hooks | ✅ Phase 2b.2+ | [`runtime/web/app_registry.js::REQUIRED_EXPORTS`](../runtime/web/app_registry.js) בודק 14 exports כולל `memory`; app בלי אחד מהם נדחה לפני הקריאה הראשונה למחזור חיים |
+| Resource references (`@string/...`, `@drawable/...`) — resolution בזמן render | ✅ Phase 3 | ResourceManager + host imports `akiva_host_resource_{color,string}`. **Validation בזמן install** (`@ref` → key קיים) — ❌ עדיין לא |
+| Permission declarations קיימות ב-system | ⏳ Phase 10 | PermissionController קיים ([`framework/src/permissions.rs`](../framework/src/permissions.rs)) עם ה-types אבל `manifest.permissions.required` לא נקרא בזמן install |
 
 Defaults (§5) מוחלים ב-`normalize()`: `exported` מחושב אוטומטית מנוכחות `intent_filters`, `task_affinity` ברירת מחדל ל-`app.id`, `launch_mode` ברירת מחדל ל-`standard`, וכו'.
 

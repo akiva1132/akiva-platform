@@ -1,6 +1,6 @@
 # Intent System & Package Manager
 
-> **סטטוס מימוש (אפריל 2026):** IntentRouter wired, filter registry פעיל, resolve של explicit + implicit intents עובד. חסרים: `start_activity` מתוך app, `start_activity_for_result`, `on_new_intent`, chooser UI — כולם ב-**Phase 9 של v0.2**. PackageManager `install`/`uninstall` פעילים אבל ה-flow עובר דרך `DEV_APPS` hack ב-worker.js; פורמט `.akv` archive + CLI install מיושמים ב-**Phase 8 של v0.2**. PendingIntent + Broadcast receivers (§13-14) — v0.3+.
+> **סטטוס מימוש (אפריל 2026):** IntentRouter wired, filter registry פעיל, resolve של explicit + implicit intents עובד. Phase 8 סגור — `.akv` archive + `akiva package`/`install`/`uninstall` פעילים, ה-worker מגלה dev-apps דרך dynamic endpoint `/dev-apps/index.json` (אין יותר hardcoded `DEV_APPS`). חסרים: `start_activity` מתוך app, `start_activity_for_result`, `on_new_intent`, chooser UI — כולם ב-**Phase 9 של v0.2**. PendingIntent + Broadcast receivers (§13-14) — v0.3+.
 
 ## 1. מטרה
 
@@ -210,41 +210,65 @@ ctx.finish();
 
 ### אחריות
 
-- **App discovery**: סורק `apps/` directory, קורא manifests
-- **Installed registry**: מחזיק database של apps מותקנות
-- **Intent resolution**: מוצא matches ל-intents
-- **Permission registry**: מה המשתמש אישר לכל app
-- **App info**: name, icon, version, declared activities
+- **Installed registry**: מחזיק database של apps מותקנות (נטען ב-boot מ-OPFS)
+- **Install/Uninstall/Upgrade**: מגלם את ה-flow של `.akv` archives ב-storage
+- **Resource tables**: קריאת `res/values/*` לכל package והעברתם ל-ResourceManager
+- **Saved-state persistence**: מפתחות `sys/packages/{id}/{class}/saved_state`
+- **App info**: name, version, version_code, activities, icon, launch modes
 
-### Public API
+### Public API (actual, Phase 8)
+
+המימוש ב-[`framework/src/package_manager.rs`](../framework/src/package_manager.rs) חושף API סינכרוני. Intent resolution הוא responsibility של `IntentRouter` נפרד (לא מוטמע ב-PackageManager כמו ב-Android).
 
 ```rust
-pub struct PackageManager;
-
-impl PackageManager {
-    pub fn installed_apps(&self) -> Vec<PackageInfo>;
-    pub fn get_package(&self, package_id: &str) -> Option<&PackageInfo>;
-    pub fn query_intent(&self, intent: &Intent) -> Vec<ResolveInfo>;
-    pub fn get_activity(&self, package_id: &str, activity_id: &str) -> Option<&ActivityInfo>;
-    pub fn install(&mut self, package_path: &Path) -> Result<PackageId>;
-    pub fn uninstall(&mut self, package_id: &str) -> Result<()>;
-}
-
-pub struct PackageInfo {
+pub struct PackageRecord {
     pub id: String,
     pub name: String,
-    pub version: Version,
-    pub activities: Vec<ActivityInfo>,
-    pub permissions: Vec<String>,
-    pub icon_res: Option<String>,
+    pub version: String,
+    pub version_code: u32,
+    pub entry_class: String,
+    pub manifest: Manifest,
 }
 
-pub struct ResolveInfo {
-    pub package_id: String,
-    pub activity_id: String,
-    pub match_score: u32,  // higher = better match
+impl PackageManager {
+    pub fn new() -> Self;
+    pub fn load_installed(&mut self, storage: &mut dyn Storage, on_error: impl FnMut(&str, LoadError)) -> usize;
+    pub fn install(&mut self, storage: &mut dyn Storage, archive_bytes: &[u8]) -> Result<Report, InstallError>;
+    pub fn uninstall(&mut self, storage: &mut dyn Storage, id: &str) -> bool;
+    pub fn get(&self, id: &str) -> Option<&PackageRecord>;
+    pub fn list(&self) -> impl Iterator<Item = &PackageRecord>;
+    pub fn count(&self) -> usize;
+    pub fn read_wasm(&self, storage: &dyn Storage, id: &str) -> Result<Vec<u8>, StorageError>;
+    pub fn read_resource_tables(&self, storage: &mut dyn Storage, on_error: impl FnMut(&str, ResourceLoadError)) -> Vec<(String, ResourceTable)>;
+}
+
+// Intent resolution lives in a sibling subsystem:
+impl IntentRouter {
+    pub fn register_filter(&mut self, filter: IntentFilter);
+    pub fn clear_package(&mut self, package_id: &str);
+    pub fn resolve(&self, intent: &Intent) -> Result<(String, String), ResolveError>;
 }
 ```
+
+אין `ResolveInfo` / `PackageInfo` — ה-API האמיתי מחזיר `(String, String)` tuples ו-`&PackageRecord` references. ה-shape של §9 בגרסאות קודמות של המסמך היה aspirational; המימוש בחר דרך אחרת (split בין `PackageManager` ל-`IntentRouter`) כדי לשמור אחריות נקייה.
+
+### Implementation (Phase 3 + Phase 8)
+
+| יכולת | סטטוס | הערה |
+|---|---|---|
+| `Intent` struct + Explicit/Implicit targets | ✅ | [`framework/src/intent.rs`](../framework/src/intent.rs) |
+| Standard action/category constants | ✅ | `intent::action::*`, `intent::category::*` |
+| Intent filter registry + resolve (first-match) | ✅ | `IntentRouter` — `NoMatch` / `AmbiguousMatch` ב-error enum |
+| Data/mime matching (scheme/host/mime) | ⏳ Phase 9.4 | `IntentFilter.data_schemes`/`mime_types` קיימים כ-fields אבל `resolve` לא משתמש בהם |
+| `start_activity` מתוך wasm app (import חדש) | ❌ Phase 9.4 | היום רק ה-Shell framework-side קורא ל-`IntentRouter::resolve` |
+| `on_new_intent` על SingleTop/SingleTask reuse | ❌ Phase 9.4 | ראה [`research-android-lifecycle.md §3`](research-android-lifecycle.md) |
+| `start_activity_for_result` + `on_activity_result` | ❌ Phase 9.5 | |
+| Chooser UI (אם `resolve` מחזיר Ambiguous) | ❌ Phase 9.4 | היום AmbiguousMatch הוא error שמושתק ב-`apply_post` |
+| `PackageManager::install` / `uninstall` (archive-based) | ✅ Phase 8 | כולל same-version/downgrade rejection + major-version saved-state wipe |
+| `PackageManager::load_installed` מ-OPFS ב-boot | ✅ | per-package errors מדווחים ל-`BootReport` |
+| Resource table loading per package | ✅ | `read_resource_tables` → `ResourceManager::register` |
+| PendingIntent (§13) | ❌ v0.3+ | |
+| Broadcast receivers (§14) | ❌ v0.3+ | |
 
 ## 10. דוגמאות שימוש
 
