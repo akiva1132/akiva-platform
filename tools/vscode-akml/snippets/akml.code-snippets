@@ -1,0 +1,59 @@
+{
+  "AKML Document": {
+    "scope": "akml",
+    "prefix": "akml",
+    "body": [
+      "<?akml version=\"1.0\"?>",
+      "<${1:VStack} padding=\"${2:16}\" gap=\"${3:8}\" cross=\"${4:stretch}\">",
+      "\t$0",
+      "</${1:VStack}>"
+    ],
+    "description": "Basic AKML document"
+  },
+  "VStack": {
+    "scope": "akml",
+    "prefix": "vstack",
+    "body": [
+      "<VStack padding=\"${1:16}\" gap=\"${2:8}\" cross=\"${3:stretch}\">",
+      "\t$0",
+      "</VStack>"
+    ],
+    "description": "Vertical stack"
+  },
+  "HStack": {
+    "scope": "akml",
+    "prefix": "hstack",
+    "body": [
+      "<HStack gap=\"${1:8}\" cross=\"${2:center}\">",
+      "\t$0",
+      "</HStack>"
+    ],
+    "description": "Horizontal stack"
+  },
+  "Button": {
+    "scope": "akml",
+    "prefix": "button",
+    "body": [
+      "<Button id=\"${1:action}\" label=\"${2:Label}\" flex=\"${3:1}\" onClick=\"${4:action}\" />"
+    ],
+    "description": "AKML button"
+  },
+  "Text": {
+    "scope": "akml",
+    "prefix": "text",
+    "body": [
+      "<Text text=\"${1:@string/app_name}\" size=\"${2:16}\" color=\"${3:@color/text_fg}\" />"
+    ],
+    "description": "AKML text"
+  },
+  "Frame": {
+    "scope": "akml",
+    "prefix": "frame",
+    "body": [
+      "<Frame>",
+      "\t$0",
+      "</Frame>"
+    ],
+    "description": "AKML frame"
+  }
+}

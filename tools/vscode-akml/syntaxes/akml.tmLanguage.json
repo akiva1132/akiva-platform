@@ -1,0 +1,167 @@
+{
+  "name": "AKML",
+  "scopeName": "text.akml",
+  "patterns": [
+    {
+      "include": "#comment"
+    },
+    {
+      "include": "#prolog"
+    },
+    {
+      "include": "#element"
+    },
+    {
+      "include": "#entity"
+    }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.block.akml",
+      "begin": "<!--",
+      "end": "-->"
+    },
+    "prolog": {
+      "name": "meta.tag.preprocessor.akml",
+      "begin": "<\\?",
+      "end": "\\?>",
+      "patterns": [
+        {
+          "match": "\\b(akml|version)\\b",
+          "name": "keyword.control.akml"
+        },
+        {
+          "include": "#string-double"
+        },
+        {
+          "include": "#string-single"
+        }
+      ]
+    },
+    "element": {
+      "patterns": [
+        {
+          "name": "meta.tag.inline.end.akml",
+          "begin": "(</)([A-Za-z_][A-Za-z0-9_.-]*)",
+          "beginCaptures": {
+            "1": {
+              "name": "punctuation.definition.tag.begin.akml"
+            },
+            "2": {
+              "name": "entity.name.tag.akml"
+            }
+          },
+          "end": "(>)",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.definition.tag.end.akml"
+            }
+          }
+        },
+        {
+          "name": "meta.tag.inline.begin.akml",
+          "begin": "(<)([A-Za-z_][A-Za-z0-9_.-]*)",
+          "beginCaptures": {
+            "1": {
+              "name": "punctuation.definition.tag.begin.akml"
+            },
+            "2": {
+              "name": "entity.name.tag.akml"
+            }
+          },
+          "end": "(/?>)",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.definition.tag.end.akml"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#attribute"
+            }
+          ]
+        }
+      ]
+    },
+    "attribute": {
+      "patterns": [
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_.-]*)(\\s*=)",
+          "captures": {
+            "1": {
+              "name": "entity.other.attribute-name.akml"
+            },
+            "2": {
+              "name": "keyword.operator.assignment.akml"
+            }
+          }
+        },
+        {
+          "include": "#string-double"
+        },
+        {
+          "include": "#string-single"
+        }
+      ]
+    },
+    "string-double": {
+      "name": "string.quoted.double.akml",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "include": "#resource-ref"
+        },
+        {
+          "include": "#binding"
+        },
+        {
+          "include": "#entity"
+        }
+      ]
+    },
+    "string-single": {
+      "name": "string.quoted.single.akml",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        {
+          "include": "#resource-ref"
+        },
+        {
+          "include": "#binding"
+        },
+        {
+          "include": "#entity"
+        }
+      ]
+    },
+    "resource-ref": {
+      "patterns": [
+        {
+          "match": "@(string|color|dimen|style|layout|drawable)/[A-Za-z0-9_.-]+",
+          "captures": {
+            "1": {
+              "name": "support.type.akml"
+            },
+            "0": {
+              "name": "constant.other.resource.akml"
+            }
+          }
+        },
+        {
+          "match": "@\\+id/[A-Za-z0-9_.-]+",
+          "name": "constant.other.resource.id.akml"
+        }
+      ]
+    },
+    "binding": {
+      "name": "variable.other.binding.akml",
+      "match": "\\{[A-Za-z_][A-Za-z0-9_]*\\}"
+    },
+    "entity": {
+      "name": "constant.character.entity.akml",
+      "match": "&(?:amp|lt|gt|quot|apos);"
+    }
+  }
+}
