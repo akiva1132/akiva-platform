@@ -8,30 +8,21 @@ _Created: 2026-04-22, after Stone 9.4 landing._
 
 ---
 
-## 1. Process-level isolation + crash recovery
+## 1. Process-level isolation + crash recovery → **promoted to Phase 11 of v0.3**
 
-**Concern.** Every app runs in the **same Web Worker** as the kernel. Each package gets its own `WebAssembly.Memory` (memory-space isolation is fine), but all apps share:
+> **Promoted 2026-04-22.** See [`ROADMAP.md` — שלב 11](../ROADMAP.md). The short version of the trigger criterion ("first genuinely third-party app") was tightened after an external review: we don't need a third-party app to know this is the gating systems problem. Phase 10 (Permissions) closing means the capability model is in place — the next systems-core bet is this one. The full concern text below stays here for historical context until Phase 11 starts; at that point the whole section moves to the "retired / promoted" footer.
 
-- the worker event loop
-- the JS heap
-- the OPFS `SyncAccessHandle`
-- the rAF frame budget
+**Original concern (kept for context).** Every app runs in the **same Web Worker** as the kernel. Each package gets its own `WebAssembly.Memory` (memory-space isolation is fine), but all apps share: the worker event loop, the JS heap, the OPFS `SyncAccessHandle`, the rAF frame budget.
 
-Consequences:
+Consequences: infinite loop in any app freezes the whole OS (no preemption); wasm trap is caught + logged but the `ActivityRecord` stays Resumed (zombie); no Low-Memory-Killer (instances live until worker terminates).
 
-- An infinite loop in one app freezes the whole OS. There is no preemption.
-- A wasm trap in one app is caught in `AppRegistry.*` try-blocks, logged, and ignored — but the `ActivityRecord` stays at `Resumed`. The next frame/pointer/key dispatch calls the same trapping path again. Zombie record, no cleanup.
-- No Low-Memory-Killer: once a package's `WebAssembly.Instance` is created in `_instantiateProcess`, it lives until the worker terminates. Idle apps hold memory forever.
+**Code surfaces that will change** (annotated for Phase 11 planning):
 
-**Why deferred.** Solving this means either (a) one worker per package (cross-tab messaging overhead, OPFS handle sharing headaches) or (b) a cooperative scheduler with time-slicing + trap-recovery state machine. Both are multi-week efforts. MVP pain is low because the app set is tiny and developer-controlled.
-
-**Trigger to promote.** First genuinely third-party app + first production report of "one app froze the OS". Both are v0.3+ territory.
-
-**Where the code would change.**
-
-- [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) — `_instantiateProcess` + error-catch paths.
-- [`runtime/web/worker.js`](../runtime/web/worker.js) — frame loop + event dispatch.
-- [`framework/src/activity_manager.rs`](../framework/src/activity_manager.rs) — new `Trapped` lifecycle state.
+- [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) — `_instantiateProcess` moves to a worker-per-app model; error-catch paths become message-handler paths.
+- [`runtime/web/worker.js`](../runtime/web/worker.js) — frame loop + event dispatch go through `postMessage` to app workers.
+- [`framework/src/activity_manager.rs`](../framework/src/activity_manager.rs) — new `Trapped` lifecycle state (Phase 11.5).
+- [`framework/src/wasm_activity.rs`](../framework/src/wasm_activity.rs) — `WasmHost` trait becomes async-capable (Phase 11.3).
+- [`sdk-rust/src/runtime.rs`](../sdk-rust/src/runtime.rs) — every host-import extern wrapped in the new message seam.
 
 ---
 

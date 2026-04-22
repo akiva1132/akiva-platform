@@ -425,37 +425,28 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 **רכיבים שנבנים:**
 
 ### 8.1 פורמט `.akv` archive
-- תיעוד ב-`docs/archive-format.md` (חדש)
-- ZIP עם layout קבוע: `manifest.toml` + `app.wasm` + `res/` + `signature.sig` (עתידי, placeholder בלבד)
-- בחירת crate: `zip` (stdlib-friendly, ללא dependency-hell) או מימוש פנימי אם ה-crate דורש תלות כבדה
-- CLI utility פנימי: `Archive::create(app_dir) -> bytes`, `Archive::extract(bytes) -> {manifest, wasm, res}`
+- ✅ **AKPK v1** (commits `ce8b500`, `d74abcf`) — פורמט custom stdlib-only ב-[`cli/src/archive.rs`](cli/src/archive.rs) (לא ZIP כדי להימנע מ-dependency-hell), מתועד ב-[`docs/archive-format.md`](docs/archive-format.md). `Archive::create` ו-`Archive::extract` עם manifest + wasm + res/ + signature placeholder.
 
 ### 8.2 `akiva package <app>`
-- ב-[`cli/src/package.rs`](cli/src/package.rs) (חדש)
-- שלבים: ודא build קיים (או `akiva build <app>` ראשון), קרא wasm מ-`runtime/web/dev-apps/<app>/` או ישירות מ-`apps/<app>/target/...`, קרא manifest, קרא `res/`, ארוז → `<app>.akv`
-- Flag: `--out <path>` (ברירת מחדל: `<app>.akv` ב-cwd)
+- ✅ (commit `d734923`) — [`cli/src/package.rs`](cli/src/package.rs) אורז staged app dir ל-`<app>.akv` עם manifest + wasm + `res/values/`. Flag `--out`.
 
 ### 8.3 `akiva install <archive>`
-- ב-[`cli/src/install.rs`](cli/src/install.rs) (חדש)
-- זה CLI-side install לא browser-side — כדי לעבוד בלי browser פתוח, ה-CLI יעתיק את ה-archive ל-`runtime/web/dev-apps/<id>/` (או לשים אותו במקום שה-worker יודע להרים ב-boot הבא)
-- v0.2 stone 1: ה-CLI עדיין מפעיל את הזרימה הישנה (פרישה ל-`dev-apps/`), אבל *דרך* קריאה ל-`PackageManager::install` של ה-framework ב-unit שרץ build-time — לאמת שה-API עובד
-- v0.2 stone 2: worker.js מוחק את `installDevApps` לטובת סריקת `runtime/web/installed/` או פקודה ב-zerver שמדחיפה `PackageManager::install` בקרנל
+- ✅ (commit `76a9daf`) — [`cli/src/install.rs`](cli/src/install.rs) פורק `.akv` ל-`runtime/web/dev-apps/<id>/`. `--as` ו-`--to` flags.
+- ⏭️ **validation דרך `PackageManager::install`** — ה-CLI כרגע רק פורש קבצים; העברה דרך ה-framework-side install (שיוודא manifest + grant permissions) מחכה לאינטגרציה שבה framework יהיה dep של ה-CLI. נעשה בזמן Phase 11 prep (דורש ממילא רפקטור של ה-boot flow).
 
 ### 8.4 Shell discovery מהאינדקס
-- [`runtime/web/worker.js`](runtime/web/worker.js): מחיקת `const DEV_APPS = [...]` ו-`installDevApps`
-- Shell קוראת `PackageManager::list()` ומציגה כל מה שמותקן (ללא תיקונים נוספים)
-- המבחן: התקנת archive חדש מה-CLI → refresh דפדפן → האפליקציה מופיעה ב-Shell בלי לגעת ב-JS
+- ✅ — `const DEV_APPS` ו-`installDevApps` מ-worker.js נמחקו. Shell מושכת דרך `PackageManager::list()`; devserver מספק endpoint `/dev-apps/index.json` לסריקת subdirs.
 
 ### 8.5 Upgrade + uninstall
-- `PackageManager::install` מזהה `version_code` חדש, מחליף in-place (כולל resources ו-saved_state של activities — או שמור `saved_state` אם אותה major version, ראה `manifest.md §6`)
-- `akiva uninstall <package_id>` — CLI command חדש; קורא ל-`PackageManager::uninstall` + מוחק גם grants (כשעמוד 3 ינחת)
-- `version_code` זהה או נמוך יותר בהתקנה → dismissal עם הודעה ברורה
+- ✅ (commit `72115b4`) — `akiva uninstall <id>` + `PackageManager::install` upgrade path. Downgrade/same-version נדחים עם שגיאות מפורשות. `saved_state` מתנקה רק כש-MAJOR של `app.version` משתנה (מתאים ל-`manifest.md §6`).
 
 **Exit criteria:**
-- [ ] `akiva package calculator && akiva install calculator.akv` עובד end-to-end
-- [ ] `runtime/web/worker.js` לא מכיל שום שם של אפליקציה ספציפית
-- [ ] התקנת archive חדש, ה-Shell מציגה את האפליקציה בלי שינוי קוד
-- [ ] upgrade + uninstall עובדים (unit tests ב-`framework/src/package_manager.rs`)
+- [x] `akiva package calculator && akiva install calculator.akv` עובד end-to-end
+- [x] `runtime/web/worker.js` לא מכיל שום שם של אפליקציה ספציפית
+- [x] התקנת archive חדש, ה-Shell מציגה את האפליקציה בלי שינוי קוד
+- [x] upgrade + uninstall עובדים (unit tests ב-`framework/src/package_manager.rs`)
+
+**סטטוס:** Phase 8 MVP core סגור. ה-`PackageManager::install` integration ב-CLI (ל-OPFS דרך הקרנל במקום file-extraction) תיסגר כחלק מ-Phase 11 prep כשהקרנל יפוצל מה-worker הראשי.
 
 **הערכת זמן:** 2-3 שבועות.
 
@@ -598,6 +589,178 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 
 ---
 
+# v0.3 — מ-"מערכת הפעלה על שלד" ל-"OS core אמיתית"
+
+v0.2 הפך את Akiva ממערכת-הפעלה-על-נייר למערכת-הפעלה-עם-חוזים. **אבל עדיין יש מקום אחד שבו היא מתנהגת כ-runtime ולא כ-OS:** כל האפליקציות חיות באותו Web Worker, על אותו event loop, עם אותו JS heap. App שנתקע ב-infinite loop מקפיא את המערכת כולה; wasm trap ב-activity משאיר `ActivityRecord` ב-Resumed ללא cleanup; אין Low-Memory Killer כי אין memory accounting.
+
+v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמודים, **בסדר חובה** — כל אחד דורש את הקודם לצאת.
+
+**חשיבות סדרי הגודל:** העמוד הראשון (isolation) לבדו הוא shift ארכיטקטוני מ-sync ABI ל-async ABI שמגע בכל הstack (framework, SDK, runtime). השני (governance) תלוי בקיום workers נפרדים כדי למדוד-ולאכוף. השלישי (window manager) הוא bounded scope, לא architectural.
+
+## Prereqs לפני Phase 11 (סגירת חזיתות פתוחות)
+
+לפני שמתחילים את ה-rewrite הגדול כדאי לסגור שתי חזיתות קצרות:
+
+### Stone 10.3b — JS-side permission filter
+- worker.js מסנן את ה-`env` object לפני `WebAssembly.instantiate` לפי ה-mapping של Stone 10.3a
+- דורש (א) extern חדש בסגנון `hal_host_imports_for_package` (2-phase buffer, LF-separated) ו-(ב) ב-SDK `akiva_app!` macro emission מותנה לפי ה-manifest
+- **למה לפני Phase 11:** ברגע ש-workers נפרדים, ההגדרה של "אילו imports ה-app מקבל" עוברת למנגנון של per-worker setup. עדיף לסגור זאת פעם אחת ב-sync world ואז רק להעביר ל-worker context; אחרת שני שינויים אינטראקטיביים באותו זמן.
+- **הערכת זמן:** ~1 שבוע.
+
+### Stone 11.0 — הוצאת Shell ל-`apps/shell/` כ-wasm app
+- Shell חי היום ב-[`framework/src/shell.rs`](framework/src/shell.rs) עם גישה ישירה ל-`fw.packages.list()` ו-`boot_count` דרך closure. זה privileged, לא אפליקציה.
+- ל-extract:
+  - Manifest + wasm binary עצמאיים ב-`apps/shell/`
+  - ה-Shell קוראת ל-`query_packages` ול-`start_activity` דרך ה-ABI הרגיל (שה-grants הוכנו להם ב-Stone 10.6 + 10.3a: QUERY_PACKAGES + LAUNCH_ANY_APP)
+  - `boot_count` עובר דרך resource (`@string/boot_count`?) או system import חדש
+  - ה-hack של intent filter סינתטי ב-`framework::boot` נהרס; Shell tצהירה intent filter רגיל ב-manifest
+- **למה לפני Phase 11:** אם Shell יישאר framework-internal, ב-Phase 11 הוא יהפוך ל-exception קבוע שדורש ייחוד בכל מנגנון isolation. אם נוציא אותו עכשיו, Phase 11 רואה אותו כ-app רגיל והקוד נשאר אחיד.
+- **Forcing function bonus:** ההפרדה תחשוף חורים ב-ABI שהיום מוסתרים ע"י ה-Shell הפריבילגי — טוב לחשוף אותם עכשיו, לא תחת לחץ של isolation bring-up.
+- **הערכת זמן:** 1-2 שבועות.
+
+---
+
+## שלב 11 — Process / Fault Isolation
+
+**מטרה:** פעילות של app אחד — trap, infinite loop, alloc של הרבה memory — לא יכולה להשפיע על apps אחרים או על ה-kernel.
+
+**תלוי ב:** Stone 10.3b + Stone 11.0 (Shell extraction).
+
+**רכיבים שנבנים:**
+
+### 11.1 Design doc ל-`docs/isolation-design.md`
+- מה המודל: worker-per-app, worker-per-task, hybrid?
+- איך ה-ABI הופך ל-async: message-passing דרך `postMessage`, SDK API נראה sync דרך futures/callbacks?
+- איך lifecycle callbacks (שהם synchronous היום — framework מחכה ל-on_create להסתיים לפני on_start) הופכים ל-state machine asynchronous?
+- איך trap ב-app מתרגם ל-`ActivityRecord` state? נוסיף `Trapped` enum variant?
+- איך OPFS SyncAccessHandle נגיש ממספר workers (זה limitation: handle אחד בלבד)?
+
+### 11.2 Async ABI prototype
+- hello-app ב-worker נפרד, עם כל ה-imports מעבירים דרך postMessage
+- מודד את ה-overhead: כמה ms נוסף לכל host call? כמה frames drops?
+- אם ה-overhead לא סביר — חוזרים לתכנון (אולי SharedArrayBuffer + Atomics לקריאות pure-read?)
+
+### 11.3 Framework הופך ל-async lifecycle driver
+- `drive_to_resumed`, `drive_to_paused`, `finish_top` הופכים למכונת מצב שממתינה ל-acks מה-worker של ה-app
+- `pending_result_for` ו-`task_history` עוברים התאמה לעולם שבו callback לא מחזיר ערך מיידית
+- מבחן הכושר: ה-test suite הקיים (141 tests) ממשיך לעבור עם harness async
+
+### 11.4 SDK adjustments
+- `Context::start_activity(intent)` עדיין נראה sync ל-app, אבל ה-dispatch של ה-intent קורה אחרי ה-callback מסתיים — שומר על semantics קיים
+- MockHost שדה ל-testing של async behavior (Rust side)
+
+### 11.5 Fault containment
+- Worker crash → kernel מזהה דרך port.onerror → ActivityRecord → Trapped → finish_top aggressive
+- `ActivityManager::destroy` עובד גם על activities ב-Trapped state (לא דורש on_pause/on_stop fire)
+- Integration test: app שהורג את עצמו ב-panic, Shell ממשיכה לעבוד
+
+### 11.6 Watchdog loop
+- Kernel (ב-worker הראשי) שולח pings ל-workers של ה-apps כל N frames
+- אם worker לא עונה בתוך timeout (say 500ms) → same Trapped flow
+- מגן מפני infinite loop
+
+**Exit criteria:**
+- [ ] hello app + calculator + Shell רצים ב-3 workers נפרדים
+- [ ] app שעושה `loop {}` ב-`on_pointer` לא מקפיא את המערכת; הוא מתים בתוך 500ms
+- [ ] wasm trap → activity state Trapped → framework cleanup → Shell ממשיכה
+- [ ] 141 tests ממשיכים לעבור על async harness
+- [ ] overhead של host call מתחת ל-1ms בדפדפן סטנדרטי
+
+**הערכת זמן:** 6-10 שבועות. **זה ה-fight הגדול ביותר בפרויקט.** אם זה נכשל, יש limitation ארכיטקטוני.
+
+---
+
+## שלב 12 — Resource Governance
+
+**מטרה:** מערכת יודעת כמה memory וכמה CPU כל app צורך, ויכולה לעצור או להקפיא apps שעוברים את ה-quota.
+
+**תלוי ב:** Phase 11 (בלי workers נפרדים, CPU attribution בלתי אפשרית ו-memory eviction מסוכנת).
+
+**רכיבים שנבנים:**
+
+### 12.1 Per-app memory accounting
+- `WebAssembly.Memory.buffer.byteLength` per instance → `MemoryManager::record(package_id, bytes)` בכל grow
+- API: `fw.memory.budget(package_id) -> UsageReport { current, peak, limit }`
+
+### 12.2 Per-app CPU attribution
+- per-worker performance.measure בין start-of-frame ל-end-of-frame
+- נצבר ל-`CpuBudget`; policy יודעת אם app "מכביד" על ה-frame budget
+
+### 12.3 Low-Memory Killer policy
+- Priority tiers בסגנון Android: FOREGROUND > VISIBLE > PAUSED > BACKGROUND > EMPTY
+- נקבעים לפי `LifecycleState` + מיקום ב-`task_history`
+- Threshold-based: כש-total memory (or system pressure signal מה-דפדפן) עובר סף → kill the lowest-priority living app
+- Kill = worker.terminate() + `ActivityManager::destroy_all_for_package`
+
+### 12.4 App suspension (soft eviction)
+- שונה מ-destroy: שמור state (saved_state blob), פרוק wasm instance, השאר metadata
+- רvive ב-`launch`: instantiate מחדש, restore state
+- זה המודל ש-Android קורא לו "process state: CACHED"
+
+### 12.5 Framework enforcement
+- `manifest.runtime.max_memory_mb` נאכף בפועל: grow שיעבור אותו → trap
+- Frame budget watchdog (מ-Phase 11.6) גם מעדכן את ה-CPU accounting
+
+**Exit criteria:**
+- [ ] אפליקציה שמקצה 100MB ממשיכה לרוץ; אפליקציה שמקצה 5GB נהרגת עם הודעה ברורה
+- [ ] 3 apps רצים, לחץ memory מלאכותי → ה-LMK הורג את ה-least-priority
+- [ ] suspension → revival שומר saved_state ומחזיר את ה-app למצב קודם
+
+**הערכת זמן:** 3-5 שבועות.
+
+---
+
+## שלב 13 — WindowManager completion
+
+**מטרה:** מעבר מ-fullscreen-only ל-layered display: overlays, dialogs, transitions, focus routing.
+
+**תלוי ב:** לא תלוי ב-Phase 11/12 (יכול לרוץ במקביל). מוזכר אחרון כי חשיבותו כ-OS-core קטנה יותר.
+
+**רכיבים שנבנים:**
+
+### 13.1 WindowManager ב-framework
+- מחליף את ה-stub ב-[`framework/src/window_manager.rs`](framework/src/window_manager.rs)
+- מודל: surfaces מרובים בין compositor לפעילויות, כל אחת עם `WindowLayer` (wallpaper, app, overlay, system)
+
+### 13.2 Compositor z-ordering
+- Compositor מרכיב frame מ-multiple surfaces בסדר z
+- Overlay אפליקטיבי (למשל system dialog) מצויר מעל app
+
+### 13.3 System dialog overlays
+- API לאפליקציה: `ctx.show_dialog(title, message, buttons)` → framework מצייר dialog ב-overlay layer
+- Focus routing: dialog מקבל input; app שמאחוריו ב-paused-but-visible
+
+### 13.4 Transitions
+- Task switch: fade between task stacks
+- Activity push: slide from right
+- configurable via resources (`@style/transition_app_enter`?)
+
+### 13.5 Cross-display (multi-tab)
+- Task חדש → display target (tab) חדש
+- ממומש על בסיס "tabs as displays" model מ-[`ARCHITECTURE.md §9`](ARCHITECTURE.md)
+
+**Exit criteria:**
+- [ ] system dialog מעל app פעיל; tap מחוץ לו סוגר אותו
+- [ ] activity push עם animation, לא jump cut
+- [ ] שני tabs מציגים שתי tasks שונות, משתמש מעביר activity ביניהן
+
+**הערכת זמן:** 3-4 שבועות.
+
+---
+
+## סיכום v0.3
+
+**סה"כ זמן:** ~13-21 שבועות (~3-5 חודשים) אחרי v0.2.
+
+בסיום v0.3, Akiva עוברת את שלושת ה-"hard systems tests" של OS אמיתית:
+- **isolation:** app אחד לא יכול להפיל את המערכת
+- **governance:** המערכת יודעת למדוד ולאכוף quota על apps
+- **window control:** המערכת מנהלת surfaces מרובים, לא רק fullscreen activity יחידה
+
+הסוקר החיצוני ([codex-notes/external-review.md](codex-notes/external-review.md), 2026-04-22) זיהה שלושת אלה כ-"three tests before real OS". v0.3 הוא הפעולה הממוקדת לסגור את השלישייה הזו.
+
+---
+
 ## סיכום זמנים
 
 | שלב | תיאור | זמן |
@@ -642,7 +805,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - WIT / Component Model migration — ראה דחייה מתועדת למעלה.
 
 **מ-Phase 5 (Shell):**
-- הוצאה ל-`apps/shell/` כ-wasm package — תלוי ב-IntentRouter.
+- הוצאה ל-`apps/shell/` כ-wasm package — **קודם לעבור ל-Stone 11.0 (Phase 11 prereq)**; ראה v0.3 לעיל. Shell כ-wasm app אמיתי חייב לקדום את Phase 11 כדי שהוא לא יהפוך ל-exception פריבילגי בתוך ה-isolation model.
 
 **מ-Phase 6 (Calculator):**
 - ✅ `res/values/colors.toml` — כל ה-palette הועבר (commit `9c3ecd6`)
