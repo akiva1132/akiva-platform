@@ -407,14 +407,28 @@ const MISSING_COLOR = 0xFFFF00FF;
 // hand rolled parser misses and reports via `BootReport.resource_errors`.
 
 /** Iterate non-comment, non-blank lines. Strips leading/trailing
- * whitespace so callers only see meaningful content. */
+ * whitespace and cuts trailing `#` comments — but only when the hash
+ * sits outside a double-quoted string. The naive `indexOf("#")` would
+ * have eaten `"#ff15172a"` as a comment; colour literals start with
+ * `#` and live inside quotes, so the scanner has to track quote
+ * state. TOML doesn't permit `"` inside a `"..."` literal without an
+ * escape, so a simple `\"` check is sufficient. */
 function* valuesLines(src) {
   for (let raw of src.split(/\r?\n/)) {
-    const hash = raw.indexOf("#");
-    if (hash >= 0) raw = raw.slice(0, hash);
-    raw = raw.trim();
+    raw = stripTrailingComment(raw).trim();
     if (raw.length > 0) yield raw;
   }
+}
+
+function stripTrailingComment(line) {
+  let inQuote = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '\\' && inQuote) { i++; continue; }  // skip escaped char inside quote
+    if (c === '"') { inQuote = !inQuote; continue; }
+    if (c === '#' && !inQuote) return line.slice(0, i);
+  }
+  return line;
 }
 
 /** Parse `key = "value"` lines into `target`. `onBad(key, reason)` runs
