@@ -151,6 +151,9 @@ pub extern "C" fn akiva_boot() {
     for (id, err) in &report.package_errors {
         log::warn(&format!("package '{id}' failed to load: {err}"));
     }
+    for (id, err) in &report.resource_errors {
+        log::warn(&format!("package '{id}' resource file: {err}"));
+    }
     let m = k.display.metrics();
     fw.set_metrics(fw_act::SurfaceMetrics {
         width_px: m.width_px,

@@ -60,6 +60,12 @@ pub struct BootReport {
     /// Per-package load failures, `(package_id, error_message)`. Empty on
     /// a clean first boot. The kernel logs these at warn level.
     pub package_errors: Vec<(String, String)>,
+    /// Per-package resource-file load failures. Distinct from
+    /// `package_errors` because a broken `res/values/*.toml` doesn't
+    /// prevent the package from launching — the app just shows
+    /// placeholders where the refs would have resolved. Reported so
+    /// `akiva run`'s log has the breadcrumb for a typo.
+    pub resource_errors: Vec<(String, String)>,
 }
 
 /// Framework boot. Called once by the kernel during `akiva_boot` after
@@ -97,7 +103,20 @@ pub fn boot(
     let packages_loaded = fw.packages.load_installed(storage, |id, e: LoadError| {
         package_errors.push((id.to_string(), format!("{e:?}")));
     });
-    let report = BootReport { packages_loaded, package_errors };
+
+    // Read per-package resource tables from storage and register them
+    // with the framework's ResourceManager. Resource errors are tracked
+    // separately — a broken values file doesn't stop a package from
+    // running, it just means its @ref lookups fall back to placeholders.
+    let mut resource_errors: Vec<(String, String)> = Vec::new();
+    let tables = fw.packages.read_resource_tables(storage, |id, e| {
+        resource_errors.push((id.to_string(), e.to_string()));
+    });
+    for (id, table) in tables {
+        fw.resources.register(&id, table);
+    }
+
+    let report = BootReport { packages_loaded, package_errors, resource_errors };
 
     // Register every installed package's entry activity as a
     // `WasmActivity` factory. The host owns the wasm process (one per

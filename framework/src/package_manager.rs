@@ -1,12 +1,14 @@
 //! Package manager.
 //!
 //! Owns the persistent registry of installed apps. Each package lives in
-//! the kernel KV store under three keys:
+//! the kernel KV store under these keys:
 //!
 //! ```text
-//! sys/packages/index         → LF-separated list of package IDs
-//! packages/{id}/manifest.toml → parsed manifest bytes
-//! packages/{id}/app.wasm      → app wasm module bytes
+//! sys/packages/index                       → LF-separated list of package IDs
+//! packages/{id}/manifest.toml              → parsed manifest bytes
+//! packages/{id}/app.wasm                   → app wasm module bytes
+//! packages/{id}/res/values/strings.toml    → @string/ resource pairs (optional)
+//! packages/{id}/res/values/colors.toml     → @color/  resource pairs (optional)
 //! ```
 //!
 //! At boot, [`PackageManager::load_installed`] rebuilds the in-memory map
@@ -18,11 +20,18 @@
 //! The app wasm bytes are *not* held in memory after install/boot — the
 //! runtime loader reads them on demand via [`read_wasm`]. That keeps the
 //! resident set small for installations with many apps.
+//!
+//! Resource files are absent-by-default: an app that declares no strings
+//! or no colors is legal, the loader returns an empty table for those
+//! lookups. Corrupt resource files get reported but never block the
+//! package from launching — the app just shows `⟨missing:foo⟩` and
+//! magenta where the refs would have resolved.
 
 use std::collections::HashMap;
 
 use crate::activity_manager::LaunchMode;
 use crate::manifest::{self, Manifest, ManifestError, RUNTIME_ABI_VERSION};
+use crate::resources::{ResourceError, ResourceTable};
 use crate::storage::{Storage, StorageError};
 
 /// A snapshot of one installed app. The fields that apps actually launch
@@ -97,6 +106,8 @@ const KEY_INDEX: &str = "sys/packages/index";
 
 fn key_manifest(id: &str) -> String { format!("packages/{id}/manifest.toml") }
 fn key_wasm(id: &str) -> String { format!("packages/{id}/app.wasm") }
+fn key_values_strings(id: &str) -> String { format!("packages/{id}/res/values/strings.toml") }
+fn key_values_colors(id: &str) -> String { format!("packages/{id}/res/values/colors.toml") }
 
 pub struct PackageManager {
     packages: HashMap<String, PackageRecord>,
@@ -153,6 +164,45 @@ impl PackageManager {
         Ok(PackageRecord::from_manifest(manifest))
     }
 
+    /// Read every loaded package's `res/values/` files and parse them
+    /// into [`ResourceTable`]s. Missing files are legal — an app with no
+    /// strings or no colors gets an empty table on that side. A broken
+    /// file is reported through `on_error` and the package still ends
+    /// up with an empty table registered for it, so subsequent
+    /// `@string/` / `@color/` lookups fail deterministically rather
+    /// than blowing up mid-render.
+    ///
+    /// Returned in insertion order of the caller's choice — callers
+    /// that want a stable order should sort by id. The framework's
+    /// boot path doesn't care since it just feeds these into
+    /// `ResourceManager::register`.
+    pub fn read_resource_tables(
+        &self,
+        storage: &dyn Storage,
+        mut on_error: impl FnMut(&str, ResourceLoadError),
+    ) -> Vec<(String, ResourceTable)> {
+        let mut out = Vec::with_capacity(self.packages.len());
+        for id in self.packages.keys() {
+            let strings = match read_optional_text(storage, &key_values_strings(id)) {
+                Ok(v) => v,
+                Err(e) => { on_error(id, e); None }
+            };
+            let colors = match read_optional_text(storage, &key_values_colors(id)) {
+                Ok(v) => v,
+                Err(e) => { on_error(id, e); None }
+            };
+            let table = match ResourceTable::parse(strings.as_deref(), colors.as_deref()) {
+                Ok(t) => t,
+                Err(e) => {
+                    on_error(id, ResourceLoadError::Parse(e));
+                    ResourceTable::default()
+                }
+            };
+            out.push((id.clone(), table));
+        }
+        out
+    }
+
     /// Install a package. Parses + validates the manifest, checks ABI
     /// compatibility, then atomically-ish writes manifest + wasm + updated
     /// index. "Atomically-ish" because we don't have transactions; a crash
@@ -195,6 +245,8 @@ impl PackageManager {
         // Best-effort: missing key == already gone, not an error.
         let _ = storage.delete(&key_wasm(id));
         let _ = storage.delete(&key_manifest(id));
+        let _ = storage.delete(&key_values_strings(id));
+        let _ = storage.delete(&key_values_colors(id));
         let mut ids: Vec<String> = self.packages.keys().cloned().collect();
         ids.sort();
         let _ = storage.write(KEY_INDEX, ids.join("\n").as_bytes());
@@ -225,6 +277,45 @@ pub enum LoadError {
     /// The index said `id` is installed but the manifest at
     /// `packages/{id}/...` declares a different package id.
     IndexDesync { index_id: String, manifest_id: String },
+}
+
+/// Why reading a package's resource tables failed. Distinct from
+/// [`LoadError`] so resource issues can be reported without polluting the
+/// package-load error channel — a broken resource file shouldn't look
+/// like a broken manifest to a human reading the boot log.
+#[derive(Debug)]
+pub enum ResourceLoadError {
+    Storage(StorageError),
+    /// File existed but wasn't valid UTF-8 — a rare case since our own
+    /// tooling writes ASCII-safe TOML, but worth flagging explicitly
+    /// instead of silently dropping to "parse error".
+    NotUtf8,
+    Parse(ResourceError),
+}
+
+impl core::fmt::Display for ResourceLoadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ResourceLoadError::Storage(e) => write!(f, "storage: {e:?}"),
+            ResourceLoadError::NotUtf8 => write!(f, "resource file is not valid UTF-8"),
+            ResourceLoadError::Parse(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Read a key that may or may not exist. Missing → `Ok(None)`; present
+/// but invalid UTF-8 → `Err(NotUtf8)`; storage I/O failure → `Err(Storage)`.
+fn read_optional_text(
+    storage: &dyn Storage,
+    key: &str,
+) -> Result<Option<String>, ResourceLoadError> {
+    match storage.read(key) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|_| ResourceLoadError::NotUtf8),
+        Err(StorageError::NotFound) => Ok(None),
+        Err(e) => Err(ResourceLoadError::Storage(e)),
+    }
 }
 
 /// Verify the package's `min_abi_version` is compatible with the runtime.
@@ -399,5 +490,77 @@ entry = true
         pm.install(&mut store, HELLO, b"\0asm\x01").unwrap();
         let bytes = pm.read_wasm(&store, "com.akiva.hello").unwrap();
         assert_eq!(bytes, b"\0asm\x01");
+    }
+
+    #[test]
+    fn resource_tables_read_populated_and_absent_packages() {
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        pm.install(&mut store, HELLO, b"x").unwrap();
+        pm.install(&mut store, WORLD, b"x").unwrap();
+
+        // Only HELLO gets resources; WORLD has no values/ at all.
+        store.write(
+            "packages/com.akiva.hello/res/values/strings.toml",
+            br#"greeting = "hi""#,
+        ).unwrap();
+        store.write(
+            "packages/com.akiva.hello/res/values/colors.toml",
+            br##"bg = "#ff101418""##,
+        ).unwrap();
+
+        let mut errors = Vec::new();
+        let tables = pm.read_resource_tables(&store, |id, e| {
+            errors.push((id.to_string(), format!("{e}")))
+        });
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(tables.len(), 2);
+
+        let by_id: std::collections::HashMap<_, _> = tables.into_iter().collect();
+        let hello = &by_id["com.akiva.hello"];
+        assert_eq!(hello.string("greeting"), Some("hi"));
+        assert_eq!(hello.color("bg"), Some(0xff101418));
+
+        let world = &by_id["com.akiva.world"];
+        assert!(world.string("greeting").is_none());
+        assert!(world.color("bg").is_none());
+    }
+
+    #[test]
+    fn resource_tables_report_corrupt_files_but_still_emit_empty_table() {
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        pm.install(&mut store, HELLO, b"x").unwrap();
+        store.write(
+            "packages/com.akiva.hello/res/values/colors.toml",
+            b"bg = \"not-a-colour\"",
+        ).unwrap();
+
+        let mut errors = Vec::new();
+        let tables = pm.read_resource_tables(&store, |id, e| {
+            errors.push((id.to_string(), format!("{e}")))
+        });
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, "com.akiva.hello");
+        // Still registered — just with empty contents, so @color/bg lookups
+        // cleanly return "not found" rather than randomly crashing later.
+        assert_eq!(tables.len(), 1);
+        assert!(tables[0].1.color("bg").is_none());
+    }
+
+    #[test]
+    fn uninstall_removes_resource_keys() {
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        pm.install(&mut store, HELLO, b"x").unwrap();
+        store.write(
+            "packages/com.akiva.hello/res/values/strings.toml",
+            br#"x = "y""#,
+        ).unwrap();
+        pm.uninstall(&mut store, "com.akiva.hello");
+        assert!(matches!(
+            store.read("packages/com.akiva.hello/res/values/strings.toml"),
+            Err(StorageError::NotFound),
+        ));
     }
 }
