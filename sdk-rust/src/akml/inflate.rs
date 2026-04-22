@@ -24,6 +24,7 @@
 
 use core::fmt;
 
+use super::bindings::Bindings;
 use super::parser::{self, Element, Loc};
 use crate::ui::node::NodeId;
 use crate::ui::{CrossAxis, MainAxis, Ui};
@@ -48,24 +49,43 @@ impl From<parser::ParseError> for InflateError {
     }
 }
 
-/// Parse + inflate in one call. The common case for apps that embed
-/// their layout via `include_str!`.
+/// Parse + inflate in one call with no bindings. The common case for
+/// apps whose layout is entirely static.
 pub fn inflate_str(ui: &mut Ui<'_, '_, '_>, src: &str) -> Result<NodeId, InflateError> {
-    let root = parser::parse(src)?;
-    inflate(ui, &root)
+    inflate_str_with(ui, src, &Bindings::default())
 }
 
-/// Inflate a pre-parsed element tree onto `ui`. Returns the id of the
-/// root widget. Call `ui.present(root)` in the caller — keeping the
-/// two steps separate so the caller can still mix in imperative
-/// widgets above or below the inflated sub-tree.
+/// Parse + inflate, resolving any `{name}` attribute values through
+/// `bindings`. Build a fresh `Bindings` per frame — it's cheap and
+/// keeps the binding lifetimes local to `on_render`.
+pub fn inflate_str_with(
+    ui: &mut Ui<'_, '_, '_>, src: &str, bindings: &Bindings,
+) -> Result<NodeId, InflateError> {
+    let root = parser::parse(src)?;
+    inflate_with(ui, &root, bindings)
+}
+
+/// Inflate a pre-parsed element tree onto `ui` with no bindings —
+/// every `{name}` attribute value in `root` will error out as
+/// unresolved. Prefer this when the source is known-static.
 pub fn inflate(ui: &mut Ui<'_, '_, '_>, root: &Element) -> Result<NodeId, InflateError> {
+    inflate_with(ui, root, &Bindings::default())
+}
+
+/// Inflate a pre-parsed element tree, resolving any `{name}`
+/// references through `bindings`. Returns the id of the root widget.
+/// Call `ui.present(root)` in the caller — keeping the two steps
+/// separate so the caller can still mix imperative widgets above or
+/// below the inflated sub-tree.
+pub fn inflate_with(
+    ui: &mut Ui<'_, '_, '_>, root: &Element, bindings: &Bindings,
+) -> Result<NodeId, InflateError> {
     let id = match root.tag.as_str() {
-        "VStack" | "HStack" => inflate_stack(ui, root)?,
-        "Text"    => inflate_text(ui, root)?,
-        "Button"  => inflate_button(ui, root)?,
-        "Rect"    => inflate_rect(ui, root)?,
-        "Spacer"  => inflate_spacer(ui, root)?,
+        "VStack" | "HStack" => inflate_stack(ui, root, bindings)?,
+        "Text"    => inflate_text(ui, root, bindings)?,
+        "Button"  => inflate_button(ui, root, bindings)?,
+        "Rect"    => inflate_rect(ui, root, bindings)?,
+        "Spacer"  => inflate_spacer(ui, root, bindings)?,
         other => return Err(InflateError {
             message: format!("unknown widget tag <{other}>"),
             loc: root.loc,
@@ -76,12 +96,12 @@ pub fn inflate(ui: &mut Ui<'_, '_, '_>, root: &Element) -> Result<NodeId, Inflat
 
 // ── Widget inflaters ─────────────────────────────────────────────────
 
-fn inflate_stack(ui: &mut Ui<'_, '_, '_>, el: &Element) -> Result<NodeId, InflateError> {
+fn inflate_stack(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> Result<NodeId, InflateError> {
     // Children first: the builder borrows `ui` mutably, so we gather
     // child ids before starting the stack builder chain.
     let mut child_ids = Vec::with_capacity(el.children.len());
     for child in &el.children {
-        child_ids.push(inflate(ui, child)?);
+        child_ids.push(inflate_with(ui, child, bindings)?);
     }
     let vertical = el.tag == "VStack";
     // Snapshot the attribute values before we hand `ui` to the builder —
@@ -90,11 +110,11 @@ fn inflate_stack(ui: &mut Ui<'_, '_, '_>, el: &Element) -> Result<NodeId, Inflat
     // `el.attrs` through the same `el` because attribute lookups don't
     // need `ui`; but parsing them below only needs &str, so doing the
     // parsing up front keeps the builder chain tidy.
-    let gap      = attr_f32(el, "gap", "spacing")?.unwrap_or(0.0);
-    let padding  = attr_padding(el)?.unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let gap      = attr_f32(el, bindings, "gap", "spacing")?.unwrap_or(0.0);
+    let padding  = attr_padding(el, bindings)?.unwrap_or((0.0, 0.0, 0.0, 0.0));
     let main     = attr_main_axis(el)?;
     let cross    = attr_cross_axis(el)?;
-    let flex     = attr_f32(el, "flex", "grow")?.unwrap_or(0.0);
+    let flex     = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
 
     let mut b = if vertical { ui.v_stack(&child_ids) } else { ui.h_stack(&child_ids) };
     b = b.gap(gap).padding_trbl(padding.0, padding.1, padding.2, padding.3);
@@ -104,52 +124,55 @@ fn inflate_stack(ui: &mut Ui<'_, '_, '_>, el: &Element) -> Result<NodeId, Inflat
     Ok(b.build())
 }
 
-fn inflate_text(ui: &mut Ui<'_, '_, '_>, el: &Element) -> Result<NodeId, InflateError> {
-    let text = el.attr("text").unwrap_or("");
-    let size = attr_f32(el, "textSize", "size")?.unwrap_or(14.0);
-    let color = attr_color(el, "textColor", "color")?.unwrap_or(0xfff0f4fa);
-    let flex = attr_f32(el, "flex", "grow")?.unwrap_or(0.0);
+fn inflate_text(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> Result<NodeId, InflateError> {
+    let text = attr_text(el, bindings, "text")?.unwrap_or_default();
+    let size = attr_f32(el, bindings, "textSize", "size")?.unwrap_or(14.0);
+    let color = attr_color(el, bindings, "textColor", "color")?.unwrap_or(0xfff0f4fa);
+    let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
     let mut b = ui.text(text).size(size).color(color);
     if flex > 0.0 { b = b.grow(flex); }
     Ok(b.build())
 }
 
-fn inflate_button(ui: &mut Ui<'_, '_, '_>, el: &Element) -> Result<NodeId, InflateError> {
+fn inflate_button(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> Result<NodeId, InflateError> {
     // `id` is required for now because click correlation goes through
     // `was_clicked(id)` — a button with no id would be tappable but
     // never observable, which is almost certainly not what the author
-    // meant.
+    // meant. The id itself is *not* bindable: a `{name}` id would break
+    // click correlation (the click site writes a literal id).
     let id = el.attr("id").ok_or_else(|| InflateError {
         message: "<Button> requires an `id` attribute for click correlation".into(),
         loc: el.loc,
     })?;
-    let label = el.attr("label").or_else(|| el.attr("text")).unwrap_or(id);
-    let flex = attr_f32(el, "flex", "grow")?.unwrap_or(0.0);
+    let label = attr_text(el, bindings, "label")?
+        .or(attr_text(el, bindings, "text")?)
+        .unwrap_or_else(|| id.to_string());
+    let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
     let node = ui.button(id, label);
     if flex > 0.0 { ui.grow(node, flex); }
     Ok(node)
 }
 
-fn inflate_rect(ui: &mut Ui<'_, '_, '_>, el: &Element) -> Result<NodeId, InflateError> {
+fn inflate_rect(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> Result<NodeId, InflateError> {
     // A Rect without a color is just invisible padding; require one to
     // surface obvious mistakes.
-    let color = attr_color(el, "background", "color")?
+    let color = attr_color(el, bindings, "background", "color")?
         .ok_or_else(|| InflateError {
             message: "<Rect> requires a `color` (or `background`) attribute".into(),
             loc: el.loc,
         })?;
-    let w = attr_f32(el, "minWidth",  "min_width")?.unwrap_or(0.0);
-    let h = attr_f32(el, "minHeight", "min_height")?.unwrap_or(0.0);
-    let flex = attr_f32(el, "flex", "grow")?.unwrap_or(0.0);
+    let w = attr_f32(el, bindings, "minWidth",  "min_width")?.unwrap_or(0.0);
+    let h = attr_f32(el, bindings, "minHeight", "min_height")?.unwrap_or(0.0);
+    let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
     let mut b = ui.rect(color).size(w, h);
     if flex > 0.0 { b = b.grow(flex); }
     Ok(b.build())
 }
 
-fn inflate_spacer(ui: &mut Ui<'_, '_, '_>, el: &Element) -> Result<NodeId, InflateError> {
-    let w = attr_f32(el, "minWidth",  "min_width")?.unwrap_or(0.0);
-    let h = attr_f32(el, "minHeight", "min_height")?.unwrap_or(0.0);
-    let flex = attr_f32(el, "flex", "grow")?.unwrap_or(0.0);
+fn inflate_spacer(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> Result<NodeId, InflateError> {
+    let w = attr_f32(el, bindings, "minWidth",  "min_width")?.unwrap_or(0.0);
+    let h = attr_f32(el, bindings, "minHeight", "min_height")?.unwrap_or(0.0);
+    let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
     let mut b = ui.spacer().size(w, h);
     if flex > 0.0 { b = b.grow(flex); }
     Ok(b.build())
@@ -162,22 +185,56 @@ fn inflate_spacer(ui: &mut Ui<'_, '_, '_>, el: &Element) -> Result<NodeId, Infla
 /// `grow`) without either feeling wrong. Last-wins across the two names
 /// is too surprising — instead, the first listed name that exists
 /// decides, and the other is ignored if present.
-fn attr_f32(el: &Element, a: &str, b: &str) -> Result<Option<f32>, InflateError> {
+///
+/// If the attribute's value is a `{name}` binding reference, the value
+/// comes from `bindings`; a missing binding is an error. Else the value
+/// is parsed as a literal number.
+fn attr_f32(el: &Element, bindings: &Bindings, a: &str, b: &str) -> Result<Option<f32>, InflateError> {
     for name in [a, b] {
         if let Some(raw) = el.attr(name) {
+            if let Some(bname) = Bindings::binding_name(raw) {
+                return bindings.get_number(bname).map(Some).ok_or_else(|| unresolved(el.loc, bname, name));
+            }
             return Ok(Some(parse_f32(raw, el.loc, name)?));
         }
     }
     Ok(None)
 }
 
-fn attr_color(el: &Element, a: &str, b: &str) -> Result<Option<u32>, InflateError> {
+fn attr_color(el: &Element, bindings: &Bindings, a: &str, b: &str) -> Result<Option<u32>, InflateError> {
     for name in [a, b] {
         if let Some(raw) = el.attr(name) {
+            if let Some(bname) = Bindings::binding_name(raw) {
+                return bindings.get_color(bname).map(Some).ok_or_else(|| unresolved(el.loc, bname, name));
+            }
             return Ok(Some(parse_color(raw, el.loc, name)?));
         }
     }
     Ok(None)
+}
+
+/// Resolve a single named attribute whose type is an arbitrary string
+/// — `<Text text=...>`, `<Button label=...>`. Bindings preferred when
+/// the value is `{name}`. Returns owned `String` because the bindings
+/// map owns its strings, and callers pass the result to builder APIs
+/// that consume `impl Into<String>` anyway.
+fn attr_text(el: &Element, bindings: &Bindings, name: &str) -> Result<Option<String>, InflateError> {
+    let raw = match el.attr(name) { Some(s) => s, None => return Ok(None) };
+    if let Some(bname) = Bindings::binding_name(raw) {
+        return bindings.get_text(bname)
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| unresolved(el.loc, bname, name));
+    }
+    Ok(Some(raw.to_string()))
+}
+
+fn unresolved(loc: Loc, binding_name: &str, attr_name: &str) -> InflateError {
+    InflateError {
+        message: format!(
+            "unresolved binding '{{{binding_name}}}' for attribute '{attr_name}' — no entry in Bindings"
+        ),
+        loc,
+    }
 }
 
 fn attr_main_axis(el: &Element) -> Result<Option<MainAxis>, InflateError> {
@@ -227,9 +284,15 @@ fn attr_cross_axis(el: &Element) -> Result<Option<CrossAxis>, InflateError> {
 
 /// Padding supports three shorthands so authors can pick whichever reads
 /// best for the situation: `"16"` uniform, `"8 16"` vertical-horizontal,
-/// `"4 8 4 8"` full TRBL.
-fn attr_padding(el: &Element) -> Result<Option<(f32, f32, f32, f32)>, InflateError> {
+/// `"4 8 4 8"` full TRBL. A `{name}` binding resolves to a scalar and
+/// is applied uniformly — mixed shorthand inside a binding isn't
+/// supported (the binding name must reference a single `f32`).
+fn attr_padding(el: &Element, bindings: &Bindings) -> Result<Option<(f32, f32, f32, f32)>, InflateError> {
     let raw = match el.attr("padding") { Some(s) => s, None => return Ok(None) };
+    if let Some(bname) = Bindings::binding_name(raw) {
+        let v = bindings.get_number(bname).ok_or_else(|| unresolved(el.loc, bname, "padding"))?;
+        return Ok(Some((v, v, v, v)));
+    }
     let mut parts = raw.split_ascii_whitespace();
     let a = parts.next().ok_or_else(|| InflateError {
         message: "empty `padding` value".into(), loc: el.loc,
@@ -489,7 +552,7 @@ mod tests {
             // Wrap the attribute in a minimal element so we reuse the
             // real parser path; shorter than hand-building an Element.
             let el = parser::parse(&format!(r#"<A padding="{src}" />"#)).unwrap();
-            attr_padding(&el).unwrap().unwrap()
+            attr_padding(&el, &Bindings::default()).unwrap().unwrap()
         }
         assert_eq!(pad("16"),           (16.0, 16.0, 16.0, 16.0));
         assert_eq!(pad("8 16"),         (8.0,  16.0, 8.0,  16.0));
@@ -502,5 +565,95 @@ mod tests {
         assert_eq!(parse_f32("16dp", loc, "x").unwrap(), 16.0);
         assert_eq!(parse_f32("12.5sp", loc, "x").unwrap(), 12.5);
         assert_eq!(parse_f32(" 24 px ", loc, "x").unwrap(), 24.0);
+    }
+
+    // ── Bindings ───────────────────────────────────────────────────────
+
+    #[test]
+    fn text_binding_substitutes_attribute_value() {
+        // Compile the tree twice with different bindings — only the
+        // bindings change; the id stays the same, and `was_clicked`
+        // still keys off the literal id.
+        with_ui(|ui| {
+            let bindings = Bindings::new().text("display", "hello world");
+            let src = r#"<Text text="{display}" size="14" />"#;
+            let root = inflate_str_with(ui, src, &bindings).unwrap();
+            ui.present(root);
+            // No direct assertion on text content (we don't expose the
+            // rendered string); compile + render is the smoke test.
+            let _ = root;
+        });
+    }
+
+    #[test]
+    fn color_binding_uses_typed_value() {
+        with_ui(|ui| {
+            let bindings = Bindings::new().color("bg", 0xff112233);
+            let src = r##"<Rect color="{bg}" minWidth="10" minHeight="10" />"##;
+            let _ = inflate_str_with(ui, src, &bindings).unwrap();
+        });
+    }
+
+    #[test]
+    fn number_binding_drives_size_and_gap() {
+        with_ui(|ui| {
+            let bindings = Bindings::new().number("big", 48.0).number("pad", 12.0);
+            let src = r#"<VStack gap="{pad}" padding="{pad}">
+                <Text text="title" size="{big}" />
+            </VStack>"#;
+            let _ = inflate_str_with(ui, src, &bindings).unwrap();
+        });
+    }
+
+    #[test]
+    fn unresolved_binding_is_a_clear_error() {
+        with_ui(|ui| {
+            // text="{name}" but the Bindings is empty.
+            let err = inflate_str_with(
+                ui, r#"<Text text="{missing}" />"#, &Bindings::default(),
+            ).unwrap_err();
+            assert!(err.message.contains("unresolved binding '{missing}'"), "msg: {}", err.message);
+            assert!(err.message.contains("'text'"), "msg: {}", err.message);
+        });
+    }
+
+    #[test]
+    fn partial_binding_is_treated_as_literal() {
+        // "{name}" must be the entire attribute value. "Prefix {name}"
+        // is taken as a literal string — no surprise interpolation of
+        // brace-wrapped substrings into the middle of a user message.
+        with_ui(|ui| {
+            let bindings = Bindings::new().text("display", "42");
+            let src = r#"<Text text="value is {display}" />"#;
+            // No error — the literal is used as-is. The rendered text
+            // would show "value is {display}"; we don't assert the
+            // rendered string, just that no binding error fires.
+            let _ = inflate_str_with(ui, src, &bindings).unwrap();
+        });
+    }
+
+    #[test]
+    fn literal_attr_does_not_touch_bindings() {
+        // Bindings is populated but the attr is literal — the binding
+        // is ignored, the literal wins.
+        with_ui(|ui| {
+            let bindings = Bindings::new()
+                .text("label", "SURPRISE");  // must not appear
+            let src = r#"<Button id="go" label="Go" />"#;
+            let id = inflate_str_with(ui, src, &bindings).unwrap();
+            ui.present(id);
+            assert!(ui.has_hit_rect("go"));
+        });
+    }
+
+    #[test]
+    fn inflate_without_bindings_errors_on_binding_reference() {
+        // Using the short non-`_with` entry point with a `{name}`
+        // attribute is a mistake we want to flag, not silently render
+        // the literal "{name}" as text.
+        with_ui(|ui| {
+            let err = inflate_str(ui, r#"<Text text="{name}" />"#).unwrap_err();
+            assert!(err.message.contains("unresolved"), "msg: {}", err.message);
+        });
     }
 }

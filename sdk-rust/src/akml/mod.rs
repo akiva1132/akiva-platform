@@ -39,8 +39,10 @@
 //! }
 //! ```
 
+pub mod bindings;
 pub mod parser;
 pub mod inflate;
 
+pub use bindings::Bindings;
 pub use parser::{parse, Element, Loc, ParseError};
-pub use inflate::{inflate, inflate_str, InflateError};
+pub use inflate::{inflate, inflate_str, inflate_with, inflate_str_with, InflateError};
