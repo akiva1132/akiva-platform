@@ -13,9 +13,14 @@ use super::{CrossAxis, MainAxis, Ui};
 pub type NodeId = usize;
 
 /// One widget in the tree. Leaves (Text, Rect, Spacer) carry their own
-/// content; containers (VStack, HStack, Padding) reference child ids.
+/// content; containers (VStack, HStack, Frame) reference child ids.
 /// `Button` is a composite leaf — it paints a rect + centred label and
 /// takes part in hit-testing.
+///
+/// `Frame` stacks children on the z-axis in document order: the first
+/// child paints at the bottom, the last on top. All children share the
+/// same rect (the frame's inner box after padding), which makes it the
+/// natural fit for "background rect + content on top" patterns.
 #[derive(Debug)]
 pub enum Node {
     Text {
@@ -43,6 +48,10 @@ pub enum Node {
         padding: (f32, f32, f32, f32),
         main: MainAxis,
         cross: CrossAxis,
+    },
+    Frame {
+        children: Vec<NodeId>,
+        padding: (f32, f32, f32, f32),
     },
     Button {
         id: String,
@@ -122,6 +131,37 @@ impl<'u, 's, 'c, 'b> SpacerBuilder<'u, 's, 'c, 'b> {
     pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
     pub fn build(self) -> NodeId {
         let id = self.ui.push(Node::Spacer { min: self.min });
+        self.ui.set_grow(id, self.grow);
+        id
+    }
+}
+
+pub struct FrameBuilder<'u, 's, 'c, 'b> {
+    ui: &'u mut Ui<'s, 'c, 'b>,
+    children: Vec<NodeId>,
+    padding: (f32, f32, f32, f32),
+    grow: f32,
+}
+
+impl<'u, 's, 'c, 'b> FrameBuilder<'u, 's, 'c, 'b> {
+    pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, children: Vec<NodeId>) -> Self {
+        Self { ui, children, padding: (0.0, 0.0, 0.0, 0.0), grow: 0.0 }
+    }
+    /// Uniform padding on all four sides.
+    pub fn padding(mut self, p: f32) -> Self {
+        self.padding = (p, p, p, p); self
+    }
+    pub fn padding_trbl(mut self, top: f32, right: f32, bottom: f32, left: f32) -> Self {
+        self.padding = (top, right, bottom, left); self
+    }
+    /// Main-axis grow factor for when this frame is itself a child of a
+    /// stack — same semantics as the equivalent builder on `StackBuilder`.
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
+    pub fn build(self) -> NodeId {
+        let id = self.ui.push(Node::Frame {
+            children: self.children,
+            padding: self.padding,
+        });
         self.ui.set_grow(id, self.grow);
         id
     }

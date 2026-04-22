@@ -11,7 +11,7 @@
 //!
 //! | area               | supported now                        | deferred |
 //! |--------------------|--------------------------------------|----------|
-//! | elements           | `VStack`, `HStack`, `Text`, `Button`, `Rect`, `Spacer` | `Grid`, `Frame`, `Image`, `Input` |
+//! | elements           | `VStack`, `HStack`, `Frame`, `Text`, `Button`, `Rect`, `Spacer` | `Grid`, `Image`, `Input` |
 //! | attributes         | `id`, `gap`, `padding`, `main`, `cross`, `flex`, `size`, `color`, `text`, `label`, `min_width`, `min_height` | `margin`, `background`, `visible`, `textAlign`, `fontWeight`, `onClick`+`tag` |
 //! | attribute values   | literal numbers, `#RGB` / `#RRGGBB` / `#AARRGGBB` / `0xAARRGGBB` colours, enum strings | `dp`/`sp`/`%` suffixes, `match_parent`/`wrap_content` |
 //! | resources          | none — literals only                 | `@string/*`, `@color/*`, `@dimen/*`, `@style/*` |

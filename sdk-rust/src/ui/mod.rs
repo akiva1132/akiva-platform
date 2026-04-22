@@ -293,6 +293,14 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         node::StackBuilder::new_h(self, children.to_vec())
     }
 
+    /// Frame: stack children on the z-axis. Document order is paint order
+    /// (first child bottom, last child top); every child gets the same
+    /// rect — the frame's inner box after padding. The common pattern is
+    /// a background `Rect` + content on top.
+    pub fn frame(&mut self, children: &[NodeId]) -> node::FrameBuilder<'_, 's, 'c, 'b> {
+        node::FrameBuilder::new(self, children.to_vec())
+    }
+
     // ── Present ──────────────────────────────────────────────────────
 
     /// Measure, lay out and paint the tree rooted at `root`. Consumes

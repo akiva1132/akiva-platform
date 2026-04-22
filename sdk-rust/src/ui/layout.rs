@@ -102,6 +102,22 @@ fn measure_node(
             }
             (sum_w + padding.1 + padding.3, max_h + padding.0 + padding.2)
         }
+        Node::Frame { children, padding } => {
+            // Z-stack: children overlap, so intrinsic = max child size on
+            // each axis (not sum). Padding adds to both sides like stacks.
+            let inner_avail = (
+                (avail.0 - padding.1 - padding.3).max(0.0),
+                (avail.1 - padding.0 - padding.2).max(0.0),
+            );
+            let mut max_w: f32 = 0.0;
+            let mut max_h: f32 = 0.0;
+            for c in children {
+                let (cw, ch) = measure_node(nodes, *c, inner_avail, text_width, out);
+                if cw > max_w { max_w = cw; }
+                if ch > max_h { max_h = ch; }
+            }
+            (max_w + padding.1 + padding.3, max_h + padding.0 + padding.2)
+        }
     };
     out.insert(id, size);
     size
@@ -151,6 +167,12 @@ fn place(
             if main.fills_slot() || any_grow { w = slot.w; }
             if cross.fills_slot() { h = slot.h; }
         }
+        Node::Frame { children, .. } => {
+            // Any grow child in a frame wants to fill — same rule as
+            // stacks, applied to both axes because a frame has no "main".
+            let any_grow = children.iter().any(|c| attrs[*c].grow > 0.0);
+            if any_grow { w = slot.w; h = slot.h; }
+        }
         _ => {}
     }
     let rect = Rect { x: slot.x, y: slot.y, w, h };
@@ -184,6 +206,22 @@ fn place(
                 inner_x, inner_y, inner_w, inner_h,
                 sizes, out,
             );
+        }
+        Node::Frame { children, padding } => {
+            // Z-stack: every child gets the same slot (the frame's inner
+            // rect) and is stretched on both axes. That makes "<Rect>
+            // background fills behind content" fall out for free, and
+            // lets overlaid stacks use their own alignment to position
+            // within the full frame.
+            let child_slot = Rect {
+                x: rect.x + padding.3,
+                y: rect.y + padding.0,
+                w: (rect.w - padding.1 - padding.3).max(0.0),
+                h: (rect.h - padding.0 - padding.2).max(0.0),
+            };
+            for c in children {
+                place(nodes, attrs, *c, child_slot, /*stretch_w=*/ true, /*stretch_h=*/ true, sizes, out);
+            }
         }
     }
 }
@@ -324,6 +362,9 @@ mod tests {
         children: Vec<NodeId>, gap: f32, main: MainAxis, cross: CrossAxis,
     ) -> Node {
         Node::HStack { children, gap, padding: (0.0, 0.0, 0.0, 0.0), main, cross }
+    }
+    fn frame(children: Vec<NodeId>, padding: (f32, f32, f32, f32)) -> Node {
+        Node::Frame { children, padding }
     }
     /// Default attrs for a tree of `n` nodes — no grow anywhere. Used by
     /// every test that doesn't exercise grow specifically.
@@ -831,6 +872,96 @@ mod tests {
         // Inner children split 80px height evenly.
         assert!(approx(rects[&0].h, 40.0));
         assert!(approx(rects[&1].h, 40.0));
+    }
+
+    // ── Frame (z-stack) ──────────────────────────────────────────────
+    //
+    // Frame stacks children at the same rect (the inner box after
+    // padding) and stretches each on both axes. That makes "background
+    // rect + content on top" trivial — the rect fills, the content
+    // overlays at full frame size with its own layout applied.
+
+    #[test]
+    fn frame_intrinsic_is_max_of_children_plus_padding() {
+        // Two children of different sizes; frame takes the max on each
+        // axis (not the sum — that's the stack rule). Padding adds.
+        let nodes = vec![
+            rect(20.0, 10.0), rect(5.0, 40.0),
+            frame(vec![0, 1], (2.0, 3.0, 4.0, 5.0)),
+        ];
+        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        // max w = 20 + left 5 + right 3 = 28; max h = 40 + top 2 + bot 4 = 46.
+        assert_eq!(sizes[&2], (28.0, 46.0));
+    }
+
+    #[test]
+    fn frame_children_share_the_inner_rect() {
+        // All children get placed at (inner_x, inner_y) with the inner
+        // dimensions as their slot — and because the frame stretches,
+        // they all end up rect-equal to the inner box.
+        let nodes = vec![
+            rect(10.0, 10.0), rect(5.0, 5.0),
+            frame(vec![0, 1], (0.0, 0.0, 0.0, 0.0)),
+        ];
+        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 2, Rect { x: 7.0, y: 11.0, w: 100.0, h: 80.0 }, &sizes, &mut rects);
+        // Frame is intrinsic (no grow child): w=10 (max), h=10 (max).
+        assert!(approx(rects[&2].w, 10.0) && approx(rects[&2].h, 10.0));
+        // Both children stretched to the frame's inner rect.
+        assert!(approx(rects[&0].x, 7.0) && approx(rects[&0].y, 11.0));
+        assert!(approx(rects[&0].w, 10.0) && approx(rects[&0].h, 10.0));
+        assert!(approx(rects[&1].x, 7.0) && approx(rects[&1].y, 11.0));
+        assert!(approx(rects[&1].w, 10.0) && approx(rects[&1].h, 10.0));
+    }
+
+    #[test]
+    fn frame_padding_shrinks_the_inner_rect_for_children() {
+        let nodes = vec![
+            rect(10.0, 10.0),
+            frame(vec![0], (4.0, 5.0, 6.0, 7.0)),
+        ];
+        let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 1, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &mut rects);
+        // Child shifted by top/left padding (4, 7).
+        assert!(approx(rects[&0].x, 7.0) && approx(rects[&0].y, 4.0));
+    }
+
+    #[test]
+    fn frame_with_grow_child_fills_slot_on_both_axes() {
+        // A grow>0 child in a frame forces the frame to fill its slot
+        // (both axes). The child then stretches to that full inner box.
+        let nodes = vec![
+            rect(0.0, 0.0),  // Rect with zero min — stand-in for a background.
+            frame(vec![0], (0.0, 0.0, 0.0, 0.0)),
+        ];
+        let mut attrs = default_attrs(nodes.len());
+        attrs[0].grow = 1.0;
+        let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout(&nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 200.0, h: 150.0 }, &sizes, &mut rects);
+        assert!(approx(rects[&1].w, 200.0) && approx(rects[&1].h, 150.0));
+        assert!(approx(rects[&0].w, 200.0) && approx(rects[&0].h, 150.0));
+    }
+
+    #[test]
+    fn frame_forwards_parent_stretch_into_its_own_rect() {
+        // A frame inside a VStack with cross=Stretch should itself fill
+        // the cross axis — exercise the place() path where parent stretch
+        // overrides intrinsic clamp for the frame node.
+        let nodes = vec![
+            rect(10.0, 10.0),
+            frame(vec![0], (0.0, 0.0, 0.0, 0.0)),
+            vstack_aligned(vec![1], 0.0, MainAxis::Start, CrossAxis::Stretch),
+        ];
+        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 2, Rect { x: 0.0, y: 0.0, w: 200.0, h: 200.0 }, &sizes, &mut rects);
+        // Frame stretched across full width (cross axis of outer VStack).
+        assert!(approx(rects[&1].w, 200.0));
+        // Frame's child in turn gets the full inner width.
+        assert!(approx(rects[&0].w, 200.0));
     }
 
     #[test]

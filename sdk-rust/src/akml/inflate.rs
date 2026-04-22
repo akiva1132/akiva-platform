@@ -82,6 +82,7 @@ pub fn inflate_with(
 ) -> Result<NodeId, InflateError> {
     let id = match root.tag.as_str() {
         "VStack" | "HStack" => inflate_stack(ui, root, bindings)?,
+        "Frame"   => inflate_frame(ui, root, bindings)?,
         "Text"    => inflate_text(ui, root, bindings)?,
         "Button"  => inflate_button(ui, root, bindings)?,
         "Rect"    => inflate_rect(ui, root, bindings)?,
@@ -120,6 +121,19 @@ fn inflate_stack(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> 
     b = b.gap(gap).padding_trbl(padding.0, padding.1, padding.2, padding.3);
     if let Some(m) = main  { b = b.main(m); }
     if let Some(c) = cross { b = b.cross(c); }
+    if flex > 0.0 { b = b.grow(flex); }
+    Ok(b.build())
+}
+
+fn inflate_frame(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> Result<NodeId, InflateError> {
+    let mut child_ids = Vec::with_capacity(el.children.len());
+    for child in &el.children {
+        child_ids.push(inflate_with(ui, child, bindings)?);
+    }
+    let padding = attr_padding(el, bindings)?.unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
+    let mut b = ui.frame(&child_ids)
+        .padding_trbl(padding.0, padding.1, padding.2, padding.3);
     if flex > 0.0 { b = b.grow(flex); }
     Ok(b.build())
 }
@@ -455,6 +469,39 @@ mod tests {
             let id = inflate_str(ui, r#"<Button id="done" text="Done!" />"#).unwrap();
             ui.present(id);
             assert!(ui.has_hit_rect("done"));
+        });
+    }
+
+    #[test]
+    fn inflates_frame_with_background_rect_and_content() {
+        // Canonical Frame use: a background Rect under an HStack of text.
+        // Smoke-checks that the tag dispatches, children inflate in
+        // order, and the button id (if any) still wires up.
+        with_ui(|ui| {
+            let src = r##"
+                <Frame padding="4">
+                    <Rect color="0xff112233" />
+                    <HStack padding="8 12" main="end" cross="center">
+                        <Text text="hint" size="12" />
+                        <Text text="display" size="24" />
+                    </HStack>
+                </Frame>
+            "##;
+            let root = inflate_str(ui, src).unwrap();
+            ui.present(root);
+            // 6 nodes in doc order: Rect, Text, Text, HStack, Frame.
+            // Root id = 4 (0..=4 indices).
+            assert_eq!(root, 4);
+        });
+    }
+
+    #[test]
+    fn frame_accepts_flex_attribute() {
+        // Frame should grow in a parent stack just like any other
+        // container builder.
+        with_ui(|ui| {
+            let src = r##"<VStack><Frame flex="1"><Rect color="0xffff0000" /></Frame></VStack>"##;
+            let _ = inflate_str(ui, src).unwrap();
         });
     }
 

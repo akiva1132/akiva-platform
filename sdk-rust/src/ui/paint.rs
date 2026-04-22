@@ -62,7 +62,13 @@ fn paint_node(
                 label,
             );
         }
-        Node::VStack { children, .. } | Node::HStack { children, .. } => {
+        Node::VStack { children, .. }
+        | Node::HStack { children, .. }
+        | Node::Frame { children, .. } => {
+            // Document order = paint order. For Frame this means earlier
+            // children paint first (bottom of the z-stack) and later
+            // children overlay them — mirrors Android FrameLayout and
+            // SwiftUI ZStack.
             for c in children { paint_node(nodes, *c, rects, clicked_ids, canvas); }
         }
     }
