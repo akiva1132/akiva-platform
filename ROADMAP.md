@@ -434,7 +434,7 @@
 - Follower rendering — tab שהוא follower לא מצייר כלום. דוחה ל-Phase 2 לפי ה-ROADMAP המקורי, מאז לא חזרנו.
 
 **מ-Phase 2 (Framework):**
-- **IntentRouter not wired** — [framework/src/intent.rs](framework/src/intent.rs) מגדיר `IntentRouter` עם `resolve()` מלא, אבל אף נתיב launch לא קורא לו. Shell משתמש ב-`activity_class` ישירות.
+- ✅ **IntentRouter wired** (אפריל 2026, commit `c8f18b6`) — כל manifest intent_filter נרשם ב-`framework::boot`, כולל filter סינתטי ל-Shell (MAIN+HOME+LAUNCHER); ה-Shell שולח `Intent::new(MAIN).with_category(LAUNCHER).with_target_package(id)` וה-framework מפעיל `IntentRouter::resolve` לפני `ActivityManager::launch`. ה-boot הראשוני של ה-Shell נפתר כעת דרך `resolve(MAIN+HOME)` במקום hard-code של class. 6 unit tests חדשים כיסוי explicit, implicit, target_package filtering, ambiguity.
 - **ResourceManager not populated** — [framework/src/resource_manager.rs](framework/src/resource_manager.rs) הוא struct שמחזיק `HashMap`s ריקים. אין code path שטוען strings/colors/dimens/drawables מ-manifest או מ-`res/`.
 - **PermissionController is a stub** — [framework/src/permissions.rs](framework/src/permissions.rs) לא אוכף שום דבר.
 - **WindowManager is a stub** — [framework/src/window_manager.rs](framework/src/window_manager.rs) לא מנתב בפועל.
