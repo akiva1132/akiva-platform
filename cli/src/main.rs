@@ -9,6 +9,7 @@
 //!   akiva devserver         — serve runtime/web/ with the cross-origin
 //!                             isolation headers OPFS + threads need
 
+mod build;
 mod devserver;
 mod workspace;
 
@@ -57,9 +58,8 @@ fn cmd_new(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_build(_args: &[String]) -> ExitCode {
-    println!("[stub] would run: cargo build-kernel && cargo build-cli");
-    ExitCode::SUCCESS
+fn cmd_build(args: &[String]) -> ExitCode {
+    build::run(args)
 }
 
 fn cmd_package(args: &[String]) -> ExitCode {
