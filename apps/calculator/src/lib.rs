@@ -252,6 +252,43 @@ impl Activity for CalculatorMain {
         self.ui.feed_pointer(ev);
     }
 
+    /// Persist the arithmetic state machine across process kills. Only
+    /// `Calculator` is saved — `UiState` is reconstructible from the
+    /// next frame's input and would inflate the blob for nothing (hit
+    /// rects etc. depend on the current layout, which re-measures from
+    /// scratch anyway). Keys are short on purpose: the whole blob is
+    /// well under 100 bytes for any reachable state, leaving headroom
+    /// for future fields without approaching the 64 KiB cap.
+    fn on_save_state(&self, state: &mut SavedState) {
+        state.put_string("d", &self.calc.display);
+        state.put_float("a", self.calc.acc);
+        state.put_int("p", match self.calc.pending {
+            None         => -1,
+            Some(Op::Add) => 0,
+            Some(Op::Sub) => 1,
+            Some(Op::Mul) => 2,
+            Some(Op::Div) => 3,
+        });
+        state.put_bool("j", self.calc.just_computed);
+        state.put_bool("e", self.calc.error);
+    }
+
+    fn on_restore_state(&mut self, state: &SavedState) {
+        if let Some(d) = state.get_string("d") { self.calc.display = d.to_string(); }
+        if let Some(a) = state.get_float("a")  { self.calc.acc = a; }
+        self.calc.pending = match state.get_int("p").unwrap_or(-1) {
+            0 => Some(Op::Add),
+            1 => Some(Op::Sub),
+            2 => Some(Op::Mul),
+            3 => Some(Op::Div),
+            _ => None,
+        };
+        if let Some(j) = state.get_bool("j") { self.calc.just_computed = j; }
+        if let Some(e) = state.get_bool("e") { self.calc.error = e; }
+        log_info!("Calculator restored: display={:?} acc={} pending={:?}",
+            self.calc.display, self.calc.acc, self.calc.pending);
+    }
+
     fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
         c.clear(res::color("bg_window"));
 
