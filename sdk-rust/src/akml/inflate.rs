@@ -497,6 +497,7 @@ mod tests {
             timestamp_ms: 0.0,
             pointer: None,
             class: "t",
+            handle: 0,
         }
     }
 

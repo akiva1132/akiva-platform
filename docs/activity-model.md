@@ -84,7 +84,8 @@
 | SDK trait — `on_create/start/resume/pause/stop/destroy` with no-op defaults | ✅ | [`sdk-rust/src/activity.rs`](../sdk-rust/src/activity.rs) |
 | `save_state_bytes` / `restore_state_bytes` wired through Create→restore→Start | ✅ | framework `launch_app`, SDK runtime |
 | `onRestart` as a distinct callback | ❌ by design | Stopped→Started re-fires `on_start` — apps that need "first start vs restart" distinction gate on internal flags |
-| `finish()` inside `on_create` short-circuit (Created→Destroyed) | ❌ Stone 9.3 | Android skips on_start/on_resume/on_pause/on_stop — our matrix currently forces the full ladder. See [research-android-lifecycle.md §1](research-android-lifecycle.md) |
+| `finish()` inside `on_create` short-circuit (Created→Destroyed) | ✅ Stone 9.3 | `legal_transition` gains the edge; `advance_through_create` returns whether finish was raised; `launch_app` calls `destroy_shortcut` (fires only `on_destroy`) + pops the stack entry instead of continuing to Start/Resume. Android parity — see [research-android-lifecycle.md §1](research-android-lifecycle.md) |
+| Wasm apps can call `ctx.finish()` | ✅ Stone 9.3 | SDK `Context::finish()` → `akiva_host_finish(handle)` import → worker sets per-handle flag → kernel drains via `hal_app_drain_finish` at the end of every ctx-bearing callback → framework flips `ActivityContext.finish_requested`. Matches in-kernel activities (Shell) that set the flag directly |
 | `on_new_intent` on SingleTop / SingleTask reuse | ❌ Stone 9.4 | Reuse path silently swallows the second `launch()` today; needs an extra ABI export + SDK hook |
 
 Bug caught by the Phase 9.1 test sweep: `destroy()` used to `break` on the first illegal edge, so destroying a Paused or Stopped activity silently skipped `on_stop`/`on_destroy`. Fixed to ignore-and-continue, matching `resume`'s shape.

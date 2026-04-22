@@ -42,6 +42,16 @@ export class AppRegistry {
      */
     this._resources = new Map();
     this._nextHandle = 1;
+    /**
+     * Handles with a pending app-raised `finish` signal. Populated when
+     * the app calls `akiva_host_finish(handle)`; drained (atomically
+     * cleared + returned) by `drainFinish(handle)` which the kernel's
+     * `hal_app_drain_finish` import reads after each lifecycle/input
+     * callback. A Set rather than a Map because the signal is boolean;
+     * multiple finish calls within one dispatch collapse to one.
+     * @type {Set<number>}
+     */
+    this._pendingFinish = new Set();
     this._decoder = new TextDecoder("utf-8");
     this._encoder = new TextEncoder();
 
@@ -83,9 +93,26 @@ export class AppRegistry {
     const slot = this._slots.get(handle);
     if (!slot) return;
     this._slots.delete(handle);
+    // Cheap tidy-up; the handle isn't reusable (`_nextHandle` is
+    // monotonic) but a stale flag sitting in the set after destroy
+    // would be harmless — still, belt-and-braces.
+    this._pendingFinish.delete(handle);
     // The process is kept alive even when no slots reference it. A future
     // GC pass could retire idle processes; for MVP the cost is one
     // `WebAssembly.Instance` per installed package, which is cheap.
+  }
+
+  /**
+   * Read + clear the pending-finish flag for `handle`. Returns `true` if
+   * the app requested finish via `akiva_host_finish` since the last
+   * drain, `false` otherwise. Called by the kernel's
+   * `hal_app_drain_finish` HAL bridge after every ctx-bearing callback,
+   * so a wasm-app-initiated finish shows up in the framework's
+   * `ActivityContext.finish_requested` identically to an in-kernel
+   * activity writing that flag directly. See docs/abi.md §2.3.
+   */
+  drainFinish(handle) {
+    return this._pendingFinish.delete(handle);
   }
 
   lifecycle(handle, transition) {
@@ -412,6 +439,15 @@ export class AppRegistry {
           const name = readName(ptr, len);
           if (name === null) return 0;
           return self._resources.get(packageId)?.strings.has(name) ? 1 : 0;
+        },
+
+        // Stone 9.3 — app-initiated finish. App calls this from inside a
+        // lifecycle or input callback; kernel drains the flag immediately
+        // afterward via `hal_app_drain_finish`. The handle identifies
+        // which activity of this package is asking — two handles for the
+        // same package wouldn't conflate.
+        akiva_host_finish: (handle) => {
+          self._pendingFinish.add(handle);
         },
       },
     };

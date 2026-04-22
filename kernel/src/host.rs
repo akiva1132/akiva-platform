@@ -130,6 +130,17 @@ extern "C" {
         bytes_ptr: *const u8,
         bytes_len: u32,
     ) -> u32;
+
+    // ── App → host signals (Stone 9.3) ────────────────────────────────────
+    //
+    // The app imports `akiva_host_finish()` to ask the platform to tear it
+    // down. The host records one pending flag per handle; the kernel drains
+    // it after each callback via `hal_app_drain_finish` and flips the
+    // framework's `ActivityContext.finish_requested`, matching the in-kernel
+    // Shell's behaviour (see `framework/src/wasm_activity.rs::WasmActivity`).
+    //
+    // Returns 1 if a finish was pending (and resets the flag), 0 otherwise.
+    pub fn hal_app_drain_finish(handle: u32) -> u32;
 }
 
 /// Safe wrapper for hal_log that never panics.

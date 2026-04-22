@@ -134,18 +134,23 @@ extern "C" fn akiva_host_resource_has_string(name_ptr: *const u8, name_len: u32)
 
 כל app מקבל את ה-set הבסיסי הזה אוטומטית ללא הצהרה. הרחבות נוספות (finish, start_activity, storage read/write, intent dispatch) תיכנסנה כשאפליקציות אמיתיות יצטרכו אותן, ובכפוף למבחני §1.2 — כל הרחבה דורשת use case מוכח ו-mapping ל-WIT interface ב-§5.
 
-**מתוכננות ל-Phase 9** (לא מיושמות עדיין; ה-trajectory תועד ב-[research-activity-boundary.md](research-activity-boundary.md)):
+**Stone 9.3 — מיושם:**
 
 ```rust
-// Stone 9.3 — אפליקציה מסיימת את עצמה (מקביל ל-Android Activity.finish()).
+// אפליקציה מסיימת את עצמה (מקביל ל-Android Activity.finish()).
 // ה-host מפעיל את אותו finish_requested flag שה-Shell framework-side
-// משתמש בו היום. חותמו של הקריאה: "finish the activity that owns the
-// handle the host is currently dispatching to."
-extern "C" fn akiva_host_finish();
+// משתמש בו היום. handle מזהה את ה-activity; קריאה מ-on_create תגרום
+// ל-Created→Destroyed shortcut (skip על Start/Resume/Pause/Stop).
+extern "C" fn akiva_host_finish(handle: u32);
+```
 
-// Stone 9.3 — system-wide Back (pops stack top אם לא root; אחרת no-op).
-// שונה מ-akiva_host_finish רק ברמת הסמנטיקה: Back מופעל ב-Shell policy,
-// finish הוא כוונה מפורשת של ה-app.
+**מתוכננות ל-Phase 9+** (לא מיושמות עדיין):
+
+```rust
+// Stone 9.3 follow-up — system-wide Back (pops stack top אם לא root;
+// אחרת no-op). שונה מ-akiva_host_finish רק בסמנטיקה: Back הוא Shell
+// policy, finish הוא כוונה מפורשת של ה-app. נדחה כרגע — ה-Framework
+// כבר קוצר על Esc מ-key events, אין קריאה מ-app שצריכה זאת.
 extern "C" fn akiva_host_back();
 
 // Stone 9.4 — פתיחת activity אחרת. intent_ptr/len מצביעים ל-blob ב-memory
@@ -197,6 +202,12 @@ fn hal_app_save_state(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
 //   app produced. Truncated blobs trigger a retry with a larger buffer.
 fn hal_app_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32) -> u32;
 // ^ 0 on success, non-zero on handle miss / alloc failure / host error.
+
+// Stone 9.3 — read + clear the per-handle "finish requested" flag the
+// app raised via `akiva_host_finish`. Called by `WasmActivity` at the
+// end of every ctx-bearing callback; return 1 flips
+// `ActivityContext.finish_requested = true` in the active dispatch.
+fn hal_app_drain_finish(handle: u32) -> u32;
 ```
 
 ### 2.5 Paint-op wire format

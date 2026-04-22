@@ -65,6 +65,26 @@ pub struct Context<'a> {
     pub timestamp_ms: f64,
     pub pointer: Option<PointerEvent>,
     pub class: &'a str,
+    /// Handle the runtime passed to the current callback. Kept
+    /// crate-private because it's only useful for host imports that need
+    /// to name the activity (see [`Context::finish`]); apps shouldn't
+    /// have to thread it around or compare two handles themselves.
+    pub(crate) handle: u32,
+}
+
+impl<'a> Context<'a> {
+    /// Ask the platform to tear this activity down. Fires after the
+    /// current callback returns — the framework runs
+    /// `on_pause → on_stop → on_destroy` in order (or, if called from
+    /// inside `on_create`, jumps straight to `on_destroy` via the
+    /// `Created → Destroyed` shortcut documented in
+    /// [docs/activity-model.md §2](../../docs/activity-model.md)).
+    ///
+    /// No-op on non-wasm targets so unit tests that build with the SDK
+    /// can call it without a host.
+    pub fn finish(&self) {
+        crate::runtime::host_finish(self.handle);
+    }
 }
 
 // ── The trait ─────────────────────────────────────────────────────────

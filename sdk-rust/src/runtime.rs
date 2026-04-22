@@ -31,6 +31,26 @@ use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEve
 extern "C" {
     pub fn akiva_host_log(level: u32, ptr: *const u8, len: u32);
     pub fn akiva_host_text_width(ptr: *const u8, len: u32, size: f32) -> f32;
+    /// Stone 9.3 — ask the platform to tear this activity down. Handle
+    /// disambiguates when the package has multiple activities. No return;
+    /// the framework picks up the signal via its `hal_app_drain_finish`
+    /// HAL bridge at the end of the callback. See docs/abi.md §2.3.
+    pub fn akiva_host_finish(handle: u32);
+}
+
+/// Request the framework finish this activity. Safe to call from any
+/// lifecycle or input callback on wasm; a no-op on host builds so unit
+/// tests compile without a real host import. Handle is the one the
+/// framework passed to the current callback.
+pub fn host_finish(handle: u32) {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        akiva_host_finish(handle);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = handle;
+    }
 }
 
 /// Measure a rendered UTF-8 string's width at `size` pixels. On wasm
@@ -133,6 +153,7 @@ pub fn on_create<T: Activity + Default>(handle: u32, class_ptr: *const u8, class
         timestamp_ms: 0.0,
         pointer: None,
         class: class.as_str(),
+        handle,
     };
     activity.on_create(&mut ctx);
     slots().insert(handle, Slot {
@@ -156,6 +177,7 @@ pub fn on_destroy(handle: u32) {
             timestamp_ms: 0.0,
             pointer: slot.last_pointer,
             class: "",
+            handle,
         };
         slot.activity.on_destroy(&mut ctx);
     }
@@ -171,6 +193,7 @@ fn dispatch_lifecycle(
         timestamp_ms: 0.0,
         pointer: slot.last_pointer,
         class: "",
+        handle,
     };
     f(slot.activity.as_mut(), &mut ctx);
 }
@@ -190,6 +213,7 @@ pub fn on_pointer(handle: u32, x: f32, y: f32, button: u32, phase_wire: u32, ts_
         timestamp_ms: ts_ms,
         pointer: Some(ev),
         class: "",
+        handle,
     };
     slot.activity.on_pointer(&mut ctx, ev);
 }
@@ -206,6 +230,7 @@ pub fn on_key(handle: u32, code: u32, modifiers: u32, phase_wire: u32, ts_ms: f6
         timestamp_ms: ts_ms,
         pointer: slot.last_pointer,
         class: "",
+        handle,
     };
     slot.activity.on_key(&mut ctx, ev);
 }
@@ -219,6 +244,7 @@ pub fn on_resize(handle: u32, width_px: u32, height_px: u32, density: f32) {
         timestamp_ms: 0.0,
         pointer: slot.last_pointer,
         class: "",
+        handle,
     };
     slot.activity.on_resize(&mut ctx, metrics);
 }
@@ -279,6 +305,7 @@ pub fn on_render(handle: u32, ts_ms: f64, out_len_ptr: *mut u32) -> *const u8 {
         timestamp_ms: ts_ms,
         pointer: slot.last_pointer,
         class: "",
+        handle,
     };
     let mut canvas = crate::canvas::Canvas::new(&mut slot.paint_buf);
     slot.activity.on_render(&mut ctx, &mut canvas);

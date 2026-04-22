@@ -362,20 +362,58 @@ impl Framework {
         // Create and Start use `advance_through_create` +
         // `drive_start_to_resumed` instead; this short-hand stays for
         // bring-up sites that have nothing to restore (the Shell).
-        self.advance_through_create(id, ts);
+        //
+        // If the activity finishes from on_create we honour the
+        // `Created → Destroyed` shortcut here too — the Shell, for
+        // example, could self-close at boot. Returning early is enough:
+        // no Start/Resume fire, and our single caller at boot
+        // (`framework::boot`) doesn't re-examine the Shell's state.
+        if self.advance_through_create(id, ts) {
+            self.destroy_shortcut(id, ts);
+            return;
+        }
         self.drive_start_to_resumed(id, ts);
+    }
+
+    /// Drive `id` directly from `Created` to `Destroyed` — the Android
+    /// parity shortcut when `finish()` is raised from inside `on_create`.
+    /// Fires only `on_destroy` (the `(Created, Destroyed)` edge is the
+    /// one `legal_transition` allows); Start / Resume / Pause / Stop are
+    /// skipped entirely, and save-state is not collected since the
+    /// activity never went `Resumed → Paused` in the first place.
+    fn destroy_shortcut(&mut self, id: ActivityId, ts: f64) {
+        let metrics = self.metrics;
+        let pointer = self.pointer;
+        self.activities.destroy(id, |a, new_state| {
+            let mut finish = false;
+            let mut launch: Option<Intent> = None;
+            let mut ctx = ActivityContext {
+                metrics, timestamp_ms: ts, pointer,
+                finish_requested: &mut finish,
+                launch_requested: &mut launch,
+            };
+            if matches!(new_state, LifecycleState::Destroyed) {
+                a.on_destroy(&mut ctx);
+            }
+        });
     }
 
     /// Fire `on_create` only. Split from the full resume driver so a
     /// restore hook can land between Created and Started (see
     /// `launch_app`). Idempotent: calling on an already-past-Created
     /// activity is a no-op.
-    fn advance_through_create(&mut self, id: ActivityId, ts: f64) {
+    ///
+    /// Returns whether the activity asked to finish from inside
+    /// `on_create`. The caller uses that to skip the restore + Start +
+    /// Resume sequence and go straight to `Destroy`, matching the
+    /// Android `Created → Destroyed` shortcut documented in
+    /// [`docs/activity-model.md §2`](../../docs/activity-model.md).
+    fn advance_through_create(&mut self, id: ActivityId, ts: f64) -> bool {
         let metrics = self.metrics;
         let pointer = self.pointer;
+        let mut finish = false;
+        let mut launch: Option<Intent> = None;
         self.activities.advance(id, LifecycleState::Created, |a, new_state| {
-            let mut finish = false;
-            let mut launch: Option<Intent> = None;
             let mut ctx = ActivityContext {
                 metrics, timestamp_ms: ts, pointer,
                 finish_requested: &mut finish,
@@ -385,6 +423,13 @@ impl Framework {
                 a.on_create(&mut ctx);
             }
         });
+        // `launch` raised from within on_create is currently a no-op:
+        // the activity hasn't reached Resumed yet so there's nowhere
+        // coherent to stack a new top on. Drop it silently rather than
+        // let it fire out of order. Apps that want this behaviour can
+        // set launch from on_resume instead.
+        let _ = launch;
+        finish
     }
 
     /// Continue bring-up from Created (or Paused, for the resume-after-
@@ -451,7 +496,20 @@ impl Framework {
         // that do we let it proceed to Start → Resumed. This matches the
         // "on_create then on_restore_state" ordering in
         // docs/activity-model.md §3.
-        self.advance_through_create(new_id, ts);
+        //
+        // Android parity: if the activity called `finish()` from inside
+        // `on_create`, skip restore + Start + Resume and jump straight
+        // to on_destroy via the `Created → Destroyed` shortcut. Then pop
+        // the stack entry and resume whatever we just paused. See
+        // docs/research-android-lifecycle.md §1.
+        if self.advance_through_create(new_id, ts) {
+            self.destroy_shortcut(new_id, ts);
+            self.stack.pop();
+            if let Some(new_top) = self.stack.last().copied() {
+                self.drive_to_resumed(new_top, ts);
+            }
+            return;
+        }
         self.try_restore_state(new_id, package_id, class);
         self.drive_start_to_resumed(new_id, ts);
     }

@@ -343,9 +343,10 @@ fn legal_transition(from: LifecycleState, to: LifecycleState) -> bool {
         | (Resumed, Paused)
         | (Paused, Resumed)
         | (Paused, Stopped)
-        | (Stopped, Started)   // onRestart → onStart
+        | (Stopped, Started)    // onRestart → onStart
         | (Stopped, Destroyed)
-        | (Paused, Destroyed)  // allowed when activity finishes from Paused
+        | (Paused, Destroyed)   // allowed when activity finishes from Paused
+        | (Created, Destroyed)  // finish() called from on_create — skip Start/Resume entirely, Android parity (research-android-lifecycle.md §1)
     )
 }
 
@@ -379,6 +380,14 @@ mod tests {
         assert!(!legal_transition(Created, Resumed));
         assert!(!legal_transition(Resumed, Stopped));
         assert!(!legal_transition(Destroyed, Created));
+    }
+
+    #[test]
+    fn created_to_destroyed_shortcut_is_legal() {
+        // Stone 9.3 — added to match Android's finish()-in-on_create
+        // behaviour (research-android-lifecycle.md §1). Lock this edge
+        // in so a future matrix cleanup doesn't quietly drop it.
+        assert!(legal_transition(LifecycleState::Created, LifecycleState::Destroyed));
     }
 
     // ── Driver tests ─────────────────────────────────────────────────────
@@ -578,6 +587,26 @@ mod tests {
         am.destroy(id, fire);
         assert_eq!(&*log.borrow(), &["stop", "destroy"]);
         assert_eq!(am.state_of(id), Some(LifecycleState::Destroyed));
+    }
+
+    #[test]
+    fn destroy_from_created_fires_only_destroy() {
+        // Stone 9.3 — the `Created → Destroyed` shortcut. Android parity:
+        // finish() called from inside on_create skips Start/Resume/Pause/
+        // Stop entirely. on_destroy fires with state flipped straight
+        // from Created to Destroyed. Before 9.3 this would've been a
+        // full no-op (every target illegal from Created).
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.advance(id, LifecycleState::Created, fire);
+        log.borrow_mut().clear();
+
+        am.destroy(id, fire);
+        assert_eq!(&*log.borrow(), &["destroy"],
+            "Created -> Destroyed shortcut must fire only on_destroy");
+        assert_eq!(am.state_of(id), Some(LifecycleState::Destroyed));
+        assert!(am.with_instance(id, |_| {}) == false,
+            "instance must be cleaned up after the shortcut, same as the long path");
     }
 
     #[test]

@@ -337,6 +337,10 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
             ));
         }
     }
+
+    fn drain_finish(&self, handle: akiva_framework::wasm_activity::AppHandle) -> bool {
+        unsafe { host::hal_app_drain_finish(handle.get()) != 0 }
+    }
 }
 
 /// Exercises the storage HAL end-to-end: read a u32 counter under

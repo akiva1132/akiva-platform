@@ -1179,7 +1179,7 @@ mod tests {
         let mut canvas = Canvas::new(&mut buf);
         let ctx = Context {
             metrics: Metrics { width_px: 400, height_px: 200, density: 1.0 },
-            timestamp_ms: 0.0, pointer: None, class: "t",
+            timestamp_ms: 0.0, pointer: None, class: "t", handle: 0,
         };
         let a;
         let b;

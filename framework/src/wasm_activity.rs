@@ -89,6 +89,22 @@ pub trait WasmHost {
     fn restore_state(&self, handle: AppHandle, bytes: &[u8]) {
         let _ = (handle, bytes);
     }
+
+    /// Pop any "finish requested" signal raised by the app during the
+    /// previous host→app call. The app sets it by calling the
+    /// `akiva_host_finish` import from inside a lifecycle or input
+    /// callback ([`docs/abi.md §2.3`](../../docs/abi.md)). The real host
+    /// tracks one flag per handle and clears it on read; tests default
+    /// to `false` unless they want to simulate app-initiated finish.
+    ///
+    /// Called by [`WasmActivity`] at the end of every method that carries
+    /// an `ActivityContext`, so a set flag propagates into the framework
+    /// dispatch exactly as if an in-kernel activity (e.g. Shell) had
+    /// written `*ctx.finish_requested = true` directly.
+    fn drain_finish(&self, handle: AppHandle) -> bool {
+        let _ = handle;
+        false
+    }
 }
 
 // ── Proxy activity ───────────────────────────────────────────────────────
@@ -110,6 +126,17 @@ impl WasmActivity {
     }
 
     pub fn handle(&self) -> AppHandle { self.handle }
+
+    /// Pop any app-raised "finish" flag for this handle and propagate it
+    /// into the active dispatch's [`ActivityContext`]. Called at the end
+    /// of every callback that carries a ctx — a single choke point so a
+    /// new lifecycle method can't silently skip it. `on_destroy` does NOT
+    /// call this (destroy is already terminal; a finish request is moot).
+    fn drain_post(&self, ctx: &mut ActivityContext<'_>) {
+        if self.host.drain_finish(self.handle) {
+            *ctx.finish_requested = true;
+        }
+    }
 }
 
 impl Activity for WasmActivity {
@@ -125,33 +152,42 @@ impl Activity for WasmActivity {
         // window". One extra round-trip here is worth a much saner
         // first frame.
         self.host.resize(self.handle, ctx.metrics);
+        self.drain_post(ctx);
     }
-    fn on_start(&mut self, _ctx: &mut ActivityContext<'_>) {
+    fn on_start(&mut self, ctx: &mut ActivityContext<'_>) {
         self.host.lifecycle(self.handle, LifecycleTransition::Start);
+        self.drain_post(ctx);
     }
-    fn on_resume(&mut self, _ctx: &mut ActivityContext<'_>) {
+    fn on_resume(&mut self, ctx: &mut ActivityContext<'_>) {
         self.host.lifecycle(self.handle, LifecycleTransition::Resume);
+        self.drain_post(ctx);
     }
     fn on_pause(&mut self, ctx: &mut ActivityContext<'_>) {
-        let _ = ctx;
         self.host.lifecycle(self.handle, LifecycleTransition::Pause);
+        self.drain_post(ctx);
     }
-    fn on_stop(&mut self, _ctx: &mut ActivityContext<'_>) {
+    fn on_stop(&mut self, ctx: &mut ActivityContext<'_>) {
         self.host.lifecycle(self.handle, LifecycleTransition::Stop);
+        self.drain_post(ctx);
     }
     fn on_destroy(&mut self, _ctx: &mut ActivityContext<'_>) {
+        // No drain_post — destroy is terminal, a finish flag here would
+        // be nonsense anyway (can't finish a destroying activity).
         self.host.lifecycle(self.handle, LifecycleTransition::Destroy);
         self.host.unregister(self.handle);
     }
 
     fn on_pointer(&mut self, ctx: &mut ActivityContext<'_>, ev: PointerEvent) {
         self.host.pointer(self.handle, ev, ctx.timestamp_ms);
+        self.drain_post(ctx);
     }
     fn on_key(&mut self, ctx: &mut ActivityContext<'_>, ev: KeyEvent) {
         self.host.key(self.handle, ev, ctx.timestamp_ms);
+        self.drain_post(ctx);
     }
-    fn on_resize(&mut self, _ctx: &mut ActivityContext<'_>, m: SurfaceMetrics) {
+    fn on_resize(&mut self, ctx: &mut ActivityContext<'_>, m: SurfaceMetrics) {
         self.host.resize(self.handle, m);
+        self.drain_post(ctx);
     }
 
     fn render(&mut self, ctx: &mut ActivityContext<'_>, out: &mut FrameCommands) {
@@ -355,6 +391,10 @@ mod tests {
         next_handle: RefCell<u32>,
         paint_bytes: RefCell<Vec<u8>>,
         save_bytes: RefCell<Vec<u8>>,
+        /// When `true`, the next call to `drain_finish` returns `true`
+        /// once then resets to `false` — mirrors the real host's
+        /// single-shot flag semantic.
+        pending_finish: RefCell<bool>,
     }
 
     impl MockHost {
@@ -364,11 +404,13 @@ mod tests {
                 next_handle: RefCell::new(1),
                 paint_bytes: RefCell::new(Vec::new()),
                 save_bytes: RefCell::new(Vec::new()),
+                pending_finish: RefCell::new(false),
             }
         }
         fn take_calls(&self) -> Vec<Call> { core::mem::take(&mut *self.calls.borrow_mut()) }
         fn set_paint_bytes(&self, bytes: Vec<u8>) { *self.paint_bytes.borrow_mut() = bytes; }
         fn set_save_bytes(&self, bytes: Vec<u8>) { *self.save_bytes.borrow_mut() = bytes; }
+        fn arm_finish(&self) { *self.pending_finish.borrow_mut() = true; }
     }
 
     impl WasmHost for MockHost {
@@ -404,6 +446,13 @@ mod tests {
         }
         fn restore_state(&self, handle: AppHandle, bytes: &[u8]) {
             self.calls.borrow_mut().push(Call::RestoreState(handle.get(), bytes.to_vec()));
+        }
+        fn drain_finish(&self, _handle: AppHandle) -> bool {
+            // Read-and-clear, matching AppRegistry.drainFinish in the JS.
+            let mut flag = self.pending_finish.borrow_mut();
+            let was = *flag;
+            *flag = false;
+            was
         }
     }
 
@@ -572,5 +621,55 @@ mod tests {
             host.take_calls(),
             vec![Call::RestoreState(handle.get(), vec![9, 8, 7])],
         );
+    }
+
+    // ── Stone 9.3: drain_finish propagation ─────────────────────────────
+
+    #[test]
+    fn drain_finish_flips_finish_requested_on_next_ctx_callback() {
+        // The wasm side "asked to finish" (MockHost.arm_finish). The next
+        // ctx-bearing callback (on_resume here) should see
+        // *ctx.finish_requested flip to true. Subsequent callbacks
+        // without a fresh arm must NOT see it re-fire — matches the
+        // single-shot semantic of AppRegistry.drainFinish in runtime.
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        let mut act = WasmActivity::new(handle, host.clone());
+        host.arm_finish();
+
+        let mut finish = false;
+        let mut launch = None;
+        let mut ctx = make_ctx(&mut finish, &mut launch);
+        act.on_resume(&mut ctx);
+        assert!(finish, "armed finish must surface to ctx");
+
+        // Second callback with no re-arm: flag stays false.
+        let mut finish2 = false;
+        let mut launch2 = None;
+        let mut ctx2 = make_ctx(&mut finish2, &mut launch2);
+        act.on_resume(&mut ctx2);
+        assert!(!finish2, "finish must not sticky");
+    }
+
+    #[test]
+    fn drain_finish_not_consulted_on_destroy() {
+        // destroy is terminal — even if the app somehow raised finish
+        // during the destroy callback, there's nothing to do with it.
+        // Stone 9.3 deliberately skips drain_post in on_destroy; this
+        // test locks that in so a future refactor doesn't change it.
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        let mut act = WasmActivity::new(handle, host.clone());
+        host.arm_finish();
+
+        let mut finish = false;
+        let mut launch = None;
+        let mut ctx = make_ctx(&mut finish, &mut launch);
+        act.on_destroy(&mut ctx);
+        // The armed flag stays armed (never drained) and the context's
+        // flag was never touched.
+        assert!(!finish);
+        assert!(*host.pending_finish.borrow(),
+            "destroy must not drain the host flag");
     }
 }

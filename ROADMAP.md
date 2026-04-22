@@ -479,12 +479,12 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
   - **SingleInstance:** יש task נפרד משלו; `launch` לפני שהוא קיים יוצר task חדש, בתחום אחר activities; פעולות נוספות באותו package פותחות ב-task הקודם שלהן.
 - Unit tests לכל תרחיש ב-[`activity-model.md §4`](docs/activity-model.md)
 
-### 9.3 Back stack + `system.back()`
-- Import חדש `system.back()` ב-ABI: אפליקציה יכולה להפעיל בעצמה, אבל במיוחד — הפלטפורמה תשתמש בזה על mapping של keyboard/gesture (v0.2: קיצור מקלדת fixed, אין gesture engine)
-- ב-framework: `ActivityManager::back()` → pop top → שולח destroy → מביא את הקודם ל-Resumed
-- ה-Shell משתמשת ב-`system.back()` כ-mechanism העיקרי למעבר בין tasks
-- **SDK `Context::finish()` plumbing:** חוטים ל-`akiva_host_finish` import; ב-`WasmActivity` dispatch ה-host יקבע `ActivityContext.finish_requested = true` לפני שה-callback מחזיר. זה סוגר את ה-gap שזוהה ב-[`research-activity-boundary.md`](docs/research-activity-boundary.md) — היום אין לאפליקציית wasm דרך לסיים את עצמה. רשום גם `Context::back()` לצד `finish()` לאותו frame של העבודה.
-- **Created→Destroyed shortcut:** אם activity קוראת `finish()` מתוך `on_create`, skip על `on_start`/`on_resume`/`on_pause`/`on_stop` וקפוץ ישר ל-`on_destroy`. מוסיף edge `(Created, Destroyed)` ל-`legal_transition` + בדיקה ב-`advance_through_create` אם `finish_requested` הופעל. parity עם Android — ראה [`research-android-lifecycle.md §1`](docs/research-android-lifecycle.md)
+### 9.3 Back stack + `Context::finish()`
+- ✅ **SDK `Context::finish()` plumbing** — `akiva_host_finish(handle)` import → worker per-handle flag table → kernel drains via `hal_app_drain_finish` → `WasmActivity.drain_post` קובע `ActivityContext.finish_requested = true`. סוגר את ה-gap מ-[`research-activity-boundary.md`](docs/research-activity-boundary.md).
+- ✅ **Created→Destroyed shortcut** — `(Created, Destroyed)` ב-`legal_transition`; `advance_through_create` מחזיר אם finish הופעל; `launch_app` קורא ל-`destroy_shortcut` (on_destroy בלבד) ו-pop של ה-stack. parity עם Android — ראה [`research-android-lifecycle.md §1`](docs/research-android-lifecycle.md).
+- ⏭️ **Integration test (test-coverage.md §4)** — Rust-side end-to-end עם MockWasmHost שמדמה `akiva_host_finish`, בודק bring-up→finish→resume-prev. מושאר ל-Stone 9.3 follow-up או לאחר 9.4.
+- ⏭️ **`Context::back()` + `akiva_host_back` import** — Shell policy / gesture mapping. כרגע ה-framework קוצר על Esc מ-key events; אין app שצריך להפעיל Back ישירות. נדחה עד שיש use case.
+- ⏭️ **Gesture engine** — v0.2: קיצור מקלדת fixed בלבד, אין gesture. נשמר כ-feature של Phase 11+.
 
 ### 9.4 `start_activity` מתוך app + `on_new_intent`
 - Import חדש `activity.start_activity(intent_blob: bytes)` (grant: `LAUNCH_ANY_APP` ל-Shell, או target-package-matches-self ל-self-launch)

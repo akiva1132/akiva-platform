@@ -296,6 +296,11 @@ function buildImports() {
     hal_app_render:     (handle, ts, outPtr, outCap) => apps.render(handle, ts, outPtr, outCap),
     hal_app_save_state: (handle, outPtr, outCap) => apps.saveState(handle, outPtr, outCap),
     hal_app_restore_state: (handle, bytesPtr, bytesLen) => apps.restoreState(handle, bytesPtr, bytesLen),
+
+    // Stone 9.3 — read + clear the pending-finish flag for `handle`.
+    // Returns 1 if the app called `akiva_host_finish` since the last
+    // drain, 0 otherwise.
+    hal_app_drain_finish: (handle) => (apps.drainFinish(handle) ? 1 : 0),
   };
   return { env };
 }
