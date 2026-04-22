@@ -180,10 +180,17 @@ Exports חדשים בצד ה-app שה-host קורא להם (מיושמים):
 extern "C" fn akiva_app_new_intent(handle: u32, ptr: *const u8, len: u32);
 ```
 
-ועוד exports מתוכננים:
+**Stone 9.5 — מיושם:**
 
 ```rust
-// Stone 9.5 — result hand-off ל-caller.
+// Callee sees — set the result bytes that will be delivered when it
+// finishes. Idempotent; last call wins. Silently dropped if the
+// activity wasn't launched via start_activity_for_result.
+extern "C" fn akiva_host_set_result(handle: u32, result_ptr: *const u8, result_len: u32);
+
+// Caller sees — result hand-off from a for-result launch. bytes encode
+// an ActivityResult (see §2.5.2). Fires AFTER the callee's on_destroy,
+// BEFORE the caller's Paused→Resumed edge (Android parity).
 extern "C" fn akiva_app_activity_result(
     handle: u32, request_code: u32, ptr: *const u8, len: u32,
 );
@@ -236,6 +243,29 @@ fn hal_app_drain_intent(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
 // `akiva_app_alloc`, calls the export, frees after return. Returns 0
 // on success; non-zero on handle miss / alloc failure / app trap.
 fn hal_app_new_intent(handle: u32, bytes_ptr: *const u8, bytes_len: u32) -> u32;
+
+// Stone 9.5 — three primitives matching the Stone 9.4 shapes.
+//
+// Drain a pending start_activity_for_result request. Two-phase buffer:
+// returns total size of the encoded Intent. `rc_out` is always written
+// with the request_code on a successful probe — so a retry (when
+// `needed > out_cap`) finds the same value. Zero return = nothing
+// pending.
+fn hal_app_drain_start_for_result(
+    handle: u32, out_ptr: *mut u8, out_cap: u32, rc_out: *mut u32,
+) -> u32;
+
+// Drain whatever bytes the app stashed via akiva_host_set_result.
+// Same two-phase contract; payload is an encoded ActivityResult
+// (see §2.5.2). Zero return = nothing stashed.
+fn hal_app_drain_set_result(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
+
+// Fire the app's akiva_app_activity_result export with the
+// caller-chosen request_code and the encoded ActivityResult bytes.
+// Same rc convention as hal_app_new_intent.
+fn hal_app_activity_result(
+    handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
+) -> u32;
 ```
 
 ### 2.5 Paint-op wire format
@@ -271,10 +301,26 @@ u32  extras_count       (v0.2: חייב להיות 0 — reserved ל-Stone 9.5)
 
 - **Max size:** 16 KiB (`Intent::MAX_WIRE_BYTES`) — בודק בשני הצדדים; blob גדול יותר → `IntentDecodeError::TooLarge`.
 - **Min size:** 17 bytes (action של 0 bytes + 4 × flag=0 + extras_count=0). לכן `drain_intent` מחזיר `0` ⇒ "אין pending" באופן חד-משמעי — כל intent ממשי יהיה ≥ 17.
-- **Extensibility:** `extras_count=0` הוא checkpoint. Stone 9.5 יוסיף payload של (`u32 key_len` + bytes + `u8 tag` + payload לפי tag). reader של גרסה ישנה שיפגוש `extras_count > 0` ידחה עם `ExtrasNotSupported` במקום להתבלבל על ה-offsets.
+- **Extensibility:** `extras_count=0` הוא checkpoint. גרסת extras תוסיף payload של (`u32 key_len` + bytes + `u8 tag` + payload לפי tag). reader של גרסה ישנה שיפגוש `extras_count > 0` ידחה עם `ExtrasNotSupported` במקום להתבלבל על ה-offsets. Stone 9.5 לא נזקק ל-extras — הוא משתמש ב-`ActivityResult` נפרד (§2.5.2).
 - **Identical encode on both sides:** `framework::intent::Intent::encode` ו-`sdk-rust::intent::Intent::encode` חייבים להישאר byte-for-byte symmetric — כמו ה-paint codec, כל שינוי הוא breaking event שעובר מבחני §1.2.
 
 הקודק המלא ב-[framework/src/intent.rs](../framework/src/intent.rs) ומקבילו ב-[sdk-rust/src/intent.rs](../sdk-rust/src/intent.rs).
+
+### 2.5.2 ActivityResult wire format (Stone 9.5)
+
+הקטן ביותר משני פורמטי ה-wire של ה-stone: קוד `i32` + בלוב bytes אטום באורך משתנה. נוסע משני הכיוונים — app→kernel דרך `akiva_host_set_result` + `hal_app_drain_set_result`, ו-kernel→app דרך `hal_app_activity_result` + `akiva_app_activity_result`.
+
+```
+i32  code           (little-endian — RESULT_OK=0, RESULT_CANCELED=1, שאר הערכים app-defined)
+u32  data_len + <data_len> bytes
+```
+
+- **Max size:** 16 KiB (`ActivityResult::MAX_WIRE_BYTES`) — אותו cap של Intent; result ממוצע של "picked=42" הוא עשרות bytes, כל מה שמעבר לזה כדאי לעבור דרך shared storage.
+- **Min size:** 8 bytes (code + data_len=0). `drain_set_result` מחזיר `0` ⇒ "אין result stashed"; synthesis של `RESULT_CANCELED` עם data ריק קורה בצד ה-framework ב-`deliver_activity_result_for`.
+- **Opaque data:** ה-framework לא בודק את ה-bytes. זוג caller+callee מסכמים על format (JSON, bincode, number כ-LE u32 ישיר) — אין lineage schema.
+- **Identical encode on both sides:** `framework::result::ActivityResult::encode` ו-`sdk-rust::result::ActivityResult::encode` byte-for-byte symmetric. breaking-change discipline כמו Intent.
+
+הקודק ב-[framework/src/result.rs](../framework/src/result.rs) ומקבילו ב-[sdk-rust/src/result.rs](../sdk-rust/src/result.rs).
 
 ### 2.6 שכבת הביניים ב-framework
 

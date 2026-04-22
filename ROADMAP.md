@@ -501,9 +501,13 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - ✅ **Doc cleanup** — `v0.2-review.md`, `research-android-lifecycle.md`, `research-activity-boundary.md` נמחקו; תוכן רלוונטי מקופל ב-`activity-model.md`; 9 cross-links עודכנו. `research-component-model.md` ו-`test-coverage.md` נשארים.
 
 ### 9.5 `start_activity_for_result` + `on_activity_result`
-- שני imports חדשים: `activity.start_activity_for_result(intent_blob, request_code)` ו-`activity.set_result(result_blob)`
-- ה-framework מתעד ב-stack את ה-`request_code` של ה-caller, וכש-B קוראת `set_result` + מסיימת, callback `akiva_app_activity_result(request_code, result_blob)` נקרא ל-A
-- Demo: hello פותחת calculator "ל-pick" מספר, calculator מחזירה value
+- ✅ **ActivityResult wire format** — `i32 code + u32 data_len + <data_len> bytes`, 16 KiB cap, byte-symmetric בין framework ל-SDK. `RESULT_OK = 0` / `RESULT_CANCELED = 1` (שלנו, לא של Android); app-defined codes מעליהם. פורמט נעול ב-[`docs/abi.md §2.5.2`](docs/abi.md).
+- ✅ **Three new primitives** — `akiva_host_start_activity_for_result(handle, ptr, len, request_code)`, `akiva_host_set_result(handle, ptr, len)` (app→kernel), ו-`akiva_app_activity_result(handle, request_code, ptr, len)` (kernel→app). שלושת ה-`hal_app_*` bridges המקבילים משתמשים ב-2-phase buffer pattern מ-Stone 9.4. ה-`REQUIRED_EXPORTS` עודכן.
+- ✅ **Framework tracking** — `pending_result_for: HashMap<callee_id, (caller_id, request_code)>` + `pending_result: HashMap<callee_id, ActivityResult>`. `launch_app_for_result` מוסיף לרישום; `finish_top` → `destroy_with_persist(callee)` → `deliver_activity_result_for(callee)` שמוציא את ה-bytes (או מסנתז `canceled()` אם אין), קורא ל-`on_activity_result` ב-caller *לפני* ה-Paused→Resumed (Android parity).
+- ✅ **Reuse path drops request_code silently** — start_for_result against SingleTop/SingleTask/SingleInstance reuse target: ה-reused activity לא "מסיימת" במובן שמפעיל delivery. Documented + tested (`for_result_reuse_path_drops_request_code_silently`).
+- ✅ **popped-above activities synthesise CANCELED** — אם SingleTask pop-above-reuse מוחק activity שהיתה for-result callee, ה-caller עדיין מקבל CANCELED ולא נתקע בהמתנה.
+- ✅ **Tests** — 8 codec (4 framework + 2 SDK mirror + 2 constant pin), 4 wasm_activity drain tests (start_for_result / set_result / malformed / activity_result forward), 3 framework integration tests (success, canceled synthesis, reuse drop), 7 JS Vitest tests (drainStartForResult / drainSetResult / activityResult / unregister cleanup). +22 tests total.
+- ⏭️ **Demo app (hello ↔ calculator)** — ה-infrastructure מוכנה; הוספת demo מותנית בעבודת UI על calculator (mode "pick") ו-hello (button שפותח את ה-calculator for-result). לא חלק מה-stone; נדחה לעבודת apps עתידית.
 
 ### 9.6 Multiple tasks לפי affinity
 - `ActivityManager` כבר מחזיק `tasks: HashMap<TaskId, Task>` ו-`Task.affinity` — חסרה ההחלטה של foreground
