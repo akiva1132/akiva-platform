@@ -50,8 +50,20 @@
 //! Two-pass: bottom-up `measure` to get intrinsic sizes, top-down `layout`
 //! to place every node within its parent. VStack sums children vertically
 //! and takes max child width; HStack is the mirror. Leaves (Text, Rect)
-//! have a content-derived intrinsic size. No wrapping, no flex, no
-//! alignment controls beyond start/start — that's Phase 3b.
+//! have a content-derived intrinsic size.
+//!
+//! Stacks expose [`MainAxis`] and [`CrossAxis`] controls through the
+//! builder API. Non-`Start` variants cause the stack to fill its slot on
+//! the corresponding axis so there is leftover space to distribute; the
+//! default stays `Start`/`Start`, which reproduces the original intrinsic
+//! start-aligned layout byte-for-byte.
+//!
+//! Per-child proportional sizing lives in a parallel [`NodeAttr`] vector
+//! on [`Ui`], set via `.grow(factor)` on any builder or
+//! [`Ui::grow`][Ui::grow] for nodes that have already been pushed
+//! (buttons). A stack with any grow>0 child fills its main axis and
+//! distributes leftover space proportionally to the grow factors — the
+//! calculator keypad pattern.
 
 pub mod node;
 pub mod layout;
@@ -62,6 +74,59 @@ use std::collections::HashMap;
 use crate::activity::{Context, PointerEvent, PointerPhase};
 use crate::canvas::Canvas;
 use node::{Node, NodeId};
+
+/// How a stack distributes its children along the main axis.
+///
+/// `Start` keeps the stack intrinsic-sized (no leftover to distribute);
+/// every other variant fills the slot on the main axis so alignment has
+/// somewhere to apply. `SpaceBetween` adds equal extra gap between each
+/// adjacent pair — the explicit `.gap()` setting is the *minimum* and
+/// this extra space stacks on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MainAxis {
+    #[default]
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+}
+
+impl MainAxis {
+    /// `true` when layout should expand the stack to its slot's main
+    /// dimension. Only `Start` leaves the stack intrinsic.
+    pub fn fills_slot(self) -> bool { !matches!(self, MainAxis::Start) }
+}
+
+/// How a stack aligns (and optionally sizes) its children on the cross
+/// axis. `Stretch` overrides each child's measured cross size with the
+/// stack's inner cross dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CrossAxis {
+    #[default]
+    Start,
+    Center,
+    End,
+    Stretch,
+}
+
+impl CrossAxis {
+    /// `true` when layout should expand the stack to its slot's cross
+    /// dimension — required for `Center`, `End`, and `Stretch` to have
+    /// room to apply.
+    pub fn fills_slot(self) -> bool { !matches!(self, CrossAxis::Start) }
+}
+
+/// Per-node layout attributes kept alongside [`Node`] in a parallel
+/// vector on [`Ui`]. Fields that affect paint stay on `Node` itself;
+/// `NodeAttr` is strictly the stuff the layout pass consults.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeAttr {
+    /// Main-axis grow factor when this node sits inside a stack. 0 means
+    /// "take intrinsic size" (default). A stack with any grow>0 child
+    /// fills its main axis and splits the leftover space among grow
+    /// children proportionally to their factors.
+    pub grow: f32,
+}
 
 /// Axis-aligned rectangle. Origin is top-left; `(x + w, y + h)` is
 /// exclusive (a point exactly on the right/bottom edge is *outside*).
@@ -118,6 +183,11 @@ pub struct Ui<'s, 'c, 'b> {
     viewport: (f32, f32),
     density: f32,
     nodes: Vec<Node>,
+    /// Parallel to `nodes`; `attrs[id]` is the layout-only side-info for
+    /// the node at `id`. Kept as a separate vec so pattern matches on
+    /// `Node` stay tight and paint-time code doesn't destructure fields
+    /// it doesn't care about.
+    attrs: Vec<NodeAttr>,
     presented: bool,
 }
 
@@ -137,6 +207,7 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             viewport: (ctx.metrics.width_px as f32, ctx.metrics.height_px as f32),
             density: if ctx.metrics.density > 0.0 { ctx.metrics.density } else { 1.0 },
             nodes: Vec::new(),
+            attrs: Vec::new(),
             presented: false,
         }
     }
@@ -144,7 +215,26 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
     pub(crate) fn push(&mut self, node: Node) -> NodeId {
         let id = self.nodes.len();
         self.nodes.push(node);
+        self.attrs.push(NodeAttr::default());
         id
+    }
+
+    /// Private setter used by builders after `push` to attach a grow
+    /// factor without re-borrowing through a public API that would also
+    /// work for callers.
+    pub(crate) fn set_grow(&mut self, id: NodeId, grow: f32) {
+        self.attrs[id].grow = grow;
+    }
+
+    /// Set the main-axis grow factor for a node that's already been
+    /// pushed. Intended for `Ui::button`, which returns a `NodeId`
+    /// directly and therefore can't chain `.grow()` the way the other
+    /// builders can. Silently no-ops on a stale or out-of-range id —
+    /// the layout pass treats missing attrs as grow=0 anyway.
+    pub fn grow(&mut self, id: NodeId, factor: f32) {
+        if let Some(a) = self.attrs.get_mut(id) {
+            a.grow = factor;
+        }
     }
 
     /// Bytes written to the canvas so far. Test-only — exists so we can
@@ -214,7 +304,11 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             &|text, size| crate::runtime::text_width(text, size),
         );
         let mut rects: HashMap<NodeId, Rect> = HashMap::new();
-        layout::layout(&self.nodes, root, Rect { x: 0.0, y: 0.0, w: self.viewport.0, h: self.viewport.1 }, &sizes, &mut rects);
+        layout::layout(
+            &self.nodes, &self.attrs, root,
+            Rect { x: 0.0, y: 0.0, w: self.viewport.0, h: self.viewport.1 },
+            &sizes, &mut rects,
+        );
 
         // Record hit rects for buttons before paint, so `was_clicked`
         // queries that come after `present()` see them.
@@ -432,6 +526,50 @@ mod tests {
         let bytes_after_first = ui.canvas_len();
         ui.present(btn);
         assert_eq!(ui.canvas_len(), bytes_after_first);
+    }
+
+    #[test]
+    fn ui_grow_setter_widens_button_in_hstack() {
+        // Exercises the post-hoc `Ui::grow` path used for buttons (which
+        // don't return a builder). Two buttons in an HStack, one
+        // grown — the grown one should end up meaningfully wider.
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let a_rect;
+        let b_rect;
+        {
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let a = ui.button("a", "A");
+            let b = ui.button("b", "B");
+            ui.grow(b, 1.0);
+            let row = ui.h_stack(&[a, b]).build();
+            ui.present(row);
+            a_rect = *ui.state.hit_rects.get("a").expect("a rect");
+            b_rect = *ui.state.hit_rects.get("b").expect("b rect");
+        }
+        // Viewport is 800px wide; non-grow "A" stays at its intrinsic
+        // button size, "B" absorbs the rest. The exact widths depend on
+        // the stub text measurer but B must be strictly wider.
+        assert!(b_rect.w > a_rect.w, "expected B wider than A, got {} vs {}", b_rect.w, a_rect.w);
+    }
+
+    #[test]
+    fn ui_grow_on_stale_id_is_noop() {
+        // Defensive: out-of-range id shouldn't panic. Layout treats
+        // missing attrs as grow=0, so the call should silently do
+        // nothing and later presents still work.
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        ui.grow(9999, 5.0);  // no such node yet
+        let btn = ui.button("g", "G");
+        ui.present(btn);
+        // Nothing crashed; button laid out at intrinsic.
+        assert!(ui.state.hit_rects.contains_key("g"));
     }
 
     #[test]

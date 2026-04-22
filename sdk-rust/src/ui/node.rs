@@ -6,7 +6,7 @@
 //! and returns its id. Keeping nodes flat-and-enum (rather than `Box<dyn
 //! Widget>`) avoids heap traffic in `on_render`, which runs every frame.
 
-use super::Ui;
+use super::{CrossAxis, MainAxis, Ui};
 
 /// Index into the flat node vec inside a [`Ui`]. Valid only for the frame
 /// on which it was issued; stale ids from previous frames panic on use.
@@ -34,11 +34,15 @@ pub enum Node {
         children: Vec<NodeId>,
         gap: f32,
         padding: (f32, f32, f32, f32), // top, right, bottom, left
+        main: MainAxis,
+        cross: CrossAxis,
     },
     HStack {
         children: Vec<NodeId>,
         gap: f32,
         padding: (f32, f32, f32, f32),
+        main: MainAxis,
+        cross: CrossAxis,
     },
     Button {
         id: String,
@@ -64,16 +68,21 @@ pub struct TextBuilder<'u, 's, 'c, 'b> {
     text: String,
     size: f32,
     color: u32,
+    grow: f32,
 }
 
 impl<'u, 's, 'c, 'b> TextBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, text: String) -> Self {
-        Self { ui, text, size: 14.0, color: 0xfff0f4fa }
+        Self { ui, text, size: 14.0, color: 0xfff0f4fa, grow: 0.0 }
     }
     pub fn size(mut self, size: f32) -> Self { self.size = size; self }
     pub fn color(mut self, color: u32) -> Self { self.color = color; self }
+    /// Main-axis grow factor when placed in a stack. See [`super::NodeAttr::grow`].
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
     pub fn build(self) -> NodeId {
-        self.ui.push(Node::Text { text: self.text, size: self.size, color: self.color })
+        let id = self.ui.push(Node::Text { text: self.text, size: self.size, color: self.color });
+        self.ui.set_grow(id, self.grow);
+        id
     }
 }
 
@@ -81,30 +90,40 @@ pub struct RectBuilder<'u, 's, 'c, 'b> {
     ui: &'u mut Ui<'s, 'c, 'b>,
     color: u32,
     min: (f32, f32),
+    grow: f32,
 }
 
 impl<'u, 's, 'c, 'b> RectBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, color: u32) -> Self {
-        Self { ui, color, min: (0.0, 0.0) }
+        Self { ui, color, min: (0.0, 0.0), grow: 0.0 }
     }
     pub fn size(mut self, w: f32, h: f32) -> Self { self.min = (w, h); self }
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
     pub fn build(self) -> NodeId {
-        self.ui.push(Node::Rect { color: self.color, min: self.min })
+        let id = self.ui.push(Node::Rect { color: self.color, min: self.min });
+        self.ui.set_grow(id, self.grow);
+        id
     }
 }
 
 pub struct SpacerBuilder<'u, 's, 'c, 'b> {
     ui: &'u mut Ui<'s, 'c, 'b>,
     min: (f32, f32),
+    grow: f32,
 }
 
 impl<'u, 's, 'c, 'b> SpacerBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>) -> Self {
-        Self { ui, min: (0.0, 0.0) }
+        Self { ui, min: (0.0, 0.0), grow: 0.0 }
     }
     pub fn size(mut self, w: f32, h: f32) -> Self { self.min = (w, h); self }
+    /// A grow>0 spacer with min (0,0) is the "push-to-end" pattern —
+    /// consume all leftover main-axis space between neighbours.
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
     pub fn build(self) -> NodeId {
-        self.ui.push(Node::Spacer { min: self.min })
+        let id = self.ui.push(Node::Spacer { min: self.min });
+        self.ui.set_grow(id, self.grow);
+        id
     }
 }
 
@@ -114,14 +133,23 @@ pub struct StackBuilder<'u, 's, 'c, 'b> {
     children: Vec<NodeId>,
     gap: f32,
     padding: (f32, f32, f32, f32),
+    main: MainAxis,
+    cross: CrossAxis,
+    grow: f32,
 }
 
 impl<'u, 's, 'c, 'b> StackBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new_v(ui: &'u mut Ui<'s, 'c, 'b>, children: Vec<NodeId>) -> Self {
-        Self { ui, vertical: true, children, gap: 0.0, padding: (0.0, 0.0, 0.0, 0.0) }
+        Self {
+            ui, vertical: true, children, gap: 0.0, padding: (0.0, 0.0, 0.0, 0.0),
+            main: MainAxis::default(), cross: CrossAxis::default(), grow: 0.0,
+        }
     }
     pub(crate) fn new_h(ui: &'u mut Ui<'s, 'c, 'b>, children: Vec<NodeId>) -> Self {
-        Self { ui, vertical: false, children, gap: 0.0, padding: (0.0, 0.0, 0.0, 0.0) }
+        Self {
+            ui, vertical: false, children, gap: 0.0, padding: (0.0, 0.0, 0.0, 0.0),
+            main: MainAxis::default(), cross: CrossAxis::default(), grow: 0.0,
+        }
     }
     pub fn gap(mut self, gap: f32) -> Self { self.gap = gap; self }
     /// Uniform padding on all four sides.
@@ -131,12 +159,31 @@ impl<'u, 's, 'c, 'b> StackBuilder<'u, 's, 'c, 'b> {
     pub fn padding_trbl(mut self, top: f32, right: f32, bottom: f32, left: f32) -> Self {
         self.padding = (top, right, bottom, left); self
     }
+    /// Main-axis distribution for children. Non-`Start` values cause the
+    /// stack to fill its slot on the main axis so there is leftover space
+    /// to distribute. Default: `Start`.
+    pub fn main(mut self, main: MainAxis) -> Self { self.main = main; self }
+    /// Cross-axis alignment (and stretching, for `Stretch`). Non-`Start`
+    /// values cause the stack to fill its slot on the cross axis. Default:
+    /// `Start`.
+    pub fn cross(mut self, cross: CrossAxis) -> Self { self.cross = cross; self }
+    /// Main-axis grow factor for when this stack is itself a child of
+    /// another stack (nested layouts).
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
     pub fn build(self) -> NodeId {
         let node = if self.vertical {
-            Node::VStack { children: self.children, gap: self.gap, padding: self.padding }
+            Node::VStack {
+                children: self.children, gap: self.gap, padding: self.padding,
+                main: self.main, cross: self.cross,
+            }
         } else {
-            Node::HStack { children: self.children, gap: self.gap, padding: self.padding }
+            Node::HStack {
+                children: self.children, gap: self.gap, padding: self.padding,
+                main: self.main, cross: self.cross,
+            }
         };
-        self.ui.push(node)
+        let id = self.ui.push(node);
+        self.ui.set_grow(id, self.grow);
+        id
     }
 }
