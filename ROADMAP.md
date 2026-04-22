@@ -483,6 +483,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - Import חדש `system.back()` ב-ABI: אפליקציה יכולה להפעיל בעצמה, אבל במיוחד — הפלטפורמה תשתמש בזה על mapping של keyboard/gesture (v0.2: קיצור מקלדת fixed, אין gesture engine)
 - ב-framework: `ActivityManager::back()` → pop top → שולח destroy → מביא את הקודם ל-Resumed
 - ה-Shell משתמשת ב-`system.back()` כ-mechanism העיקרי למעבר בין tasks
+- **Created→Destroyed shortcut:** אם activity קוראת `finish()` מתוך `on_create`, skip על `on_start`/`on_resume`/`on_pause`/`on_stop` וקפוץ ישר ל-`on_destroy`. מוסיף edge `(Created, Destroyed)` ל-`legal_transition` + בדיקה ב-`advance_through_create` אם `finish_requested` הופעל. parity עם Android — ראה [`research-android-lifecycle.md §1`](docs/research-android-lifecycle.md)
 
 ### 9.4 `start_activity` מתוך app + `on_new_intent`
 - Import חדש `activity.start_activity(intent_blob: bytes)` (grant: `LAUNCH_ANY_APP` ל-Shell, או target-package-matches-self ל-self-launch)

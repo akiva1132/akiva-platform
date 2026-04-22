@@ -84,8 +84,14 @@
 | SDK trait — `on_create/start/resume/pause/stop/destroy` with no-op defaults | ✅ | [`sdk-rust/src/activity.rs`](../sdk-rust/src/activity.rs) |
 | `save_state_bytes` / `restore_state_bytes` wired through Create→restore→Start | ✅ | framework `launch_app`, SDK runtime |
 | `onRestart` as a distinct callback | ❌ by design | Stopped→Started re-fires `on_start` — apps that need "first start vs restart" distinction gate on internal flags |
+| `finish()` inside `on_create` short-circuit (Created→Destroyed) | ❌ Stone 9.3 | Android skips on_start/on_resume/on_pause/on_stop — our matrix currently forces the full ladder. See [research-android-lifecycle.md §1](research-android-lifecycle.md) |
+| `on_new_intent` on SingleTop / SingleTask reuse | ❌ Stone 9.4 | Reuse path silently swallows the second `launch()` today; needs an extra ABI export + SDK hook |
 
 Bug caught by the Phase 9.1 test sweep: `destroy()` used to `break` on the first illegal edge, so destroying a Paused or Stopped activity silently skipped `on_stop`/`on_destroy`. Fixed to ignore-and-continue, matching `resume`'s shape.
+
+Bug caught by the Task 1 state-machine audit ([v0.2-review.md](v0.2-review.md)): `destroy()` called from `Initial` silently dropped the instance and rewrote the stack even though no lifecycle callback fired. Guard added so cleanup only runs once the record actually reached `Destroyed`.
+
+External research backing the above table lives in [research-android-lifecycle.md](research-android-lifecycle.md) — five AOSP edges audited, decisions documented.
 
 ## 3. Saved State
 
