@@ -31,43 +31,46 @@
         </HStack>
     </Frame>
 
-    <!-- Keypad: 5 rows × 4 columns, every cell grow=1 inside a Stretch HStack. -->
-    <VStack flex="1" gap="8" cross="stretch">
+    <!--
+        Keypad: 4 columns × 5 rows, every cell the same size.
+        Previously this was a VStack of five HStacks with flex=1 on
+        every row and every cell — functionally identical, but the
+        intent ("it's a grid") was buried in scaffolding. A single
+        <Grid> says what we mean and measures the same.
 
-        <HStack flex="1" gap="8" cross="stretch">
-            <Button id="clr"  label="C" flex="1" onClick="clear" />
-            <Button id="sign" label="±" flex="1" onClick="toggle_sign" />
-            <Button id="pct"  label="%" flex="1" onClick="percent" />
-            <Button id="div"  label="÷" flex="1" onClick="apply_div" />
-        </HStack>
+        Children are laid out row-major, top-left first:
+            row 0: C   ±   %   ÷
+            row 1: 7   8   9   ×
+            row 2: 4   5   6   −
+            row 3: 1   2   3   +
+            row 4: 0   .   ⌫   =
+        The grid itself is `flex=1` so the outer VStack hands it the
+        rest of the vertical space after the display panel.
+    -->
+    <Grid cols="4" rows="5" gap="8" flex="1">
+        <Button id="clr"  label="C" onClick="clear" />
+        <Button id="sign" label="±" onClick="toggle_sign" />
+        <Button id="pct"  label="%" onClick="percent" />
+        <Button id="div"  label="÷" onClick="apply_div" />
 
-        <HStack flex="1" gap="8" cross="stretch">
-            <Button id="d7"  label="7" flex="1" onClick="digit_7" />
-            <Button id="d8"  label="8" flex="1" onClick="digit_8" />
-            <Button id="d9"  label="9" flex="1" onClick="digit_9" />
-            <Button id="mul" label="×" flex="1" onClick="apply_mul" />
-        </HStack>
+        <Button id="d7"  label="7" onClick="digit_7" />
+        <Button id="d8"  label="8" onClick="digit_8" />
+        <Button id="d9"  label="9" onClick="digit_9" />
+        <Button id="mul" label="×" onClick="apply_mul" />
 
-        <HStack flex="1" gap="8" cross="stretch">
-            <Button id="d4"  label="4" flex="1" onClick="digit_4" />
-            <Button id="d5"  label="5" flex="1" onClick="digit_5" />
-            <Button id="d6"  label="6" flex="1" onClick="digit_6" />
-            <Button id="sub" label="−" flex="1" onClick="apply_sub" />
-        </HStack>
+        <Button id="d4"  label="4" onClick="digit_4" />
+        <Button id="d5"  label="5" onClick="digit_5" />
+        <Button id="d6"  label="6" onClick="digit_6" />
+        <Button id="sub" label="−" onClick="apply_sub" />
 
-        <HStack flex="1" gap="8" cross="stretch">
-            <Button id="d1"  label="1" flex="1" onClick="digit_1" />
-            <Button id="d2"  label="2" flex="1" onClick="digit_2" />
-            <Button id="d3"  label="3" flex="1" onClick="digit_3" />
-            <Button id="add" label="+" flex="1" onClick="apply_add" />
-        </HStack>
+        <Button id="d1"  label="1" onClick="digit_1" />
+        <Button id="d2"  label="2" onClick="digit_2" />
+        <Button id="d3"  label="3" onClick="digit_3" />
+        <Button id="add" label="+" onClick="apply_add" />
 
-        <HStack flex="1" gap="8" cross="stretch">
-            <Button id="d0"   label="0" flex="1" onClick="digit_0" />
-            <Button id="dot"  label="." flex="1" onClick="input_dot" />
-            <Button id="back" label="⌫" flex="1" onClick="backspace" />
-            <Button id="eq"   label="=" flex="1" onClick="equals" />
-        </HStack>
-
-    </VStack>
+        <Button id="d0"   label="0" onClick="digit_0" />
+        <Button id="dot"  label="." onClick="input_dot" />
+        <Button id="back" label="⌫" onClick="backspace" />
+        <Button id="eq"   label="=" onClick="equals" />
+    </Grid>
 </VStack>

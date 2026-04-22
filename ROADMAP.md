@@ -440,10 +440,11 @@
 - **WindowManager is a stub** — [framework/src/window_manager.rs](framework/src/window_manager.rs) לא מנתב בפועל.
 
 **מ-Phase 3 (AKML):**
-- Grid widget, Image widget, Input widget
+- ✅ **Grid widget** (אפריל 2026, 3 stones, commits `0fc6d86` → `51d88c9` + calculator migration) — fixed cols×rows row-major container (Android GridLayout style, no auto-wrap/span). Cells split slot evenly minus gaps+padding, `<Grid cols="N" rows="M" gap="G" flex="F">` ב-AKML, ה-calculator עבר מ-VStack של 5×HStack ל-`<Grid cols="4" rows="5">` אחד. 8 layout tests + 6 inflater tests, total 143 SDK tests (was 129).
+- Image widget, Input widget
 - Attributes: `margin`, `background`, `visible`, `textAlign`, `fontWeight`, `tag`
 - יחידות `dp`/`sp`/`%`; `match_parent`/`wrap_content`
-- Resource references — תלוי ב-ResourceManager wired
+- ✅ **Resource references** — `@color/` + `@string/` פועלים; `@dimen/` / `@drawable/` / `@style/` פוסט-MVP.
 
 **מ-Phase 4 (ABI):**
 - WIT / Component Model migration — ראה דחייה מתועדת למעלה.
