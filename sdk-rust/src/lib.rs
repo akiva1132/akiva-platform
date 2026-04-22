@@ -11,6 +11,7 @@
 //! their implementation.
 
 pub mod activity;
+pub mod akml;
 pub mod app;
 pub mod canvas;
 pub mod intent;

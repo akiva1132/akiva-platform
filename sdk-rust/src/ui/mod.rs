@@ -243,6 +243,15 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
     #[cfg(test)]
     pub(crate) fn canvas_len(&self) -> usize { self.canvas.buf_len() }
 
+    /// Whether a widget with this id registered a hit rect during the
+    /// most recent [`present`][Self::present]. Test-only — used by
+    /// sibling modules (e.g. `akml::inflate`) that need a yes/no
+    /// answer without reaching into private state.
+    #[cfg(test)]
+    pub(crate) fn has_hit_rect(&self, id: &str) -> bool {
+        self.state.hit_rects.contains_key(id)
+    }
+
     // ── Builders ─────────────────────────────────────────────────────
     //
     // All builders return borrowing configurators that terminate with
