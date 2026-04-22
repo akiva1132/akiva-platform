@@ -268,7 +268,15 @@ impl ActivityManager {
         ] {
             let _ = self.advance_to(id, target, &mut cb);
         }
-        // Clean up once destroyed.
+        // Only tear down the instance + stack entry once we actually reached
+        // `Destroyed`. An out-of-order call (e.g. `destroy()` on an `Initial`
+        // activity — no transitions legal, no callbacks fired) would
+        // otherwise silently drop the instance and leave the record stuck at
+        // `Initial`. Leaking a record is better than inventing an `on_destroy`
+        // that never had a matching `on_create`.
+        if self.records.get(&id).map(|r| r.state) != Some(LifecycleState::Destroyed) {
+            return;
+        }
         self.instances.remove(&id);
         // Keep the record so observers can see `Destroyed`; the next GC
         // pass (Phase 2b) will prune it.
@@ -280,21 +288,30 @@ impl ActivityManager {
     }
 
     /// Advance `id` to exactly `target`. Returns `Some(prev)` if we moved,
-    /// `None` if we couldn't (unknown id, illegal transition, or already
-    /// past). The callback is invoked once per transition so the framework
-    /// can call the corresponding trait method with a fresh context.
+    /// `None` if we couldn't (unknown id, missing instance, illegal
+    /// transition, or already past). The callback is invoked once per
+    /// transition so the framework can call the corresponding trait method
+    /// with a fresh context.
+    ///
+    /// Implementation note: we check `instances` *before* flipping
+    /// `record.state`. An instance-less record is treated as "nothing to
+    /// advance" and the record's state is left untouched — otherwise a
+    /// caller who saw `None` would still face a silently-mutated state.
+    /// In practice `instances` is only drained at the end of `destroy()`
+    /// (when the state is already `Destroyed`, blocking every transition
+    /// anyway) so this guard is defensive — but cheap, and it keeps
+    /// "state flipped" and "cb fired" atomic from the outside.
     fn advance_to(
         &mut self,
         id: ActivityId,
         target: LifecycleState,
         cb: &mut dyn FnMut(&mut dyn Activity, LifecycleState),
     ) -> Option<LifecycleState> {
-        let record = self.records.get_mut(&id)?;
-        let prev = record.state;
+        let prev = self.records.get(&id)?.state;
         if !legal_transition(prev, target) { return None; }
-        record.state = target;
-
-        let inst = self.instances.get_mut(&id)?;
+        if !self.instances.contains_key(&id) { return None; }
+        self.records.get_mut(&id).expect("record checked above").state = target;
+        let inst = self.instances.get_mut(&id).expect("instance checked above");
         cb(inst.as_mut(), target);
         Some(prev)
     }
@@ -671,5 +688,90 @@ mod tests {
     struct NullActivity;
     impl crate::activity::Activity for NullActivity {
         fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut FrameCommands) {}
+    }
+
+    // ── Audit regressions (v0.2-review Task 1) ───────────────────────────
+    //
+    // These tests pin down the edges the audit turned up: out-of-order
+    // driver calls, destroyed-id reuse, and the two guards added to keep
+    // the state machine self-consistent.
+
+    #[test]
+    fn destroy_from_initial_is_full_noop() {
+        // Calling destroy() before on_create ran must not drop the
+        // instance or rewrite the stack — every transition is illegal
+        // from Initial, so no callback fires, and the cleanup branch
+        // refuses to act on a record that never reached Destroyed.
+        // Previous behaviour wiped instances/stack silently, leaving a
+        // record stuck at `Initial` with no matching on_destroy.
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        assert_eq!(am.state_of(id), Some(LifecycleState::Initial));
+
+        am.destroy(id, fire);
+        assert!(log.borrow().is_empty(), "no callbacks must fire from Initial");
+        assert_eq!(am.state_of(id), Some(LifecycleState::Initial),
+            "state must not flip when no edge was taken");
+        assert!(am.with_instance(id, |_| {}), "instance must still be alive");
+        let task = am.foreground_task().expect("task exists");
+        assert_eq!(am.tasks[&task].stack, vec![id],
+            "stack entry must still be present");
+    }
+
+    #[test]
+    fn advance_to_on_destroyed_record_is_rejected() {
+        // After destroy(), the record remains at Destroyed while the
+        // instance is dropped. Any further advance_to must return None
+        // and leave the state untouched (legal_transition blocks every
+        // edge out of Destroyed). Regression guard: if someone ever adds
+        // an edge out of Destroyed, the instance-missing check becomes
+        // the second line of defence.
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap();
+        am.resume(id, fire);
+        am.destroy(id, fire);
+        assert_eq!(am.state_of(id), Some(LifecycleState::Destroyed));
+
+        for target in [
+            LifecycleState::Created,
+            LifecycleState::Started,
+            LifecycleState::Resumed,
+            LifecycleState::Paused,
+            LifecycleState::Stopped,
+        ] {
+            assert_eq!(am.advance(id, target, fire), None,
+                "advance {:?} -> {:?} must be rejected", LifecycleState::Destroyed, target);
+            assert_eq!(am.state_of(id), Some(LifecycleState::Destroyed),
+                "state must remain Destroyed after rejected advance");
+        }
+    }
+
+    #[test]
+    fn singletop_reuse_returns_current_top_id() {
+        // The reuse path trusts that the foreground top is in a sane
+        // state when launch() is called on its (pkg, class). In practice
+        // it's always Resumed (the only time stack.last() isn't Resumed
+        // is mid-driver, and drivers are synchronous). This test pins
+        // that invariant: a fresh SingleTop launch → resume → relaunch
+        // yields the same id with state still Resumed, no lifecycle
+        // churn, stack unchanged.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut am = ActivityManager::new();
+        let log_for_factory = log.clone();
+        am.register(
+            "test.pkg",
+            "TopMain",
+            LaunchMode::SingleTop,
+            move || Box::new(RecordingActivity { log: log_for_factory.clone() }),
+        );
+        let first = am.launch("test.pkg", "TopMain").unwrap();
+        am.resume(first, fire);
+        log.borrow_mut().clear();
+
+        let second = am.launch("test.pkg", "TopMain").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(am.state_of(second), Some(LifecycleState::Resumed),
+            "reused top must still be Resumed");
+        assert!(log.borrow().is_empty(), "reuse must not fire any callback");
     }
 }
