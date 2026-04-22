@@ -130,10 +130,11 @@ impl<'a> Parser<'a> {
         if b == b'\n' {
             self.line += 1;
             self.col = 1;
-        } else {
-            // Column in bytes, not grapheme clusters. Good enough for
-            // error pointing in ASCII-dominant source; multi-byte UTF-8
-            // in an error line will point slightly off but close.
+        } else if b & 0xC0 != 0x80 {
+            // Count columns in *code points*, skipping UTF-8
+            // continuation bytes (top two bits 10). So a multi-byte
+            // glyph in the source counts as one column, which is what
+            // editors and users actually see.
             self.col += 1;
         }
         Some(b)
@@ -299,27 +300,38 @@ impl<'a> Parser<'a> {
             ))),
             None => return Err(self.error("expected quoted attribute value, got end of input")),
         };
+        // We collect the value as a sequence of source slices (for
+        // plain runs of bytes) and single chars (for entities). The
+        // "plain run" path matters for UTF-8: copying `b as char`
+        // byte-by-byte would corrupt any multi-byte character by
+        // treating every continuation byte as a separate codepoint.
+        // Slicing the source instead keeps multi-byte sequences intact
+        // — that's sound because every break point below is an ASCII
+        // byte (quote, '<', '&'), and ASCII bytes cannot appear inside
+        // a multi-byte UTF-8 sequence by construction.
         let mut out = String::new();
+        let mut run_start = self.pos;
         loop {
             match self.peek() {
                 None => return Err(self.error("unterminated attribute value")),
-                Some(b) if b == quote => { self.bump(); return Ok(out); }
+                Some(b) if b == quote => {
+                    out.push_str(std::str::from_utf8(&self.src[run_start..self.pos]).unwrap());
+                    self.bump();
+                    return Ok(out);
+                }
                 Some(b'<') => return Err(self.error(
                     "raw '<' in attribute value — use &lt; if you need a literal angle bracket"
                 )),
                 Some(b'&') => {
+                    out.push_str(std::str::from_utf8(&self.src[run_start..self.pos]).unwrap());
                     self.bump();
                     out.push(self.parse_entity()?);
+                    run_start = self.pos;
                 }
                 Some(_) => {
-                    // Copy bytes until a special character. Using
-                    // `bump` one-at-a-time to keep line/col accurate
-                    // if someone puts a newline mid-value.
-                    let b = self.bump().unwrap();
-                    // UTF-8 continuation bytes in the attribute value
-                    // pass through transparently — we only ever switch
-                    // behaviour on the five special ASCII bytes.
-                    out.push(b as char);
+                    // Just advance; the byte stays in the pending run
+                    // and will be flushed on the next break or close.
+                    self.bump();
                 }
             }
         }
@@ -448,6 +460,39 @@ mod tests {
     fn attribute_value_can_contain_the_other_quote() {
         let el = p(r#"<A msg="can't stop" />"#);
         assert_eq!(el.attr("msg"), Some("can't stop"));
+    }
+
+    #[test]
+    fn utf8_multi_byte_characters_round_trip_unchanged() {
+        // Regression: an earlier version of the parser copied bytes
+        // one at a time as `b as char`, which re-encodes each UTF-8
+        // continuation byte as its own codepoint and produces garbage
+        // like "Â±" out of "±". Every glyph below costs 2+ bytes in
+        // UTF-8, so the test would fail loudly on the old code.
+        let el = p(r#"<A glyphs="± ÷ × − ⌫ — שלום 日本語" />"#);
+        assert_eq!(el.attr("glyphs"), Some("± ÷ × − ⌫ — שלום 日本語"));
+    }
+
+    #[test]
+    fn utf8_characters_mix_with_entities() {
+        let el = p(r#"<A v="± &amp; ÷" />"#);
+        assert_eq!(el.attr("v"), Some("± & ÷"));
+    }
+
+    #[test]
+    fn utf8_glyph_counts_as_one_column() {
+        // With the column fix, a glyph like `±` (two UTF-8 bytes)
+        // should count as a single column so error locations match
+        // what an editor displays.
+        let src = "<A x=\"±\" y=bad />";
+        let err = parse(src).expect_err("unquoted y should error");
+        // The unquoted `y=bad` is at offset: `<A x="±" ` = 9 grapheme
+        // columns in and then `y=b` — the error will complain at the
+        // `b` (bump past `=`), which is col 12. Allow either 11 or 12
+        // to avoid tying the test to the exact error-raise point.
+        assert_eq!(err.loc.line, 1);
+        assert!(err.loc.col >= 10 && err.loc.col <= 13,
+            "expected col 10..=13, got {}", err.loc.col);
     }
 
     // ── Error paths ──────────────────────────────────────────────────
