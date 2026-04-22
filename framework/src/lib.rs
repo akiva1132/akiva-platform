@@ -27,7 +27,7 @@ pub mod intent;
 pub mod manifest;
 pub mod package_manager;
 pub mod permissions;
-pub mod resource_manager;
+pub mod resources;
 pub mod shell;
 pub mod storage;
 pub mod wasm_activity;
@@ -82,7 +82,7 @@ pub fn boot(
         activities: ActivityManager::new(),
         packages: package_manager::PackageManager::new(),
         windows: window_manager::WindowManager::new(),
-        resources: resource_manager::ResourceManager::new(),
+        resources: resources::ResourceManager::new(),
         intents: intent::IntentRouter::new(),
         permissions: permissions::PermissionController::new(),
         compositor: Compositor::new(),
@@ -197,7 +197,7 @@ pub struct Framework {
     pub activities: ActivityManager,
     pub packages: package_manager::PackageManager,
     pub windows: window_manager::WindowManager,
-    pub resources: resource_manager::ResourceManager,
+    pub resources: resources::ResourceManager,
     pub intents: intent::IntentRouter,
     pub permissions: permissions::PermissionController,
     pub compositor: Compositor,
