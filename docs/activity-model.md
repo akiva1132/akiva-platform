@@ -1,6 +1,6 @@
 # Activity Model — מודל תהליכים ו-Activities
 
-> **סטטוס מימוש (אפריל 2026):** lifecycle state machine מלא (6 המעברים) + launch modes `Standard`/`SingleTop` פעילים ב-[framework/src/activity_manager.rs](../framework/src/activity_manager.rs), עם test coverage end-to-end (Stone 9.1). `SingleTask`/`SingleInstance`, back navigation, `start_activity_for_result`, ו-`on_new_intent` — stones 9.2–9.6. ראה [v0.2-design.md §4 (עמוד 2)](v0.2-design.md) ל-gap map מלא ו-[ROADMAP.md שלב 9](../ROADMAP.md) לסטונים.
+> **סטטוס מימוש (אפריל 2026):** lifecycle state machine מלא (6 המעברים) + כל ארבעת ה-launch modes (`Standard`/`SingleTop`/`SingleTask`/`SingleInstance`) פעילים ב-[framework/src/activity_manager.rs](../framework/src/activity_manager.rs), עם test coverage end-to-end (Stones 9.1–9.4, 9.2). `SingleInstance` מיושם כ-SingleTask ב-MVP — isolation של task נפרד מחכה ל-Stone 9.6. back navigation, `start_activity_for_result` — stones 9.5–9.6. ראה [v0.2-design.md §4 (עמוד 2)](v0.2-design.md) ל-gap map מלא ו-[ROADMAP.md שלב 9](../ROADMAP.md) לסטונים.
 
 ## 1. מושגים יסודיים
 
@@ -89,7 +89,8 @@
 | `on_new_intent` on SingleTop reuse | ✅ Stone 9.4 | `Framework::launch_app` detects `new_id == current top` → `deliver_new_intent` runs the callback, no bring-up chain, no stack churn. Framework-level test: `singletop_reuse_fires_on_new_intent_instead_of_bring_up` |
 | Wasm apps can call `ctx.start_activity(&intent)` | ✅ Stone 9.4 | SDK `Context::start_activity` → `akiva_host_start_activity(handle, ptr, len)` import with [`Intent::encode`](../sdk-rust/src/intent.rs) → worker stashes on `_pendingIntent` → kernel drains via `hal_app_drain_intent` after each ctx-bearing callback → `ActivityContext.launch_requested` → `IntentRouter::resolve` → `launch_app`. Symmetric wire codec pinned in [docs/abi.md §2.5.1](abi.md) |
 | SDK `Activity::on_new_intent(ctx, &intent)` + `akiva_app_new_intent` export | ✅ Stone 9.4 | Default no-op; dispatched from `runtime::on_new_intent(handle, ptr, len)`. Framework `WasmActivity::on_new_intent` re-encodes the decoded `Intent` and forwards via `WasmHost::new_intent` → `hal_app_new_intent` |
-| `on_new_intent` on SingleTask / SingleInstance reuse | ⏳ Stone 9.2 | The reuse-path plumbing is in place; what's missing is `ActivityManager::launch` actually implementing those modes (currently returns `Unsupported`). When 9.2 lands, the existing `deliver_new_intent` picks up the new-intent delivery automatically |
+| `on_new_intent` on SingleTask / SingleInstance reuse | ✅ Stone 9.2 | `ActivityManager::launch` now returns [`LaunchOutcome`](../framework/src/activity_manager.rs) with `{ id, reused, popped }`. SingleTask / SingleInstance scan the foreground task for a matching `(pkg, class)`; if found, `popped` lists every activity above it in top-first order. `Framework::launch_app` destroys each (via the new `destroy_with_persist` helper, reused from `finish_top`), resumes the target from `Paused → Resumed`, then calls `deliver_new_intent`. Integration test: `singletask_relaunch_pops_above_and_fires_new_intent` |
+| `SingleInstance` dedicated-task isolation | ⏳ Stone 9.6 | MVP flattens SingleInstance to SingleTask semantics inside the single foreground task. Full "activity alone in its own task, foreground swap" lands when `bring_task_to_front` does |
 
 Bug caught by the Phase 9.1 test sweep: `destroy()` used to `break` on the first illegal edge, so destroying a Paused or Stopped activity silently skipped `on_stop`/`on_destroy`. Fixed to ignore-and-continue, matching `resume`'s shape.
 
@@ -208,6 +209,8 @@ impl App for TasksApp {
 יש **instance אחד בלבד במערכת כולה**, ב-task נפרד לחלוטין. אף activity אחרת לא יכולה להיכנס ל-task שלו.
 
 שימושי ל-dialer, phone call screens.
+
+> **MVP (Stone 9.2):** ה-uniqueness מיושם (instance אחד, pop-above-reuse, on_new_intent), אבל ה-"task נפרד לחלוטין" מחכה ל-Stone 9.6 (`bring_task_to_front` + multi-task foreground). כרגע `singleInstance` מתנהג כמו `singleTask` בתוך ה-foreground task היחיד.
 
 ### הצהרה ב-manifest
 

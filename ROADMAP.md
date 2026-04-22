@@ -476,11 +476,13 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - עדכון [`docs/activity-model.md §9`](docs/activity-model.md) עם טבלת "Implementation" כמו ב-`manifest.md`
 
 ### 9.2 Launch modes: SingleTask + SingleInstance
-- `ActivityManager::launch` מסיר את ה-`Unsupported` ומיישם:
-  - **SingleTask:** אם instance כבר קיים ב-task (לאו דווקא top) — pop כל מה שמעליו → resume אותו. אם לא ב-task — יוצר instance חדש.
-  - **SingleInstance:** יש task נפרד משלו; `launch` לפני שהוא קיים יוצר task חדש, בתחום אחר activities; פעולות נוספות באותו package פותחות ב-task הקודם שלהן.
-- Unit tests לכל תרחיש ב-[`activity-model.md §4`](docs/activity-model.md)
-- **הערה (אחרי 9.4):** ה-`on_new_intent` delivery path (`Framework::deliver_new_intent`) כבר מוכן וחותך ב-`launch_app` ברגע שה-reuse branch מזהה `new_id == top`. כש-9.2 ננחת, ה-semantics של "SingleTask reuse" צריכה רק להחזיר את ה-id הקיים מ-`ActivityManager::launch` ו-`launch_app` יפעיל את on_new_intent אוטומטית. עבור SingleTask שמוצא instance עמוק ב-stack (לא top), צריך גם להרים אותו מעל — שם תוספת קטנה של pop-above-then-reuse תידרש.
+- ✅ **`LaunchOutcome` return type** — `ActivityManager::launch` מחזיר `{ id, reused, popped }` במקום `ActivityId` גלמי. `popped` (top-first order) מזהה activities מעל ה-target שה-caller (Framework) חייב לסגור. החלטה מודעת: `launch()` רק **מזהה** את ה-popped, לא משנה את ה-lifecycle state שלהם — ה-destroy callbacks שייכים ל-Framework.
+- ✅ **SingleTask reuse** — `ActivityManager::launch` סורק את foreground task ל-`(pkg, class)` תואם; אם נמצא, `popped = stack[pos+1..].rev()`. `LaunchError::Unsupported` הוסר מה-enum.
+- ✅ **SingleInstance reuse (MVP)** — זהה סמנטית ל-SingleTask ב-MVP עם task קדמי יחיד. ה-"dedicated task isolation" האמיתי נדחה ל-Stone 9.6 — `launch()` הוא ה-seam הלא נכון לזה, ה-foreground-switch decision שייך ל-Framework.
+- ✅ **`Framework::launch_app` מטפל ב-popped** — לכל id ב-`outcome.popped` קורא ל-`destroy_with_persist` (factored out from `finish_top`) שמריץ pause→stop→destroy ומשמר save-state על edge ה-Stop. אחרי ה-destroy loop, אם `reused`, קורא ל-`drive_start_to_resumed` (מכסה Paused→Resumed ו-Resumed no-op) ואז `deliver_new_intent`.
+- ✅ **Unit tests** — 4 ב-`activity_manager::tests`: empty-task create-fresh, top-match reuse-no-pop, below-top pop-above-reuse, SingleInstance ≡ SingleTask, popped-state-untouched invariant.
+- ✅ **Integration test** — `framework::tests::singletask_relaunch_pops_above_and_fires_new_intent`: Shell→TaskApp(SingleTask)→Filler(Standard)→relaunch TaskApp; מאמת רצוף Filler pause/stop/destroy → task:resume → task:new_intent.
+- ⏭️ **SingleInstance dedicated-task isolation** — Stone 9.6.
 
 ### 9.3 Back stack + `Context::finish()`
 - ✅ **SDK `Context::finish()` plumbing** — `akiva_host_finish(handle)` import → worker per-handle flag table → kernel drains via `hal_app_drain_finish` → `WasmActivity.drain_post` קובע `ActivityContext.finish_requested = true`. סוגר את ה-gap מ-[`research-activity-boundary.md`](docs/research-activity-boundary.md).

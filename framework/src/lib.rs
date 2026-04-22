@@ -203,7 +203,8 @@ pub fn boot(
     let (shell_pkg, shell_class) = fw.intents.resolve(&home).expect("HOME resolves");
     let shell_id = fw.activities
         .launch(&shell_pkg, &shell_class)
-        .expect("shell launch");
+        .expect("shell launch")
+        .id;
     fw.stack.push(shell_id);
     // Shell has no saved state to restore — it's built-in and stateless
     // from the framework's perspective (boot counter + package list are
@@ -480,29 +481,50 @@ impl Framework {
     /// log nothing (no log binding in framework) and swallow so the Shell
     /// survives the miss.
     ///
-    /// `intent` is carried through from `apply_post` so that a
-    /// `SingleTop` reuse can deliver `on_new_intent` to the existing
-    /// top instead of silently swallowing the request. (Stone 9.4 —
-    /// Phase 9.2's `SingleTask` / `SingleInstance` will also land on
-    /// this reuse branch.)
+    /// `intent` is carried through from `apply_post` so the reuse branch
+    /// (SingleTop top match, or Stone 9.2's SingleTask / SingleInstance
+    /// finding a matching instance anywhere in the foreground task) can
+    /// deliver `on_new_intent` to the reused activity.
     fn launch_app(&mut self, intent: &Intent, package_id: &str, class: &str, ts: f64) {
-        let new_id = match self.activities.launch(package_id, class) {
-            Ok(id) => id,
+        let outcome = match self.activities.launch(package_id, class) {
+            Ok(o) => o,
             Err(_) => return,
         };
-        // Reuse path: `ActivityManager::launch` returned the existing
-        // top (SingleTop on its own class, or Phase 9.2's SingleTask
-        // finding a matching instance). Deliver the fresh intent via
-        // `on_new_intent` — the activity stays `Resumed`, no bring-up
-        // chain runs, no stack churn.
-        if Some(new_id) == self.stack.last().copied() {
-            self.deliver_new_intent(new_id, intent, ts);
+
+        // SingleTask / SingleInstance reuse may have identified activities
+        // stacked above the target. Destroy each (top-first order is
+        // already baked into `outcome.popped`) so their on_pause /
+        // on_stop / on_destroy fire in the correct sequence and any
+        // save-state is persisted. Remove from our mirror of the stack
+        // as we go — `destroy_with_persist` drops them from the
+        // ActivityManager's task.stack via its normal cleanup.
+        for popped_id in &outcome.popped {
+            self.destroy_with_persist(*popped_id, ts);
+            self.stack.retain(|x| *x != *popped_id);
+        }
+
+        if outcome.reused {
+            // Three reuse shapes merge here:
+            //   1. SingleTop top match — target was Resumed, stays Resumed.
+            //   2. SingleTask / SingleInstance finding the target at top —
+            //      same as (1).
+            //   3. SingleTask / SingleInstance finding the target below
+            //      top — target was Paused (covered), the pop loop above
+            //      destroyed whatever covered it, now we must drive it
+            //      back to Resumed.
+            //
+            // `drive_start_to_resumed` handles both Paused→Resumed and
+            // the Resumed no-op, so we don't need to branch on prior state.
+            self.drive_start_to_resumed(outcome.id, ts);
+            self.deliver_new_intent(outcome.id, intent, ts);
             return;
         }
+
+        // Fresh-instance path.
         if let Some(prev) = self.stack.last().copied() {
             self.drive_to_paused(prev, ts);
         }
-        self.stack.push(new_id);
+        self.stack.push(outcome.id);
         // Drive Create first so the activity exists, then hand it any
         // saved-state blob we persisted on a previous run. Only after
         // that do we let it proceed to Start → Resumed. This matches the
@@ -514,16 +536,16 @@ impl Framework {
         // to on_destroy via the `Created → Destroyed` shortcut. Then pop
         // the stack entry and resume whatever we just paused. See
         // docs/research-android-lifecycle.md §1.
-        if self.advance_through_create(new_id, ts) {
-            self.destroy_shortcut(new_id, ts);
+        if self.advance_through_create(outcome.id, ts) {
+            self.destroy_shortcut(outcome.id, ts);
             self.stack.pop();
             if let Some(new_top) = self.stack.last().copied() {
                 self.drive_to_resumed(new_top, ts);
             }
             return;
         }
-        self.try_restore_state(new_id, package_id, class);
-        self.drive_start_to_resumed(new_id, ts);
+        self.try_restore_state(outcome.id, package_id, class);
+        self.drive_start_to_resumed(outcome.id, ts);
     }
 
     /// Fire `on_new_intent` on an already-Resumed activity and drain any
@@ -544,15 +566,26 @@ impl Framework {
     fn finish_top(&mut self, ts: f64) {
         if self.stack.len() <= 1 { return; }
         let id = self.stack.pop().expect("checked len > 1");
+        self.destroy_with_persist(id, ts);
+        if let Some(new_top) = self.stack.last().copied() {
+            self.drive_to_resumed(new_top, ts);
+        }
+    }
 
-        // Capture the save-state blob on the Pause→Stopped edge. The
-        // activity has already seen `on_pause` by this point (driven
-        // below), so its internal state is whatever it wants persisted.
-        // We pull the bytes out *before* Stop fires because Android's
-        // contract — mirrored in docs/activity-model.md §3 — is that
-        // on_save_state precedes on_stop, and the app is allowed to
-        // assume its state is frozen by the time it sees on_stop.
-        //
+    /// Drive an activity through its full destroy chain (pause → stop →
+    /// destroy, whatever edges are legal from its current state) and
+    /// persist any save-state bytes produced on the Stop edge.
+    ///
+    /// Save-state is captured *before* `on_stop` fires because Android's
+    /// contract — mirrored in docs/activity-model.md §3 — is that
+    /// on_save_state precedes on_stop, and the app is allowed to assume
+    /// its state is frozen by the time it sees on_stop.
+    ///
+    /// Pulled out of `finish_top` so SingleTask / SingleInstance's
+    /// pop-above-reuse path (`launch_app`) can destroy each covered
+    /// activity with the same save-state discipline. Does NOT touch
+    /// `self.stack` — the caller is responsible for mirror bookkeeping.
+    fn destroy_with_persist(&mut self, id: ActivityId, ts: f64) {
         // Collect (package_id, class) first so the later storage.write
         // call doesn't need to reach through the (still-borrowed)
         // activity manager.
@@ -573,7 +606,6 @@ impl Framework {
             match new_state {
                 LifecycleState::Paused => a.on_pause(&mut ctx),
                 LifecycleState::Stopped => {
-                    // Pull the blob first, then deliver the Stop edge.
                     save_bytes = Some(a.save_state_bytes());
                     a.on_stop(&mut ctx);
                 }
@@ -583,9 +615,6 @@ impl Framework {
         });
         if let (Some((pkg, class)), Some(bytes)) = (meta, save_bytes) {
             self.persist_saved_state(&pkg, &class, &bytes);
-        }
-        if let Some(new_top) = self.stack.last().copied() {
-            self.drive_to_resumed(new_top, ts);
         }
     }
 
@@ -752,7 +781,7 @@ mod tests {
 
         // Bring the shell up by the same path `boot()` uses: launch +
         // push onto the stack + drive to resumed.
-        let shell_id = fw.activities.launch("test.shell", "Main").unwrap();
+        let shell_id = fw.activities.launch("test.shell", "Main").unwrap().id;
         fw.stack.push(shell_id);
         fw.drive_to_resumed(shell_id, 0.0);
         log.borrow_mut().clear();
@@ -817,7 +846,7 @@ mod tests {
             mime_types: vec![],
         });
 
-        let shell_id = fw.activities.launch("test.shell", "Main").unwrap();
+        let shell_id = fw.activities.launch("test.shell", "Main").unwrap().id;
         fw.stack.push(shell_id);
         fw.drive_to_resumed(shell_id, 0.0);
         log.borrow_mut().clear();
@@ -858,6 +887,179 @@ mod tests {
         assert_eq!(fw.stack, vec![shell_id]);
         assert_eq!(
             fw.activities.state_of(shell_id),
+            Some(activity_manager::LifecycleState::Resumed),
+        );
+    }
+
+    #[test]
+    fn singletask_relaunch_pops_above_and_fires_new_intent() {
+        // Stone 9.2 — end-to-end SingleTask reuse. Stack shape:
+        //   Shell (SingleTop, bottom)
+        //   TaskApp (SingleTask, the target of the reuse)
+        //   Filler (Standard, covers the target)
+        // Relaunching TaskApp must destroy Filler (pause/stop/destroy in
+        // order), resume TaskApp from Paused, and deliver on_new_intent —
+        // all in one apply_post pass, no second user input needed.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut fw = empty_framework();
+
+        // Shell: clicks launch TaskApp first time, then the Filler, then
+        // request TaskApp again (the reuse we're testing). The sequence
+        // is driven by a mutable pointer-click counter so the test can
+        // step through each launch one pointer at a time.
+        struct ShellActivity {
+            name: &'static str,
+            log: Rc<RefCell<Vec<String>>>,
+            clicks: Rc<RefCell<u32>>,
+            intents: Rc<[Intent; 3]>,
+        }
+        impl activity::Activity for ShellActivity {
+            fn on_create(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push(format!("{}:create", self.name));
+            }
+            fn on_start(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push(format!("{}:start", self.name));
+            }
+            fn on_resume(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push(format!("{}:resume", self.name));
+            }
+            fn on_pause(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push(format!("{}:pause", self.name));
+            }
+            fn on_stop(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push(format!("{}:stop", self.name));
+            }
+            fn on_destroy(&mut self, _: &mut ActivityContext<'_>) {
+                self.log.borrow_mut().push(format!("{}:destroy", self.name));
+            }
+            fn on_pointer(&mut self, ctx: &mut ActivityContext<'_>, _: activity::PointerEvent) {
+                self.log.borrow_mut().push(format!("{}:pointer", self.name));
+                let n = *self.clicks.borrow() as usize;
+                *self.clicks.borrow_mut() += 1;
+                if n < self.intents.len() {
+                    *ctx.launch_requested = Some(self.intents[n].clone());
+                }
+            }
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+        }
+
+        let clicks = Rc::new(RefCell::new(0u32));
+        let task_intent = Intent::explicit("test.pkg", "TaskMain");
+        let filler_intent = Intent::explicit("test.pkg", "Filler");
+        let task_intent_for_reuse = Intent::explicit("test.pkg", "TaskMain");
+        let intents: Rc<[Intent; 3]> = Rc::new([
+            task_intent.clone(),
+            filler_intent.clone(),
+            task_intent_for_reuse.clone(),
+        ]);
+
+        let log_shell = log.clone();
+        let clicks_shell = clicks.clone();
+        let intents_shell = intents.clone();
+        fw.activities.register("test.shell", "Main", LaunchMode::SingleTop, move || {
+            Box::new(ShellActivity {
+                name: "shell",
+                log: log_shell.clone(),
+                clicks: clicks_shell.clone(),
+                intents: intents_shell.clone(),
+            })
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.shell".into(),
+            activity_class: "Main".into(),
+            actions: vec![action::MAIN.into()],
+            categories: vec![category::HOME.into()],
+            data_schemes: vec![], mime_types: vec![],
+        });
+
+        // TaskApp — SingleTask. Plain ScriptedActivity, no scripted
+        // pointer launch. on_new_intent delivery is the assertion.
+        let log_task = log.clone();
+        fw.activities.register("test.pkg", "TaskMain", LaunchMode::SingleTask, move || {
+            Box::new(ScriptedActivity::new("task", log_task.clone()))
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.pkg".into(),
+            activity_class: "TaskMain".into(),
+            actions: vec!["akiva.action.TaskMain".into()],
+            categories: vec![], data_schemes: vec![], mime_types: vec![],
+        });
+
+        // Filler — Standard. Just needs to cover the target.
+        let log_filler = log.clone();
+        fw.activities.register("test.pkg", "Filler", LaunchMode::Standard, move || {
+            Box::new(ScriptedActivity::new("filler", log_filler.clone()))
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.pkg".into(),
+            activity_class: "Filler".into(),
+            actions: vec!["akiva.action.Filler".into()],
+            categories: vec![], data_schemes: vec![], mime_types: vec![],
+        });
+
+        // Boot the shell the same way framework::boot does.
+        let shell_id = fw.activities.launch("test.shell", "Main").unwrap().id;
+        fw.stack.push(shell_id);
+        fw.drive_to_resumed(shell_id, 0.0);
+        log.borrow_mut().clear();
+
+        // Click 1: Shell launches TaskApp (fresh create).
+        fw.dispatch_pointer(pointer_down(), 1.0);
+        assert_eq!(
+            &*log.borrow(),
+            &[
+                "shell:pointer",
+                "shell:pause",
+                "task:create",
+                "task:start",
+                "task:resume",
+            ],
+        );
+        assert_eq!(fw.stack.len(), 2);
+        let task_id = fw.stack[1];
+        log.borrow_mut().clear();
+
+        // Click 2 is delivered to the top of the stack — which is now
+        // TaskApp. The scripted `task` activity has no pointer launch, so
+        // we need to go back to the Shell first. The easier approach: drive
+        // click through Shell by calling dispatch_pointer while Shell is
+        // top. Instead, bypass by calling launch_app directly to push the
+        // filler; it's a framework-internal test anyway.
+        fw.launch_app(&filler_intent, "test.pkg", "Filler", 2.0);
+        assert_eq!(
+            &*log.borrow(),
+            &[
+                "task:pause",
+                "filler:create",
+                "filler:start",
+                "filler:resume",
+            ],
+        );
+        assert_eq!(fw.stack.len(), 3);
+        log.borrow_mut().clear();
+
+        // The reuse under test: relaunch TaskApp. Stack was
+        //   [shell, task, filler]
+        // Expected sequence:
+        //   filler:pause, filler:stop, filler:destroy  ← pop-above
+        //   task:resume                                ← Paused → Resumed
+        //   task:new_intent:<action>                   ← deliver_new_intent
+        // Stack after: [shell, task]
+        fw.launch_app(&task_intent_for_reuse, "test.pkg", "TaskMain", 3.0);
+        assert_eq!(
+            &*log.borrow(),
+            &[
+                "filler:pause",
+                "filler:stop",
+                "filler:destroy",
+                "task:resume",
+                "task:new_intent:akiva.intent.action.MAIN",
+            ],
+            "SingleTask reuse must destroy popped, resume target, then deliver on_new_intent",
+        );
+        assert_eq!(fw.stack, vec![shell_id, task_id]);
+        assert_eq!(
+            fw.activities.state_of(task_id),
             Some(activity_manager::LifecycleState::Resumed),
         );
     }
