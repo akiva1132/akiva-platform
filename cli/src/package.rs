@@ -198,8 +198,8 @@ mod tests {
 
         let bytes = std::fs::read(&out).unwrap();
         let archive = Archive::decode(&bytes).unwrap();
-        assert_eq!(archive.manifest_toml(), b"id = \"com.example.x\"");
-        assert_eq!(archive.app_wasm(), b"\0asm\x01\x00\x00\x00");
+        assert_eq!(archive.get("manifest.toml").unwrap().data, b"id = \"com.example.x\"");
+        assert_eq!(archive.get("app.wasm").unwrap().data, b"\0asm\x01\x00\x00\x00");
         assert_eq!(archive.entries().len(), 2);
         let _ = std::fs::remove_dir_all(&staged);
     }

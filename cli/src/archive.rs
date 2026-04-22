@@ -14,13 +14,6 @@
 //! against traversal on decode — an `.akv` archive cannot name a file
 //! outside its own tree.
 
-// `encode` + `add` + `new` are used by `akiva package` (Stone 8.2); the
-// reader half (`decode`, `entries`, accessors) lands its first caller in
-// Stone 8.3 (`akiva install`). Until then keep them public without the
-// warning noise rather than pollute the API with `pub(crate)` just to
-// suppress a transient signal.
-#![allow(dead_code)]
-
 use std::fmt;
 
 /// Magic bytes at offset 0. Chosen to not collide with ZIP (`PK\x03\x04`),
@@ -112,23 +105,6 @@ impl Archive {
 
     pub fn get(&self, path: &str) -> Option<&Entry> {
         self.entries.iter().find(|e| e.path == path)
-    }
-
-    /// The `manifest.toml` bytes. Safe to call on any archive produced
-    /// by [`encode`][Self::encode] or returned from [`decode`][Self::decode]
-    /// — both guarantee this entry exists.
-    pub fn manifest_toml(&self) -> &[u8] {
-        &self.get("manifest.toml")
-            .expect("validated: manifest.toml is required on every archive")
-            .data
-    }
-
-    /// The `app.wasm` bytes. Same existence guarantee as
-    /// [`manifest_toml`][Self::manifest_toml].
-    pub fn app_wasm(&self) -> &[u8] {
-        &self.get("app.wasm")
-            .expect("validated: app.wasm is required on every archive")
-            .data
     }
 
     /// Add an entry. Validates the path and rejects duplicates. The
@@ -286,12 +262,12 @@ mod tests {
     }
 
     #[test]
-    fn accessors_return_required_entries() {
+    fn get_returns_required_entries() {
         let a = minimal();
         let bytes = a.encode().unwrap();
         let b = Archive::decode(&bytes).unwrap();
-        assert_eq!(b.manifest_toml(), b"id=\"x\"");
-        assert_eq!(b.app_wasm(), b"\0asm\x01\x00\x00\x00");
+        assert_eq!(b.get("manifest.toml").unwrap().data, b"id=\"x\"");
+        assert_eq!(b.get("app.wasm").unwrap().data, b"\0asm\x01\x00\x00\x00");
     }
 
     // ── Header + version guards ───────────────────────────────────────
@@ -502,6 +478,6 @@ mod tests {
         a.add("app.wasm", wasm.clone()).unwrap();
         let bytes = a.encode().unwrap();
         let b = Archive::decode(&bytes).unwrap();
-        assert_eq!(b.app_wasm(), wasm.as_slice());
+        assert_eq!(b.get("app.wasm").unwrap().data, wasm);
     }
 }

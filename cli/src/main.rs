@@ -12,6 +12,7 @@
 mod archive;
 mod build;
 mod devserver;
+mod install;
 mod new;
 mod package;
 mod run;
@@ -67,11 +68,7 @@ fn cmd_package(args: &[String]) -> ExitCode {
 }
 
 fn cmd_install(args: &[String]) -> ExitCode {
-    let Some(archive) = args.first() else {
-        eprintln!("akiva install: missing <archive>"); return ExitCode::from(2);
-    };
-    println!("[stub] would install {archive} into the runtime package store");
-    ExitCode::SUCCESS
+    install::run(args)
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
