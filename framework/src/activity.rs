@@ -105,6 +105,17 @@ pub trait Activity: 'static {
     /// activity is in `Resumed` state.
     fn render(&mut self, ctx: &mut ActivityContext<'_>, out: &mut FrameCommands);
 
+    /// Deliver an already-resolved intent to an activity that is already
+    /// live on the stack — i.e. `SingleTop` reuse (Stone 9.4) or
+    /// `SingleTask`/`SingleInstance` reuse (Stone 9.2). The activity
+    /// stays `Resumed`; only `on_new_intent` fires, no bring-up chain
+    /// runs. Default is a no-op for in-kernel activities that don't
+    /// care about being re-addressed. See
+    /// [docs/activity-model.md §2](../../docs/activity-model.md).
+    fn on_new_intent(&mut self, ctx: &mut ActivityContext<'_>, intent: &Intent) {
+        let _ = (ctx, intent);
+    }
+
     /// Hand back an opaque blob the framework will persist before the
     /// activity is stopped. The wire format lives in the SDK — the
     /// framework treats the bytes as opaque and never inspects them.

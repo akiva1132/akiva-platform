@@ -26,6 +26,7 @@ use core::num::NonZeroU32;
 
 use crate::activity::{Activity, ActivityContext, KeyEvent, PointerEvent, PointerPhase, KeyPhase, SurfaceMetrics};
 use crate::compositor::{FrameCommands, PaintOp};
+use crate::intent::Intent;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -105,6 +106,29 @@ pub trait WasmHost {
         let _ = handle;
         false
     }
+
+    /// Pop any pending intent blob raised by the app via
+    /// `akiva_host_start_activity`. Same single-shot semantic as
+    /// `drain_finish` — the host clears its per-handle slot on read.
+    /// The bytes are the SDK's encoded `Intent` (see
+    /// `akiva_sdk::intent::Intent::encode`); `WasmActivity` decodes them
+    /// into `framework::intent::Intent` and feeds them into
+    /// `ctx.launch_requested`. Default `None` keeps in-process hosts
+    /// opt-out. See [`docs/abi.md §2.3`](../../docs/abi.md).
+    fn drain_intent(&self, handle: AppHandle) -> Option<Vec<u8>> {
+        let _ = handle;
+        None
+    }
+
+    /// Deliver an already-resolved intent to an existing activity handle
+    /// — fires `akiva_app_new_intent(handle, ptr, len)` on the real
+    /// host. Called when `ActivityManager::launch` picks a reuse path
+    /// (SingleTop; and Phase 9.2's SingleTask/SingleInstance) instead
+    /// of stamping out a fresh instance. Default no-op so in-kernel
+    /// hosts (Shell) that don't expose a new-intent path stay quiet.
+    fn new_intent(&self, handle: AppHandle, bytes: &[u8]) {
+        let _ = (handle, bytes);
+    }
 }
 
 // ── Proxy activity ───────────────────────────────────────────────────────
@@ -127,14 +151,27 @@ impl WasmActivity {
 
     pub fn handle(&self) -> AppHandle { self.handle }
 
-    /// Pop any app-raised "finish" flag for this handle and propagate it
-    /// into the active dispatch's [`ActivityContext`]. Called at the end
-    /// of every callback that carries a ctx — a single choke point so a
-    /// new lifecycle method can't silently skip it. `on_destroy` does NOT
-    /// call this (destroy is already terminal; a finish request is moot).
+    /// Pop any app-raised post-callback signals for this handle and
+    /// propagate them into the active dispatch's [`ActivityContext`].
+    /// Called at the end of every callback that carries a ctx — a single
+    /// choke point so a new lifecycle method can't silently skip it.
+    /// `on_destroy` does NOT call this (destroy is already terminal;
+    /// post-callback requests are moot there).
+    ///
+    /// A malformed `Intent` blob from the host is dropped silently — the
+    /// wasm app is the only code that could have produced it, and
+    /// panicking mid-dispatch would trap the whole app on what's almost
+    /// certainly a version skew. The request surfaces as "start_activity
+    /// did nothing" to the app, which is the same outcome as an
+    /// unresolvable intent (`apply_post` drops those too).
     fn drain_post(&self, ctx: &mut ActivityContext<'_>) {
         if self.host.drain_finish(self.handle) {
             *ctx.finish_requested = true;
+        }
+        if let Some(bytes) = self.host.drain_intent(self.handle) {
+            if let Ok(intent) = Intent::decode(&bytes) {
+                *ctx.launch_requested = Some(intent);
+            }
         }
     }
 }
@@ -199,6 +236,17 @@ impl Activity for WasmActivity {
     }
     fn restore_state_bytes(&mut self, bytes: &[u8]) {
         self.host.restore_state(self.handle, bytes);
+    }
+
+    fn on_new_intent(&mut self, ctx: &mut ActivityContext<'_>, intent: &Intent) {
+        // Re-encode rather than passing the original bytes through —
+        // `Framework` doesn't retain the wire buffer past `apply_post`,
+        // and the cost is trivial compared to the wasm call that
+        // follows. Keeps the boundary symmetric: framework side owns a
+        // decoded `Intent`, wasm side receives an encoded blob.
+        let bytes = intent.encode();
+        self.host.new_intent(self.handle, &bytes);
+        self.drain_post(ctx);
     }
 }
 
@@ -382,6 +430,7 @@ mod tests {
         Render(u32, f64),
         SaveState(u32),
         RestoreState(u32, Vec<u8>),
+        NewIntent(u32, Vec<u8>),
     }
 
     /// Mock that records every call and lets tests pre-seed encoded paint
@@ -395,6 +444,9 @@ mod tests {
         /// once then resets to `false` — mirrors the real host's
         /// single-shot flag semantic.
         pending_finish: RefCell<bool>,
+        /// Stone 9.4 — pending intent blob. Read-and-clear, matching
+        /// `AppRegistry.drainIntent` semantics.
+        pending_intent: RefCell<Option<Vec<u8>>>,
     }
 
     impl MockHost {
@@ -405,12 +457,14 @@ mod tests {
                 paint_bytes: RefCell::new(Vec::new()),
                 save_bytes: RefCell::new(Vec::new()),
                 pending_finish: RefCell::new(false),
+                pending_intent: RefCell::new(None),
             }
         }
         fn take_calls(&self) -> Vec<Call> { core::mem::take(&mut *self.calls.borrow_mut()) }
         fn set_paint_bytes(&self, bytes: Vec<u8>) { *self.paint_bytes.borrow_mut() = bytes; }
         fn set_save_bytes(&self, bytes: Vec<u8>) { *self.save_bytes.borrow_mut() = bytes; }
         fn arm_finish(&self) { *self.pending_finish.borrow_mut() = true; }
+        fn arm_intent(&self, bytes: Vec<u8>) { *self.pending_intent.borrow_mut() = Some(bytes); }
     }
 
     impl WasmHost for MockHost {
@@ -453,6 +507,12 @@ mod tests {
             let was = *flag;
             *flag = false;
             was
+        }
+        fn drain_intent(&self, _handle: AppHandle) -> Option<Vec<u8>> {
+            self.pending_intent.borrow_mut().take()
+        }
+        fn new_intent(&self, handle: AppHandle, bytes: &[u8]) {
+            self.calls.borrow_mut().push(Call::NewIntent(handle.get(), bytes.to_vec()));
         }
     }
 
@@ -649,6 +709,83 @@ mod tests {
         let mut ctx2 = make_ctx(&mut finish2, &mut launch2);
         act.on_resume(&mut ctx2);
         assert!(!finish2, "finish must not sticky");
+    }
+
+    // ── Stone 9.4: drain_intent + on_new_intent ─────────────────────────
+
+    #[test]
+    fn drain_intent_sets_launch_requested_on_next_ctx_callback() {
+        // App called akiva_host_start_activity; kernel must see the
+        // request surface as ctx.launch_requested on the next
+        // ctx-bearing callback, single-shot (mirrors drain_finish).
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        let mut act = WasmActivity::new(handle, host.clone());
+        let intent = Intent::explicit("com.example.target", "Main");
+        host.arm_intent(intent.encode());
+
+        let mut finish = false;
+        let mut launch: Option<Intent> = None;
+        let mut ctx = make_ctx(&mut finish, &mut launch);
+        act.on_resume(&mut ctx);
+        let got = launch.expect("armed intent must surface to ctx");
+        assert_eq!(got.target_package.as_deref(), Some("com.example.target"));
+        assert_eq!(got.target_class.as_deref(), Some("Main"));
+
+        // Second callback without re-arm: no launch resurfaces.
+        let mut finish2 = false;
+        let mut launch2: Option<Intent> = None;
+        let mut ctx2 = make_ctx(&mut finish2, &mut launch2);
+        act.on_resume(&mut ctx2);
+        assert!(launch2.is_none(), "intent must not sticky");
+    }
+
+    #[test]
+    fn malformed_intent_blob_is_silently_dropped() {
+        // A buggy app that writes junk into the host's intent slot
+        // must not crash the whole dispatch. The decode error is
+        // swallowed and ctx.launch_requested stays None.
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        let mut act = WasmActivity::new(handle, host.clone());
+        host.arm_intent(vec![0xff; 3]);  // too short for even the action_len header
+
+        let mut finish = false;
+        let mut launch: Option<Intent> = None;
+        let mut ctx = make_ctx(&mut finish, &mut launch);
+        act.on_resume(&mut ctx);
+        assert!(launch.is_none());
+        assert!(!finish);
+    }
+
+    #[test]
+    fn on_new_intent_forwards_encoded_blob_to_host() {
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        host.take_calls();
+        let mut act = WasmActivity::new(handle, host.clone());
+
+        let intent = Intent::new(crate::intent::action::VIEW)
+            .with_category(crate::intent::category::DEFAULT);
+        let mut finish = false;
+        let mut launch: Option<Intent> = None;
+        let mut ctx = make_ctx(&mut finish, &mut launch);
+        act.on_new_intent(&mut ctx, &intent);
+
+        let calls = host.take_calls();
+        assert_eq!(calls.len(), 1, "exactly one host call per on_new_intent");
+        match &calls[0] {
+            Call::NewIntent(h, bytes) => {
+                assert_eq!(*h, handle.get());
+                // Round-trip the bytes the host received to prove the
+                // payload carries the original fields — the encoding is
+                // opaque from the perspective of this test.
+                let round = Intent::decode(bytes).expect("host got decodable bytes");
+                assert_eq!(round.action, intent.action);
+                assert_eq!(round.categories, intent.categories);
+            }
+            other => panic!("expected NewIntent, got {other:?}"),
+        }
     }
 
     #[test]

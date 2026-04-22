@@ -85,6 +85,18 @@ impl<'a> Context<'a> {
     pub fn finish(&self) {
         crate::runtime::host_finish(self.handle);
     }
+
+    /// Ask the platform to resolve `intent` through `IntentRouter` and
+    /// launch the matching activity on top of this one. The current
+    /// activity keeps its handle and transitions to `Paused` while the
+    /// new activity comes up. If the resolver picks a reuse path
+    /// (`SingleTop` on this same class, or — Stone 9.2 —
+    /// `SingleTask`/`SingleInstance` for an existing instance) the
+    /// target sees `on_new_intent` rather than a fresh bring-up. See
+    /// [docs/intents.md §8](../../docs/intents.md).
+    pub fn start_activity(&self, intent: &crate::intent::Intent) {
+        crate::runtime::host_start_activity(self.handle, intent);
+    }
 }
 
 // ── The trait ─────────────────────────────────────────────────────────
@@ -114,6 +126,17 @@ pub trait Activity: 'static {
     /// 60 Hz). Must be fast — all ops are serialised immediately.
     fn on_render(&mut self, ctx: &mut Context<'_>, canvas: &mut Canvas<'_>) {
         let _ = (ctx, canvas);
+    }
+
+    // ── Intent redelivery (Stone 9.4) ───────────────────────────────────
+    /// Called when the activity is re-launched while still alive — for
+    /// a `SingleTop` top re-click, or (Stone 9.2) a matching
+    /// `SingleTask`/`SingleInstance` reuse. The activity does not
+    /// transition through `on_create`/`on_resume` again; it receives
+    /// the fresh intent in place. Default is a no-op for apps that
+    /// don't distinguish reuse from first-launch.
+    fn on_new_intent(&mut self, ctx: &mut Context<'_>, intent: &crate::intent::Intent) {
+        let _ = (ctx, intent);
     }
 
     // ── Saved state — forward-compat stubs for Phase 3 ─────────────────

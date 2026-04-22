@@ -141,6 +141,33 @@ extern "C" {
     //
     // Returns 1 if a finish was pending (and resets the flag), 0 otherwise.
     pub fn hal_app_drain_finish(handle: u32) -> u32;
+
+    // ── Intent delivery (Stone 9.4) ───────────────────────────────────────
+    //
+    // `hal_app_drain_intent` pairs with `hal_app_drain_finish`: the app
+    // raised a `start_activity` request via `akiva_host_start_activity`,
+    // we drain it here into the kernel buffer the framework can feed to
+    // `IntentRouter`. Two-phase buffer (same shape as `hal_app_save_state`):
+    // the return value is the total blob size; if it exceeds `out_cap`
+    // nothing is copied and the kernel retries with a larger buffer.
+    // A zero return means "no pending intent" — not the same as "empty
+    // intent", which is impossible (the encoder always emits a minimum
+    // of 17 bytes even for the empty action).
+    pub fn hal_app_drain_intent(
+        handle: u32,
+        out_ptr: *mut u8,
+        out_cap: u32,
+    ) -> u32;
+
+    // `hal_app_new_intent` fires the app's `akiva_app_new_intent` export.
+    // Payload is a fresh `Intent::encode` blob the framework produced.
+    // Returns 0 on success, non-zero if the handle is unknown or the
+    // host-side copy failed (same convention as `hal_app_restore_state`).
+    pub fn hal_app_new_intent(
+        handle: u32,
+        bytes_ptr: *const u8,
+        bytes_len: u32,
+    ) -> u32;
 }
 
 /// Safe wrapper for hal_log that never panics.

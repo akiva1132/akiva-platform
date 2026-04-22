@@ -135,5 +135,17 @@ macro_rules! akiva_app {
         ) {
             $crate::runtime::on_restore_state(handle, bytes_ptr, bytes_len)
         }
+
+        // ── Intent redelivery (Stone 9.4) ───────────────────────────────
+        // Called when an already-existing activity (SingleTop reuse, or
+        // Phase 9.2's SingleTask/SingleInstance) is re-launched via
+        // start_activity. The handle stays the same; the intent blob
+        // carries whatever the launcher sent. See docs/intents.md §8.
+        #[no_mangle]
+        pub extern "C" fn akiva_app_new_intent(
+            handle: u32, bytes_ptr: *const u8, bytes_len: u32,
+        ) {
+            $crate::runtime::on_new_intent(handle, bytes_ptr, bytes_len)
+        }
     };
 }

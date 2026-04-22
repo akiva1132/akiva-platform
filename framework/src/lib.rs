@@ -349,7 +349,7 @@ impl Framework {
     fn apply_post(&mut self, post: PostCallback, ts: f64) {
         if let Some(intent) = post.launch {
             if let Ok((pkg, class)) = self.intents.resolve(&intent) {
-                self.launch_app(&pkg, &class, ts);
+                self.launch_app(&intent, &pkg, &class, ts);
             }
         } else if post.finish {
             self.finish_top(ts);
@@ -479,14 +479,26 @@ impl Framework {
     /// failures here indicate a buggy Shell handing us a stale entry — we
     /// log nothing (no log binding in framework) and swallow so the Shell
     /// survives the miss.
-    fn launch_app(&mut self, package_id: &str, class: &str, ts: f64) {
+    ///
+    /// `intent` is carried through from `apply_post` so that a
+    /// `SingleTop` reuse can deliver `on_new_intent` to the existing
+    /// top instead of silently swallowing the request. (Stone 9.4 —
+    /// Phase 9.2's `SingleTask` / `SingleInstance` will also land on
+    /// this reuse branch.)
+    fn launch_app(&mut self, intent: &Intent, package_id: &str, class: &str, ts: f64) {
         let new_id = match self.activities.launch(package_id, class) {
             Ok(id) => id,
             Err(_) => return,
         };
-        // Reusing a SingleTop top is a no-op: the launched id equals the
-        // current top, so don't pause it and don't stack it twice.
-        if Some(new_id) == self.stack.last().copied() { return; }
+        // Reuse path: `ActivityManager::launch` returned the existing
+        // top (SingleTop on its own class, or Phase 9.2's SingleTask
+        // finding a matching instance). Deliver the fresh intent via
+        // `on_new_intent` — the activity stays `Resumed`, no bring-up
+        // chain runs, no stack churn.
+        if Some(new_id) == self.stack.last().copied() {
+            self.deliver_new_intent(new_id, intent, ts);
+            return;
+        }
         if let Some(prev) = self.stack.last().copied() {
             self.drive_to_paused(prev, ts);
         }
@@ -512,6 +524,18 @@ impl Framework {
         }
         self.try_restore_state(new_id, package_id, class);
         self.drive_start_to_resumed(new_id, ts);
+    }
+
+    /// Fire `on_new_intent` on an already-Resumed activity and drain any
+    /// follow-up requests. Split out from `launch_app`'s reuse branch so
+    /// a future launch-mode path (e.g. SingleTask finding an instance
+    /// deeper in the stack than the top) can call it directly after
+    /// bringing that instance forward. `apply_post` recurses into
+    /// whatever the handler requested — a chained `ctx.start_activity`
+    /// is honoured, a `ctx.finish` unwinds immediately.
+    fn deliver_new_intent(&mut self, id: ActivityId, intent: &Intent, ts: f64) {
+        let (post, _) = self.with_ctx(id, ts, |a, ctx| a.on_new_intent(ctx, intent));
+        self.apply_post(post, ts);
     }
 
     /// Finish the top of the stack and resume whatever it was covering.
@@ -603,4 +627,238 @@ impl Framework {
 struct PostCallback {
     finish: bool,
     launch: Option<Intent>,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Framework-level integration tests covering cross-module behaviour
+    //! (ActivityManager + IntentRouter + stack discipline + post-callback
+    //! application). `activity_manager.rs` owns the state-machine tests;
+    //! `wasm_activity.rs` owns the proxy tests; this module owns the
+    //! end-to-end paths that can only be asserted after wiring them
+    //! together.
+    //
+    // Boot path (`framework::boot`) is heavy — it rehydrates packages
+    // from a Storage, registers every package's intent filters, brings
+    // up the Shell. Tests here build a [`Framework`] manually instead,
+    // registering only what they exercise. That's why the tests touch
+    // `fw.stack.push(...)` directly — the field is crate-private but
+    // visible inside this module.
+    //
+    // No Storage means `try_restore_state` / `persist_saved_state` are
+    // no-ops (they early-return on `self.storage.is_none()`), which is
+    // exactly what these tests want: we're asserting lifecycle routing,
+    // not save-state persistence.
+
+    use super::*;
+    use crate::activity_manager::LaunchMode;
+    use crate::intent::{action, category, IntentFilter};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Activity that (a) records every callback it sees and (b) may fire
+    /// a pre-programmed `launch_requested` or `finish_requested` on a
+    /// named callback. Test cases inject intents to exercise reuse vs
+    /// bring-up paths without having to simulate wasm input.
+    struct ScriptedActivity {
+        name: &'static str,
+        log: Rc<RefCell<Vec<String>>>,
+        on_pointer_launch: Option<Intent>,
+    }
+
+    impl ScriptedActivity {
+        fn new(name: &'static str, log: Rc<RefCell<Vec<String>>>) -> Self {
+            Self { name, log, on_pointer_launch: None }
+        }
+
+        fn with_pointer_launch(mut self, intent: Intent) -> Self {
+            self.on_pointer_launch = Some(intent);
+            self
+        }
+
+        fn note(&self, tag: &str) {
+            self.log.borrow_mut().push(format!("{}:{}", self.name, tag));
+        }
+    }
+
+    impl activity::Activity for ScriptedActivity {
+        fn on_create(&mut self, _: &mut ActivityContext<'_>) { self.note("create"); }
+        fn on_start(&mut self, _: &mut ActivityContext<'_>) { self.note("start"); }
+        fn on_resume(&mut self, _: &mut ActivityContext<'_>) { self.note("resume"); }
+        fn on_pause(&mut self, _: &mut ActivityContext<'_>) { self.note("pause"); }
+        fn on_stop(&mut self, _: &mut ActivityContext<'_>) { self.note("stop"); }
+        fn on_destroy(&mut self, _: &mut ActivityContext<'_>) { self.note("destroy"); }
+        fn on_new_intent(&mut self, _: &mut ActivityContext<'_>, intent: &Intent) {
+            self.note(&format!("new_intent:{}", intent.action));
+        }
+        fn on_pointer(&mut self, ctx: &mut ActivityContext<'_>, _ev: activity::PointerEvent) {
+            self.note("pointer");
+            if let Some(intent) = self.on_pointer_launch.clone() {
+                *ctx.launch_requested = Some(intent);
+            }
+        }
+        fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+    }
+
+    fn empty_framework() -> Framework {
+        Framework {
+            activities: ActivityManager::new(),
+            packages: package_manager::PackageManager::new(),
+            windows: window_manager::WindowManager::new(),
+            resources: resources::ResourceManager::new(),
+            intents: intent::IntentRouter::new(),
+            permissions: permissions::PermissionController::new(),
+            compositor: Compositor::new(),
+            metrics: SurfaceMetrics::default(),
+            pointer: None,
+            stack: Vec::new(),
+            storage: None,
+        }
+    }
+
+    fn pointer_down() -> activity::PointerEvent {
+        activity::PointerEvent {
+            x: 0.0, y: 0.0, button: 0,
+            phase: activity::PointerPhase::Down,
+        }
+    }
+
+    #[test]
+    fn singletop_reuse_fires_on_new_intent_instead_of_bring_up() {
+        // Stone 9.4 — the core reuse assertion. Shell is `SingleTop` in
+        // the real boot; launching it again while it sits on top must
+        // not double-create, double-resume, or churn the stack — the
+        // live instance receives `on_new_intent` and stays Resumed.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut fw = empty_framework();
+
+        let log_for_shell = log.clone();
+        // Re-launching the Shell through an explicit intent gives us a
+        // deterministic resolution target; we don't need the IntentRouter
+        // to search.
+        let shell_relaunch = Intent::explicit("test.shell", "Main");
+        fw.activities.register("test.shell", "Main", LaunchMode::SingleTop, move || {
+            Box::new(ScriptedActivity::new("shell", log_for_shell.clone())
+                .with_pointer_launch(shell_relaunch.clone()))
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.shell".into(),
+            activity_class: "Main".into(),
+            actions: vec![action::MAIN.into()],
+            categories: vec![category::HOME.into()],
+            data_schemes: vec![],
+            mime_types: vec![],
+        });
+
+        // Bring the shell up by the same path `boot()` uses: launch +
+        // push onto the stack + drive to resumed.
+        let shell_id = fw.activities.launch("test.shell", "Main").unwrap();
+        fw.stack.push(shell_id);
+        fw.drive_to_resumed(shell_id, 0.0);
+        log.borrow_mut().clear();
+
+        // Pointer fires, the scripted activity asks to launch itself.
+        // `apply_post` should resolve the intent, see the reuse path
+        // (new_id == top), and deliver `on_new_intent` — nothing else.
+        fw.dispatch_pointer(pointer_down(), 1.0);
+
+        let events = log.borrow().clone();
+        assert_eq!(
+            events,
+            vec![
+                "shell:pointer".to_string(),
+                format!("shell:new_intent:{}", action::MAIN),
+            ],
+            "SingleTop reuse must fire pointer then exactly one on_new_intent",
+        );
+        // Stack unchanged — no double-push on reuse.
+        assert_eq!(fw.stack.len(), 1);
+        assert_eq!(fw.stack[0], shell_id);
+        assert_eq!(
+            fw.activities.state_of(shell_id),
+            Some(activity_manager::LifecycleState::Resumed),
+            "reused activity must stay Resumed — no pause/resume churn",
+        );
+    }
+
+    #[test]
+    fn standard_launch_stacks_and_finish_unwinds() {
+        // Stone 9.4 — the "A opens B, back → A" spine. Two Standard
+        // activities: Shell (bottom) and App on top. Opening App from
+        // Shell's pointer pushes App; the Escape-back key in
+        // `dispatch_key` finishes App and resumes Shell.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut fw = empty_framework();
+
+        let log_for_shell = log.clone();
+        let app_intent = Intent::explicit("test.app", "Main");
+        fw.activities.register("test.shell", "Main", LaunchMode::SingleTop, move || {
+            Box::new(ScriptedActivity::new("shell", log_for_shell.clone())
+                .with_pointer_launch(app_intent.clone()))
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.shell".into(),
+            activity_class: "Main".into(),
+            actions: vec![action::MAIN.into()],
+            categories: vec![category::HOME.into()],
+            data_schemes: vec![],
+            mime_types: vec![],
+        });
+        let log_for_app = log.clone();
+        fw.activities.register("test.app", "Main", LaunchMode::Standard, move || {
+            Box::new(ScriptedActivity::new("app", log_for_app.clone()))
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.app".into(),
+            activity_class: "Main".into(),
+            actions: vec![action::MAIN.into()],
+            categories: vec![],
+            data_schemes: vec![],
+            mime_types: vec![],
+        });
+
+        let shell_id = fw.activities.launch("test.shell", "Main").unwrap();
+        fw.stack.push(shell_id);
+        fw.drive_to_resumed(shell_id, 0.0);
+        log.borrow_mut().clear();
+
+        // Shell pointer → launch App. Expected events:
+        //   shell:pointer, shell:pause, app:create, app:start, app:resume
+        fw.dispatch_pointer(pointer_down(), 1.0);
+        assert_eq!(
+            &*log.borrow(),
+            &[
+                "shell:pointer",
+                "shell:pause",
+                "app:create",
+                "app:start",
+                "app:resume",
+            ],
+        );
+        assert_eq!(fw.stack.len(), 2);
+        log.borrow_mut().clear();
+
+        // Escape back → finish_top → App pauses+stops+destroys,
+        // Shell resumes.
+        let esc = activity::KeyEvent {
+            code: KEY_CODE_BACK,
+            modifiers: 0,
+            phase: activity::KeyPhase::Down,
+        };
+        fw.dispatch_key(esc, 2.0);
+        assert_eq!(
+            &*log.borrow(),
+            &[
+                "app:pause",
+                "app:stop",
+                "app:destroy",
+                "shell:resume",
+            ],
+        );
+        assert_eq!(fw.stack, vec![shell_id]);
+        assert_eq!(
+            fw.activities.state_of(shell_id),
+            Some(activity_manager::LifecycleState::Resumed),
+        );
+    }
 }

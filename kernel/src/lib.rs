@@ -341,6 +341,60 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
     fn drain_finish(&self, handle: akiva_framework::wasm_activity::AppHandle) -> bool {
         unsafe { host::hal_app_drain_finish(handle.get()) != 0 }
     }
+
+    fn drain_intent(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+    ) -> Option<Vec<u8>> {
+        // Two-phase buffer fetch — start at 512 bytes (covers the common
+        // MAIN+LAUNCHER + target_package intent) and retry once with an
+        // exact-sized buffer if the app produced more. An Intent blob is
+        // hard-capped by `Intent::MAX_WIRE_BYTES` (16 KiB) on the
+        // framework side, so a single retry suffices even for the
+        // worst-case payload.
+        let mut buf = vec![0u8; 512];
+        let needed = unsafe {
+            host::hal_app_drain_intent(handle.get(), buf.as_mut_ptr(), buf.len() as u32)
+        } as usize;
+        if needed == 0 {
+            return None;
+        }
+        if needed > buf.len() {
+            buf = vec![0u8; needed];
+            let got = unsafe {
+                host::hal_app_drain_intent(handle.get(), buf.as_mut_ptr(), buf.len() as u32)
+            } as usize;
+            if got == 0 {
+                // The host drained the slot on the first call; a second
+                // drain returns 0. This shouldn't happen — the host
+                // contract is "if the first call returns `needed > cap`,
+                // keep the blob armed". Treat as a host bug and drop.
+                log::warn(&format!("app {}: drain_intent lost payload on retry", handle.get()));
+                return None;
+            }
+            buf.truncate(got.min(buf.len()));
+        } else {
+            buf.truncate(needed);
+        }
+        Some(buf)
+    }
+
+    fn new_intent(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        bytes: &[u8],
+    ) {
+        if bytes.is_empty() { return; }
+        let rc = unsafe {
+            host::hal_app_new_intent(handle.get(), bytes.as_ptr(), bytes.len() as u32)
+        };
+        if rc != 0 {
+            log::warn(&format!(
+                "app {}: new_intent returned {} (handle miss or host copy failed)",
+                handle.get(), rc
+            ));
+        }
+    }
 }
 
 /// Exercises the storage HAL end-to-end: read a u32 counter under
