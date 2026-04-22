@@ -91,8 +91,18 @@ impl WasmActivity {
 }
 
 impl Activity for WasmActivity {
-    fn on_create(&mut self, _ctx: &mut ActivityContext<'_>) {
+    fn on_create(&mut self, ctx: &mut ActivityContext<'_>) {
         self.host.lifecycle(self.handle, LifecycleTransition::Create);
+        // Prime the app's slot with the live surface metrics right after
+        // construction. The SDK's `on_create` builds the slot with
+        // `Metrics::default()` (zeros) because the `lifecycle(Create)`
+        // wire doesn't carry a surface size; without this follow-up
+        // resize, the first `on_render` would run with zero metrics and
+        // lay out the whole tree at the origin — manifesting as a
+        // "tiny calculator in the top-left until the user resizes the
+        // window". One extra round-trip here is worth a much saner
+        // first frame.
+        self.host.resize(self.handle, ctx.metrics);
     }
     fn on_start(&mut self, _ctx: &mut ActivityContext<'_>) {
         self.host.lifecycle(self.handle, LifecycleTransition::Start);
@@ -387,6 +397,11 @@ mod tests {
         let calls = host.take_calls();
         assert_eq!(calls, vec![
             Call::Lifecycle(handle.get(), LifecycleTransition::Create),
+            // WasmActivity::on_create fires a resize immediately after
+            // lifecycle(Create) so the SDK's slot picks up real surface
+            // metrics before the first on_render runs — ctx above is
+            // built with (800 × 600 @ 1.0×).
+            Call::Resize(handle.get(), 800, 600),
             Call::Lifecycle(handle.get(), LifecycleTransition::Start),
             Call::Lifecycle(handle.get(), LifecycleTransition::Resume),
             Call::Lifecycle(handle.get(), LifecycleTransition::Pause),

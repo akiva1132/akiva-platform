@@ -348,6 +348,14 @@ function encodeResize(m) {
 }
 
 function postEvent(kind, bytes) {
+  // Silently drop events that land before the kernel wasm is live. Boot
+  // is async (storage load + dev install + fetch + instantiate), and the
+  // leader may have forwarded resize/pointer events in the meantime.
+  // Reading `instance.exports` before instantiate resolves throws
+  // "Cannot read properties of null", which the session reports as a
+  // worker panic — dropping is correct because the kernel will read the
+  // fresh surface state from the HAL on its very first frame anyway.
+  if (!booted || !instance) return;
   const len = bytes.length;
   const ptr = instance.exports.akiva_alloc(len);
   if (ptr === 0) { log("warn", `akiva_alloc(${len}) → null, dropping event`); return; }
