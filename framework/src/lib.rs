@@ -103,6 +103,12 @@ pub fn boot(
         task_history: Vec::new(),
     };
 
+    // Stone 10.1 — declare the MVP permission catalog before any
+    // package rehydration. `PackageManager::install` will refuse to
+    // grant a manifest-requested permission that isn't declared here,
+    // so the order matters: declare first, then rehydrate packages.
+    permissions::declare_mvp_permissions(&mut fw.permissions);
+
     // Rehydrate installed packages from storage. A corrupt manifest is
     // reported but not fatal — the Shell and healthy apps stay usable.
     let mut package_errors: Vec<(String, String)> = Vec::new();

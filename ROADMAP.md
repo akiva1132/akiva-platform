@@ -542,9 +542,10 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 **רכיבים שנבנים:**
 
 ### 10.1 System permission registry
-- ב-framework boot: `PermissionController::declare` לכל אחת מההרשאות בטבלה ב-[`ARCHITECTURE.md §8`](ARCHITECTURE.md):
-  `STORAGE_SANDBOX`, `QUERY_PACKAGES`, `LAUNCH_ANY_APP`, `NOTIFICATIONS`, `NETWORK`, `CAMERA`
-- כל הצהרה כוללת `ProtectionLevel`; ב-v0.2 כולן `Normal` (auto-granted install-time)
+- ✅ **`declare_mvp_permissions(&mut PermissionController)`** — helper חדש ב-[`framework/src/permissions.rs`](framework/src/permissions.rs) שמכריז על שש ההרשאות מ-[ARCHITECTURE.md §8](ARCHITECTURE.md) בבת אחת: `STORAGE_SANDBOX`, `QUERY_PACKAGES`, `LAUNCH_ANY_APP`, `NOTIFICATIONS`, `NETWORK`, `CAMERA`. קבועי `pub const` לכל שם (למניעת typo ב-wiring של Stone 10.3).
+- ✅ **`framework::boot` מכריז לפני rehydrate** — Stone 10.2 ישען על זה: install יבדוק `is_declared` לפני grant, אז ההצהרה חייבת לקדם את load_installed.
+- ✅ **`ProtectionLevel::Normal` לכולן (v0.2)** — auto-granted install-time, בלי user prompt. Tripwire test (`mvp_permissions_are_all_normal_protection`) שובר את ה-build אם מישהו מעלה הרשאה ל-`Dangerous` בלי לעדכן את ה-install path.
+- ✅ **API additions ל-`PermissionController`** — `is_declared(name)` ו-`declarations()` iterator; Stone 10.2 ישתמש בהם. 5 unit tests חדשים.
 
 ### 10.2 Install-time grant
 - `PackageManager::install` קוראת לאחר parse ל-`grant_requested_permissions(manifest)`
