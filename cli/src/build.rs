@@ -19,13 +19,24 @@ use std::process::{Command, ExitCode};
 use crate::workspace;
 
 /// CLI entry point for `akiva build [names...] [--debug] [--all]`.
-///
+/// Wraps [`run_bool`] with the top-level `ExitCode` conversion; other
+/// subcommands (`akiva run`) call `run_bool` directly so they can
+/// branch on success without poking at `ExitCode`, which isn't
+/// comparable.
+pub fn run(args: &[String]) -> ExitCode {
+    if run_bool(args) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
 /// Positional args are app directory names (e.g. `hello`,
 /// `calculator`). With no names and no `--all`, we default to building
 /// every app under `apps/` — in practice the most useful shape since
 /// the calculator's AKML or SDK change almost always wants every
 /// dev-app re-staged.
-pub fn run(args: &[String]) -> ExitCode {
+///
+/// Returns `true` on full success, `false` if any step failed. Help
+/// and arg-error exits are also `true` (they're user-facing termination
+/// states, not build failures the caller should chain past).
+pub fn run_bool(args: &[String]) -> bool {
     let mut debug = false;
     let mut all = false;
     let mut names: Vec<String> = Vec::new();
@@ -43,11 +54,11 @@ pub fn run(args: &[String]) -> ExitCode {
                 println!("  --debug    Use the `dev` cargo profile (faster compile, larger wasm)");
                 println!("  --release  Explicit opposite of --debug (this is the default)");
                 println!("  --all      Equivalent to passing every app name explicitly");
-                return ExitCode::SUCCESS;
+                return true;
             }
             other if other.starts_with("--") => {
                 eprintln!("akiva build: unknown flag '{other}'");
-                return ExitCode::from(2);
+                return false;
             }
             name => { names.push(name.into()); i += 1; }
         }
@@ -55,7 +66,7 @@ pub fn run(args: &[String]) -> ExitCode {
 
     let root = match workspace::find_root_from_cwd() {
         Ok(r) => r,
-        Err(e) => { eprintln!("akiva build: {e}"); return ExitCode::FAILURE; }
+        Err(e) => { eprintln!("akiva build: {e}"); return false; }
     };
 
     // Resolve the final app list: explicit names if any, else everything.
@@ -66,12 +77,12 @@ pub fn run(args: &[String]) -> ExitCode {
         match discover_apps(&apps_root) {
             Ok(v) if v.is_empty() => {
                 eprintln!("akiva build: no apps found under {}", apps_root.display());
-                return ExitCode::FAILURE;
+                return false;
             }
             Ok(v) => v,
             Err(e) => {
                 eprintln!("akiva build: scanning {}: {e}", apps_root.display());
-                return ExitCode::FAILURE;
+                return false;
             }
         }
     } else {
@@ -88,7 +99,7 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         }
     }
-    if any_failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+    !any_failed
 }
 
 /// List every directory under `apps/` that looks like a buildable crate.

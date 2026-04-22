@@ -11,6 +11,7 @@
 
 mod build;
 mod devserver;
+mod run;
 mod workspace;
 
 use std::process::ExitCode;
@@ -78,9 +79,8 @@ fn cmd_install(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_run(_args: &[String]) -> ExitCode {
-    println!("[stub] would: build, then launch devserver on http://localhost:8765/");
-    ExitCode::SUCCESS
+fn cmd_run(args: &[String]) -> ExitCode {
+    run::run(args)
 }
 
 fn cmd_devserver(args: &[String]) -> ExitCode {
