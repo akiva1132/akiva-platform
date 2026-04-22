@@ -43,9 +43,23 @@ self.addEventListener("message", (e) => {
   const msg = e.data;
   switch (msg?.type) {
     case "init":
+      // Forward the initial debug categories (if any) before boot so
+      // the first lifecycle events — register, shell's on_create —
+      // are observable. Arrives as `{ debug: ["lifecycle", "intent"] }`
+      // parsed from the tab's `?debug=...` query on the main thread.
+      if (Array.isArray(msg.debug)) {
+        apps.setDebugCategories(msg.debug);
+      }
       bootKernel(msg.kernelUrl, msg.tabId).catch((err) => {
         self.postMessage({ type: "panic", text: `boot failed: ${err?.message ?? err}` });
       });
+      break;
+    case "set_debug":
+      // Live toggle: supports flipping categories at runtime without
+      // rebooting the worker (`postMessage({type:'set_debug',debug:['lifecycle']})`
+      // from devtools console on the main thread works).
+      apps.setDebugCategories(Array.isArray(msg.debug) ? msg.debug : []);
+      log("info", `debug categories set: ${(msg.debug ?? []).join(",") || "(none)"}`);
       break;
     case "attach_display":
       attachDisplay(msg);
@@ -301,8 +315,33 @@ function buildImports() {
     // Returns 1 if the app called `akiva_host_finish` since the last
     // drain, 0 otherwise.
     hal_app_drain_finish: (handle) => (apps.drainFinish(handle) ? 1 : 0),
+
+    // Stone 9.4 — drain the pending intent blob for `handle` and copy
+    // it into `outPtr`. Returns the total blob size. If the return
+    // value exceeds `outCap` nothing was copied and the kernel retries
+    // with a larger buffer; the blob stays armed until a call actually
+    // consumes it.
+    hal_app_drain_intent: (handle, outPtr, outCap) => halAppDrainIntent(handle, outPtr, outCap),
+
+    // Deliver a fresh intent to an already-existing activity handle
+    // — fires the app's `akiva_app_new_intent` export. Symmetric with
+    // `hal_app_restore_state`: returns 0 on success.
+    hal_app_new_intent: (handle, bytesPtr, bytesLen) => apps.newIntent(handle, bytesPtr, bytesLen),
   };
   return { env };
+}
+
+function halAppDrainIntent(handle, outPtr, outCap) {
+  const bytes = apps.drainIntent(handle);
+  if (!bytes || bytes.length === 0) return 0;
+  if (bytes.length > outCap) {
+    // Two-phase contract: buffer too small, leave the blob armed and
+    // report the required size so the kernel can retry.
+    return bytes.length;
+  }
+  new Uint8Array(memory.buffer, outPtr, bytes.length).set(bytes);
+  apps._consumeIntent(handle);
+  return bytes.length;
 }
 
 // ── Storage bridge ──────────────────────────────────────────────────────

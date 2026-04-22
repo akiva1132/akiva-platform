@@ -30,6 +30,7 @@ export class Session extends EventTarget {
    *   tabId: string,       // stable ID of this tab
    *   kernelUrl: string,   // URL of akiva-kernel.wasm
    *   workerUrl: URL,      // URL of worker.js
+   *   debugCategories?: string[], // initial worker debug categories (?debug=...)
    * }} opts
    */
   constructor(opts) {
@@ -153,6 +154,7 @@ export class Session extends EventTarget {
       type: "init",
       kernelUrl: this.opts.kernelUrl,
       tabId: this.opts.tabId,
+      debug: this.opts.debugCategories ?? [],
     });
     this.worker.addEventListener("message", (e) => {
       // Deliver locally.

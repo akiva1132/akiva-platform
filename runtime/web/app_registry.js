@@ -52,6 +52,27 @@ export class AppRegistry {
      * @type {Set<number>}
      */
     this._pendingFinish = new Set();
+    /**
+     * Stone 9.4 — handles with a pending encoded `Intent` blob the app
+     * staged via `akiva_host_start_activity`. The map stores the most
+     * recent request; multiple start_activity calls within one dispatch
+     * collapse to the last one, matching the single-slot framework
+     * `ctx.launch_requested` semantic. Drained by `drainIntent(handle)`
+     * once per dispatch via `hal_app_drain_intent`.
+     * @type {Map<number, Uint8Array>}
+     */
+    this._pendingIntent = new Map();
+    /**
+     * Enabled debug categories. Empty Set = quiet (every `_debug` call
+     * short-circuits). Populated via `setDebugCategories` from the main
+     * thread's URL/query parser (e.g. `?debug=lifecycle,intent`). The
+     * wildcard `"*"` enables everything. Kept small by design — each
+     * category is a string, and adding a new one is cheap; avoids the
+     * "log everything at info level" anti-pattern that makes a running
+     * OS's console unreadable.
+     * @type {Set<string>}
+     */
+    this._debug = new Set();
     this._decoder = new TextDecoder("utf-8");
     this._encoder = new TextEncoder();
 
@@ -60,12 +81,45 @@ export class AppRegistry {
     // readiness — an app can call `text_width` before the display has
     // attached. Keeping it separate also lets us `font=` it freely
     // without thrashing the renderer's state.
-    this._measureCanvas = new OffscreenCanvas(1, 1);
-    this._measureCtx = this._measureCanvas.getContext("2d");
+    //
+    // Constructed lazily on the first `measureTextWidth` call: the
+    // typical registry lifetime spans boot (where no app has painted
+    // yet) through shutdown, and deferring keeps the constructor
+    // free of `OffscreenCanvas` — a browser/worker-only global that
+    // Node's vitest env doesn't provide, letting these tests run
+    // without a DOM shim.
+    this._measureCanvas = null;
+    this._measureCtx = null;
+  }
+
+  /**
+   * Replace the active debug-category Set. `["*"]` enables everything;
+   * `[]` disables all debug output. Overrides rather than merges so a
+   * second call is a reset, not an accumulation. Main thread reads
+   * `?debug=<csv>` and forwards via the `set_debug` worker message.
+   */
+  setDebugCategories(categories) {
+    this._debug = new Set(categories);
+  }
+
+  /**
+   * Emit a `debug`-level log tagged with the category if the category
+   * is enabled (or `"*"` is). Category strings are free-form — adding
+   * a new one is as cheap as a string literal at the call site, and
+   * tests/grep find every emitter under one tag.
+   */
+  _dbg(category, text) {
+    if (this._debug.has(category) || this._debug.has("*")) {
+      this._log("debug", `[${category}] ${text}`);
+    }
   }
 
   /** Width in pixels of `text` at `size_px` in the shared UI font. */
   measureTextWidth(text, size_px) {
+    if (!this._measureCtx) {
+      this._measureCanvas = new OffscreenCanvas(1, 1);
+      this._measureCtx = this._measureCanvas.getContext("2d");
+    }
     this._measureCtx.font = fontString(size_px);
     return this._measureCtx.measureText(text).width;
   }
@@ -85,7 +139,7 @@ export class AppRegistry {
 
     const handle = this._nextHandle++;
     this._slots.set(handle, { packageId, class: className });
-    this._log("info", `app register: ${packageId}/${className} → handle ${handle}`);
+    this._dbg("lifecycle", `register ${packageId}/${className} → handle ${handle}`);
     return handle;
   }
 
@@ -97,6 +151,7 @@ export class AppRegistry {
     // monotonic) but a stale flag sitting in the set after destroy
     // would be harmless — still, belt-and-braces.
     this._pendingFinish.delete(handle);
+    this._pendingIntent.delete(handle);
     // The process is kept alive even when no slots reference it. A future
     // GC pass could retire idle processes; for MVP the cost is one
     // `WebAssembly.Instance` per installed package, which is cheap.
@@ -112,13 +167,48 @@ export class AppRegistry {
    * activity writing that flag directly. See docs/abi.md §2.3.
    */
   drainFinish(handle) {
-    return this._pendingFinish.delete(handle);
+    const had = this._pendingFinish.delete(handle);
+    if (had) this._dbg("intent", `drain_finish[handle=${handle}] → true`);
+    return had;
+  }
+
+  /**
+   * Read + clear the pending intent blob for `handle`. Returns the bytes
+   * (Uint8Array) the app staged via `akiva_host_start_activity`, or
+   * `null` if no start_activity was raised this dispatch. The kernel's
+   * `hal_app_drain_intent` bridge consumes this with the two-phase
+   * buffer contract: if the requested `outCap` is too small, the buffer
+   * stays armed and the next drain retries. See docs/abi.md §2.3.
+   */
+  drainIntent(handle) {
+    const bytes = this._pendingIntent.get(handle);
+    if (bytes) this._dbg("intent", `drain_intent[handle=${handle}] → ${bytes.length} bytes`);
+    return bytes ?? null;
+  }
+
+  /** Clear the intent slot after a successful drain. */
+  _consumeIntent(handle) {
+    this._pendingIntent.delete(handle);
+  }
+
+  /**
+   * Deliver a freshly-resolved intent blob to an already-existing
+   * activity handle — fires `akiva_app_new_intent`. Same rc convention
+   * as `restoreState`: 0 ok, 1 handle miss, 2 alloc failed, 3 trap.
+   */
+  newIntent(handle, bytesPtr, bytesLen) {
+    if (bytesLen === 0) return this._lookup(handle) ? 0 : 1;
+    const bytes = this._copyKernelSlice(bytesPtr, bytesLen);
+    return this._callAppWithBytes(handle, "new_intent", bytes,
+      (proc, appPtr, len) => proc.instance.exports.akiva_app_new_intent(handle, appPtr, len));
   }
 
   lifecycle(handle, transition) {
     const ctx = this._lookup(handle);
     if (!ctx) return;
     const { slot, proc } = ctx;
+    const name = LIFECYCLE_NAMES[transition] ?? transition;
+    this._dbg("lifecycle", `${slot.packageId}[handle=${handle}] → ${name}`);
     try {
       if (transition === 0 /* Create */) {
         // Create is the only lifecycle transition that needs extra
@@ -135,7 +225,7 @@ export class AppRegistry {
         proc.instance.exports[fn](handle);
       }
     } catch (err) {
-      this._log("error", `app ${slot.packageId}.${LIFECYCLE_NAMES[transition] ?? transition}: ${err?.message ?? err}`);
+      this._log("error", `app ${slot.packageId}.${name}: ${err?.message ?? err}`);
     }
   }
 
@@ -170,124 +260,47 @@ export class AppRegistry {
   }
 
   /**
-   * Ask the app to paint. Copies paint-op bytes from app memory into
-   * kernel memory at `outPtr`. Returns the number of bytes the app
-   * produced — which may exceed `outCap`, in which case the kernel
-   * retries with a larger buffer and we copy nothing on this call.
+   * Ask the app to paint. Two-phase buffer: app produces a paint-op
+   * stream in its own memory; we copy up to `outCap` bytes into kernel
+   * memory. Return value is the full length the app produced — if it
+   * exceeds `outCap` the kernel retries with a larger buffer and we
+   * copied nothing on this call.
    */
   render(handle, tsMs, outPtr, outCap) {
-    const ctx = this._lookup(handle);
-    if (!ctx) return 0;
-    const { slot, proc } = ctx;
-
-    let len, srcPtr;
-    try {
-      const lenPtr = proc.instance.exports.akiva_app_alloc(4);
-      if (lenPtr === 0) {
-        this._log("warn", `app ${slot.packageId}: alloc(4) for len returned null`);
-        return 0;
-      }
-      try {
-        srcPtr = proc.instance.exports.akiva_app_render(handle, tsMs, lenPtr);
-        len = new DataView(proc.memory.buffer).getUint32(lenPtr, true);
-      } finally {
-        proc.instance.exports.akiva_app_dealloc(lenPtr, 4);
-      }
-    } catch (err) {
-      this._log("error", `app ${slot.packageId}.render: ${err?.message ?? err}`);
-      return 0;
-    }
-
-    if (len === 0 || srcPtr === 0) return 0;
-    if (len > outCap) return len;  // kernel retries with a larger buffer
-
-    const src = new Uint8Array(proc.memory.buffer, srcPtr, len);
-    const kernelBuf = this._kernelMemory().buffer;
-    new Uint8Array(kernelBuf, outPtr, len).set(src);
-    return len;
+    const ret = this._copyAppToKernel(handle, "render", outPtr, outCap,
+      (proc, lenPtr) => proc.instance.exports.akiva_app_render(handle, tsMs, lenPtr));
+    // Only emit the "paint" category when a frame actually produced
+    // bytes — `ret === 0` is the idle-app path and every frame would
+    // spam the log with zeros. `ret > outCap` is the retry path (no
+    // copy happened yet); count it too since it's informative.
+    if (ret > 0) this._dbg("paint", `render[handle=${handle}] ${ret} bytes${ret > outCap ? " (retry)" : ""}`);
+    return ret;
   }
 
   /**
    * Ask the app to serialise its UI state. Same two-phase buffer contract
-   * as `render`: returns the number of bytes the app produced. If the
-   * return value exceeds `outCap` the kernel retries with a larger buffer
-   * and we copy nothing on this call.
+   * as `render`: returns the number of bytes the app produced.
    */
   saveState(handle, outPtr, outCap) {
-    const ctx = this._lookup(handle);
-    if (!ctx) return 0;
-    const { slot, proc } = ctx;
-
-    let len, srcPtr;
-    try {
-      const lenPtr = proc.instance.exports.akiva_app_alloc(4);
-      if (lenPtr === 0) {
-        this._log("warn", `app ${slot.packageId}: alloc(4) for save_state len returned null`);
-        return 0;
-      }
-      try {
-        srcPtr = proc.instance.exports.akiva_app_save_state(handle, lenPtr);
-        len = new DataView(proc.memory.buffer).getUint32(lenPtr, true);
-      } finally {
-        proc.instance.exports.akiva_app_dealloc(lenPtr, 4);
-      }
-    } catch (err) {
-      this._log("error", `app ${slot.packageId}.save_state: ${err?.message ?? err}`);
-      return 0;
-    }
-
-    if (len === 0 || srcPtr === 0) return 0;
-    if (len > outCap) return len;
-
-    const src = new Uint8Array(proc.memory.buffer, srcPtr, len);
-    const kernelBuf = this._kernelMemory().buffer;
-    new Uint8Array(kernelBuf, outPtr, len).set(src);
-    return len;
+    return this._copyAppToKernel(handle, "save_state", outPtr, outCap,
+      (proc, lenPtr) => proc.instance.exports.akiva_app_save_state(handle, lenPtr));
   }
 
   /**
-   * Hand previously-persisted bytes back to the app. The kernel passes a
-   * pointer into its own memory; we read those bytes, allocate a matching
-   * region inside the app's memory via `akiva_app_alloc`, copy, and hand
-   * the app pointer to `akiva_app_restore_state`. The app is responsible
-   * for decoding. Returns 0 on success, non-zero on handle miss / alloc
-   * failure.
+   * Hand previously-persisted bytes back to the app via
+   * `akiva_app_restore_state`. Returns the rc convention shared by every
+   * kernel→app bytes path: 0 on success, 1 = handle miss, 2 = alloc
+   * failed, 3 = app export threw.
    */
   restoreState(handle, bytesPtr, bytesLen) {
-    const ctx = this._lookup(handle);
-    if (!ctx) return 1;
-    const { slot, proc } = ctx;
-    if (bytesLen === 0) return 0;
-
-    // Pull the bytes out of kernel memory first — the kernel buffer is
-    // detached by `WebAssembly.Memory.grow` on either side, so we take
-    // an owned copy before hopping memories.
-    const kernelBuf = this._kernelMemory().buffer;
-    const srcCopy = new Uint8Array(bytesLen);
-    srcCopy.set(new Uint8Array(kernelBuf, bytesPtr, bytesLen));
-
-    let appPtr;
-    try {
-      appPtr = proc.instance.exports.akiva_app_alloc(bytesLen);
-      if (appPtr === 0) {
-        this._log("warn", `app ${slot.packageId}: alloc(${bytesLen}) for restore_state returned null`);
-        return 2;
-      }
-      new Uint8Array(proc.memory.buffer, appPtr, bytesLen).set(srcCopy);
-      proc.instance.exports.akiva_app_restore_state(handle, appPtr, bytesLen);
-    } catch (err) {
-      this._log("error", `app ${slot.packageId}.restore_state: ${err?.message ?? err}`);
-      return 3;
-    } finally {
-      // App is done with the buffer the instant `restore_state` returns
-      // — the app has already decoded everything it cares about into its
-      // own owned structures.
-      if (appPtr) {
-        try { proc.instance.exports.akiva_app_dealloc(appPtr, bytesLen); }
-        catch (_) { /* best effort */ }
-      }
+    if (bytesLen === 0) {
+      // Fast-path: still fail the handle-miss case so the kernel can
+      // log, but skip every alloc/copy/dealloc step for a no-op restore.
+      return this._lookup(handle) ? 0 : 1;
     }
-    return 0;
+    const bytes = this._copyKernelSlice(bytesPtr, bytesLen);
+    return this._callAppWithBytes(handle, "restore_state", bytes,
+      (proc, appPtr, len) => proc.instance.exports.akiva_app_restore_state(handle, appPtr, len));
   }
 
   // ── Internals ───────────────────────────────────────────────────────────
@@ -449,6 +462,23 @@ export class AppRegistry {
         akiva_host_finish: (handle) => {
           self._pendingFinish.add(handle);
         },
+
+        // Stone 9.4 — app-initiated start_activity. `ptr..ptr+len` is
+        // the encoded Intent blob in app memory. Copy it out
+        // immediately: the app's memory buffer can detach on any
+        // subsequent wasm call (including the final drain), and we'll
+        // be serving it back through `drainIntent` which runs on the
+        // kernel's schedule. Overwrites any previously-staged intent
+        // for this handle — a second start_activity in the same
+        // dispatch wins, matching the single-slot `launch_requested`
+        // field on the framework side.
+        akiva_host_start_activity: (handle, ptr, len) => {
+          const proc = self._processes.get(packageId);
+          if (!proc?.memory || len === 0) return;
+          const copy = new Uint8Array(len);
+          copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
+          self._pendingIntent.set(handle, copy);
+        },
       },
     };
   }
@@ -461,19 +491,111 @@ export class AppRegistry {
     return { slot, proc };
   }
 
-  _dispatchCreate(slot, proc, handle) {
-    const classBytes = new TextEncoder().encode(slot.class);
-    const ptr = proc.instance.exports.akiva_app_alloc(classBytes.length);
-    if (ptr === 0) {
-      this._log("warn", `app ${slot.packageId}: alloc for class name returned null`);
-      return;
-    }
+  _dispatchCreate(_slot, _proc, handle) {
+    // Class-name passing reuses the generic app-bytes path: the only
+    // quirk is the export takes `(handle, ptr, len)` instead of
+    // `(handle, bytes_ptr, bytes_len)` but that's identical semantics.
+    // rc is ignored — the only recoverable outcome (handle miss) can't
+    // happen here because the slot was just inserted by `register`.
+    this._callAppWithBytes(handle, "create", this._encoder.encode(_slot.class),
+      (proc, appPtr, len) => proc.instance.exports.akiva_app_create(handle, appPtr, len));
+  }
+
+  // ── Shared host ↔ app byte-transfer helpers ────────────────────────────
+  //
+  // Three patterns used to live inline at five call sites each with its
+  // own try/catch/rc convention. They've been hoisted so every
+  // app-memory exchange goes through the same code path — less surface
+  // area for subtle bugs (wrong rc on alloc failure, forgotten
+  // dealloc, mismatched length field handling) and less noise when a
+  // future primitive (e.g. Stone 9.5's `activity_result`) lands.
+
+  /**
+   * Two-phase buffer read: the app-side export produces a byte stream
+   * in its own memory; we copy up to `outCap` bytes into kernel memory
+   * at `outPtr`. `invoke(proc, lenPtr)` calls the export and returns
+   * the source pointer in app memory. Returns the total length the app
+   * produced; `len > outCap` means nothing was copied and the caller
+   * should retry with a larger buffer.
+   */
+  _copyAppToKernel(handle, opLabel, outPtr, outCap, invoke) {
+    const ctx = this._lookup(handle);
+    if (!ctx) return 0;
+    const { slot, proc } = ctx;
+
+    let len, srcPtr;
     try {
-      new Uint8Array(proc.memory.buffer, ptr, classBytes.length).set(classBytes);
-      proc.instance.exports.akiva_app_create(handle, ptr, classBytes.length);
-    } finally {
-      proc.instance.exports.akiva_app_dealloc(ptr, classBytes.length);
+      const lenPtr = proc.instance.exports.akiva_app_alloc(4);
+      if (lenPtr === 0) {
+        this._log("warn", `app ${slot.packageId}: alloc(4) for ${opLabel} len returned null`);
+        return 0;
+      }
+      try {
+        srcPtr = invoke(proc, lenPtr);
+        len = new DataView(proc.memory.buffer).getUint32(lenPtr, true);
+      } finally {
+        proc.instance.exports.akiva_app_dealloc(lenPtr, 4);
+      }
+    } catch (err) {
+      this._log("error", `app ${slot.packageId}.${opLabel}: ${err?.message ?? err}`);
+      return 0;
     }
+
+    if (len === 0 || srcPtr === 0) return 0;
+    if (len > outCap) return len;  // caller retries with a larger buffer
+
+    const src = new Uint8Array(proc.memory.buffer, srcPtr, len);
+    const kernelBuf = this._kernelMemory().buffer;
+    new Uint8Array(kernelBuf, outPtr, len).set(src);
+    return len;
+  }
+
+  /**
+   * Two-phase buffer write: we have kernel-owned bytes, allocate a
+   * matching region in the app's memory, copy them in, invoke the
+   * export that consumes them, then free. `invoke(proc, appPtr, len)`
+   * fires the export. Returns rc: 0 ok, 1 handle miss, 2 alloc failed,
+   * 3 app export threw. A zero-length `bytes` short-circuits to 0 / 1
+   * without touching the allocator.
+   */
+  _callAppWithBytes(handle, opLabel, bytes, invoke) {
+    const ctx = this._lookup(handle);
+    if (!ctx) return 1;
+    const { slot, proc } = ctx;
+    if (bytes.length === 0) return 0;
+
+    let appPtr;
+    try {
+      appPtr = proc.instance.exports.akiva_app_alloc(bytes.length);
+      if (appPtr === 0) {
+        this._log("warn", `app ${slot.packageId}: alloc(${bytes.length}) for ${opLabel} returned null`);
+        return 2;
+      }
+      new Uint8Array(proc.memory.buffer, appPtr, bytes.length).set(bytes);
+      invoke(proc, appPtr, bytes.length);
+    } catch (err) {
+      this._log("error", `app ${slot.packageId}.${opLabel}: ${err?.message ?? err}`);
+      return 3;
+    } finally {
+      if (appPtr) {
+        try { proc.instance.exports.akiva_app_dealloc(appPtr, bytes.length); }
+        catch (_) { /* best effort */ }
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * Copy `len` bytes out of kernel memory at `ptr` into an owned
+   * `Uint8Array`. Necessary before any call that may detach the kernel
+   * buffer — `WebAssembly.Memory.grow` on either side invalidates
+   * existing views.
+   */
+  _copyKernelSlice(ptr, len) {
+    const kernelBuf = this._kernelMemory().buffer;
+    const copy = new Uint8Array(len);
+    copy.set(new Uint8Array(kernelBuf, ptr, len));
+    return copy;
   }
 }
 
@@ -513,6 +635,7 @@ const REQUIRED_EXPORTS = [
   "akiva_app_render",
   "akiva_app_save_state",
   "akiva_app_restore_state",
+  "akiva_app_new_intent",
 ];
 
 // Loud-and-obvious placeholder when an `@color/` ref is undefined.

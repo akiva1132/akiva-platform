@@ -29,6 +29,20 @@ const WORKER_URL = new URL("./worker.js", import.meta.url);
 const CHANNEL = "akiva.os";
 const LEADER_LOCK = "akiva.os.leader";
 
+/**
+ * Parse the `?debug=<csv>` query param into the worker's debug-category
+ * list. Accepts `*` as a wildcard that enables every category. Missing
+ * or empty → silent runtime, matching the default. Examples:
+ *   ?debug=lifecycle              → ["lifecycle"]
+ *   ?debug=lifecycle,intent,paint → three categories
+ *   ?debug=*                      → ["*"] (wildcard)
+ */
+function parseDebugCategories() {
+  const raw = new URLSearchParams(window.location.search).get("debug");
+  if (!raw) return [];
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 const surfaceEl = document.getElementById("akiva-surface");
 const bootEl = document.getElementById("akiva-boot");
 
@@ -70,6 +84,7 @@ const session = new Session({
   tabId,
   kernelUrl: KERNEL_URL,
   workerUrl: WORKER_URL,
+  debugCategories: parseDebugCategories(),
 });
 
 session.addEventListener("role", (e) => onRoleChange(e.detail));
