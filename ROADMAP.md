@@ -547,11 +547,13 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - ✅ **`ProtectionLevel::Normal` לכולן (v0.2)** — auto-granted install-time, בלי user prompt. Tripwire test (`mvp_permissions_are_all_normal_protection`) שובר את ה-build אם מישהו מעלה הרשאה ל-`Dangerous` בלי לעדכן את ה-install path.
 - ✅ **API additions ל-`PermissionController`** — `is_declared(name)` ו-`declarations()` iterator; Stone 10.2 ישתמש בהם. 5 unit tests חדשים.
 
-### 10.2 Install-time grant
-- `PackageManager::install` קוראת לאחר parse ל-`grant_requested_permissions(manifest)`
-- כל הרשאה ב-`permissions.required` → check שהיא מוצהרת במערכת → `PermissionController::grant`
-- הרשאה לא מוכרת → `InstallError::UnknownPermission(name)`
-- Persistence: grants נכתבים ל-`sys/permissions/{package_id}` (LF-separated); ב-`load_installed` הם נטענים בחזרה
+### 10.2 Install-time grant + persistence
+- ✅ **Signature change** — `PackageManager::install` ו-`uninstall` מקבלים כעת `&mut PermissionController` נוסף (forward-compat ל-production install flow ב-Phase 8). 23 test call-sites עודכנו אוטומטית.
+- ✅ **Validation first** — install בודק `is_declared` לכל `manifest.permissions.required` **לפני** כל כתיבה ל-storage. הרשאה לא מוכרת → `InstallError::UnknownPermission { package_id, name }`; storage נשאר נקי לחלוטין (אין manifest, wasm, index או permissions file).
+- ✅ **`apply_grants` helper** — כותב set מלא ל-`sys/permissions/{id}` (LF-separated, סדר מה-manifest). כולל blob ריק ל-apps בלי permissions, כדי ש-rehydration תדע להבחין בין "installed בלי permissions" ל-"pre-10.2 install".
+- ✅ **Upgrade semantics** — v2 שמסיר permissions מה-manifest משקף זאת: ה-controller revokes את מה שאבד, ו-blob הפרסיסטנטי נכתב מחדש. v2 שמוסיף — מקבל grants חדשים.
+- ✅ **Boot-time rehydration** — `PackageManager::load_granted_permissions` נקרא מ-`framework::boot` אחרי `load_installed`, קורא את `sys/permissions/{id}` לכל package ו-grants דרך ה-controller. כישלונות נרשמים ל-`package_errors` אבל לא שוברים את ה-boot.
+- ✅ **Tests** — 6 חדשים ב-`package_manager::tests`: grant-on-install, unknown-permission-rejection (כולל storage clean-state), rehydration round-trip, upgrade revocation, uninstall cleanup (Stone 10.5 tripwire), empty-blob invariant.
 
 ### 10.3 Import map לפי capabilities
 - [`framework/src/wasm_activity.rs`](framework/src/wasm_activity.rs) — בקישור הקרנל↔wasm, לפני instantiation:

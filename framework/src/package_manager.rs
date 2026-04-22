@@ -31,6 +31,7 @@ use std::collections::HashMap;
 
 use crate::activity_manager::LaunchMode;
 use crate::manifest::{self, Manifest, ManifestError, RUNTIME_ABI_VERSION};
+use crate::permissions::PermissionController;
 use crate::resources::{ResourceError, ResourceTable};
 use crate::storage::{Storage, StorageError};
 
@@ -87,6 +88,11 @@ pub enum InstallError {
     /// caller can tell "stale archive" from "forgot to bump the code".
     /// Upgrades (strictly greater `version_code`) succeed silently.
     SameVersionRejected { id: String, version_code: u64 },
+    /// The manifest's `permissions.required` list names a permission
+    /// the system hasn't declared. Catches typos at install time rather
+    /// than letting the app silently link without the capability it
+    /// asked for.
+    UnknownPermission { package_id: String, name: String },
     Storage(StorageError),
 }
 
@@ -102,6 +108,9 @@ impl core::fmt::Display for InstallError {
             }
             InstallError::SameVersionRejected { id, version_code } => {
                 write!(f, "same version already installed for {id}: version_code={version_code} (bump version_code to upgrade)")
+            }
+            InstallError::UnknownPermission { package_id, name } => {
+                write!(f, "unknown permission '{name}' required by {package_id} — not declared by the system")
             }
             InstallError::Storage(e) => write!(f, "storage error: {e:?}"),
         }
@@ -121,6 +130,16 @@ fn key_manifest(id: &str) -> String { format!("packages/{id}/manifest.toml") }
 fn key_wasm(id: &str) -> String { format!("packages/{id}/app.wasm") }
 fn key_values_strings(id: &str) -> String { format!("packages/{id}/res/values/strings.toml") }
 fn key_values_colors(id: &str) -> String { format!("packages/{id}/res/values/colors.toml") }
+
+/// Storage key for the LF-separated list of permissions granted to a
+/// package. Written on install, deleted on uninstall, read at boot so
+/// grants persist across reboots.
+///
+/// Kept under `sys/` (not `packages/`) because these are system-side
+/// grants — an app listing its own granted permissions without going
+/// through the `PermissionController` would violate the capability
+/// invariant.
+fn key_permissions(id: &str) -> String { format!("sys/permissions/{id}") }
 
 /// Storage key for an activity's persisted saved-state blob. Scoped to
 /// `(package, class)` so two activity classes in the same app keep their
@@ -249,6 +268,7 @@ impl PackageManager {
     pub fn install(
         &mut self,
         storage: &mut dyn Storage,
+        permissions: &mut PermissionController,
         manifest_toml: &str,
         wasm_bytes: &[u8],
     ) -> Result<String, InstallError> {
@@ -257,6 +277,20 @@ impl PackageManager {
 
         let id = manifest.app.id.clone();
         let offered_code = manifest.app.version_code;
+
+        // Stone 10.2 — validate every required permission is declared
+        // by the system BEFORE we touch storage. Catching a typo'd
+        // permission name after we've half-written the package leaves
+        // the install in a partial state; doing the check first means
+        // a bad manifest bounces cleanly.
+        for name in &manifest.permissions.required {
+            if !permissions.is_declared(name) {
+                return Err(InstallError::UnknownPermission {
+                    package_id: id.clone(),
+                    name: name.clone(),
+                });
+            }
+        }
 
         if let Some(existing) = self.packages.get(&id) {
             if offered_code < existing.version_code {
@@ -284,6 +318,21 @@ impl PackageManager {
 
             storage.write(&key_manifest(&id), manifest_toml.as_bytes())?;
             storage.write(&key_wasm(&id), wasm_bytes)?;
+            // Upgrade: revoke any grants from the previous version that
+            // the new manifest no longer requests (app tightened its
+            // permissions). Then grant whatever the new manifest asks
+            // for, and overwrite the persisted grants file.
+            let new_set: std::collections::HashSet<&str> =
+                manifest.permissions.required.iter().map(String::as_str).collect();
+            let old_grants: Vec<String> = permissions.granted_to(&id)
+                .into_iter().map(String::from).collect();
+            for old in old_grants {
+                if !new_set.contains(old.as_str()) {
+                    permissions.revoke(&id, &old);
+                }
+            }
+            apply_grants(storage, permissions, &id, &manifest.permissions.required)?;
+
             // Index already contains this id — no update needed.
             self.packages.insert(id.clone(), PackageRecord::from_manifest(manifest));
             return Ok(id);
@@ -292,6 +341,7 @@ impl PackageManager {
         // First install for this id.
         storage.write(&key_manifest(&id), manifest_toml.as_bytes())?;
         storage.write(&key_wasm(&id), wasm_bytes)?;
+        apply_grants(storage, permissions, &id, &manifest.permissions.required)?;
 
         let mut ids: Vec<String> = self.packages.keys().cloned().collect();
         ids.push(id.clone());
@@ -305,7 +355,12 @@ impl PackageManager {
     /// Remove a package. Returns `true` if it was installed. Failures in
     /// the middle leave the store in a partially-uninstalled state, which
     /// the next `load_installed` heals.
-    pub fn uninstall(&mut self, storage: &mut dyn Storage, id: &str) -> bool {
+    pub fn uninstall(
+        &mut self,
+        storage: &mut dyn Storage,
+        permissions: &mut PermissionController,
+        id: &str,
+    ) -> bool {
         if self.packages.remove(id).is_none() {
             return false;
         }
@@ -314,10 +369,58 @@ impl PackageManager {
         let _ = storage.delete(&key_manifest(id));
         let _ = storage.delete(&key_values_strings(id));
         let _ = storage.delete(&key_values_colors(id));
+        let _ = storage.delete(&key_permissions(id));
+        // Drop in-memory grants for this package (Stone 10.5 — keeps
+        // `fw.permissions` from holding stale grants against a dead
+        // package id that a future reinstall could inherit by mistake).
+        let stale: Vec<String> = permissions.granted_to(id)
+            .into_iter().map(String::from).collect();
+        for p in stale {
+            permissions.revoke(id, &p);
+        }
         let mut ids: Vec<String> = self.packages.keys().cloned().collect();
         ids.sort();
         let _ = storage.write(KEY_INDEX, ids.join("\n").as_bytes());
         true
+    }
+
+    /// Rehydrate granted permissions into `controller` from the
+    /// `sys/permissions/{id}` blobs written by `install`. Called once
+    /// from `framework::boot` after `load_installed` finishes, so both
+    /// in-memory package state and grant state reflect what's on disk
+    /// before any activity is instantiated. Returns the total number
+    /// of grants rehydrated; per-package failures are reported through
+    /// `on_error` but never abort the scan (a corrupt grants file is
+    /// worse than missing — better to boot without grants than to
+    /// refuse to boot at all).
+    pub fn load_granted_permissions(
+        &self,
+        storage: &dyn Storage,
+        controller: &mut PermissionController,
+        mut on_error: impl FnMut(&str, LoadError),
+    ) -> usize {
+        let mut count = 0usize;
+        for id in self.packages.keys() {
+            let bytes = match storage.read(&key_permissions(id)) {
+                Ok(b) => b,
+                Err(StorageError::NotFound) => continue, // app installed before 10.2, or no permissions
+                Err(e) => { on_error(id, LoadError::Storage(e)); continue; }
+            };
+            let Ok(text) = core::str::from_utf8(&bytes) else {
+                on_error(id, LoadError::CorruptManifest);
+                continue;
+            };
+            for name in text.lines().filter(|l| !l.is_empty()) {
+                // `grant` silently returns false if the system no longer
+                // declares this permission — e.g. a future boot dropped
+                // a permission from the catalog. The grants file is the
+                // source of historical truth, not the override.
+                if controller.grant(id, name) {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     pub fn get(&self, id: &str) -> Option<&PackageRecord> { self.packages.get(id) }
@@ -383,6 +486,43 @@ fn read_optional_text(
         Err(StorageError::NotFound) => Ok(None),
         Err(e) => Err(ResourceLoadError::Storage(e)),
     }
+}
+
+/// Grant every permission in `required` to `package_id` (they've
+/// already been validated as declared by the caller) and persist the
+/// resulting set to `sys/permissions/{id}`. Called from both the
+/// fresh-install and upgrade branches of [`PackageManager::install`].
+///
+/// We write the **full** new set rather than appending, so an upgrade
+/// that removed a permission leaves behind only what the new manifest
+/// asks for. The order of lines is stable (iteration over the input
+/// slice) to keep the blob diff-able.
+fn apply_grants(
+    storage: &mut dyn Storage,
+    controller: &mut PermissionController,
+    package_id: &str,
+    required: &[String],
+) -> Result<(), InstallError> {
+    for name in required {
+        // `grant` returns false only when the permission isn't declared,
+        // which `install` already ruled out. Treat a false return as an
+        // assertion failure rather than a silent no-op.
+        debug_assert!(controller.is_declared(name),
+            "apply_grants called with undeclared permission '{}'; install should reject earlier", name);
+        controller.grant(package_id, name);
+    }
+    let blob = required.join("\n");
+    if blob.is_empty() {
+        // Empty blob still written so boot-time rehydration can tell
+        // "installed with no permissions" from "permissions file
+        // missing because this was a pre-10.2 install". Readers can
+        // treat both the same way today, but the distinction may
+        // matter once we add upgrade-time audit logging.
+        storage.write(&key_permissions(package_id), &[])?;
+    } else {
+        storage.write(&key_permissions(package_id), blob.as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Verify the package's `min_abi_version` is compatible with the runtime.
@@ -459,7 +599,9 @@ entry = true
     fn install_then_list() {
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"\0asm\x01\x00\x00\x00").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"\0asm\x01\x00\x00\x00").unwrap();
         assert_eq!(pm.count(), 1);
         let rec = pm.get("com.akiva.hello").unwrap();
         assert_eq!(rec.entry_class, "HelloMain");
@@ -469,12 +611,16 @@ entry = true
     fn install_is_persistent() {
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"wasm-bytes").unwrap();
-        pm.install(&mut store, WORLD, b"wasm-bytes").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"wasm-bytes").unwrap();
+        pm.install(&mut store, &mut pc, WORLD, b"wasm-bytes").unwrap();
         drop(pm);
 
         // Fresh manager, same storage — should rehydrate both.
         let mut pm2 = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
         let loaded = pm2.load_installed(&store, |id, e| panic!("load error for {id}: {e:?}"));
         assert_eq!(loaded, 2);
         assert!(pm2.get("com.akiva.hello").is_some());
@@ -487,8 +633,10 @@ entry = true
         // Distinct error so a CLI can suggest the fix.
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"x").unwrap();
-        let err = pm.install(&mut store, HELLO, b"x").unwrap_err();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"x").unwrap();
+        let err = pm.install(&mut store, &mut pc, HELLO, b"x").unwrap_err();
         assert!(matches!(
             err,
             InstallError::SameVersionRejected { version_code: 1, .. }
@@ -500,9 +648,11 @@ entry = true
         // Installing version_code=1 after version_code=2 is blocked.
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
         let v2 = HELLO.replace("version_code = 1", "version_code = 2");
-        pm.install(&mut store, &v2, b"new").unwrap();
-        let err = pm.install(&mut store, HELLO, b"old").unwrap_err();
+        pm.install(&mut store, &mut pc, &v2, b"new").unwrap();
+        let err = pm.install(&mut store, &mut pc, HELLO, b"old").unwrap_err();
         assert!(matches!(
             err,
             InstallError::DowngradeRejected { installed: 2, offered: 1, .. }
@@ -518,13 +668,15 @@ entry = true
         // reflects the new version_code.
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"v1-wasm").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"v1-wasm").unwrap();
         // Only bump `version`, not `min_abi_version` — a naive string
         // replace would match both and trip AbiMismatch.
         let v2 = HELLO
             .replace("version_code = 1", "version_code = 2")
             .replacen("version = \"0.1.0\"", "version = \"0.2.0\"", 1);
-        pm.install(&mut store, &v2, b"v2-wasm").unwrap();
+        pm.install(&mut store, &mut pc, &v2, b"v2-wasm").unwrap();
 
         assert_eq!(pm.count(), 1);
         assert_eq!(pm.get("com.akiva.hello").unwrap().version_code, 2);
@@ -537,7 +689,9 @@ entry = true
         // an activity persisted via onSaveInstanceState.
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"v1-wasm").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"v1-wasm").unwrap();
         let state_key = key_saved_state("com.akiva.hello", "HelloMain");
         store.write(&state_key, b"persisted blob").unwrap();
 
@@ -546,7 +700,7 @@ entry = true
         let v2 = HELLO
             .replace("version_code = 1", "version_code = 2")
             .replacen("version = \"0.1.0\"", "version = \"0.2.0\"", 1);
-        pm.install(&mut store, &v2, b"v2-wasm").unwrap();
+        pm.install(&mut store, &mut pc, &v2, b"v2-wasm").unwrap();
         assert_eq!(store.read(&state_key).unwrap(), b"persisted blob");
     }
 
@@ -557,14 +711,16 @@ entry = true
         // the new code doesn't decode incompatible bytes.
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"v0-wasm").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"v0-wasm").unwrap();
         let state_key = key_saved_state("com.akiva.hello", "HelloMain");
         store.write(&state_key, b"legacy blob").unwrap();
 
         let v1 = HELLO
             .replace("version_code = 1", "version_code = 2")
             .replacen("version = \"0.1.0\"", "version = \"1.0.0\"", 1);
-        pm.install(&mut store, &v1, b"v1-wasm").unwrap();
+        pm.install(&mut store, &mut pc, &v1, b"v1-wasm").unwrap();
         assert!(matches!(store.read(&state_key), Err(StorageError::NotFound)));
     }
 
@@ -572,10 +728,14 @@ entry = true
     fn uninstall_removes_all_traces() {
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"wasm").unwrap();
-        assert!(pm.uninstall(&mut store, "com.akiva.hello"));
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"wasm").unwrap();
+        assert!(pm.uninstall(&mut store, &mut pc, "com.akiva.hello"));
 
         let mut pm2 = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
         pm2.load_installed(&store, |id, e| panic!("load error for {id}: {e:?}"));
         assert_eq!(pm2.count(), 0);
         // The wasm key should be gone too.
@@ -586,6 +746,8 @@ entry = true
     fn first_boot_no_index() {
         let store = MemoryStorage::new();
         let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
         let loaded = pm.load_installed(&store, |_, _| panic!("unexpected error"));
         assert_eq!(loaded, 0);
     }
@@ -594,11 +756,15 @@ entry = true
     fn corrupted_manifest_is_reported_not_fatal() {
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"x").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"x").unwrap();
         // Deliberately overwrite one manifest with garbage.
         store.write(&key_manifest("com.akiva.hello"), b"not valid toml =====").unwrap();
 
         let mut pm2 = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
         let mut errors = Vec::new();
         pm2.load_installed(&store, |id, e| errors.push((id.to_string(), format!("{e:?}"))));
         assert_eq!(pm2.count(), 0);
@@ -612,6 +778,8 @@ entry = true
         // Write an index pointing at a package that doesn't exist.
         store.write(KEY_INDEX, b"com.akiva.ghost").unwrap();
         let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
         let mut errors = Vec::new();
         pm.load_installed(&store, |id, e| errors.push((id.to_string(), format!("{e:?}"))));
         assert_eq!(pm.count(), 0);
@@ -635,7 +803,9 @@ entry = true
 "#;
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        let err = pm.install(&mut store, future, b"x").unwrap_err();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        let err = pm.install(&mut store, &mut pc, future, b"x").unwrap_err();
         assert!(matches!(err, InstallError::AbiMismatch { .. }));
     }
 
@@ -643,7 +813,9 @@ entry = true
     fn read_wasm_roundtrip() {
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"\0asm\x01").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"\0asm\x01").unwrap();
         let bytes = pm.read_wasm(&store, "com.akiva.hello").unwrap();
         assert_eq!(bytes, b"\0asm\x01");
     }
@@ -652,8 +824,10 @@ entry = true
     fn resource_tables_read_populated_and_absent_packages() {
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"x").unwrap();
-        pm.install(&mut store, WORLD, b"x").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"x").unwrap();
+        pm.install(&mut store, &mut pc, WORLD, b"x").unwrap();
 
         // Only HELLO gets resources; WORLD has no values/ at all.
         store.write(
@@ -686,7 +860,9 @@ entry = true
     fn resource_tables_report_corrupt_files_but_still_emit_empty_table() {
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"x").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"x").unwrap();
         store.write(
             "packages/com.akiva.hello/res/values/colors.toml",
             b"bg = \"not-a-colour\"",
@@ -708,16 +884,194 @@ entry = true
     fn uninstall_removes_resource_keys() {
         let mut store = MemoryStorage::new();
         let mut pm = PackageManager::new();
-        pm.install(&mut store, HELLO, b"x").unwrap();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"x").unwrap();
         store.write(
             "packages/com.akiva.hello/res/values/strings.toml",
             br#"x = "y""#,
         ).unwrap();
-        pm.uninstall(&mut store, "com.akiva.hello");
+        pm.uninstall(&mut store, &mut pc, "com.akiva.hello");
         assert!(matches!(
             store.read("packages/com.akiva.hello/res/values/strings.toml"),
             Err(StorageError::NotFound),
         ));
+    }
+
+    // ── Stone 10.2: install-time grants + persistence ───────────────────
+
+    const HELLO_WITH_NETWORK: &str = r#"
+[app]
+id = "com.akiva.hello"
+name = "Hello"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+[runtime]
+wasm = "hello.wasm"
+[permissions]
+required = ["akiva.permission.NETWORK", "akiva.permission.STORAGE_SANDBOX"]
+[[activities]]
+id = "main"
+class = "HelloMain"
+entry = true
+"#;
+
+    const HELLO_WITH_UNKNOWN: &str = r#"
+[app]
+id = "com.akiva.hello"
+name = "Hello"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+[runtime]
+wasm = "hello.wasm"
+[permissions]
+required = ["akiva.permission.MADE_UP"]
+[[activities]]
+id = "main"
+class = "HelloMain"
+entry = true
+"#;
+
+    #[test]
+    fn install_grants_required_permissions() {
+        // A manifest's `permissions.required` becomes live grants in
+        // the controller post-install. The persistence blob holds the
+        // same list for boot-time rehydration.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+
+        pm.install(&mut store, &mut pc, HELLO_WITH_NETWORK, b"x").unwrap();
+
+        assert!(pc.check("com.akiva.hello", crate::permissions::NETWORK));
+        assert!(pc.check("com.akiva.hello", crate::permissions::STORAGE_SANDBOX));
+        assert!(!pc.check("com.akiva.hello", crate::permissions::CAMERA),
+            "install must only grant what the manifest requests");
+
+        let blob = store.read("sys/permissions/com.akiva.hello").unwrap();
+        let text = std::str::from_utf8(&blob).unwrap();
+        // Order preserved from the manifest list.
+        assert_eq!(text,
+            "akiva.permission.NETWORK\nakiva.permission.STORAGE_SANDBOX");
+    }
+
+    #[test]
+    fn install_rejects_unknown_permission_before_touching_storage() {
+        // A typo in `permissions.required` must fail the install
+        // before any package bytes are written — otherwise a CLI would
+        // have to unwind a half-committed install to clean up.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+
+        let err = pm.install(&mut store, &mut pc, HELLO_WITH_UNKNOWN, b"x").unwrap_err();
+        assert!(matches!(err,
+            InstallError::UnknownPermission { name, .. }
+                if name == "akiva.permission.MADE_UP"));
+
+        // Storage must be completely clean — no manifest, no wasm, no
+        // index, no permissions file.
+        assert!(matches!(store.read("packages/com.akiva.hello/manifest.toml"),
+            Err(StorageError::NotFound)));
+        assert!(matches!(store.read("packages/com.akiva.hello/app.wasm"),
+            Err(StorageError::NotFound)));
+        assert!(matches!(store.read("sys/packages/index"),
+            Err(StorageError::NotFound)));
+        assert!(matches!(store.read("sys/permissions/com.akiva.hello"),
+            Err(StorageError::NotFound)));
+    }
+
+    #[test]
+    fn grants_rehydrate_from_storage_on_boot() {
+        // Install in one PackageManager+PermissionController pair, then
+        // drop them and rebuild from storage — grants must come back.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO_WITH_NETWORK, b"x").unwrap();
+        drop(pm);
+        drop(pc);
+
+        // Fresh boot.
+        let mut pm2 = PackageManager::new();
+        let mut pc2 = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc2);
+        pm2.load_installed(&store, |id, e| panic!("load error for {id}: {e:?}"));
+        let count = pm2.load_granted_permissions(&store, &mut pc2,
+            |id, e| panic!("grants error for {id}: {e:?}"));
+        assert_eq!(count, 2);
+        assert!(pc2.check("com.akiva.hello", crate::permissions::NETWORK));
+        assert!(pc2.check("com.akiva.hello", crate::permissions::STORAGE_SANDBOX));
+    }
+
+    #[test]
+    fn upgrade_revokes_permissions_removed_from_new_manifest() {
+        // v1 asks for NETWORK + STORAGE_SANDBOX; v2 only asks for
+        // NETWORK. After upgrade, STORAGE_SANDBOX must be revoked so
+        // the app can't use a capability it no longer declares.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO_WITH_NETWORK, b"v1").unwrap();
+        assert!(pc.check("com.akiva.hello", crate::permissions::STORAGE_SANDBOX));
+
+        let v2 = HELLO_WITH_NETWORK
+            .replace("version_code = 1", "version_code = 2")
+            .replacen("version = \"0.1.0\"", "version = \"0.2.0\"", 1)
+            .replace(
+                r#"required = ["akiva.permission.NETWORK", "akiva.permission.STORAGE_SANDBOX"]"#,
+                r#"required = ["akiva.permission.NETWORK"]"#,
+            );
+        pm.install(&mut store, &mut pc, &v2, b"v2").unwrap();
+
+        assert!(pc.check("com.akiva.hello", crate::permissions::NETWORK),
+            "kept permission must remain granted");
+        assert!(!pc.check("com.akiva.hello", crate::permissions::STORAGE_SANDBOX),
+            "permission dropped from manifest must be revoked on upgrade");
+        // Persisted blob reflects the tightened set.
+        let blob = store.read("sys/permissions/com.akiva.hello").unwrap();
+        assert_eq!(std::str::from_utf8(&blob).unwrap(), "akiva.permission.NETWORK");
+    }
+
+    #[test]
+    fn uninstall_deletes_permissions_file_and_revokes_grants() {
+        // Stone 10.5 tripwire: uninstall cleans up both the persisted
+        // blob and the in-memory grants so a reinstall under the same
+        // id starts fresh.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO_WITH_NETWORK, b"x").unwrap();
+        assert!(pc.check("com.akiva.hello", crate::permissions::NETWORK));
+
+        assert!(pm.uninstall(&mut store, &mut pc, "com.akiva.hello"));
+        assert!(!pc.check("com.akiva.hello", crate::permissions::NETWORK),
+            "uninstall must drop in-memory grants");
+        assert!(matches!(store.read("sys/permissions/com.akiva.hello"),
+            Err(StorageError::NotFound)),
+            "uninstall must delete the persisted permissions blob");
+    }
+
+    #[test]
+    fn install_with_no_permissions_writes_empty_blob() {
+        // The HELLO fixture has no [permissions] section. Install still
+        // writes an (empty) blob so rehydration can distinguish "no
+        // permissions requested" from "pre-10.2 install".
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"x").unwrap();
+        let blob = store.read("sys/permissions/com.akiva.hello").unwrap();
+        assert!(blob.is_empty());
+        assert!(pc.granted_to("com.akiva.hello").is_empty());
     }
 
     #[test]

@@ -116,6 +116,21 @@ pub fn boot(
         package_errors.push((id.to_string(), format!("{e:?}")));
     });
 
+    // Stone 10.2 — rehydrate persisted permission grants. Must run
+    // after `load_installed` (needs the package list) and before any
+    // activity instantiation (Stone 10.3 will build import maps from
+    // these grants). Per-package read failures are folded into the
+    // same error channel as package-rehydration failures because from
+    // the user's perspective a package without its grants is as broken
+    // as a package without its manifest.
+    fw.packages.load_granted_permissions(
+        storage.as_ref(),
+        &mut fw.permissions,
+        |id, e: LoadError| {
+            package_errors.push((id.to_string(), format!("grants: {e:?}")));
+        },
+    );
+
     // Read per-package resource tables from storage and register them
     // with the framework's ResourceManager. Resource errors are tracked
     // separately — a broken values file doesn't stop a package from
