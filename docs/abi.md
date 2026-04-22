@@ -134,6 +134,44 @@ extern "C" fn akiva_host_resource_has_string(name_ptr: *const u8, name_len: u32)
 
 כל app מקבל את ה-set הבסיסי הזה אוטומטית ללא הצהרה. הרחבות נוספות (finish, start_activity, storage read/write, intent dispatch) תיכנסנה כשאפליקציות אמיתיות יצטרכו אותן, ובכפוף למבחני §1.2 — כל הרחבה דורשת use case מוכח ו-mapping ל-WIT interface ב-§5.
 
+**מתוכננות ל-Phase 9** (לא מיושמות עדיין; ה-trajectory תועד ב-[research-activity-boundary.md](research-activity-boundary.md)):
+
+```rust
+// Stone 9.3 — אפליקציה מסיימת את עצמה (מקביל ל-Android Activity.finish()).
+// ה-host מפעיל את אותו finish_requested flag שה-Shell framework-side
+// משתמש בו היום. חותמו של הקריאה: "finish the activity that owns the
+// handle the host is currently dispatching to."
+extern "C" fn akiva_host_finish();
+
+// Stone 9.3 — system-wide Back (pops stack top אם לא root; אחרת no-op).
+// שונה מ-akiva_host_finish רק ברמת הסמנטיקה: Back מופעל ב-Shell policy,
+// finish הוא כוונה מפורשת של ה-app.
+extern "C" fn akiva_host_back();
+
+// Stone 9.4 — פתיחת activity אחרת. intent_ptr/len מצביעים ל-blob ב-memory
+// של ה-app; ה-host decodes ל-`framework::Intent` ומפעיל IntentRouter.
+extern "C" fn akiva_host_start_activity(intent_ptr: *const u8, intent_len: u32);
+
+// Stone 9.5 — אותו דבר עם request code שה-framework יזכור וימסור חזרה
+// דרך akiva_app_activity_result.
+extern "C" fn akiva_host_start_activity_for_result(
+    intent_ptr: *const u8, intent_len: u32, request_code: u32,
+);
+extern "C" fn akiva_host_set_result(result_ptr: *const u8, result_len: u32);
+```
+
+וההפך — exports חדשים בצד ה-app שה-host יקרא להם:
+
+```rust
+// Stone 9.4 — SingleTop/SingleTask reuse fires this with the new intent.
+extern "C" fn akiva_app_new_intent(handle: u32, ptr: *const u8, len: u32);
+
+// Stone 9.5 — result hand-off ל-caller.
+extern "C" fn akiva_app_activity_result(
+    handle: u32, request_code: u32, ptr: *const u8, len: u32,
+);
+```
+
 ב-v1 כל ה-imports יתמפו ל-interfaces המובנים של ה-world `akiva:app/host`: `log`, `activity-api`, `storage`, `intent`, וכו'. נקודת ה-mapping: `akiva_host_log` ⇔ `log.log(level, msg)`, `akiva_host_text_width` ⇔ `text.measure-width(text, size)`.
 
 ### 2.4 Imports (kernel → host) — `hal_app_*`
