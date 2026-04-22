@@ -509,17 +509,25 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - ✅ **Tests** — 8 codec (4 framework + 2 SDK mirror + 2 constant pin), 4 wasm_activity drain tests (start_for_result / set_result / malformed / activity_result forward), 3 framework integration tests (success, canceled synthesis, reuse drop), 7 JS Vitest tests (drainStartForResult / drainSetResult / activityResult / unregister cleanup). +22 tests total.
 - ⏭️ **Demo app (hello ↔ calculator)** — ה-infrastructure מוכנה; הוספת demo מותנית בעבודת UI על calculator (mode "pick") ו-hello (button שפותח את ה-calculator for-result). לא חלק מה-stone; נדחה לעבודת apps עתידית.
 
-### 9.6 Multiple tasks לפי affinity
-- `ActivityManager` כבר מחזיק `tasks: HashMap<TaskId, Task>` ו-`Task.affinity` — חסרה ההחלטה של foreground
-- הוסף `bring_task_to_front(task_id)`; Shell יכולה לעבור בין tasks כשמשתמש בוחר app שכבר רץ
-- Unit test: A ב-task 1, B ב-task 2 (affinity שונה), swap ביניהם שומר על ה-stack של כל אחד
+### 9.6 Multiple tasks / foreground switching
+- ✅ **`ActivityManager::bring_task_to_front(task_id) -> Option<TaskId>`** — מחזיר את ה-foreground הקודם אם החלפה קרתה, `None` ל-no-op (task לא קיים, או כבר foreground). ה-state machine של ה-activities עצמן לא זזה — ה-Framework אחראי ל-pause/resume.
+- ✅ **`ActivityManager::task_stack(task_id) -> Option<&[ActivityId]>`** — accessor ל-bottom-to-top stack. ה-Framework משתמש בו כדי לסנכרן את ה-`fw.stack` (mirror של ה-foreground task) בזמן switch.
+- ✅ **`SingleInstance` dedicated-task אמיתי** — fresh-create מקצה task חדש דרך `allocate_task` (לא דרך `ensure_foreground_task`), ולא מגדיר foreground. ה-Framework מפעיל `bring_task_to_front` אחרי ה-launch. reuse סורק את **כל** ה-tasks (cross-task), `popped` תמיד ריק כי ה-dedicated task מחזיק רק instance אחד. Standard / SingleTop / SingleTask ממשיכים לנחות ב-foreground task הקיים (task-by-affinity נדחה — לא מורגש כשיש display יחיד).
+- ✅ **`Framework::switch_to_task(task_id, ts)`** — public API שהופעל ע"י Shell כאשר משתמש בוחר app רץ. משתמש ב-`switch_to_task_if_needed` פנימי שמריץ `drive_to_paused` על top הקודם, `switch_foreground_stack` (שמפעיל `bring_task_to_front` + mirror-sync), ואז `drive_start_to_resumed` על ה-top החדש. `task_history: Vec<TaskId>` נדחף בכל switch כדי ש-`finish_top` יוכל לחזור לאחור כשה-foreground מתרוקן.
+- ✅ **Back-out מ-dedicated task** — `finish_top` במקרה של `stack.len() == 1` + `task_history` לא ריק מחזיר את ה-foreground ל-task הקודם (pop מה-history) במקום לחסום finish. ה-Back-key short-circuit עודכן ל-`stack.len() > 1 || !task_history.is_empty()` — משתמש יכול לברוח מ-SingleInstance דרך Escape.
+- ✅ **Cross-task fresh-create כולל Created→Destroyed shortcut** — אם ה-activity החדשה (ב-task חדש) מסיימת מ-on_create, ה-framework מבטל את ה-foreground switch ומחזיר את ה-task הקודם.
+- ✅ **Tests** — 5 ב-`activity_manager::tests` (`launch_singleinstance_lives_in_its_own_task`, `launch_singleinstance_reuse_is_system_wide`, `bring_task_to_front_switches_foreground_and_returns_prev`, `task_stack_returns_bottom_to_top_slice`), 4 integration ב-`framework::tests` (`singleinstance_fresh_create_allocates_dedicated_task_and_foregrounds_it`, `singleinstance_reuse_across_tasks_brings_target_task_forward`, `task_swap_preserves_each_tasks_stack`, `back_from_singleinstance_returns_to_prev_task`).
+- ⏭️ **Task-by-affinity routing** — Standard / SingleTop / SingleTask ממשיכים לנחות ב-foreground task הקיים. עם display יחיד ההבדל לא נראה; task-per-affinity אמיתי נדחה ל-Phase 11+ (multi-display / picture-in-picture).
+- ⏭️ **Shell UI ל-task switcher** — ה-infrastructure מוכנה (`switch_to_task` public). UI שמציג את ה-tasks החיים לבחירה נדחה לעבודת Shell עתידית.
 
 **Exit criteria:**
-- [ ] כל ארבעת ה-launch modes עוברים acceptance tests שמותווים ב-[`activity-model.md §4`](docs/activity-model.md)
-- [ ] 5 ה-lifecycle callbacks כולם נקראים ב-apps (מאומת ידנית + unit tests)
-- [ ] `start_activity_for_result` demo (hello ↔ calculator) עובד end-to-end
-- [ ] back navigation עובד ב-stack של לפחות 3 activities
-- [ ] tasks מרובים עם affinity שונה — יש unit test המדגים swap
+- [x] כל ארבעת ה-launch modes עוברים acceptance tests שמותווים ב-[`activity-model.md §4`](docs/activity-model.md)
+- [x] 5 ה-lifecycle callbacks כולם נקראים ב-apps (מאומת ב-unit tests + integration tests; manual-exercise demo נדחה עם ה-Shell task switcher UI)
+- [ ] `start_activity_for_result` demo (hello ↔ calculator) — infrastructure מוכנה, demo app UI נדחה (9.5 deferred note)
+- [x] back navigation עובד ב-stack של לפחות 3 activities (`standard_launch_stacks_and_finish_unwinds` + `singletask_relaunch_pops_above_and_fires_new_intent`; `back_from_singleinstance_returns_to_prev_task` מוסיף cross-task back)
+- [x] tasks מרובים עם affinity שונה — `task_swap_preserves_each_tasks_stack` + `bring_task_to_front_switches_foreground_and_returns_prev`
+
+**סטטוס:** Phase 9 סגור (Stones 9.1–9.6). עבודה שנדחתה במודע: demo app UI של start_activity_for_result ו-Shell task-switcher UI — שתיהן עבודת apps/shell, לא infrastructure.
 
 **הערכת זמן:** 3-4 שבועות.
 

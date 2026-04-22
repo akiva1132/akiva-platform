@@ -7,12 +7,16 @@
 //! transitions.
 //!
 //! MVP scope:
-//!   - Single foreground task, single display.
+//!   - Multiple tasks on a single display. One task is `foreground_task`
+//!     at a time; the Framework is responsible for driving lifecycle
+//!     callbacks when the foreground switches.
 //!   - Launch modes: all four (`Standard`, `SingleTop`, `SingleTask`,
-//!     `SingleInstance`). `SingleInstance`'s "dedicated task" isolation
-//!     is flattened to the single foreground task for MVP — the reuse
-//!     semantics (system-wide uniqueness + pop-above + `on_new_intent`)
-//!     are faithful; full task isolation lands with Stone 9.6.
+//!     `SingleInstance`). Standard / SingleTop / SingleTask fresh-create
+//!     lands in the current foreground task (task-by-affinity routing
+//!     is a later optimisation — with a single display the visible
+//!     behaviour is identical). `SingleInstance` gets a dedicated,
+//!     system-wide-unique task: reuse scans *every* task, fresh-create
+//!     allocates a new task just for that activity.
 //!   - Activities are system-side only (registered by the framework at
 //!     boot). User-app wasm activities come through the wasm activity
 //!     proxy on the same path.
@@ -173,16 +177,11 @@ impl ActivityManager {
             }
         }
 
-        // SingleTask / SingleInstance: find an existing instance with the
-        // matching (pkg, class) anywhere in the foreground task. If found,
-        // the caller will destroy everything above it (top-first) and
-        // resume the target. If not found, fall through to fresh-create.
-        //
-        // In MVP's single-foreground-task world SingleInstance reduces to
-        // SingleTask semantically — full dedicated-task isolation is
-        // Stone 9.6, and `launch()` is the wrong seam for that anyway
-        // (the foreground-switch decision lives in the Framework).
-        if matches!(launch_mode, LaunchMode::SingleTask | LaunchMode::SingleInstance) {
+        // SingleTask: find an existing instance in the foreground task.
+        // If found, the caller will destroy everything above it
+        // (top-first) and resume the target. If not found, fall through
+        // to fresh-create.
+        if launch_mode == LaunchMode::SingleTask {
             if let Some(task_id) = self.foreground_task {
                 let task_stack = &self.tasks[&task_id].stack;
                 let target_pos = task_stack.iter().position(|id| {
@@ -191,22 +190,46 @@ impl ActivityManager {
                 });
                 if let Some(pos) = target_pos {
                     let target_id = task_stack[pos];
-                    // Activities above the target, top-first. Cloned so
-                    // the caller can iterate while we've released the
-                    // borrow.
                     let popped: Vec<ActivityId> = task_stack[pos + 1..].iter().rev().copied().collect();
                     return Ok(LaunchOutcome { id: target_id, reused: true, popped });
                 }
             }
         }
 
-        // Fresh-create path — shared by Standard, SingleTop-no-match, and
-        // SingleTask/SingleInstance-not-found.
+        // SingleInstance: system-wide uniqueness. Scan every task (not
+        // just foreground) for a matching (pkg, class). A live instance
+        // means we reuse it; whichever task it lives in becomes the
+        // caller's responsibility to bring to the foreground. The
+        // dedicated-task invariant guarantees popped is empty — nothing
+        // else is ever in that task.
+        if launch_mode == LaunchMode::SingleInstance {
+            let hit = self.tasks.values().find_map(|t| {
+                t.stack.iter().copied().find(|id| {
+                    let r = &self.records[id];
+                    r.package_id == package_id && r.class == class
+                })
+            });
+            if let Some(target_id) = hit {
+                return Ok(LaunchOutcome { id: target_id, reused: true, popped: Vec::new() });
+            }
+        }
+
+        // Fresh-create path — shared by Standard, SingleTop-no-match,
+        // SingleTask-not-found, and SingleInstance-not-found.
         let instance = (factory)();
         let id = self.next_activity_id;
         self.next_activity_id += 1;
 
-        let task_id = self.ensure_foreground_task(package_id);
+        // SingleInstance lands in a freshly-allocated dedicated task;
+        // every other mode shares the foreground task. The Framework
+        // is responsible for calling `bring_task_to_front` on the new
+        // task after `launch` returns — `launch` doesn't flip foreground
+        // itself so the caller can pause the old top first.
+        let task_id = if launch_mode == LaunchMode::SingleInstance {
+            self.allocate_task(&format!("__singleInstance__:{}:{}", package_id, class))
+        } else {
+            self.ensure_foreground_task(package_id)
+        };
         self.tasks.get_mut(&task_id).unwrap().stack.push(id);
 
         self.records.insert(id, ActivityRecord {
@@ -225,11 +248,34 @@ impl ActivityManager {
         if let Some(t) = self.foreground_task {
             return t;
         }
+        let id = self.allocate_task(affinity);
+        self.foreground_task = Some(id);
+        id
+    }
+
+    /// Allocate a new task without touching `foreground_task`. Used for
+    /// the SingleInstance dedicated-task path, where the Framework owns
+    /// the decision to bring the new task forward (so it can pause the
+    /// old foreground top first).
+    fn allocate_task(&mut self, affinity: &str) -> TaskId {
         let id = self.next_task_id;
         self.next_task_id += 1;
         self.tasks.insert(id, Task { id, affinity: affinity.into(), stack: Vec::new() });
-        self.foreground_task = Some(id);
         id
+    }
+
+    /// Move `task_id` to the foreground, returning the previous
+    /// foreground task. Returns `None` if the task doesn't exist OR if
+    /// it was already foreground (the caller reads this as "nothing to
+    /// do"). The state machine of the activities themselves is not
+    /// touched — the Framework is responsible for pausing the old top
+    /// and resuming the new one.
+    pub fn bring_task_to_front(&mut self, task_id: TaskId) -> Option<TaskId> {
+        if !self.tasks.contains_key(&task_id) { return None; }
+        let prev = self.foreground_task;
+        if prev == Some(task_id) { return None; }
+        self.foreground_task = Some(task_id);
+        prev
     }
 
     // ── Introspection ────────────────────────────────────────────────────
@@ -239,6 +285,13 @@ impl ActivityManager {
     pub fn foreground_top(&self) -> Option<ActivityId> {
         let t = self.tasks.get(&self.foreground_task?)?;
         t.stack.last().copied()
+    }
+
+    /// Bottom-to-top stack of activity ids in `task_id`, or `None` if
+    /// the task doesn't exist. Used by the Framework to sync its own
+    /// `stack` mirror when the foreground switches.
+    pub fn task_stack(&self, task_id: TaskId) -> Option<&[ActivityId]> {
+        self.tasks.get(&task_id).map(|t| t.stack.as_slice())
     }
 
     pub fn state_of(&self, id: ActivityId) -> Option<LifecycleState> {
@@ -824,19 +877,80 @@ mod tests {
     }
 
     #[test]
-    fn launch_singleinstance_matches_singletask_in_single_foreground_task() {
-        // MVP collapse: with only one foreground task, SingleInstance's
-        // "dedicated task" isolation doesn't manifest — it behaves
-        // identically to SingleTask. This test locks that equivalence so
-        // 9.6's multi-task foreground work can break it deliberately.
+    fn launch_singleinstance_lives_in_its_own_task() {
+        // Stone 9.6 — SingleInstance gets a dedicated, system-wide-unique
+        // task. A later launch of any other activity (here: Filler via
+        // Standard) lands in a different task and never shares stack
+        // with the SingleInstance.
         let (mut am, _log) = harness_9_2();
-        let inst_id = am.launch("test.pkg", "InstMain").unwrap().id;
+        let inst = am.launch("test.pkg", "InstMain").unwrap();
         let filler = am.launch("test.pkg", "Filler").unwrap().id;
+
+        let inst_task = am.record(inst.id).unwrap().task;
+        let filler_task = am.record(filler).unwrap().task;
+        assert_ne!(inst_task, filler_task,
+            "SingleInstance must not share a task with other activities");
+        assert_eq!(am.task_stack(inst_task).unwrap(), &[inst.id],
+            "SingleInstance's dedicated task must contain exactly one activity");
+    }
+
+    #[test]
+    fn launch_singleinstance_reuse_is_system_wide() {
+        // Reuse scan crosses task boundaries: the second launch finds
+        // the instance in its dedicated task even though the foreground
+        // task is someone else's. `popped` is always empty on
+        // SingleInstance reuse because the dedicated task has no room
+        // above the instance to stack anything.
+        let (mut am, _log) = harness_9_2();
+        let first = am.launch("test.pkg", "InstMain").unwrap().id;
+        // Filler ends up in the foreground task, not the SingleInstance's.
+        let _filler = am.launch("test.pkg", "Filler").unwrap().id;
 
         let outcome = am.launch("test.pkg", "InstMain").unwrap();
         assert!(outcome.reused);
-        assert_eq!(outcome.id, inst_id);
-        assert_eq!(outcome.popped, vec![filler]);
+        assert_eq!(outcome.id, first);
+        assert!(outcome.popped.is_empty(),
+            "SingleInstance reuse never has a popped set");
+    }
+
+    // ── bring_task_to_front / task_stack (Stone 9.6) ─────────────────────
+
+    #[test]
+    fn bring_task_to_front_switches_foreground_and_returns_prev() {
+        // Two SingleInstance activities → two dedicated tasks, plus
+        // whatever foreground task the first implicit Filler created.
+        // `bring_task_to_front` flips foreground and hands back the
+        // previous id so the Framework can pause its top.
+        let (mut am, _log) = harness_9_2();
+        let _filler = am.launch("test.pkg", "Filler").unwrap().id;
+        let fg_before = am.foreground_task().expect("Filler set foreground");
+        let inst = am.launch("test.pkg", "InstMain").unwrap().id;
+        let inst_task = am.record(inst).unwrap().task;
+        assert_ne!(inst_task, fg_before,
+            "SingleInstance dedicated task must not be foreground yet");
+
+        let prev = am.bring_task_to_front(inst_task);
+        assert_eq!(prev, Some(fg_before));
+        assert_eq!(am.foreground_task(), Some(inst_task));
+
+        // Idempotent: same task twice → None.
+        let again = am.bring_task_to_front(inst_task);
+        assert_eq!(again, None, "bringing already-foreground task must be a no-op signal");
+
+        // Unknown task → None, foreground unchanged.
+        let unknown = am.bring_task_to_front(999);
+        assert_eq!(unknown, None);
+        assert_eq!(am.foreground_task(), Some(inst_task));
+    }
+
+    #[test]
+    fn task_stack_returns_bottom_to_top_slice() {
+        let (mut am, _log) = harness_9_2();
+        let a = am.launch("test.pkg", "Filler").unwrap().id;
+        let b = am.launch("test.pkg", "Filler").unwrap().id;
+        let fg = am.foreground_task().expect("task exists");
+        assert_eq!(am.task_stack(fg), Some(&[a, b][..]));
+        assert_eq!(am.task_stack(999), None);
     }
 
     #[test]

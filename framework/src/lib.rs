@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use activity::{ActivityContext, KeyEvent, PointerEvent, SurfaceMetrics};
-use activity_manager::{ActivityId, ActivityManager, LaunchMode, LifecycleState};
+use activity_manager::{ActivityId, ActivityManager, LaunchMode, LifecycleState, TaskId};
 use compositor::{Compositor, FrameCommands};
 use intent::{Intent, IntentFilter};
 use package_manager::LoadError;
@@ -100,6 +100,7 @@ pub fn boot(
         storage: None,  // populated at the end once we finish using `storage` locally
         pending_result_for: HashMap::new(),
         pending_result: HashMap::new(),
+        task_history: Vec::new(),
     };
 
     // Rehydrate installed packages from storage. A corrupt manifest is
@@ -259,6 +260,15 @@ pub struct Framework {
     /// finished without producing a result, and the framework
     /// synthesises `ActivityResult::canceled()` on delivery.
     pending_result: HashMap<ActivityId, result::ActivityResult>,
+    /// Stone 9.6 — back-stack of task ids the Framework has visited.
+    /// Pushed every time `switch_to_task` brings a new task forward
+    /// (the *previous* foreground is recorded). Popped when the
+    /// current foreground task empties out (SingleInstance finishing
+    /// alone) so we can restore the prior task instead of stranding
+    /// the display on an empty stack. Never grows unbounded in
+    /// practice — the Shell's task sits at position 0 and is never
+    /// popped, so worst-case depth is the number of live tasks.
+    task_history: Vec<TaskId>,
 }
 
 impl Framework {
@@ -285,9 +295,15 @@ impl Framework {
         // Android convention of a global Back button and spares each
         // app from having to implement "close me" themselves. Only
         // `Down` triggers so a held-down Escape doesn't rapid-fire.
+        //
+        // Stone 9.6 — a SingleInstance living alone in its dedicated
+        // task has `stack.len() == 1`, so we also short-circuit when
+        // `task_history` has a task to return to. Without this, Back
+        // would fall through to the activity and users couldn't
+        // escape a full-screen SingleInstance via Escape.
         if ev.code == KEY_CODE_BACK
             && matches!(ev.phase, activity::KeyPhase::Down)
-            && self.stack.len() > 1
+            && (self.stack.len() > 1 || !self.task_history.is_empty())
         {
             self.finish_top(ts);
             return;
@@ -538,25 +554,39 @@ impl Framework {
     /// (SingleTop top match, or Stone 9.2's SingleTask / SingleInstance
     /// finding a matching instance anywhere in the foreground task) can
     /// deliver `on_new_intent` to the reused activity.
+    ///
+    /// Stone 9.6 — the target may land in a task that isn't currently
+    /// foreground (SingleInstance always gets its own dedicated task;
+    /// SingleInstance reuse can find the target in any task). The
+    /// fresh-create and reuse branches both funnel through a
+    /// "switch-if-needed" step so a non-foreground target becomes the
+    /// active task with correct pause/resume semantics on the old top.
     fn launch_app(&mut self, intent: &Intent, package_id: &str, class: &str, ts: f64) {
         let outcome = match self.activities.launch(package_id, class) {
             Ok(o) => o,
             Err(_) => return,
         };
 
+        // Stash the task the target lands in — we need it both for the
+        // fresh-create branch (where AM already pushed outcome.id onto
+        // this task's stack) and for the reuse branch (where we may
+        // need to bring the task to foreground before resuming).
+        let target_task = self.activities.record(outcome.id)
+            .expect("just launched")
+            .task;
+
         // SingleTask / SingleInstance reuse may have identified activities
         // stacked above the target. Destroy each (top-first order is
         // already baked into `outcome.popped`) so their on_pause /
         // on_stop / on_destroy fire in the correct sequence and any
-        // save-state is persisted. Remove from our mirror of the stack
-        // as we go — `destroy_with_persist` drops them from the
-        // ActivityManager's task.stack via its normal cleanup.
+        // save-state is persisted. Popped ids always live in the target
+        // task (SingleTask restricts to foreground; SingleInstance's
+        // dedicated-task invariant guarantees `popped` is empty), so the
+        // `self.stack.retain` mirror update only matters when
+        // target_task is already foreground.
         //
         // Stone 9.5: if any popped activity was launched for a result,
-        // synthesise a CANCELED delivery to its caller. Otherwise a
-        // pending `on_activity_result` expectation would silently
-        // disappear when the callee was torn down by a SingleTask
-        // relaunch, leaving the caller in undefined-wait.
+        // synthesise a CANCELED delivery to its caller.
         for popped_id in &outcome.popped {
             self.destroy_with_persist(*popped_id, ts);
             self.deliver_activity_result_for(*popped_id, ts);
@@ -565,26 +595,47 @@ impl Framework {
 
         if outcome.reused {
             // Three reuse shapes merge here:
-            //   1. SingleTop top match — target was Resumed, stays Resumed.
-            //   2. SingleTask / SingleInstance finding the target at top —
-            //      same as (1).
-            //   3. SingleTask / SingleInstance finding the target below
-            //      top — target was Paused (covered), the pop loop above
-            //      destroyed whatever covered it, now we must drive it
-            //      back to Resumed.
+            //   1. SingleTop / SingleTask top match — target was Resumed.
+            //   2. SingleTask below-top after pop loop above — target was
+            //      Paused (covered) and covering activities are gone.
+            //   3. SingleInstance across tasks — target was Paused in its
+            //      dedicated (background) task; we need to bring that
+            //      task to foreground before driving resume.
             //
-            // `drive_start_to_resumed` handles both Paused→Resumed and
-            // the Resumed no-op, so we don't need to branch on prior state.
+            // `drive_start_to_resumed` handles Paused→Resumed and the
+            // Resumed no-op, so the only extra work is the optional
+            // task switch.
+            self.switch_to_task_if_needed(target_task, ts);
             self.drive_start_to_resumed(outcome.id, ts);
             self.deliver_new_intent(outcome.id, intent, ts);
             return;
         }
 
-        // Fresh-instance path.
-        if let Some(prev) = self.stack.last().copied() {
-            self.drive_to_paused(prev, ts);
+        // Fresh-instance path. Branch on "same foreground task" vs
+        // "dedicated task" (SingleInstance) so the fw.stack mirror stays
+        // in sync with whichever task is foreground.
+        let prev_fg = self.activities.foreground_task();
+        let switching = Some(target_task) != prev_fg;
+        if switching {
+            // SingleInstance only, in MVP. Pause the old foreground top
+            // (it lives in `prev_fg`, which is still mirrored in
+            // fw.stack until we swap below), then bring the new task
+            // forward. AM already pushed outcome.id onto `target_task`'s
+            // stack, so the mirror update below picks up `[outcome.id]`.
+            if let Some(prev_top) = self.stack.last().copied() {
+                self.drive_to_paused(prev_top, ts);
+            }
+            self.switch_foreground_stack(target_task);
+        } else {
+            // Same-task push (Standard / SingleTop-no-match / SingleTask-
+            // not-found): AM pushed onto the foreground task; mirror the
+            // push into fw.stack after pausing the current top.
+            if let Some(prev_top) = self.stack.last().copied() {
+                self.drive_to_paused(prev_top, ts);
+            }
+            self.stack.push(outcome.id);
         }
-        self.stack.push(outcome.id);
+
         // Drive Create first so the activity exists, then hand it any
         // saved-state blob we persisted on a previous run. Only after
         // that do we let it proceed to Start → Resumed. This matches the
@@ -593,11 +644,18 @@ impl Framework {
         //
         // Android parity: if the activity called `finish()` from inside
         // `on_create`, skip restore + Start + Resume and jump straight
-        // to on_destroy via the `Created → Destroyed` shortcut. Then pop
-        // the stack entry and resume whatever we just paused.
+        // to on_destroy via the `Created → Destroyed` shortcut. Then
+        // remove the stack entry and resume whatever we just paused —
+        // possibly reverting the foreground switch if a dedicated task
+        // just emptied out.
         if self.advance_through_create(outcome.id, ts) {
             self.destroy_shortcut(outcome.id, ts);
-            self.stack.pop();
+            self.stack.retain(|x| *x != outcome.id);
+            if switching && self.stack.is_empty() {
+                if let Some(prev) = prev_fg {
+                    self.switch_foreground_stack(prev);
+                }
+            }
             if let Some(new_top) = self.stack.last().copied() {
                 self.drive_to_resumed(new_top, ts);
             }
@@ -634,6 +692,9 @@ impl Framework {
             Ok(o) => o,
             Err(_) => return,
         };
+        let target_task = self.activities.record(outcome.id)
+            .expect("just launched")
+            .task;
         if outcome.reused {
             // Reuse branch — drop the request_code on the floor. The
             // caller's `on_activity_result` simply never fires for this
@@ -642,6 +703,7 @@ impl Framework {
                 self.destroy_with_persist(*popped_id, ts);
                 self.stack.retain(|x| *x != *popped_id);
             }
+            self.switch_to_task_if_needed(target_task, ts);
             self.drive_start_to_resumed(outcome.id, ts);
             self.deliver_new_intent(outcome.id, intent, ts);
             return;
@@ -651,17 +713,31 @@ impl Framework {
         // finish path sees it even if on_create finishes immediately
         // via the Created→Destroyed shortcut.
         self.pending_result_for.insert(outcome.id, (caller_id, request_code));
-        if let Some(prev) = self.stack.last().copied() {
-            self.drive_to_paused(prev, ts);
+        let prev_fg = self.activities.foreground_task();
+        let switching = Some(target_task) != prev_fg;
+        if switching {
+            if let Some(prev_top) = self.stack.last().copied() {
+                self.drive_to_paused(prev_top, ts);
+            }
+            self.switch_foreground_stack(target_task);
+        } else {
+            if let Some(prev_top) = self.stack.last().copied() {
+                self.drive_to_paused(prev_top, ts);
+            }
+            self.stack.push(outcome.id);
         }
-        self.stack.push(outcome.id);
         if self.advance_through_create(outcome.id, ts) {
             self.destroy_shortcut(outcome.id, ts);
             // destroy_shortcut bypasses destroy_with_persist — it fires
             // on_destroy only, no pause/stop, no save-state. But the
             // caller still needs a result, so deliver CANCELED explicitly.
             self.deliver_activity_result_for(outcome.id, ts);
-            self.stack.pop();
+            self.stack.retain(|x| *x != outcome.id);
+            if switching && self.stack.is_empty() {
+                if let Some(prev) = prev_fg {
+                    self.switch_foreground_stack(prev);
+                }
+            }
             if let Some(new_top) = self.stack.last().copied() {
                 self.drive_to_resumed(new_top, ts);
             }
@@ -669,6 +745,48 @@ impl Framework {
         }
         self.try_restore_state(outcome.id, package_id, class);
         self.drive_start_to_resumed(outcome.id, ts);
+    }
+
+    // ── Task switching (Stone 9.6) ───────────────────────────────────────
+
+    /// Public Shell-facing API: bring `task_id` to the foreground,
+    /// pausing the old top and resuming the new task's top. No-op if the
+    /// task is already foreground or doesn't exist. The previous
+    /// foreground is pushed onto `task_history` so `finish_top` can
+    /// return there when the current foreground empties out.
+    pub fn switch_to_task(&mut self, task_id: TaskId, ts: f64) {
+        self.switch_to_task_if_needed(task_id, ts);
+    }
+
+    /// Switch foreground to `target_task` if it isn't already. Drives
+    /// the old top to `Paused` and the new top to `Resumed`; no-op when
+    /// the target is already foreground (or unknown). Safe to call from
+    /// any launch path after the target activity's state has been
+    /// settled by ActivityManager.
+    fn switch_to_task_if_needed(&mut self, target_task: TaskId, ts: f64) {
+        if self.activities.foreground_task() == Some(target_task) { return; }
+        if let Some(prev_top) = self.stack.last().copied() {
+            self.drive_to_paused(prev_top, ts);
+        }
+        self.switch_foreground_stack(target_task);
+        if let Some(new_top) = self.stack.last().copied() {
+            self.drive_start_to_resumed(new_top, ts);
+        }
+    }
+
+    /// Swap the foreground task in ActivityManager and re-sync `fw.stack`
+    /// to the new task's stack. Records the previous foreground in
+    /// `task_history` so a later `finish_top` that empties the new
+    /// foreground can restore it. No lifecycle callbacks fire here —
+    /// callers own pause/resume.
+    fn switch_foreground_stack(&mut self, target_task: TaskId) {
+        if let Some(prev) = self.activities.bring_task_to_front(target_task) {
+            self.task_history.push(prev);
+        }
+        self.stack = self.activities
+            .task_stack(target_task)
+            .map(|s| s.to_vec())
+            .unwrap_or_default();
     }
 
     /// If `callee_id` was launched via `start_activity_for_result`,
@@ -717,8 +835,36 @@ impl Framework {
     /// observes its own state-flip from Paused→Resumed afterwards as
     /// a single coherent sequence.
     fn finish_top(&mut self, ts: f64) {
-        if self.stack.len() <= 1 { return; }
-        let id = self.stack.pop().expect("checked len > 1");
+        let Some(id) = self.stack.last().copied() else { return; };
+
+        // Stone 9.6 — if this finish would empty the foreground task
+        // (e.g. a SingleInstance living alone in its dedicated task
+        // calling `finish()`), revert to the most recently visited
+        // task so the display isn't stranded on an empty stack. When
+        // there's no prior task to return to (which in practice means
+        // we're about to finish the Shell itself from an uncovered
+        // foreground), refuse — same guard as before. The Shell's own
+        // task always has the Shell at position 0, so the same-task
+        // path below handles `len > 1` without ever hitting this
+        // branch.
+        if self.stack.len() == 1 {
+            let Some(prev_task) = self.task_history.pop() else { return; };
+            self.stack.pop();
+            self.destroy_with_persist(id, ts);
+            self.deliver_activity_result_for(id, ts);
+            self.switch_foreground_stack(prev_task);
+            // `switch_foreground_stack` pushed the just-emptied task
+            // back onto history when flipping foreground; drop it so a
+            // future finish in the restored task doesn't bounce back
+            // to the dead one.
+            self.task_history.pop();
+            if let Some(new_top) = self.stack.last().copied() {
+                self.drive_to_resumed(new_top, ts);
+            }
+            return;
+        }
+
+        self.stack.pop();
         self.destroy_with_persist(id, ts);
         self.deliver_activity_result_for(id, ts);
         if let Some(new_top) = self.stack.last().copied() {
@@ -946,6 +1092,7 @@ mod tests {
             storage: None,
             pending_result_for: HashMap::new(),
             pending_result: HashMap::new(),
+            task_history: Vec::new(),
         }
     }
 
@@ -1515,5 +1662,190 @@ mod tests {
             "for-result against a reuse target must NOT deliver a result");
         assert!(fw.pending_result_for.is_empty(),
             "no request_code should persist for the dropped reuse path");
+    }
+
+    // ── Stone 9.6: multiple tasks / foreground switching ────────────────
+
+    /// Build a Framework with a Shell (SingleTop), a Standard "App" that
+    /// will sit on top of the Shell, and a SingleInstance "SI" that
+    /// lives in its own dedicated task. Returns the framework with Shell
+    /// already resumed (fw.stack = [shell_id]). Tests use
+    /// `dispatch_pointer` to trigger the scripted launch of App or SI.
+    fn task_switch_harness(
+        log: Rc<RefCell<Vec<String>>>,
+    ) -> (Framework, ActivityId) {
+        let mut fw = empty_framework();
+        let log_shell = log.clone();
+        fw.activities.register("test.shell", "Main", LaunchMode::SingleTop, move || {
+            Box::new(ScriptedActivity::new("shell", log_shell.clone()))
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.shell".into(),
+            activity_class: "Main".into(),
+            actions: vec![action::MAIN.into()],
+            categories: vec![category::HOME.into()],
+            data_schemes: vec![], mime_types: vec![],
+        });
+        let log_app = log.clone();
+        fw.activities.register("test.app", "Main", LaunchMode::Standard, move || {
+            Box::new(ScriptedActivity::new("app", log_app.clone()))
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.app".into(),
+            activity_class: "Main".into(),
+            actions: vec!["test.OPEN_APP".into()],
+            categories: vec![], data_schemes: vec![], mime_types: vec![],
+        });
+        let log_si = log.clone();
+        fw.activities.register("test.si", "Main", LaunchMode::SingleInstance, move || {
+            Box::new(ScriptedActivity::new("si", log_si.clone()))
+        });
+        fw.intents.register_filter(IntentFilter {
+            package_id: "test.si".into(),
+            activity_class: "Main".into(),
+            actions: vec!["test.OPEN_SI".into()],
+            categories: vec![], data_schemes: vec![], mime_types: vec![],
+        });
+
+        let shell_id = fw.activities.launch("test.shell", "Main").unwrap().id;
+        fw.stack.push(shell_id);
+        fw.drive_to_resumed(shell_id, 0.0);
+        (fw, shell_id)
+    }
+
+    #[test]
+    fn singleinstance_fresh_create_allocates_dedicated_task_and_foregrounds_it() {
+        // Shell → launch SI. SI lands in its own task; Shell's task is
+        // pushed onto the back-stack. Callback sequence must be
+        // shell:pause, si:create, si:start, si:resume (the new task
+        // becomes foreground as part of the launch).
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (mut fw, shell_id) = task_switch_harness(log.clone());
+        log.borrow_mut().clear();
+
+        let si_id = fw.launch_via_intent(Intent::new("test.OPEN_SI"), 1.0);
+
+        let shell_task = fw.activities.record(shell_id).unwrap().task;
+        let si_task = fw.activities.record(si_id).unwrap().task;
+        assert_ne!(shell_task, si_task, "SingleInstance must live in its own task");
+        assert_eq!(fw.activities.foreground_task(), Some(si_task),
+            "foreground must follow the launched SingleInstance");
+        assert_eq!(fw.stack, vec![si_id], "fw.stack mirrors the SI's task");
+        assert_eq!(fw.task_history, vec![shell_task],
+            "shell's task recorded for back-out");
+        assert_eq!(
+            &*log.borrow(),
+            &["shell:pause", "si:create", "si:start", "si:resume"],
+        );
+    }
+
+    #[test]
+    fn singleinstance_reuse_across_tasks_brings_target_task_forward() {
+        // Shell → SI (dedicated task, now foreground) → Shell re-foreground
+        // via `switch_to_task` → re-launch SI via intent. SI must be
+        // reused (not recreated), its task brought forward, and
+        // on_new_intent delivered. Stack of each task is preserved.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (mut fw, shell_id) = task_switch_harness(log.clone());
+        let si_id = fw.launch_via_intent(Intent::new("test.OPEN_SI"), 1.0);
+        let shell_task = fw.activities.record(shell_id).unwrap().task;
+        let si_task = fw.activities.record(si_id).unwrap().task;
+
+        // Shell explicitly asks to switch back to its own task (mimicking
+        // a task-switcher UI). SI goes to Paused, Shell resumes.
+        log.borrow_mut().clear();
+        fw.switch_to_task(shell_task, 2.0);
+        assert_eq!(fw.activities.foreground_task(), Some(shell_task));
+        assert_eq!(fw.stack, vec![shell_id]);
+        assert_eq!(&*log.borrow(), &["si:pause", "shell:resume"]);
+
+        // Re-launching the SI from Shell must reuse the existing instance
+        // (not call on_create again) and bring its task back to front.
+        log.borrow_mut().clear();
+        let reused = fw.launch_via_intent(Intent::new("test.OPEN_SI"), 3.0);
+        assert_eq!(reused, si_id, "SingleInstance reuse must return the same id");
+        assert_eq!(fw.activities.foreground_task(), Some(si_task));
+        assert_eq!(fw.stack, vec![si_id]);
+        // Stack of each task preserved across the swap.
+        assert_eq!(fw.activities.task_stack(shell_task), Some(&[shell_id][..]));
+        assert_eq!(fw.activities.task_stack(si_task), Some(&[si_id][..]));
+        assert_eq!(
+            &*log.borrow(),
+            &["shell:pause", "si:resume", "si:new_intent:test.OPEN_SI"],
+            "reuse must fire on_new_intent, not on_create",
+        );
+    }
+
+    #[test]
+    fn task_swap_preserves_each_tasks_stack() {
+        // Shell → App (stacks in Shell's task) → SI (dedicated task,
+        // foreground) → switch back to Shell's task. Each task's stack
+        // must remain intact across the swap.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (mut fw, shell_id) = task_switch_harness(log.clone());
+        let app_id = fw.launch_via_intent(Intent::new("test.OPEN_APP"), 1.0);
+        let shell_task = fw.activities.record(shell_id).unwrap().task;
+        assert_eq!(fw.activities.task_stack(shell_task), Some(&[shell_id, app_id][..]),
+            "App stacks into Shell's task");
+
+        let si_id = fw.launch_via_intent(Intent::new("test.OPEN_SI"), 2.0);
+        let si_task = fw.activities.record(si_id).unwrap().task;
+        assert_eq!(fw.stack, vec![si_id], "fw.stack follows SI's dedicated task");
+
+        // Bring Shell's task back; App's Paused state is unchanged and
+        // it's still on top of the Shell task's stack.
+        log.borrow_mut().clear();
+        fw.switch_to_task(shell_task, 3.0);
+        assert_eq!(fw.stack, vec![shell_id, app_id],
+            "Shell task's stack [shell, app] preserved");
+        assert_eq!(fw.activities.task_stack(si_task), Some(&[si_id][..]),
+            "SI task's stack also preserved");
+        assert_eq!(fw.activities.state_of(app_id),
+            Some(activity_manager::LifecycleState::Resumed),
+            "App resumes on top of Shell task");
+        assert_eq!(&*log.borrow(), &["si:pause", "app:resume"]);
+    }
+
+    #[test]
+    fn back_from_singleinstance_returns_to_prev_task() {
+        // Shell → SI (dedicated task) → back key. SI's task empties out;
+        // foreground must revert to Shell's task and Shell resumes.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let (mut fw, shell_id) = task_switch_harness(log.clone());
+        let si_id = fw.launch_via_intent(Intent::new("test.OPEN_SI"), 1.0);
+        let shell_task = fw.activities.record(shell_id).unwrap().task;
+
+        log.borrow_mut().clear();
+        let esc = activity::KeyEvent {
+            code: KEY_CODE_BACK,
+            modifiers: 0,
+            phase: activity::KeyPhase::Down,
+        };
+        fw.dispatch_key(esc, 2.0);
+
+        assert_eq!(fw.activities.foreground_task(), Some(shell_task));
+        assert_eq!(fw.stack, vec![shell_id]);
+        assert!(fw.task_history.is_empty(),
+            "task_history must drain as we back out of the dedicated task");
+        assert_eq!(fw.activities.state_of(si_id),
+            Some(activity_manager::LifecycleState::Destroyed),
+            "finish destroys the SingleInstance fully");
+        assert_eq!(
+            &*log.borrow(),
+            &["si:pause", "si:stop", "si:destroy", "shell:resume"],
+        );
+    }
+
+    /// Convenience helper for the 9.6 tests: inject an intent through
+    /// the router + launch path and return the resulting activity id.
+    /// Mirrors what `apply_post` does for a pointer-driven launch,
+    /// without forcing every test to spin up a scripted-pointer
+    /// activity.
+    impl Framework {
+        fn launch_via_intent(&mut self, intent: Intent, ts: f64) -> ActivityId {
+            let (pkg, class) = self.intents.resolve(&intent).expect("intent resolves");
+            self.launch_app(&intent, &pkg, &class, ts);
+            *self.stack.last().expect("stack non-empty after launch")
+        }
     }
 }
