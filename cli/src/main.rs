@@ -11,6 +11,7 @@
 
 mod build;
 mod devserver;
+mod new;
 mod run;
 mod workspace;
 
@@ -52,11 +53,7 @@ fn print_help() {
 }
 
 fn cmd_new(args: &[String]) -> ExitCode {
-    let Some(name) = args.first() else {
-        eprintln!("akiva new: missing <name>"); return ExitCode::from(2);
-    };
-    println!("[stub] would scaffold apps/{name}/ with manifest.toml + src/lib.rs");
-    ExitCode::SUCCESS
+    new::run(args)
 }
 
 fn cmd_build(args: &[String]) -> ExitCode {
