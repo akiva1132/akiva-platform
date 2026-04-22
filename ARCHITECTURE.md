@@ -12,10 +12,13 @@
 ┌───────────────────────────────────────────────────────────────┐
 │                     Akiva User Space                          │
 │   ┌──────────┐  ┌──────────┐  ┌──────────┐                    │
-│   │ App: Calc│  │ App: Note│  │ App: Shell│  (apps = wasm)     │
-│   └─────┬────┘  └─────┬────┘  └────┬─────┘                    │
-│         │             │            │                           │
-│   ═════════════ ABI boundary ═══════════════                   │
+│   │ App: Calc│  │ App: Note│  │ App: Shell│  (apps = wasm,    │
+│   └─────┬────┘  └─────┬────┘  └────┬─────┘   each linking the │
+│         │             │            │         Akiva SDK:       │
+│         │             │            │         widget toolkit + │
+│         │             │            │         AKML inflater +  │
+│         │             │            │         layout engine)   │
+│   ══════════ ABI boundary — paint ops only ═══════════         │
 │         │             │            │                           │
 ├─────────┼─────────────┼────────────┼──────────────────────────┤
 │         ▼             ▼            ▼                           │
@@ -27,8 +30,8 @@
 │  │  WindowManager     │  ResourceManager  │  PermissionMgr │  │
 │  │  shell composition │  qualifiers + look│  enforcement   │  │
 │  ├─────────────────────────────────────────────────────────┤  │
-│  │  LayoutInflater    │  LayoutEngine     │  Compositor    │  │
-│  │  AKML → widget tree│  measure + place  │  draw commands │  │
+│  │  Compositor — accumulates paint ops from the active     │  │
+│  │  activity each frame and flushes the buffer to the HAL. │  │
 │  └─────────────────────────────────────────────────────────┘  │
 ├───────────────────────────────────────────────────────────────┤
 │                    Akiva Kernel (runtime core)                │
@@ -64,9 +67,14 @@
 - **WindowManager** — איזה Activity מוצג מתי, animations של מעברים
 - **ResourceManager** — טעינת resources עם qualifier matching
 - **PermissionMgr** — בודק אם app הכריז על permission ואישור המשתמש
-- **LayoutInflater** — מפרסר AKML ובונה widget tree
-- **LayoutEngine** — מחשב מידות ומיקומים (measure + layout pass)
-- **Compositor** — הופך widget tree אחרי layout ל-draw commands
+- **Compositor** — מחזיק את buffer ה-`FrameCommands` (paint ops) של ה-frame הנוכחי, מקבל אותם מה-activity הפעילה ומעביר ל-HAL
+
+**Akiva SDK** (linked into each app — קוד שרץ *בתוך* wasm האפליקציה, לא בקרנל):
+- **Widget toolkit** (`sdk-rust/src/ui`) — `VStack`/`HStack`/`Frame`/`Text`/`Button`/`Rect`/`Spacer`, alignment, grow, click detection
+- **Layout engine** (`sdk-rust/src/ui/layout.rs`) — measure pass + place pass, בדיוק הפונקציונליות שה-ROADMAP המקורי ייעד ל-framework
+- **AKML inflater** (`sdk-rust/src/akml`) — parser + inflater + bindings (`{name}` substitution); ה-AKML הופך ל-widget tree בתוך ה-app, לא בקרנל
+
+ראה סעיף 2.1 להסבר למה widgets/layout/AKML חיים ב-SDK ולא ב-framework.
 
 **JS HAL** (רק זה לא-Rust):
 - דקיק. ~500 שורות סך הכל. שום לוגיקה של OS.
@@ -74,6 +82,24 @@
   - **Tab HAL** (`tab.js`, בכל tab): canvas + input events + leader election client. שולח/מקבל מ-Worker דרך MessagePort.
   - **Worker HAL** (`worker.js`, רק ב-leader tab): storage (OPFS), wasm loading, מנהל את ה-runtime ואת ה-renderer.
   - ראה סעיף 9 לפרטי ארכיטקטורת ה-Single-Instance.
+
+## 2.1 ABI boundary — למה widgets ו-AKML חיים ב-SDK ולא ב-framework
+
+ה-ROADMAP המקורי ייעד את ה-LayoutInflater, LayoutEngine, והwidget tree ל-framework. בפועל (Phase 3a + 3b) הם הועברו ל-SDK. ההחלטה היא אדריכלית, לא שרירותית:
+
+**מה עובר את ה-ABI בפועל:** `PaintOp` בלבד — `FillRect`, `DrawText`, `PushClip`, וכו'. פורמט binary פשוט ויציב, מוגדר ב-[docs/abi.md §2](docs/abi.md).
+
+**אם ה-widgets היו ב-framework:** ה-ABI היה צריך לשאת widget declarations (hierarchy + attributes), ולהחזיר events חזרה ל-app עם widget ids כ-handles. פרוטוקול דו-כיווני מורכב, ששינוי widget אחד בו הוא breaking change לכל האפליקציות.
+
+**מה ה-SDK-side נותן:**
+- ABI צר ויציב — paint ops בלבד. שינוי widget toolkit לא נוגע ב-framework.
+- אפליקציות מתפתחות כל אחת בקצב שלה; `cargo update` על SDK שומר תאימות binary מלאה.
+- ה-framework הוא בפועל "decoder של paint ops" — פשוט, נבדל, קל לבדוק.
+- Layout logic חי יחד עם ה-widgets שמשתמשים בה — אין split של measure/place בין שני crates.
+
+**המחיר:** כל app נושאת את ה-widget code בתוך ה-wasm שלה (~50KB compressed). ב-post-MVP, אם זה יהפוך לצוואר בקבוק או אם נרצה enforcement של a11y/RTL מרכזי, אפשר יהיה לשקול widget ABI — אבל זה לא מחויב היום.
+
+ראה פירוט מלא של מה ש-`akiva_app_*` ו-`akiva_host_*` exports/imports מחליפים ב-[docs/abi.md](docs/abi.md).
 
 ## 3. Process Model
 
@@ -201,6 +227,8 @@ apps/calculator/
 
 AKML = **Akiva Markup Language**. XML-based. נפרד מהאפליקציה.
 
+> **מיקום פיזי ב-MVP (Phase 3b):** ה-parser + inflater חיים ב-SDK (`sdk-rust/src/akml`), לא ב-framework. כל app שקוראת `akml::inflate_str(&mut ui, LAYOUT)` מריצה את הפארסר בתוך ה-wasm שלה, מייצרת widget tree ב-SDK, ומפיקה paint ops ש-framework מאסף. ה-`set_content_view` + callback-auto-wiring שמופיעים בדוגמה למטה הם ה-API ה-**ארוך-טווח**; ה-MVP מוחלף ב-builder API (`akml::inflate_str_with(&mut ui, LAYOUT, &bindings)`) + dispatch pull-based (`ui.was_triggered("action")`). ראה [docs/akml.md](docs/akml.md) + [sdk-rust/src/akml/mod.rs](sdk-rust/src/akml/mod.rs) למה שעובד בפועל כיום.
+
 ### דוגמה
 
 ```xml
@@ -246,7 +274,7 @@ fn on_clear(&mut self) {
 
 ה-runtime מפרסר את ה-AKML, יוצר widgets, קושר callbacks — הכל דרך attribute binding.
 
-### Inflation flow
+### Inflation flow — ארוך-טווח (עם ResourceManager + callback registry)
 
 ```
 1. App:      ctx.set_content_view("@layout/main")
@@ -258,6 +286,23 @@ fn on_clear(&mut self) {
 7. Framework: onClick="on_clear" נרשם דרך callback registry של האפליקציה
 8. LayoutEngine: measure pass → layout pass
 9. Compositor: draw commands → canvas
+```
+
+### Inflation flow — MVP (Phase 3b; ללא ResourceManager, ללא callback registry)
+
+```
+1. App:     Bindings::new().text("display", ...).color("display_color", ...)
+2. SDK:     akml::inflate_str_with(&mut ui, LAYOUT, &bindings)
+3. SDK:     parser → AST → Ui node ids (כולל רישום id + onClick action)
+4. SDK:     measure pass → place pass (bottom-up / top-down)
+5. SDK:     paint pass emits PaintOps דרך Canvas
+6. Framework: מצטרף ל-FrameCommands, מעביר ל-HAL
+7. Frame הבא: App שואל `ui.was_triggered("equals")` ומנתב לעצמו
+
+השלבים שחסרים לעומת ה-long-term: resource lookup (ה-AKML נצרך
+literals בלבד), qualifier matching (אין layout-land/), callback
+auto-wire (ה-app קוראת was_triggered ידנית), set_content_view
+(ה-app מחזיקה את ה-layout בתור &'static str).
 ```
 
 ## 6. Intent System
@@ -322,13 +367,15 @@ ctx.start_activity(intent);
 
 ### Shell
 
-**Shell הוא אפליקציית Akiva רגילה** עם permission מיוחד:
+**ה-Shell הוא אפליקציית Akiva רגילה** עם permission מיוחד:
 - מופעלת אוטומטית ב-boot
 - מטפלת ב-intent `akiva.intent.category.HOME`
 - מציגה רשימת אפליקציות מותקנות דרך `PackageManager`
 - מציגה task switcher (רשימת activities פתוחות)
 
 **Back button**: WindowManager שולט בזה. לחיצה → ActivityManager.pop().
+
+> **מיקום פיזי ב-MVP (Phase 2b.5):** ה-Shell עדיין לא apps/shell נפרד — הוא built-in ב-[framework/src/shell.rs](framework/src/shell.rs), נרשם ע"י `framework::boot` עם `package_id = "sys.shell"`, launch mode SingleTop, ומודגר תמיד בתחתית ה-task stack. ההוצאה ל-`apps/shell/` כ-wasm package רגיל דוחה ל-post-MVP, אחרי ש-IntentRouter מחובר בפועל (הקוד של IntentRouter קיים ב-[framework/src/intent.rs](framework/src/intent.rs) אבל אף אחד לא קורא לו). עד אז, launch עובד דרך `ActivityManager::launch(package_id, class)` ישירות, ללא intent resolution.
 
 ## 8. Permission Model (Capability-via-Imports)
 
@@ -703,9 +750,9 @@ let backend: Box<dyn RendererBackend> = if gpu_available() {
 11. ActivityManager.launch("com.akiva.shell/.HomeActivity", display=1)
     a. WasmLoader.load(shell.wasm) → new instance
     b. קורא akiva_on_create
-    c. Shell קורא ctx.set_content_view("@layout/home")
-    d. LayoutInflater מפרסר home.akml
-    e. LayoutEngine + Compositor → draw commands
+    c. ה-app קוראת `akml::inflate_str_with(&mut ui, LAYOUT, &bindings)` (SDK-side)
+    d. SDK: parser → AST → measure → place → paint ops על `Canvas`
+    e. Canvas כותב את ה-ops אל buffer שה-framework מעביר כ-`FrameCommands`
     f. Compositor שולח draw commands ל-display #1 דרך MessagePort
     g. Tab HAL מצייר על canvas
 12. משתמש לוחץ על icon של calculator
@@ -724,7 +771,7 @@ let backend: Box<dyn RendererBackend> = if gpu_available() {
 | `PackageManagerService` | PackageManager |
 | `WindowManagerService` | WindowManager |
 | `Resources` / `AssetManager` | ResourceManager |
-| `LayoutInflater` | LayoutInflater |
+| `LayoutInflater` | AKML inflater (ב-SDK, לא ב-framework — ראה §2.1) |
 | `Intent` + `IntentFilter` | Intent + IntentRouter |
 | XML layouts | AKML |
 | XML themes/styles | AKML styles |
