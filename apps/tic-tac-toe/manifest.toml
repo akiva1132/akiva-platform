@@ -25,7 +25,9 @@ actions = ["akiva.intent.action.MAIN"]
 categories = ["akiva.intent.category.LAUNCHER"]
 
 [permissions]
-required = []
+# STORAGE_SANDBOX: board state persists across destroy-restore via
+# on_save_state / on_restore_state. Auto-granted at install time.
+required = ["akiva.permission.STORAGE_SANDBOX"]
 optional = []
 
 [display]

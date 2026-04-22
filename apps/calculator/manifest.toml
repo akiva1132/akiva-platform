@@ -25,7 +25,10 @@ actions = ["akiva.intent.action.MAIN"]
 categories = ["akiva.intent.category.LAUNCHER"]
 
 [permissions]
-required = []
+# STORAGE_SANDBOX: calculator persists display/accumulator state across
+# destroy-restore via on_save_state / on_restore_state. Auto-granted at
+# install time (ProtectionLevel::Normal in v0.2).
+required = ["akiva.permission.STORAGE_SANDBOX"]
 optional = []
 
 [display]

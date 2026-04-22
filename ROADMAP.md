@@ -561,25 +561,26 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 - ⏭️ **10.3b — JS-side enforcement (instantiation filter)** — worker.js יצטרך לשאול את ה-kernel לקבל את רשימת ה-imports המותרים per-package, ולמחוק מה-`env` object כל מה שלא ברשימה לפני `WebAssembly.instantiate`. דורש (א) extern חדש בסגנון `hal_host_imports_for_package` עם 2-phase buffer, ו-(ב) או שה-SDK יצטרך לתמוך ב-conditional imports ברמת ה-build (כרגע ה-`akiva_app!` macro מייצא את כל ה-externs הלא-תנאי, אז app בלי `LAUNCH_ANY_APP` שמקמפל עם ה-macro יגרום ל-LinkError — שזה בעצם ההתנהגות הרצויה). נדחה לעבודת SDK build-tooling עתידית.
 
 ### 10.4 תיעוד ABI לפי capability
-- עדכון [`docs/abi.md`](docs/abi.md) — סעיף חדש "Imports by Capability" שמצטט את ה-mapping
-- כל import מסומן עם ה-capability שמקנה אותו (או `auto` אם always-granted)
+- ✅ **סעיף 2.3.1 חדש ב-[`docs/abi.md`](docs/abi.md)** — "Imports by Capability" עם טבלת mapping מלאה (auto set + כל אחת מהשש permissions). ה-slots הlead-reserved (STORAGE_SANDBOX / QUERY_PACKAGES / NOTIFICATIONS / NETWORK / CAMERA) מסומנים כ-"reserved — post-MVP" כך שמפתח יודע שהם ב-mapping אבל עדיין לא מחוברים. עיקרון האכיפה מוסבר: "link error, not runtime error."
 
 ### 10.5 Uninstall cleanup
-- `PackageManager::uninstall` מוחק גם את `sys/permissions/{id}`
-- `PermissionController` מעדכן את in-memory state
+- ✅ **נחת כחלק מ-Stone 10.2** — `PackageManager::uninstall(storage, &mut PermissionController, id)` מוחק את `sys/permissions/{id}` ועושה revoke לכל ה-grants של ה-package מה-controller. Test: `uninstall_deletes_permissions_file_and_revokes_grants`.
 
-### 10.6 calculator + tic-tac-toe מצהירות permissions
-- calculator: `[permissions] required = ["akiva.permission.STORAGE_SANDBOX"]` (לשמירת saved_state — auto-granted)
-- tic-tac-toe: אותו דבר
-- Shell: `["akiva.permission.QUERY_ALL_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"]`
-- hello: אין required permissions — מוודא ש-import map ריק מ-optionals פועל
+### 10.6 calculator + tic-tac-toe + Shell מצהירים permissions
+- ✅ **calculator** — `[permissions] required = ["akiva.permission.STORAGE_SANDBOX"]` (שמירת display/accumulator state דרך `on_save_state`/`on_restore_state`).
+- ✅ **tic-tac-toe** — אותו `STORAGE_SANDBOX` (שמירת board state).
+- ✅ **Shell** — `QUERY_PACKAGES` + `LAUNCH_ANY_APP` grants נרשמים ישירות ב-`framework::boot` (Shell built-in, לא עובר דרך PackageManager::install). קוד: `fw.permissions.grant(shell::PACKAGE_ID, ...)` אחרי `declare_mvp_permissions`.
+- ✅ **hello** — נשאר בלי `required`. משמש כ-tripwire ל-empty-permissions path (install_with_no_permissions_writes_empty_blob test ב-Stone 10.2).
 
 **Exit criteria:**
-- [ ] אפליקציה שמצהירה `STORAGE_SANDBOX` מקבלת גישה; אפליקציה בלי ההצהרה — הקריאה `storage.put` לא קיימת ב-imports
-- [ ] Shell מצהירה ומקבלת `QUERY_ALL_PACKAGES` ו-`LAUNCH_ANY_APP`; calculator שתנסה לקרוא `query_packages` — fails instantiation
-- [ ] grants persist בין boots — התקנה → reboot → grants עדיין שם
-- [ ] uninstall מוחק גם את ה-grants (unit test)
-- [ ] `docs/abi.md` מסמל capability פר import
+- [x] אפליקציה שמצהירה `STORAGE_SANDBOX` מקבלת grant ב-install-time (test: `install_grants_required_permissions`). אכיפת "import map ריק מ-storage" — Stone 10.3b.
+- [x] Shell מקבלת `QUERY_PACKAGES` ו-`LAUNCH_ANY_APP` ב-boot; mapping מוכיח ש-`akiva_host_start_activity` ב-import set של Shell (test: `launch_any_app_adds_start_activity_imports`). אכיפת "calculator בלי LAUNCH_ANY_APP → LinkError" — Stone 10.3b.
+- [x] grants persist בין boots — `grants_rehydrate_from_storage_on_boot` test.
+- [x] uninstall מוחק גם את ה-grants — `uninstall_deletes_permissions_file_and_revokes_grants` test.
+- [x] `docs/abi.md` מסמל capability פר import — §2.3.1.
+- [ ] JS-side instantiation filter (Stone 10.3b) — נדחה; דורש kernel-to-worker bridge + SDK build-tooling.
+
+**סטטוס:** Phase 10 MVP core סגור. 10 tests חדשים (5 permissions + 6 install/grant + הסרה -1 old). Stone 10.3b (JS enforcement) ממתין לעבודת SDK build tooling.
 
 **הערכת זמן:** 2-3 שבועות.
 

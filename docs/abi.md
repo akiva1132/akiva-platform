@@ -198,6 +198,24 @@ extern "C" fn akiva_app_activity_result(
 
 ב-v1 כל ה-imports יתמפו ל-interfaces המובנים של ה-world `akiva:app/host`: `log`, `activity-api`, `storage`, `intent`, וכו'. נקודת ה-mapping: `akiva_host_log` ⇔ `log.log(level, msg)`, `akiva_host_text_width` ⇔ `text.measure-width(text, size)`.
 
+### 2.3.1 Imports by Capability (Stone 10.3)
+
+האם ה-host מספק לאפליקציה import ספציפי נקבע לפי ה-permissions ש-ה-`PermissionController` הקצה לה ב-install time. ה-Rust-side mapping ב-[`framework/src/permissions.rs`](../framework/src/permissions.rs) הוא ה-source of truth; worker.js שואל את ה-kernel (ב-Stone 10.3b, עדיין לא ב-wiring) ומסנן את ה-`env` object לפני `WebAssembly.instantiate`. אפליקציה שמנסה לייבא פונקציה לא מורשה — `LinkError` ב-instantiation, לא runtime panic.
+
+| Capability                          | Host imports mounted                                  |
+|-------------------------------------|-------------------------------------------------------|
+| `auto` (ללא הצהרה)                  | `akiva_host_log`, `akiva_host_text_width`, `akiva_host_resource_color`, `akiva_host_resource_string`, `akiva_host_resource_has_color`, `akiva_host_resource_has_string`, `akiva_host_finish`, `akiva_host_set_result` |
+| `akiva.permission.LAUNCH_ANY_APP`   | `akiva_host_start_activity`, `akiva_host_start_activity_for_result` |
+| `akiva.permission.STORAGE_SANDBOX`  | *(reserved — `akiva_host_storage_*` לא נחת ב-HAL של ה-app עדיין; framework-side save/restore עובר דרך `hal_app_save_state` / `hal_app_restore_state` ב-§2.4)* |
+| `akiva.permission.QUERY_PACKAGES`   | *(reserved — `akiva_host_query_packages` post-MVP)* |
+| `akiva.permission.NOTIFICATIONS`    | *(reserved — post-MVP)* |
+| `akiva.permission.NETWORK`          | *(reserved — post-MVP)* |
+| `akiva.permission.CAMERA`           | *(reserved — post-MVP)* |
+
+ה-auto set כולל את `akiva_host_set_result` למרות שהוא "app writing to host" — כי כל activity שקריאו לה-`start_activity_for_result` חייבת יכולת להחזיר תוצאה, גם אם ה-caller ההוא משייך לאפליקציה אחרת. הגדרת ה-mapping מפורשת ב-Rust: `AUTO_IMPORTS` ו-`imports_for_capability` (ראה [permissions.rs](../framework/src/permissions.rs)).
+
+**עיקרון האכיפה:** "link error, not runtime error." ה-permission check לא קורה בזמן call-site; הוא קורה פעם אחת ב-instantiation. אם ה-host לא סיפק את ה-import, ה-wasm module לא הצליח בכלל להיטען — ה-app לא יכול להגיע ל-code path שמשתמש ב-permission שאין לו.
+
 ### 2.4 Imports (kernel → host) — `hal_app_*`
 
 אלה imports שה-kernel wasm מבקש; ה-host (worker.js) מספק. מוגדרים ב-[kernel/src/host.rs](../kernel/src/host.rs):

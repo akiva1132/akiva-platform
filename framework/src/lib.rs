@@ -109,6 +109,17 @@ pub fn boot(
     // so the order matters: declare first, then rehydrate packages.
     permissions::declare_mvp_permissions(&mut fw.permissions);
 
+    // Stone 10.6 — the Shell is built in (not installed via
+    // PackageManager) so it never goes through the install-time grant
+    // path. Grant it directly here: QUERY_PACKAGES so the app-picker
+    // can enumerate installed apps, and LAUNCH_ANY_APP so tapping a
+    // tile can fire an intent into any package. Without these two
+    // grants the Shell would instantiate without `akiva_host_start_activity`
+    // once 10.3b enforcement lands — the home screen would be a
+    // glass cage.
+    fw.permissions.grant(shell::PACKAGE_ID, permissions::QUERY_PACKAGES);
+    fw.permissions.grant(shell::PACKAGE_ID, permissions::LAUNCH_ANY_APP);
+
     // Rehydrate installed packages from storage. A corrupt manifest is
     // reported but not fatal — the Shell and healthy apps stay usable.
     let mut package_errors: Vec<(String, String)> = Vec::new();
