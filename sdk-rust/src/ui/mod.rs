@@ -336,6 +336,17 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         node::FrameBuilder::new(self, children.to_vec())
     }
 
+    /// Grid: `cols × rows` equal-sized cells laid out in row-major order.
+    /// Children past `cols * rows` are silently ignored, so AKML can
+    /// over-declare rows and let empty trailing cells fall out naturally.
+    /// Both `cols` and `rows` are clamped to ≥ 1 to avoid divide-by-zero
+    /// in layout.
+    pub fn grid(&mut self, children: &[NodeId], cols: u32, rows: u32)
+        -> node::GridBuilder<'_, 's, 'c, 'b>
+    {
+        node::GridBuilder::new(self, children.to_vec(), cols, rows)
+    }
+
     // ── Present ──────────────────────────────────────────────────────
 
     /// Measure, lay out and paint the tree rooted at `root`. Consumes

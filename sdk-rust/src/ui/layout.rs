@@ -118,6 +118,39 @@ fn measure_node(
             }
             (max_w + padding.1 + padding.3, max_h + padding.0 + padding.2)
         }
+        Node::Grid { children, cols, rows, gap_x, gap_y, padding } => {
+            // Intrinsic = `cols × max_child_w + (cols-1) × gap_x` for
+            // width, mirror for height. Cells are uniform so the biggest
+            // child dictates them all; at place() time the cells get
+            // whatever the slot hands over and stretch accordingly.
+            //
+            // Clamp cols/rows to ≥ 1 here too (mirrors `place`) so a
+            // `<Grid cols="0">` doesn't divide by zero and skip all
+            // measurement — which would trip the `measured before
+            // layout` assertion in `place`.
+            let cols_i = (*cols).max(1);
+            let rows_i = (*rows).max(1);
+            let cols_f = cols_i as f32;
+            let rows_f = rows_i as f32;
+            let cell_avail_w = ((avail.0 - padding.1 - padding.3
+                - (cols_f - 1.0).max(0.0) * gap_x) / cols_f).max(0.0);
+            let cell_avail_h = ((avail.1 - padding.0 - padding.2
+                - (rows_f - 1.0).max(0.0) * gap_y) / rows_f).max(0.0);
+            let cell_avail = (cell_avail_w, cell_avail_h);
+            let capacity = (cols_i as usize) * (rows_i as usize);
+            let mut max_w: f32 = 0.0;
+            let mut max_h: f32 = 0.0;
+            for c in children.iter().take(capacity) {
+                let (cw, ch) = measure_node(nodes, *c, cell_avail, text_width, out);
+                if cw > max_w { max_w = cw; }
+                if ch > max_h { max_h = ch; }
+            }
+            let w = max_w * cols_f + (cols_f - 1.0).max(0.0) * gap_x
+                + padding.1 + padding.3;
+            let h = max_h * rows_f + (rows_f - 1.0).max(0.0) * gap_y
+                + padding.0 + padding.2;
+            (w, h)
+        }
     };
     out.insert(id, size);
     size
@@ -173,6 +206,16 @@ fn place(
             let any_grow = children.iter().any(|c| attrs[*c].grow > 0.0);
             if any_grow { w = slot.w; h = slot.h; }
         }
+        Node::Grid { .. } => {
+            // Grid always fills the slot on both axes when there is one
+            // to fill. Cells derive from `(inner - gaps) / (cols, rows)`,
+            // so the grid is only useful when it knows how big it is.
+            // Intrinsic sizing still works for root-less tests via the
+            // `mw`/`mh` path above, but in real trees the parent stack /
+            // viewport always hands over a slot, and the grid takes it.
+            w = slot.w;
+            h = slot.h;
+        }
         _ => {}
     }
     let rect = Rect { x: slot.x, y: slot.y, w, h };
@@ -220,6 +263,34 @@ fn place(
                 h: (rect.h - padding.0 - padding.2).max(0.0),
             };
             for c in children {
+                place(nodes, attrs, *c, child_slot, /*stretch_w=*/ true, /*stretch_h=*/ true, sizes, out);
+            }
+        }
+        Node::Grid { children, cols, rows, gap_x, gap_y, padding } => {
+            // Inner rect after padding; cells are equal-sized pieces of
+            // it. Each child goes in its row-major slot, stretched to
+            // fill that cell exactly — mirrors what the buttons on a
+            // calculator keypad want 100% of the time.
+            let inner_x = rect.x + padding.3;
+            let inner_y = rect.y + padding.0;
+            let inner_w = (rect.w - padding.1 - padding.3).max(0.0);
+            let inner_h = (rect.h - padding.0 - padding.2).max(0.0);
+            let cols_i = (*cols).max(1);
+            let rows_i = (*rows).max(1);
+            let cols_f = cols_i as f32;
+            let rows_f = rows_i as f32;
+            let cell_w = ((inner_w - (cols_f - 1.0).max(0.0) * gap_x) / cols_f).max(0.0);
+            let cell_h = ((inner_h - (rows_f - 1.0).max(0.0) * gap_y) / rows_f).max(0.0);
+            let capacity = (cols_i as usize) * (rows_i as usize);
+            for (i, c) in children.iter().take(capacity).enumerate() {
+                let col = (i as u32) % cols_i;
+                let row = (i as u32) / cols_i;
+                let child_slot = Rect {
+                    x: inner_x + (col as f32) * (cell_w + gap_x),
+                    y: inner_y + (row as f32) * (cell_h + gap_y),
+                    w: cell_w,
+                    h: cell_h,
+                };
                 place(nodes, attrs, *c, child_slot, /*stretch_w=*/ true, /*stretch_h=*/ true, sizes, out);
             }
         }
@@ -962,6 +1033,168 @@ mod tests {
         assert!(approx(rects[&1].w, 200.0));
         // Frame's child in turn gets the full inner width.
         assert!(approx(rects[&0].w, 200.0));
+    }
+
+    // ── Grid ─────────────────────────────────────────────────────────
+    //
+    // Grid pins down a uniform-cell row-major layout. The slot-fill rule
+    // is "always", so these tests all hand over concrete slot sizes and
+    // assert that cells divide them evenly (minus gaps + padding).
+
+    fn grid(
+        children: Vec<NodeId>, cols: u32, rows: u32, gap: f32,
+        padding: (f32, f32, f32, f32),
+    ) -> Node {
+        Node::Grid { children, cols, rows, gap_x: gap, gap_y: gap, padding }
+    }
+
+    #[test]
+    fn grid_fills_slot_on_both_axes() {
+        // Every grid takes its slot on both axes regardless of intrinsic
+        // child sizes — cells are slot-derived.
+        let nodes = vec![
+            rect(0.0, 0.0), rect(0.0, 0.0), rect(0.0, 0.0), rect(0.0, 0.0),
+            grid(vec![0, 1, 2, 3], 2, 2, 0.0, (0.0, 0.0, 0.0, 0.0)),
+        ];
+        let sizes = measure(&nodes, 4, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 4, Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 }, &sizes, &mut rects);
+        assert!(approx(rects[&4].w, 200.0) && approx(rects[&4].h, 100.0));
+    }
+
+    #[test]
+    fn grid_cells_are_equal_size_and_row_major() {
+        // 2×2 grid in 200×100: each cell is 100×50, children in order
+        // (0,0), (1,0), (0,1), (1,1) — i.e. left-to-right, top-to-bottom.
+        let nodes = vec![
+            rect(0.0, 0.0), rect(0.0, 0.0), rect(0.0, 0.0), rect(0.0, 0.0),
+            grid(vec![0, 1, 2, 3], 2, 2, 0.0, (0.0, 0.0, 0.0, 0.0)),
+        ];
+        let sizes = measure(&nodes, 4, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 4, Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 }, &sizes, &mut rects);
+        // (col 0, row 0)
+        assert!(approx(rects[&0].x, 0.0) && approx(rects[&0].y, 0.0));
+        assert!(approx(rects[&0].w, 100.0) && approx(rects[&0].h, 50.0));
+        // (col 1, row 0)
+        assert!(approx(rects[&1].x, 100.0) && approx(rects[&1].y, 0.0));
+        // (col 0, row 1)
+        assert!(approx(rects[&2].x, 0.0) && approx(rects[&2].y, 50.0));
+        // (col 1, row 1)
+        assert!(approx(rects[&3].x, 100.0) && approx(rects[&3].y, 50.0));
+    }
+
+    #[test]
+    fn grid_gap_subtracts_from_cell_dimensions() {
+        // 2×2 grid, gap 10, slot 210×110: cell = (210-10)/2 × (110-10)/2 = 100×50.
+        let nodes = vec![
+            rect(0.0, 0.0), rect(0.0, 0.0), rect(0.0, 0.0), rect(0.0, 0.0),
+            grid(vec![0, 1, 2, 3], 2, 2, 10.0, (0.0, 0.0, 0.0, 0.0)),
+        ];
+        let sizes = measure(&nodes, 4, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 4, Rect { x: 0.0, y: 0.0, w: 210.0, h: 110.0 }, &sizes, &mut rects);
+        assert!(approx(rects[&0].w, 100.0) && approx(rects[&0].h, 50.0));
+        // Second column starts after first cell + gap: x = 100 + 10.
+        assert!(approx(rects[&1].x, 110.0));
+        // Second row y: 50 + 10.
+        assert!(approx(rects[&2].y, 60.0));
+    }
+
+    #[test]
+    fn grid_padding_shrinks_the_cell_area() {
+        // 2×1 grid, padding (4,5,6,7): inner = 200-5-7 × 50-4-6 = 188 × 40.
+        // cell = 94 × 40.
+        let nodes = vec![
+            rect(0.0, 0.0), rect(0.0, 0.0),
+            grid(vec![0, 1], 2, 1, 0.0, (4.0, 5.0, 6.0, 7.0)),
+        ];
+        let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 2, Rect { x: 0.0, y: 0.0, w: 200.0, h: 50.0 }, &sizes, &mut rects);
+        // First child: offset by left/top padding; cell is 94×40.
+        assert!(approx(rects[&0].x, 7.0));
+        assert!(approx(rects[&0].y, 4.0));
+        assert!(approx(rects[&0].w, 94.0) && approx(rects[&0].h, 40.0));
+        // Second child shifts by cell width (no gap).
+        assert!(approx(rects[&1].x, 7.0 + 94.0));
+    }
+
+    #[test]
+    fn grid_extra_children_past_capacity_are_ignored() {
+        // 2×1 capacity = 2. Third child isn't painted and doesn't
+        // corrupt the first two's cells.
+        let nodes = vec![
+            rect(0.0, 0.0), rect(0.0, 0.0), rect(0.0, 0.0),
+            grid(vec![0, 1, 2], 2, 1, 0.0, (0.0, 0.0, 0.0, 0.0)),
+        ];
+        let sizes = measure(&nodes, 3, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 3, Rect { x: 0.0, y: 0.0, w: 200.0, h: 50.0 }, &sizes, &mut rects);
+        assert!(rects.contains_key(&0) && rects.contains_key(&1));
+        // The extra child shouldn't have a rect placed at all.
+        assert!(!rects.contains_key(&2));
+    }
+
+    #[test]
+    fn grid_with_fewer_children_than_capacity_leaves_trailing_cells_empty() {
+        // 4 cells, only 3 children: cells 0..2 populate; cell 3 stays empty.
+        // Nothing crashes; paint just skips the missing slot.
+        let nodes = vec![
+            rect(0.0, 0.0), rect(0.0, 0.0), rect(0.0, 0.0),
+            grid(vec![0, 1, 2], 2, 2, 0.0, (0.0, 0.0, 0.0, 0.0)),
+        ];
+        let sizes = measure(&nodes, 3, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 3, Rect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 }, &sizes, &mut rects);
+        // First three cells laid out normally.
+        assert!(approx(rects[&0].x, 0.0)   && approx(rects[&0].y, 0.0));
+        assert!(approx(rects[&1].x, 100.0) && approx(rects[&1].y, 0.0));
+        assert!(approx(rects[&2].x, 0.0)   && approx(rects[&2].y, 50.0));
+    }
+
+    #[test]
+    fn grid_zero_cols_is_clamped_to_one() {
+        // Degenerate input — shouldn't divide-by-zero. Cols clamp to 1.
+        let nodes = vec![
+            rect(0.0, 0.0),
+            grid(vec![0], 0, 1, 0.0, (0.0, 0.0, 0.0, 0.0)),
+        ];
+        let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout_default(&nodes, 1, Rect { x: 0.0, y: 0.0, w: 100.0, h: 50.0 }, &sizes, &mut rects);
+        // Single cell = whole slot.
+        assert!(approx(rects[&0].w, 100.0) && approx(rects[&0].h, 50.0));
+    }
+
+    #[test]
+    fn grid_buttons_register_hit_rects_at_their_cell() {
+        // End-to-end through the public `Ui` API: a Grid of buttons
+        // should latch hit rects at the same cell rects layout computed.
+        use crate::activity::{Context, Metrics};
+        use crate::canvas::Canvas;
+        use super::super::{Ui, UiState};
+        let mut state = UiState::default();
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let ctx = Context {
+            metrics: Metrics { width_px: 400, height_px: 200, density: 1.0 },
+            timestamp_ms: 0.0, pointer: None, class: "t",
+        };
+        let a;
+        let b;
+        {
+            let mut ui = Ui::new(&mut state, &ctx, &mut canvas);
+            let b0 = ui.button("a", "A");
+            let b1 = ui.button("b", "B");
+            let root = ui.grid(&[b0, b1], 2, 1).build();
+            ui.present(root);
+            a = *state.hit_rects.get("a").expect("a");
+            b = *state.hit_rects.get("b").expect("b");
+        }
+        // Two cells in 400×200: each 200×200. B is to the right of A.
+        assert!((a.w - 200.0).abs() < 0.01);
+        assert!(b.x >= 199.0);  // allow sub-pixel drift
     }
 
     #[test]

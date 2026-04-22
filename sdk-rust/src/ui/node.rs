@@ -53,6 +53,28 @@ pub enum Node {
         children: Vec<NodeId>,
         padding: (f32, f32, f32, f32),
     },
+    /// Fixed-dimension grid. `cols × rows` cells laid out in row-major
+    /// order; every cell is the same size. Extra children past
+    /// `cols * rows` are ignored (not painted, not laid out) — AKML can
+    /// over-declare rows and have empty trailing cells fall out.
+    ///
+    /// Semantics match Android's GridLayout more than CSS Grid: no
+    /// auto-wrap, no span, no per-track sizing. If an app needs those,
+    /// nest stacks or a second Grid. The minimal API is the sweet spot
+    /// for keypads, toolbars, and icon trays — the cases that make Grid
+    /// worth its existence in the first place.
+    Grid {
+        children: Vec<NodeId>,
+        cols: u32,
+        rows: u32,
+        /// Horizontal spacing between columns (between-cell only — not
+        /// before column 0 or after the last one; use `padding` for edge
+        /// insets).
+        gap_x: f32,
+        /// Vertical spacing between rows.
+        gap_y: f32,
+        padding: (f32, f32, f32, f32),
+    },
     Button {
         id: String,
         /// Semantic action fired on click, separate from `id`. When set,
@@ -168,6 +190,55 @@ impl<'u, 's, 'c, 'b> FrameBuilder<'u, 's, 'c, 'b> {
     pub fn build(self) -> NodeId {
         let id = self.ui.push(Node::Frame {
             children: self.children,
+            padding: self.padding,
+        });
+        self.ui.set_grow(id, self.grow);
+        id
+    }
+}
+
+pub struct GridBuilder<'u, 's, 'c, 'b> {
+    ui: &'u mut Ui<'s, 'c, 'b>,
+    children: Vec<NodeId>,
+    cols: u32,
+    rows: u32,
+    gap_x: f32,
+    gap_y: f32,
+    padding: (f32, f32, f32, f32),
+    grow: f32,
+}
+
+impl<'u, 's, 'c, 'b> GridBuilder<'u, 's, 'c, 'b> {
+    pub(crate) fn new(
+        ui: &'u mut Ui<'s, 'c, 'b>, children: Vec<NodeId>, cols: u32, rows: u32,
+    ) -> Self {
+        Self {
+            ui, children, cols: cols.max(1), rows: rows.max(1),
+            gap_x: 0.0, gap_y: 0.0,
+            padding: (0.0, 0.0, 0.0, 0.0), grow: 0.0,
+        }
+    }
+    /// Uniform gap applied on both axes. Shorthand for the common case
+    /// where column and row spacing are equal.
+    pub fn gap(mut self, gap: f32) -> Self {
+        self.gap_x = gap; self.gap_y = gap; self
+    }
+    pub fn gap_xy(mut self, gap_x: f32, gap_y: f32) -> Self {
+        self.gap_x = gap_x; self.gap_y = gap_y; self
+    }
+    pub fn padding(mut self, p: f32) -> Self {
+        self.padding = (p, p, p, p); self
+    }
+    pub fn padding_trbl(mut self, top: f32, right: f32, bottom: f32, left: f32) -> Self {
+        self.padding = (top, right, bottom, left); self
+    }
+    /// Main-axis grow factor for when this grid sits inside a stack.
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
+    pub fn build(self) -> NodeId {
+        let id = self.ui.push(Node::Grid {
+            children: self.children,
+            cols: self.cols, rows: self.rows,
+            gap_x: self.gap_x, gap_y: self.gap_y,
             padding: self.padding,
         });
         self.ui.set_grow(id, self.grow);
