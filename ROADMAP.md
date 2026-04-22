@@ -455,7 +455,7 @@
 - ✅ `res/values/colors.toml` — כל ה-palette הועבר (commit `9c3ecd6`)
 - `res/values/strings.toml` — נדחה; אין כרגע טקסט סטטי UI משמעותי במחשבון (הלייבלים של הכפתורים הם glyphs של תו אחד)
 - `res/layout-land/main.akml` — תלוי ב-qualifier matching (post-MVP)
-- `on_save_state` / restore — דורש SDK API + kernel side
+- ✅ `on_save_state` / restore (אפריל 2026, 5 stones, commits `53e9e0d` → `3973c26`) — SavedState wire codec ב-SDK (TLV, max 64 KiB), שני exports חדשים `akiva_app_save_state` / `akiva_app_restore_state`, שני imports kernel↔host חדשים (`hal_app_save_state`, `hal_app_restore_state`), `WasmHost` trait בframework קיבל save/restore defaults ו-WasmActivity מעביר אותם דרך ה-host. Framework מחזיק `Box<dyn Storage>` post-boot ומתמיד ל-`packages/{id}/activities/{class}/saved_state.bin` בקצה Paused→Stopped, ומשחזר בין Create ל-Start. Calculator משמר display/acc/pending/just_computed/error ומדפיס את מצב ה-restore ב-log. +10 unit tests (8 SDK codec, 2 framework mock host).
 - `values-he` — **מוחרג מ-MVP** (user preference: MVP-first, skip i18n)
 
 **מ-Phase 7 (CLI):**
