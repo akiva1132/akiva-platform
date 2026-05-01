@@ -385,6 +385,19 @@ akiva_host_io_poll(
 
 ה-app worker (ב-`app_worker_shell.js`) מקשיב לpostMessage `{type: "future_ready", id}`. כשמגיע, executor (embassy) wake's את הtask המבטל מהtoken המקושר ל-id, ובdraft הback ל-`akiva_host_io_poll` של ה-future.
 
+**Cross-worker protocol (Stone 11.4c).** ה-`io_start` / `io_poll` / `fire` רצים בתוך app-worker, אבל חלק מה-op_kinds דורשים שירות מ-kernel-worker (QUERY_PACKAGES, START_ACTIVITY, STORAGE_SET, …). הזרימה:
+
+1. **App-worker, on `io_start`:** מקצה `future_id` מ-local registry (counter פרטי ל-worker); רושם entry `{status: PENDING, packageId, payload: null}`; מחליט אם ה-op_kind מוגש locally (TEXT_WIDTH דרך OffscreenCanvas פרטי) או דורש kernel-worker. אם kernel — posts `{type: "host_op", future_id, op_kind, args}` ל-kernel-worker. מחזיר `future_id` ל-wasm מיד.
+2. **Kernel-worker:** מעבד את ה-op (consults grants, runs handler), posts `{type: "host_op_done", future_id, status, payload}` חזרה לאותו app-worker. ה-payload מועבר כ-Transferable Uint8Array.
+3. **App-worker, on `host_op_done`:** מעדכן `_futures[future_id] = {status, payload}`; ה-embassy executor רואה את השינוי ב-poll הבא של ה-task המבטל.
+4. **App-worker, on `io_poll(future_id, out_ptr, out_cap)`:** קורא מה-local `_futures`. ה-API קונסיסטנטי עם 11.3 — זהה two-phase contract.
+
+**`fire` ops** עוברים אותה זרימה אבל ללא future_id (ה-app-worker שולח, לא מחכה לתשובה). LOG מטופל locally ב-app-worker (כותב ל-console עם prefix `[worker:<package>]`); FINISH/START_ACTIVITY/SET_RESULT מועברים ל-kernel-worker שמעדכן את `_pendingFinish` / `_pendingIntent` / `_pendingSetResult` של ה-handle ב-AppRegistry של ה-kernel.
+
+**Lifecycle direction (kernel → app)** מקבילה: kernel-worker posts `{type: "dispatch", dispatch_id, cmd_kind, payload}` ל-app-worker. app-worker בvokes `akiva_app_dispatch(cmd_kind, ptr, len)` (Stone 11.4b — single export), מקבל future_id wasm-side, polls עד resolved (ה-async fn יכול ל-await על host calls באמצע), ואז posts `{type: "dispatch_done", dispatch_id, result_bytes}` חזרה. kernel-worker מעדכן את `WasmHost::poll_future(dispatch_id)`.
+
+**`dispatch_id` vs `future_id`.** שני מספרים נפרדים: `dispatch_id` הוא ה-tracking של kernel→app (kernel-worker מקצה, app-worker עונה); `future_id` הוא ה-tracking של app→host (app-worker מקצה, kernel-worker עונה). אין collision כי הם רצים ב-namespaces נפרדים על ערוצים מנוגדים.
+
 ### 6.2 fire-and-forget calls
 
 לcalls בלי result (`log_info!`, `start_activity`, `set_result`):
@@ -435,13 +448,13 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<PackageEntry>> { ... }
 
 ```
 framework/src/wire/
-├── op_kinds.rs        // u32 constants per op
-├── log.rs            // op encoder/decoder
-├── start_activity.rs
-├── storage.rs
-├── pkgs.rs            // already exists
-└── lifecycle.rs
+├── mod.rs             // re-exports
+├── op_kinds.rs        // u32 constants per op + cross-crate parity test
+├── pkgs.rs            // QUERY_PACKAGES encoder/decoder
+└── (per-op modules added as new ops land — log/start_activity/storage encode inline today)
 ```
+
+**מצב נוכחי (post-Stone 11.3):** רק `op_kinds.rs` + `pkgs.rs` נדרשו בפועל. ה-args layouts של LOG / FINISH / START_ACTIVITY / TEXT_WIDTH פשוטים מספיק (header u32 + bytes) שה-dispatcher ב-`runtime/web/app_registry.js` מקודד inline ללא module ייעודי. ה-rule פשוט: op_kind ש-args/result שלו מצריכים ≥3 שדות structured, או shared encode/decode בין SDK ל-host — מקבל module משלו ב-`wire/`. אחרים נשארים inline. STORAGE_GET/SET ב-Stone 11.6 כנראה יקבלו `wire/storage.rs` משלהם.
 
 כשנעבור ל-Component Model ב-v0.5, ה-encoders/decoders האלה ייהפכו ל-WIT-generated code אוטומטית.
 
@@ -617,14 +630,43 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
 
 ### Stone 11.4 — worker-per-app (3-4 שבועות)
 **מטרה:** **ה-isolation**. כל app ב-Worker משלה.
-- `runtime/web/app_worker_shell.js` חדש.
-- `WorkerPool` ב-`runtime/web/app_registry.js` — lifecycle של workers.
-- lifecycle dispatch via postMessage.
-- pong handler ב-JS-level.
-- 4 האפליקציות רצות ב-4 Workers נפרדים.
-- log breadcrumbs מוכיחים את ה-isolation (`[worker:com.akiva.calculator] ...`).
 
-**Definition of Done:** 4 apps ב-4 workers; פעולות end-to-end (Shell → calc → back) עובדות.
+**מחולק ל-3 sub-stones** כי זה ה-stone הגדול של Phase 11 ו-refactor של ה-framework state machine מצדיק commit נפרד ממה שמערב את ה-postMessage transport.
+
+#### Stone 11.4a — async WasmHost trait + framework state machine
+**מטרה:** ה-framework מוכן לעולם async. עדיין worker יחיד.
+- `LifecycleState` enum מורחב לפי §7.1: `Initialized → Creating → Created → Starting → Started → Resuming → Resumed → Pausing → Paused → Stopping → Stopped → Destroying → Destroyed`. `Trapped` מצטרף ב-11.5.
+- `ActivityRecord` מקבל `pending: Option<PendingTransition>` עם `target`, `future_id`, `started_at`, `deadline`.
+- `WasmHost` trait: כל ה-mutating ops (lifecycle, render, save_state, restore_state, pointer, key, resize, new_intent, activity_result) מחזירים `u64 future_id` במקום לבצע inline. שתי מתודות חדשות: `poll_future(future_id) -> Option<Result<Vec<u8>, String>>` ו-`drop_future(future_id)`.
+- `MockHost` ב-tests: resolve מיד (ה-future_id `1` תמיד `Some(Ok(...))` בקריאה ראשונה ל-poll). שימור compatibility עם ה-tests הקיימים.
+- `KernelWasmHost` ב-runtime: באותה רוח — single-worker, ה-call ל-`AppRegistry` ב-host מתבצע מיד והתוצאה נשמרת ב-future_id. רק ה-shape של ה-trait משתנה.
+- `ActivityManager`: לולאת frame קוראת `drive_lifecycle_transitions(now)` שדוחה כל `ActivityRecord` עם `pending` עד שהיא ready. עד אז הקריאה הבאה ל-`Activity::on_*` נדחית.
+- כל הבדיקות הקיימות מסתגלות (~141 framework tests).
+
+**Definition of Done:** כל ה-test suites עוברות עם ה-trait async. ה-runtime עדיין single-worker, אבל ה-flow כבר מתאים ל-11.4c.
+
+#### Stone 11.4b — collapse lifecycle exports ל-`akiva_app_dispatch`
+**מטרה:** קריאת lifecycle יחידה בצד ה-app, לפי §6.3.
+- SDK: `akiva_app!(MyActivity)` macro מייצר export יחיד `akiva_app_dispatch(cmd_kind: u32, payload_ptr: *const u8, payload_len: u32) -> u64`. הפנימי שלו decodes cmd_kind ל-create/start/resume/pause/stop/destroy/pointer/key/resize/render/save_state/restore_state/new_intent/activity_result. מחזיר future_id (כל הקריאות עכשיו async ב-app side — ה-executor של embassy מחזיר `Pending` אם ה-`async fn on_*` מ-`await`'s על host call).
+- אם הקריאה הסתיימה sync (כמו on_render שלא await על שום דבר), ה-future_id `0` יוחזר ו-host יודע שהוא יכול לקרוא ל-`akiva_app_get_result(future_id=0)` מיד. שאר ה-future_ids הם 1+.
+- `runtime/web/app_registry.js` ו-`framework/src/wasm_activity.rs::KernelWasmHost`: לקרוא ל-`akiva_app_dispatch(cmd_kind, ...)` במקום ל-13 ה-exports הנפרדים. `REQUIRED_EXPORTS` מתכווץ.
+- 4 ה-apps מוסתגלות (כולן עוברות דרך ה-macro, אבל ה-macro מעדכן בהן).
+- abi.md §2.2 מתעדכן.
+
+**Definition of Done:** 4 apps רצות עם export יחיד; כל ה-tests עוברות; ה-app שmissing the dispatch export נדחה ב-load.
+
+#### Stone 11.4c — `app_worker_shell.js` + WorkerPool isolation
+**מטרה:** **ה-isolation האמיתי**. כל app ב-Worker משלה. lifecycle ו-host ops עוברים postMessage.
+- `runtime/web/app_worker_shell.js` חדש: ה-Worker bootstraps את wasm app יחיד, מחזיק future_registry מקומי, מקשיב ל-`{type:"dispatch", future_id, cmd_kind, payload}` מ-kernel-worker, מבצע `akiva_app_dispatch`, מחזיר `{type:"dispatch_done", future_id, result}`.
+- App-worker מטפל ב-host imports בתוכו: `akiva_host_fire` / `akiva_host_io_start` / `akiva_host_io_poll` יורדים ל-app-worker-local registry. עבור op_kinds שדורשים שירות מ-kernel (TEXT_WIDTH, QUERY_PACKAGES, START_ACTIVITY וכו') — app-worker מקצה future_id מקומי, posts `{type:"host_op", future_id, op_kind, args}` ל-kernel-worker, מחזיר את ה-future_id מיד. כשה-kernel-worker מחזיר `{type:"host_op_done", future_id, status, payload}` — app-worker מעדכן את ה-local registry; הקריאה הבאה ל-`akiva_host_io_poll` רואה READY.
+- App-worker מטפל ב-LOG locally (logs prefixed `[worker:<package>]`); FINISH/START_ACTIVITY/SET_RESULT proxied ל-kernel.
+- TEXT_WIDTH: כל app-worker מקבל OffscreenCanvas משלו ל-measureText (אין צורך ב-round-trip — ה-API זמין בכל worker; לא כל op_kind מוסכם בהכרח kernel).
+- `runtime/web/app_registry.js` הופך ל-`WorkerPool`: `_processes: Map<packageId, Worker>` במקום `Map<packageId, WebAssembly.Instance>`. `register()` מ-spawn worker ב-first use; `unregister()` משאיר את ה-worker חי (lazy GC).
+- Paint-op transfer: ה-app-worker מחזיר `{type:"render_done", future_id, paint_bytes}` כ-Transferable Uint8Array. kernel-worker copies ל-kernel memory.
+- pong handler stub ב-`app_worker_shell.js` (מיועד ל-11.5; כרגע רק מאשר alive).
+- log breadcrumbs: כל log line נושא tag `[worker:<package>]`. ראייה ויזואלית ל-isolation.
+
+**Definition of Done:** 4 apps ב-4 Workers נפרדים; Shell → calc → back עובד; ה-DevTools חושף 5 workers (kernel + 4 app-workers); ה-tests של app_registry עוברים מחדש על ה-WorkerPool API.
 
 ### Stone 11.5 — fault containment + watchdog (2 שבועות)
 **מטרה:** Trapped state, cleanup flow, ping/pong watchdog.
@@ -791,4 +833,4 @@ App שעושה `for i in 0..1_000_000` — לא loop infinity, אבל לא חו�
 
 ---
 
-**מצב המסמך:** Design v2, מאושר. Stone 11.2 רשאי להתחיל.
+**מצב המסמך:** Design v2.1 (2026-05-01). Stones 11.0-11.3 הושלמו. ה-update הזה מוסיף sub-stones (11.4a/b/c) ל-Stone 11.4, מפרט את ה-cross-worker protocol ב-§6 (dispatch_id vs future_id, OffscreenCanvas per app-worker, paint Transferable), ומיישר את §6.4 (`wire/`) למצב בפועל אחרי Stone 11.3. Stone 11.4a רשאי להתחיל.
