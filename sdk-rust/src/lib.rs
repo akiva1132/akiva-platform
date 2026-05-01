@@ -11,6 +11,7 @@
 //! their implementation.
 
 pub mod activity;
+pub mod activity_async;
 pub mod akml;
 pub mod app;
 pub mod canvas;
@@ -20,10 +21,12 @@ pub mod pkgs;
 pub mod res;
 pub mod result;
 pub mod runtime;
+pub mod runtime_async;
 pub mod storage;
 pub mod ui;
 
 pub use activity::{Activity, ActivityContext, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState};
+pub use activity_async::AsyncActivity;
 pub use app::{App, AppContext};
 pub use canvas::Canvas;
 pub use intent::{Intent, IntentBuilder};
@@ -32,11 +35,17 @@ pub use result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
 /// Everything a minimal app needs with one `use`.
 pub mod prelude {
     pub use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState};
+    pub use crate::activity_async::AsyncActivity;
     pub use crate::canvas::Canvas;
     pub use crate::intent::{Intent, IntentBuilder};
     pub use crate::result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
     pub use crate::ui::{CrossAxis, MainAxis, Ui, UiState};
     pub use crate::{log_debug, log_error, log_info, log_trace, log_warn};
+    // Re-export `async_trait` so app code can write
+    // `#[async_trait(?Send)] impl AsyncActivity for ...` without adding
+    // the dep to its own Cargo.toml. Path alias keeps the macro
+    // resolution working when the SDK is renamed.
+    pub use async_trait::async_trait;
 }
 
 /// Install the wasm exports required by the App ABI v0. Takes the
@@ -164,6 +173,110 @@ macro_rules! akiva_app {
             handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
         ) {
             $crate::runtime::on_activity_result(handle, request_code, bytes_ptr, bytes_len)
+        }
+    };
+}
+
+/// Stone 11.2 async-native counterpart of [`akiva_app!`].
+///
+/// Same `extern "C"` surface — the framework can't tell the two apart
+/// at the wire level — but every dispatch funnels through
+/// [`runtime_async`] which awaits the activity's future via
+/// [`block_on_ready`](activity_async::block_on_ready). The macro takes
+/// a type that implements [`AsyncActivity`] (and `Default`).
+///
+/// Exactly one `akiva_async_app!` *or* `akiva_app!` per crate. Both
+/// emit the same `#[no_mangle]` symbols, so picking both is a link
+/// error.
+#[macro_export]
+macro_rules! akiva_async_app {
+    ($ty:ty) => {
+        // ── Memory ABI ─────────────────────────────────────────────────
+        #[no_mangle]
+        pub extern "C" fn akiva_app_alloc(size: u32) -> *mut u8 {
+            $crate::runtime::alloc(size)
+        }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_dealloc(ptr: *mut u8, size: u32) {
+            $crate::runtime::dealloc(ptr, size)
+        }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_abi_version() -> *const u8 {
+            $crate::runtime::ABI_VERSION.as_ptr()
+        }
+
+        // ── Lifecycle ──────────────────────────────────────────────────
+        #[no_mangle]
+        pub extern "C" fn akiva_app_create(handle: u32, class_ptr: *const u8, class_len: u32) {
+            $crate::runtime_async::on_create::<$ty>(handle, class_ptr, class_len);
+        }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_start(handle: u32)   { $crate::runtime_async::on_start(handle);   }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_resume(handle: u32)  { $crate::runtime_async::on_resume(handle);  }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_pause(handle: u32)   { $crate::runtime_async::on_pause(handle);   }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_stop(handle: u32)    { $crate::runtime_async::on_stop(handle);    }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_destroy(handle: u32) { $crate::runtime_async::on_destroy(handle); }
+
+        // ── Input ──────────────────────────────────────────────────────
+        #[no_mangle]
+        pub extern "C" fn akiva_app_pointer(
+            handle: u32, x: f32, y: f32, button: u32, phase: u32, ts_ms: f64,
+        ) {
+            $crate::runtime_async::on_pointer(handle, x, y, button, phase, ts_ms);
+        }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_key(
+            handle: u32, code: u32, modifiers: u32, phase: u32, ts_ms: f64,
+        ) {
+            $crate::runtime_async::on_key(handle, code, modifiers, phase, ts_ms);
+        }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_resize(
+            handle: u32, width_px: u32, height_px: u32, density: f32,
+        ) {
+            $crate::runtime_async::on_resize(handle, width_px, height_px, density);
+        }
+
+        // ── Render ─────────────────────────────────────────────────────
+        #[no_mangle]
+        pub extern "C" fn akiva_app_render(
+            handle: u32, ts_ms: f64, out_len_ptr: *mut u32,
+        ) -> *const u8 {
+            $crate::runtime_async::on_render(handle, ts_ms, out_len_ptr)
+        }
+
+        // ── Saved state ────────────────────────────────────────────────
+        #[no_mangle]
+        pub extern "C" fn akiva_app_save_state(
+            handle: u32, out_len_ptr: *mut u32,
+        ) -> *const u8 {
+            $crate::runtime_async::on_save_state(handle, out_len_ptr)
+        }
+        #[no_mangle]
+        pub extern "C" fn akiva_app_restore_state(
+            handle: u32, bytes_ptr: *const u8, bytes_len: u32,
+        ) {
+            $crate::runtime_async::on_restore_state(handle, bytes_ptr, bytes_len)
+        }
+
+        // ── Intent redelivery (Stone 9.4) ───────────────────────────────
+        #[no_mangle]
+        pub extern "C" fn akiva_app_new_intent(
+            handle: u32, bytes_ptr: *const u8, bytes_len: u32,
+        ) {
+            $crate::runtime_async::on_new_intent(handle, bytes_ptr, bytes_len)
+        }
+
+        // ── Activity result delivery (Stone 9.5) ────────────────────────
+        #[no_mangle]
+        pub extern "C" fn akiva_app_activity_result(
+            handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
+        ) {
+            $crate::runtime_async::on_activity_result(handle, request_code, bytes_ptr, bytes_len)
         }
     };
 }

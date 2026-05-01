@@ -17,6 +17,12 @@ default = []
 bindings = []
 
 [dependencies]
+# Stone 11.2 spike — async fn in trait via boxed futures. AFIT in stable
+# Rust 1.75+ doesn't compose with `dyn Trait`; until we redesign the
+# runtime slot table to be generic over the concrete activity type
+# (deferred to a follow-up commit in 11.2), `async_trait` is the
+# pragmatic bridge.
+async-trait = "0.1"
 
 [package.metadata.akiva]
 role = "sdk"
