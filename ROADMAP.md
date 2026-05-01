@@ -627,12 +627,15 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 **רכיבים שנבנים:**
 
-### 11.1 Design doc ל-`docs/isolation-design.md`
-- מה המודל: worker-per-app, worker-per-task, hybrid?
-- איך ה-ABI הופך ל-async: message-passing דרך `postMessage`, SDK API נראה sync דרך futures/callbacks?
-- איך lifecycle callbacks (שהם synchronous היום — framework מחכה ל-on_create להסתיים לפני on_start) הופכים ל-state machine asynchronous?
-- איך trap ב-app מתרגם ל-`ActivityRecord` state? נוסיף `Trapped` enum variant?
-- איך OPFS SyncAccessHandle נגיש ממספר workers (זה limitation: handle אחד בלבד)?
+### 11.1 Design doc ל-`docs/isolation-design.md` ✅
+- ✅ **נחת (מאי 2026)** — [`docs/isolation-design.md`](docs/isolation-design.md). 13 סעיפים מקיפים:
+  - **מודל:** worker-per-app (לא -task ולא -activity).
+  - **ABI:** sync facade עם `Atomics.wait` על `SharedArrayBuffer` — אופציה B נבחרה. ה-API ל-apps לא משתנה; כל host call כותב ל-SAB וחוסם עד תשובה. דורש COOP/COEP headers.
+  - **OPFS:** כל ה-storage עובר דרך kernel-worker (אופציה I). uninstall/migration נשמרים פשוטים, sandboxing אטומי, latency budget 2ms.
+  - **lifecycle:** state machine ב-`ActivityRecord` עם `pending` slot — ה-framework לא חוסם, מחכה ל-ack ב-frame הבא. MockHost נשארת sync לטובת unit tests.
+  - **Trapped:** `LifecycleState::Trapped` חדש (terminal). worker.terminate() מנקה. כל activities של אותו package עוברות יחד ל-Trapped (שיתוף heap).
+  - **watchdog:** ping/pong פעם בשנייה ב-JS-level (לא wasm) ל-detect busy-loop. timeout = 1s → terminate.
+  - **6 stones מוגדרים:** 11.1 (זה) → 11.2 prototype → 11.3 framework lifecycle → 11.4 SDK → 11.5 fault containment → 11.6 watchdog.
 
 ### 11.2 Async ABI prototype
 - hello-app ב-worker נפרד, עם כל ה-imports מעבירים דרך postMessage
