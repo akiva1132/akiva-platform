@@ -19,6 +19,13 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 # edition2024 (Rust ≥1.85) and we support stable Rust 1.82+.
 indexmap = { version = ">=2, <2.10", default-features = false }
 
+[dev-dependencies]
+# Used only for the `cross_crate_op_kinds_match` test in `wire/op_kinds.rs`,
+# which pins that the SDK's mirror of op_kind constants stays numerically
+# in lockstep. The SDK never depends back on the framework — that would
+# pull half the platform into every app.
+akiva-sdk = { workspace = true }
+
 [features]
 # Exposes `storage::MemoryStorage` to dependents (kernel, tests). Always
 # compiled in when running `cargo test -p akiva-framework`.

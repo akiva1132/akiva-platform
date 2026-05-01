@@ -10,6 +10,7 @@ version = "0.0.1"
 name = "akiva-framework"
 version = "0.0.1"
 dependencies = [
+ "akiva-sdk",
  "indexmap",
  "serde",
  "toml",

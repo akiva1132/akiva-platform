@@ -18,6 +18,7 @@ pub mod app;
 pub mod canvas;
 pub mod intent;
 pub mod log;
+pub mod op_kinds;
 pub mod pkgs;
 pub mod res;
 pub mod result;

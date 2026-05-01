@@ -31,6 +31,8 @@ use crate::activity::{
     SavedState,
 };
 use crate::intent::Intent;
+#[cfg(target_arch = "wasm32")]
+use crate::op_kinds;
 use crate::result::ActivityResult;
 
 // Host-provided imports. Matches `AppRegistry._buildAppImports` in
@@ -41,7 +43,6 @@ use crate::result::ActivityResult;
 #[cfg(target_arch = "wasm32")]
 extern "C" {
     pub fn akiva_host_log(level: u32, ptr: *const u8, len: u32);
-    pub fn akiva_host_text_width(ptr: *const u8, len: u32, size: f32) -> f32;
     /// Stone 9.3 — ask the platform to tear this activity down. Handle
     /// disambiguates when the package has multiple activities. No return;
     /// the framework picks up the signal via its `hal_app_drain_finish`
@@ -212,36 +213,18 @@ pub(crate) fn host_fire(op_kind: u32, args: &[u8]) -> u32 {
 }
 
 /// Start an async op, returning a future_id. See [`akiva_host_io_start`].
-/// Non-wasm builds return `0` ("couldn't start") so unit tests don't
-/// pretend to have an async result waiting.
-#[allow(dead_code)]
+/// Wasm-only — the host isn't reachable from `cargo test`, so callers
+/// gate their wasm-vs-host paths inline rather than relying on a fake.
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn host_io_start(op_kind: u32, args: &[u8]) -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        akiva_host_io_start(op_kind, args.as_ptr(), args.len() as u32)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (op_kind, args);
-        0
-    }
+    unsafe { akiva_host_io_start(op_kind, args.as_ptr(), args.len() as u32) }
 }
 
-/// Poll an async op. See [`akiva_host_io_poll`]. Non-wasm builds
-/// resolve to `ERROR` with empty payload so the caller can exercise
-/// its error path in unit tests without a host.
-#[allow(dead_code)]
+/// Poll an async op. See [`akiva_host_io_poll`]. Wasm-only for the same
+/// reason as [`host_io_start`].
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn host_io_poll(future_id: u64, out: &mut [u8]) -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        akiva_host_io_poll(future_id, out.as_mut_ptr(), out.len() as u32)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (future_id, out);
-        // status = ERROR (2), length = 0
-        2
-    }
+    unsafe { akiva_host_io_poll(future_id, out.as_mut_ptr(), out.len() as u32) }
 }
 
 /// Measure a rendered UTF-8 string's width at `size` pixels. On wasm
@@ -251,15 +234,50 @@ pub(crate) fn host_io_poll(future_id: u64, out: &mut [u8]) -> u64 {
 /// back to the cheap `chars × size × 0.55` estimate — layout tests that
 /// depend on exact numbers should pass in their own fake to avoid
 /// coupling to this heuristic.
+///
+/// Stone 11.3c-2 — first call site migrated to the unified ABI. Args
+/// are `[size: f32 LE | text: utf8...]`; the host returns the rendered
+/// width as a 4-byte f32 LE result through the FutureRegistry. Falls
+/// back to the cheap estimate on any failure (denied capability,
+/// poll error, malformed result) so a misbehaving host can't crash
+/// app layout — text just measures slightly wrong, which is recoverable.
 pub fn text_width(text: &str, size: f32) -> f32 {
     #[cfg(target_arch = "wasm32")]
-    unsafe {
-        akiva_host_text_width(text.as_ptr(), text.len() as u32, size)
+    {
+        // Args: [size: f32 LE | text bytes...]. text.as_bytes() is
+        // already UTF-8; the host decodes with the same encoder/decoder
+        // pair that the legacy `akiva_host_text_width` import used.
+        let mut args = Vec::with_capacity(4 + text.len());
+        args.extend_from_slice(&size.to_le_bytes());
+        args.extend_from_slice(text.as_bytes());
+        let future_id = host_io_start(op_kinds::io::TEXT_WIDTH, &args);
+        if future_id == 0 {
+            return text_width_fallback(text, size);
+        }
+        // Single poll: in 11.3 single-worker the future is always
+        // Ready on first poll, so a 4-byte buffer always suffices.
+        let mut buf = [0u8; 4];
+        let packed = host_io_poll(future_id, &mut buf);
+        let (status, len) = op_kinds::unpack_poll(packed);
+        if status == op_kinds::status::READY && len == 4 {
+            f32::from_le_bytes(buf)
+        } else {
+            text_width_fallback(text, size)
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        text.chars().count() as f32 * size * 0.55
+        text_width_fallback(text, size)
     }
+}
+
+/// Cheap per-char estimate used when the host can't be consulted (non-wasm
+/// builds and the wasm-side error path). Don't write a layout test that
+/// depends on this heuristic — the real wasm measurement uses canvas
+/// `measureText`, which can drift from this by a meaningful amount.
+#[inline]
+fn text_width_fallback(text: &str, size: f32) -> f32 {
+    text.chars().count() as f32 * size * 0.55
 }
 
 /// Minimum paint-op capacity we pre-allocate per slot. Grows on demand;

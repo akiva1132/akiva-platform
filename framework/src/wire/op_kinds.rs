@@ -141,6 +141,29 @@ mod tests {
     }
 
     #[test]
+    fn cross_crate_op_kinds_match_sdk_mirror() {
+        // sdk-rust duplicates these constants in `akiva_sdk::op_kinds`
+        // because it can't depend on `akiva-framework` (kernel-side
+        // crate, would bloat every app). This test pins that the two
+        // copies stay numerically equal — the dispatcher in
+        // `runtime/web/app_registry.js` routes by these integers, so
+        // a drift means the SDK calls one op and the host runs another.
+        use akiva_sdk::op_kinds as sdk;
+        assert_eq!(fire::LOG,                       sdk::fire::LOG);
+        assert_eq!(fire::FINISH,                    sdk::fire::FINISH);
+        assert_eq!(fire::START_ACTIVITY,            sdk::fire::START_ACTIVITY);
+        assert_eq!(fire::START_ACTIVITY_FOR_RESULT, sdk::fire::START_ACTIVITY_FOR_RESULT);
+        assert_eq!(fire::SET_RESULT,                sdk::fire::SET_RESULT);
+        assert_eq!(io::TEXT_WIDTH,                  sdk::io::TEXT_WIDTH);
+        assert_eq!(io::QUERY_PACKAGES,              sdk::io::QUERY_PACKAGES);
+        assert_eq!(io::STORAGE_GET,                 sdk::io::STORAGE_GET);
+        assert_eq!(io::STORAGE_SET,                 sdk::io::STORAGE_SET);
+        assert_eq!(status::PENDING,                 sdk::status::PENDING);
+        assert_eq!(status::READY,                   sdk::status::READY);
+        assert_eq!(status::ERROR,                   sdk::status::ERROR);
+    }
+
+    #[test]
     fn status_codes_match_the_design() {
         // PENDING/READY/ERROR encode 0/1/2 — locked because
         // app-side poll loops check for `>= 1` (resolved) vs `== 0`
