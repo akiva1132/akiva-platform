@@ -1,6 +1,9 @@
-//! App-side logging. Forwards to the runtime's `akiva_host_log` import,
-//! which the worker's `AppRegistry` routes to the kernel log channel with
-//! a `[package-id]` prefix. Level codes match `kernel/src/host.rs::LogLevel`.
+//! App-side logging. Stone 11.3c-4 — forwards through the unified-ABI
+//! `host_fire(FIRE::LOG, [level | msg])` rather than the legacy
+//! per-op `akiva_host_log` import. The host dispatcher decodes the
+//! args and routes the same `_log()` callback the kernel hooked up,
+//! so log lines still land with the `[package-id]` prefix and the
+//! standard level mapping. Level codes match `kernel/src/host.rs::LogLevel`.
 
 /// Numeric level codes shared with the host. Exposed so apps that want
 /// to log without `format!`-ing can call `__emit` directly.
@@ -12,14 +15,23 @@ pub const LEVEL_ERROR: u32 = 4;
 
 #[doc(hidden)]
 pub fn __emit(level: u32, msg: &str) {
-    // On wasm the host supplies `akiva_host_log`. On non-wasm (cargo
-    // test, docs) the extern isn't in scope — we swallow the message
-    // so apps' log macros don't block unit tests. Level is unused in
-    // the fallback; tag it so the compiler doesn't warn.
+    // On wasm the host's dispatcher resolves FIRE::LOG by decoding the
+    // first 4 bytes as a u32 LE level and the remainder as UTF-8 message
+    // bytes. On non-wasm (cargo test, docs) we swallow the message so
+    // apps' log macros don't block unit tests.
     #[cfg(target_arch = "wasm32")]
-    unsafe {
+    {
+        use crate::op_kinds::fire;
+        use crate::runtime::host_fire;
         let bytes = msg.as_bytes();
-        crate::runtime::akiva_host_log(level, bytes.as_ptr(), bytes.len() as u32);
+        let mut args = Vec::with_capacity(4 + bytes.len());
+        args.extend_from_slice(&level.to_le_bytes());
+        args.extend_from_slice(bytes);
+        // Return code is intentionally ignored: a logging failure
+        // shouldn't propagate to call sites that may themselves be in
+        // a panic-handler chain. The dispatcher logs its own warning
+        // on unknown op_kinds, so a silent rc check here adds nothing.
+        let _ = host_fire(fire::LOG, &args);
     }
     #[cfg(not(target_arch = "wasm32"))]
     { let _ = (level, msg); }

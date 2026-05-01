@@ -42,7 +42,6 @@ use crate::result::ActivityResult;
 // approximations when the host isn't available.
 #[cfg(target_arch = "wasm32")]
 extern "C" {
-    pub fn akiva_host_log(level: u32, ptr: *const u8, len: u32);
     /// Stone 9.3 — ask the platform to tear this activity down. Handle
     /// disambiguates when the package has multiple activities. No return;
     /// the framework picks up the signal via its `hal_app_drain_finish`
@@ -188,19 +187,12 @@ pub fn host_set_result(handle: u32, result: &ActivityResult) {
 // migrate operations one by one (e.g. `pkgs::list` flips from
 // `akiva_host_query_packages` to `host_io(QUERY_PACKAGES, &[])`).
 
-/// Fire a side-effecting op. See [`akiva_host_fire`]. Non-wasm builds
-/// return `0` (success) so unit tests link without a real host.
-#[allow(dead_code)]
+/// Fire a side-effecting op. See [`akiva_host_fire`]. Wasm-only — the
+/// host isn't reachable from `cargo test`, so callers gate their
+/// wasm-vs-host paths inline.
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn host_fire(op_kind: u32, args: &[u8]) -> u32 {
-    #[cfg(target_arch = "wasm32")]
-    unsafe {
-        akiva_host_fire(op_kind, args.as_ptr(), args.len() as u32)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (op_kind, args);
-        0
-    }
+    unsafe { akiva_host_fire(op_kind, args.as_ptr(), args.len() as u32) }
 }
 
 /// Start an async op, returning a future_id. See [`akiva_host_io_start`].
