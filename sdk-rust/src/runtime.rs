@@ -42,48 +42,23 @@ use crate::result::ActivityResult;
 // approximations when the host isn't available.
 #[cfg(target_arch = "wasm32")]
 extern "C" {
-    /// Stone 9.3 — ask the platform to tear this activity down. Handle
-    /// disambiguates when the package has multiple activities. No return;
-    /// the framework picks up the signal via its `hal_app_drain_finish`
-    /// HAL bridge at the end of the callback. See docs/abi.md §2.3.
-    pub fn akiva_host_finish(handle: u32);
-    /// Stone 9.4 — ask the platform to launch another activity. The
-    /// payload is an encoded `Intent` (see `Intent::encode`). Same
-    /// drain-at-callback-end semantics as `akiva_host_finish`; the
-    /// framework calls its `hal_app_drain_intent` HAL bridge to read
-    /// back the blob. See docs/abi.md §2.3.
-    pub fn akiva_host_start_activity(handle: u32, ptr: *const u8, len: u32);
-    /// Stone 9.5 — launch another activity and keep the door open for a
-    /// result. `request_code` is an app-chosen u32 that identifies the
-    /// call site; the framework threads it back through
-    /// `akiva_app_activity_result` so the caller can disambiguate. Same
-    /// drain-at-callback-end flow as `akiva_host_start_activity`.
-    pub fn akiva_host_start_activity_for_result(
-        handle: u32, ptr: *const u8, len: u32, request_code: u32,
-    );
-    /// Stone 9.5 — stash the bytes this activity wants to return to its
-    /// caller. Only meaningful when the activity was launched via
-    /// `start_activity_for_result`. Repeatable (last call wins). The
-    /// framework drains via `hal_app_drain_set_result` when this activity
-    /// is about to be destroyed.
-    pub fn akiva_host_set_result(handle: u32, ptr: *const u8, len: u32);
     // ── Stone 11.3 unified ABI ────────────────────────────────────────
     //
-    // Three multiplexers that, in v0.5+, replace the per-operation
-    // imports above. Every host-mediated op gets a stable `op_kind`
-    // (see `framework::wire::op_kinds`) and routes through one of
-    // these three transports:
+    // Three multiplexers that subsume every per-op import the SDK used
+    // to declare. Every host-mediated op gets a stable `op_kind`
+    // (see `crate::op_kinds`, mirrored from `framework::wire::op_kinds`)
+    // and routes through one of these three transports:
     //
     //   * `fire`     — fire-and-forget, sync return code.
     //   * `io_start` — start an async op, returns a future_id.
     //   * `io_poll`  — poll a future_id for status + payload.
     //
-    // Stone 11.3b just declares the symbols on both sides of the ABI
-    // so a future stone can migrate call sites one op at a time
-    // without the SDK and host disagreeing on what's available.
-    // The kernel-side handlers in `runtime/web/app_registry.js` are
-    // stubs in 11.3b — calling them returns "not implemented" until
-    // 11.3c wires the dispatcher.
+    // Today's call sites: every `host_fire` / `host_io_start` /
+    // `host_io_poll` helper below. Legacy per-op imports
+    // (`akiva_host_log`, `akiva_host_finish`, …) have all been
+    // removed from the SDK extern block; the host-side legacy
+    // handlers in `runtime/web/app_registry.js` stay in place until
+    // 11.3-final to keep older app builds operational.
 
     /// Fire a side-effecting op identified by `op_kind`. The args blob
     /// layout is op-specific (see `framework::wire::*` encoders). Returns
@@ -118,10 +93,15 @@ extern "C" {
 /// lifecycle or input callback on wasm; a no-op on host builds so unit
 /// tests compile without a real host import. Handle is the one the
 /// framework passed to the current callback.
+///
+/// Wire: `fire(FIRE::FINISH, [handle: u32 LE])`. The host's dispatcher
+/// adds the handle to `_pendingFinish`; the framework drains it at
+/// the end of the current callback via the existing
+/// `hal_app_drain_finish` HAL bridge.
 pub fn host_finish(handle: u32) {
     #[cfg(target_arch = "wasm32")]
-    unsafe {
-        akiva_host_finish(handle);
+    {
+        let _ = host_fire(op_kinds::fire::FINISH, &handle.to_le_bytes());
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -133,11 +113,19 @@ pub fn host_finish(handle: u32) {
 /// supplied `Intent`. The encoded bytes must outlive this call (the host
 /// copies them out synchronously before we return). On non-wasm this is
 /// a no-op so tests link without a real host.
+///
+/// Wire: `fire(FIRE::START_ACTIVITY, [handle: u32 LE | intent bytes...])`.
+/// Gated by `LAUNCH_ANY_APP` — the dispatcher returns rc=2 (denied) if
+/// the package lacks the grant; this call ignores the rc since the host
+/// already logs the denial.
 pub fn host_start_activity(handle: u32, intent: &Intent) {
     let bytes = intent.encode();
     #[cfg(target_arch = "wasm32")]
-    unsafe {
-        akiva_host_start_activity(handle, bytes.as_ptr(), bytes.len() as u32);
+    {
+        let mut args = Vec::with_capacity(4 + bytes.len());
+        args.extend_from_slice(&handle.to_le_bytes());
+        args.extend_from_slice(&bytes);
+        let _ = host_fire(op_kinds::fire::START_ACTIVITY, &args);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -148,13 +136,19 @@ pub fn host_start_activity(handle: u32, intent: &Intent) {
 /// Request the framework launch `intent` and record that this activity
 /// expects a result back with `request_code`. Same lifetime rules as
 /// `host_start_activity` (host copies bytes synchronously).
+///
+/// Wire: `fire(FIRE::START_ACTIVITY_FOR_RESULT,
+///   [handle: u32 LE | request_code: u32 LE | intent bytes...])`.
+/// Gated by `LAUNCH_ANY_APP`, same as `host_start_activity`.
 pub fn host_start_activity_for_result(handle: u32, intent: &Intent, request_code: u32) {
     let bytes = intent.encode();
     #[cfg(target_arch = "wasm32")]
-    unsafe {
-        akiva_host_start_activity_for_result(
-            handle, bytes.as_ptr(), bytes.len() as u32, request_code,
-        );
+    {
+        let mut args = Vec::with_capacity(8 + bytes.len());
+        args.extend_from_slice(&handle.to_le_bytes());
+        args.extend_from_slice(&request_code.to_le_bytes());
+        args.extend_from_slice(&bytes);
+        let _ = host_fire(op_kinds::fire::START_ACTIVITY_FOR_RESULT, &args);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -167,11 +161,16 @@ pub fn host_start_activity_for_result(handle: u32, intent: &Intent, request_code
 /// times in the activity's lifetime; only the last call's bytes are
 /// delivered. If this activity was not launched for a result, the
 /// framework silently drops the stashed bytes.
+///
+/// Wire: `fire(FIRE::SET_RESULT, [handle: u32 LE | result bytes...])`.
 pub fn host_set_result(handle: u32, result: &ActivityResult) {
     let bytes = result.encode();
     #[cfg(target_arch = "wasm32")]
-    unsafe {
-        akiva_host_set_result(handle, bytes.as_ptr(), bytes.len() as u32);
+    {
+        let mut args = Vec::with_capacity(4 + bytes.len());
+        args.extend_from_slice(&handle.to_le_bytes());
+        args.extend_from_slice(&bytes);
+        let _ = host_fire(op_kinds::fire::SET_RESULT, &args);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
