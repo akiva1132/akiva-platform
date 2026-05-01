@@ -335,6 +335,18 @@ function buildImports() {
       halAppDrainSetResult(handle, outPtr, outCap),
     hal_app_activity_result: (handle, requestCode, bytesPtr, bytesLen) =>
       apps.activityResult(handle, requestCode, bytesPtr, bytesLen),
+
+    // Stone 10.3b — push per-package permission grants. Called from
+    // `framework::boot` after rehydration, once per installed package,
+    // before any activity is launched. `grantsPtr..grantsLen` is the
+    // LF-separated UTF-8 name list that `PackageManager::install`
+    // persists to `sys/permissions/{id}`; empty payload = "no grants".
+    hal_host_set_grants: (pkgPtr, pkgLen, grantsPtr, grantsLen) => {
+      const packageId = readUtf8(pkgPtr, pkgLen);
+      const blob = grantsLen === 0 ? "" : readUtf8(grantsPtr, grantsLen);
+      const grants = blob.length === 0 ? [] : blob.split("\n").filter((s) => s.length > 0);
+      apps.setGrants(packageId, grants);
+    },
   };
   return { env };
 }

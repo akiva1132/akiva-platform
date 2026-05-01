@@ -15,7 +15,7 @@
 // to the semantic contract these tests pin down.
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { AppRegistry } from "../app_registry.js";
+import { AppRegistry, AUTO_IMPORTS, CAPABILITY_IMPORTS } from "../app_registry.js";
 
 // ── Test harness ──────────────────────────────────────────────────────
 
@@ -570,5 +570,117 @@ describe("activityResult — deliver result blob to caller app", () => {
     // `akiva_app_alloc` first, then populates the slice).
     const appBytes = new Uint8Array(fake.memory.buffer, appPtr, appLen);
     expect(Array.from(appBytes)).toEqual(payload);
+  });
+});
+
+// ── Stone 10.3b: capability-based import filtering ───────────────────────
+
+describe("setGrants — per-package permission tracking", () => {
+  it("stores the grant set for later filter consultation", () => {
+    const { registry } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.LAUNCH_ANY_APP"]);
+    expect(registry._grants.get(PACKAGE_ID)).toEqual(
+      new Set(["akiva.permission.LAUNCH_ANY_APP"]),
+    );
+  });
+
+  it("is last-write-wins (upgrade semantics: new full set replaces old)", () => {
+    // An upgrade via PackageManager::install re-pushes the full new
+    // list; the previous set must be replaced, not merged. A naïve
+    // add-only implementation would preserve permissions the new
+    // manifest dropped — a stealth-grant hazard this test guards.
+    const { registry } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, [
+      "akiva.permission.LAUNCH_ANY_APP",
+      "akiva.permission.NETWORK",
+    ]);
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.LAUNCH_ANY_APP"]);
+    expect(registry._grants.get(PACKAGE_ID)).toEqual(
+      new Set(["akiva.permission.LAUNCH_ANY_APP"]),
+    );
+  });
+
+  it("treats empty list as 'auto imports only'", () => {
+    const { registry } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, []);
+    expect(registry._grants.get(PACKAGE_ID).size).toBe(0);
+  });
+});
+
+describe("_buildAppImports — capability filter", () => {
+  it("passes every AUTO import through untouched regardless of grants", () => {
+    // Auto imports are foundational — log, text_width, resource lookups,
+    // finish, set_result. Gating them would break every app's render
+    // path. This test pins that AUTO stays unconditional.
+    const { registry } = makeRegistry();
+    // No setGrants call at all — the most restrictive possible state.
+    const filtered = registry._buildAppImports(PACKAGE_ID).env;
+    for (const name of AUTO_IMPORTS) {
+      expect(typeof filtered[name]).toBe("function");
+      // The returned function's name differs between passthrough and
+      // stub — assert it's NOT the stub by checking the name pattern
+      // (stubs are named `permissionDeniedStub`).
+      expect(filtered[name].name).not.toBe("permissionDeniedStub");
+    }
+  });
+
+  it("replaces gated imports with deny-stubs when the grant is absent", () => {
+    const { registry, log } = makeRegistry();
+    // No grant for LAUNCH_ANY_APP → start_activity is stubbed.
+    const filtered = registry._buildAppImports(PACKAGE_ID).env;
+    const startFn = filtered.akiva_host_start_activity;
+    expect(startFn.name).toBe("permissionDeniedStub");
+
+    // Calling the stub must NOT fire the real logic; it logs + returns 0.
+    const result = startFn(1, 0, 0);
+    expect(result).toBe(0);
+    // Warning log fired.
+    const warnCalls = log.mock.calls.filter(([lvl]) => lvl === "warn");
+    expect(warnCalls.some(([, msg]) =>
+      msg.includes("permission denied") &&
+      msg.includes("akiva_host_start_activity") &&
+      msg.includes("akiva.permission.LAUNCH_ANY_APP"),
+    )).toBe(true);
+  });
+
+  it("unlocks gated imports when the grant is present", () => {
+    const { registry } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.LAUNCH_ANY_APP"]);
+    const filtered = registry._buildAppImports(PACKAGE_ID).env;
+    for (const name of CAPABILITY_IMPORTS["akiva.permission.LAUNCH_ANY_APP"]) {
+      expect(filtered[name].name).not.toBe("permissionDeniedStub");
+    }
+  });
+
+  it("grants apply per-package, not globally", () => {
+    // Shell gets LAUNCH_ANY_APP; a second package must NOT inherit it.
+    const { registry } = makeRegistry();
+    registry.setGrants("com.shell", ["akiva.permission.LAUNCH_ANY_APP"]);
+
+    const shellImports = registry._buildAppImports("com.shell").env;
+    expect(shellImports.akiva_host_start_activity.name)
+      .not.toBe("permissionDeniedStub");
+
+    const appImports = registry._buildAppImports("com.otherapp").env;
+    expect(appImports.akiva_host_start_activity.name)
+      .toBe("permissionDeniedStub");
+  });
+
+  it("reserved capabilities (STORAGE_SANDBOX etc.) are accepted but contribute no imports today", () => {
+    // Pinning the current shape: v0.2 declares these permissions but
+    // the `akiva_host_*` HAL surface for them doesn't exist yet.
+    // Granting them does nothing observable. The day the HAL lands,
+    // `CAPABILITY_IMPORTS` gets non-empty arrays and this test flips
+    // to assert the expected unlocks — tripwire for keeping Rust +
+    // JS mappings in lockstep.
+    for (const cap of [
+      "akiva.permission.STORAGE_SANDBOX",
+      "akiva.permission.QUERY_PACKAGES",
+      "akiva.permission.NOTIFICATIONS",
+      "akiva.permission.NETWORK",
+      "akiva.permission.CAMERA",
+    ]) {
+      expect(CAPABILITY_IMPORTS[cap]).toEqual([]);
+    }
   });
 });

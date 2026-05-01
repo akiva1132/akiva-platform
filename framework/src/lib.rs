@@ -142,6 +142,20 @@ pub fn boot(
         },
     );
 
+    // Stone 10.3b — push each package's grants to the wasm host so
+    // `_instantiateProcess` can filter the `akiva_host_*` import map
+    // at link time (soft enforcement via stub replacement). Must run
+    // AFTER rehydration (so the set is complete) and BEFORE the Shell
+    // launch below — if the Shell were a wasm app (Stone 11.0) its
+    // instantiation would need the grant list already pushed. Shell
+    // isn't a wasm app yet, so its own grants (Stone 10.6) flow through
+    // the direct `fw.permissions.grant` path without needing a host push.
+    let package_ids: Vec<String> = fw.packages.list().map(|r| r.id.clone()).collect();
+    for pkg in &package_ids {
+        let grants = fw.permissions.granted_to(pkg);
+        host.set_grants(pkg, &grants);
+    }
+
     // Read per-package resource tables from storage and register them
     // with the framework's ResourceManager. Resource errors are tracked
     // separately — a broken values file doesn't stop a package from

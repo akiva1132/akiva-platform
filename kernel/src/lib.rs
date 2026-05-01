@@ -488,6 +488,24 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
             ));
         }
     }
+
+    // ── Stone 10.3b ───────────────────────────────────────────────────────
+
+    fn set_grants(&self, package_id: &str, grants: &[&str]) {
+        // Serialise as LF-separated UTF-8; matches the on-disk format
+        // used by `PackageManager::install` in `sys/permissions/{id}`.
+        // Empty slice → empty blob, which the host reads as "no grants"
+        // (the app still gets the auto import set).
+        let blob = grants.join("\n");
+        let pid = package_id.as_bytes();
+        let bytes = blob.as_bytes();
+        unsafe {
+            host::hal_host_set_grants(
+                pid.as_ptr(), pid.len(),
+                bytes.as_ptr(), bytes.len(),
+            );
+        }
+    }
 }
 
 /// Exercises the storage HAL end-to-end: read a u32 counter under

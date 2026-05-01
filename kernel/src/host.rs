@@ -205,6 +205,24 @@ extern "C" {
         bytes_ptr: *const u8,
         bytes_len: u32,
     ) -> u32;
+
+    // ── Permission grants (Stone 10.3b) ───────────────────────────────────
+    //
+    // Push the list of permissions granted to `package_id` to the host so
+    // it can filter the `akiva_host_*` import map at `_instantiateProcess`
+    // time. Called once per installed package at the end of
+    // `framework::boot`, before any activity is launched.
+    //
+    // `grants_ptr..grants_len` is a UTF-8, LF-separated list of permission
+    // names (e.g. "akiva.permission.STORAGE_SANDBOX\nakiva.permission.NETWORK").
+    // An empty payload means "no grants" — the app gets only the auto set.
+    // Last-write-wins semantics: a second call for the same `package_id`
+    // replaces the earlier list, matching how `PackageManager::install`
+    // rewrites the full set on upgrade.
+    pub fn hal_host_set_grants(
+        package_id_ptr: *const u8, package_id_len: usize,
+        grants_ptr: *const u8, grants_len: usize,
+    );
 }
 
 /// Safe wrapper for hal_log that never panics.

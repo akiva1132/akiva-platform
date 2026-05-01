@@ -90,6 +90,18 @@ export class AppRegistry {
      * @type {Set<string>}
      */
     this._debug = new Set();
+    /**
+     * Stone 10.3b — permission grants per package, pushed from
+     * `framework::boot` via `hal_host_set_grants`. Read at
+     * `_instantiateProcess` time to decide which gated
+     * `akiva_host_*` imports are real functions vs deny-stubs. A
+     * missing entry is treated identically to an empty Set: the app
+     * gets the auto import set only. Populated once per boot; on
+     * upgrade `PackageManager::install` re-pushes the full new set
+     * (last-write-wins — replace the stored Set outright).
+     * @type {Map<string, Set<string>>}
+     */
+    this._grants = new Map();
     this._decoder = new TextDecoder("utf-8");
     this._encoder = new TextEncoder();
 
@@ -117,6 +129,26 @@ export class AppRegistry {
    */
   setDebugCategories(categories) {
     this._debug = new Set(categories);
+  }
+
+  /**
+   * Stone 10.3b — record the full list of permissions granted to a
+   * package. Kernel pushes one call per installed package at the end
+   * of `framework::boot` (via `hal_host_set_grants`) and again from
+   * `PackageManager::install` on upgrade. The filter in
+   * `_buildAppImports` consults this map to decide which gated
+   * `akiva_host_*` imports resolve to real functions vs deny-stubs.
+   *
+   * Last-write-wins: a second call for the same `packageId` replaces
+   * the earlier list, matching the Rust-side controller behaviour
+   * where `apply_grants` writes the full new set on upgrade.
+   *
+   * @param {string} packageId
+   * @param {string[]} permissionNames  e.g. `["akiva.permission.NETWORK"]`
+   */
+  setGrants(packageId, permissionNames) {
+    this._grants.set(packageId, new Set(permissionNames));
+    this._dbg("permissions", `${packageId} grants: [${permissionNames.join(", ")}]`);
   }
 
   /**
@@ -462,7 +494,7 @@ export class AppRegistry {
       if (len === 0 || !proc?.memory) return null;
       return self._decoder.decode(new Uint8Array(proc.memory.buffer, ptr, len));
     };
-    return {
+    const full = {
       env: {
         akiva_host_log: (level, ptr, len) => {
           const proc = self._processes.get(packageId);
@@ -570,6 +602,89 @@ export class AppRegistry {
           self._pendingSetResult.set(handle, copy);
         },
       },
+    };
+    return this._applyPermissionFilter(packageId, full);
+  }
+
+  /**
+   * Stone 10.3b — apply the capability→imports filter to the fully
+   * built `env` object. Every import is classified:
+   *
+   *   1. **Auto** (`AUTO_IMPORTS`): passes through untouched. Every app
+   *      gets these — log, resource lookups, text measurement, finish,
+   *      set_result. Gating them would mean the app can't even draw.
+   *   2. **Gated + granted**: passes through untouched. The controller
+   *      stored this grant via `setGrants` (Stone 10.3b push from
+   *      Rust), so the app earned access at install time.
+   *   3. **Gated + NOT granted**: replaced with a deny-stub that logs
+   *      a warning and returns a zero-shaped value. An app shouldn't
+   *      import these in the first place (Stone 10.3b-true / LinkError
+   *      enforcement waits for SDK build-tooling that conditions
+   *      extern emission on manifest). Until then, soft deny is the
+   *      shippable enforcement: deterministic no-op, not silent pass.
+   *   4. **Unknown** (present in `env` but not in AUTO + any capability
+   *      list): treated as auto. This is the tripwire slot for a new
+   *      host import that was added in JS but never mapped in Rust;
+   *      worth noting in logs but not blocking. The Rust-side Vitest
+   *      mirror test catches a persistent drift.
+   */
+  _applyPermissionFilter(packageId, env) {
+    const grants = this._grants.get(packageId) ?? new Set();
+    const allowedGated = new Set();
+    for (const capability of grants) {
+      const mapped = CAPABILITY_IMPORTS[capability];
+      if (mapped) for (const name of mapped) allowedGated.add(name);
+    }
+    // Build the reverse map: import name → capability that gates it.
+    // Used only to shape the deny-stub's log message; fast enough to
+    // rebuild per instantiation since it's ~15 strings.
+    const gatedBy = new Map();
+    for (const [cap, names] of Object.entries(CAPABILITY_IMPORTS)) {
+      for (const name of names) gatedBy.set(name, cap);
+    }
+    const filtered = {};
+    const envImports = env.env;
+    const autoSet = new Set(AUTO_IMPORTS);
+    for (const [name, fn] of Object.entries(envImports)) {
+      if (autoSet.has(name)) {
+        filtered[name] = fn;
+        continue;
+      }
+      const cap = gatedBy.get(name);
+      if (cap === undefined) {
+        // Unknown import — not in AUTO and not in any capability list.
+        // Pass through, but flag once in logs so the mapping drift is
+        // observable.
+        this._log("warn",
+          `[${packageId}] host import '${name}' is not in AUTO_IMPORTS or any capability mapping — passing through. Update runtime/web/app_registry.js and framework/src/permissions.rs in lockstep.`);
+        filtered[name] = fn;
+        continue;
+      }
+      if (allowedGated.has(name)) {
+        filtered[name] = fn;
+      } else {
+        filtered[name] = this._makeDenyStub(packageId, name, cap, fn);
+      }
+    }
+    return { env: filtered };
+  }
+
+  /**
+   * Build a no-op stand-in for a gated import the package doesn't have
+   * the capability for. Logs once per call so a silent call site is
+   * observable; returns a zero-shaped value matching the wasm function
+   * signature (we can't know the signature statically, but returning
+   * `0` is safe for every import in the current set — all of them are
+   * `() -> ()` or `() -> i32`-or-smaller). `originalFn` is kept in the
+   * closure for diagnostics only; we never call it.
+   */
+  _makeDenyStub(packageId, importName, capability, originalFn) {
+    void originalFn;  // retained so a future audit can show what was blocked
+    const self = this;
+    return function permissionDeniedStub(..._args) {
+      self._log("warn",
+        `[${packageId}] permission denied: '${importName}' requires '${capability}' which is not granted. Call returned no-op (0).`);
+      return 0;
     };
   }
 
@@ -690,6 +805,40 @@ export class AppRegistry {
 }
 
 // ── Constants ────────────────────────────────────────────────────────────
+
+// Stone 10.3b — mirror of Rust's `framework::permissions::AUTO_IMPORTS` +
+// `imports_for_capability`. Must stay byte-for-byte in sync with
+// `framework/src/permissions.rs`; a Vitest test asserts the same shape
+// by round-tripping an app through `setGrants` + `_buildAppImports`,
+// and a Rust test in the same stone pins the canonical list. If you
+// add a new host import, update BOTH sides or the filter will either
+// stub a real function or ship an ungated one.
+export const AUTO_IMPORTS = Object.freeze([
+  "akiva_host_log",
+  "akiva_host_text_width",
+  "akiva_host_resource_color",
+  "akiva_host_resource_string",
+  "akiva_host_resource_has_color",
+  "akiva_host_resource_has_string",
+  "akiva_host_finish",
+  "akiva_host_set_result",
+]);
+
+// Capability → gated imports. Only LAUNCH_ANY_APP has concrete imports
+// in v0.2; reserved capabilities (STORAGE_SANDBOX, QUERY_PACKAGES,
+// NOTIFICATIONS, NETWORK, CAMERA) exist in the manifest vocabulary but
+// don't yet map to `akiva_host_*` surface.
+export const CAPABILITY_IMPORTS = Object.freeze({
+  "akiva.permission.LAUNCH_ANY_APP": Object.freeze([
+    "akiva_host_start_activity",
+    "akiva_host_start_activity_for_result",
+  ]),
+  "akiva.permission.STORAGE_SANDBOX": Object.freeze([]),
+  "akiva.permission.QUERY_PACKAGES":  Object.freeze([]),
+  "akiva.permission.NOTIFICATIONS":   Object.freeze([]),
+  "akiva.permission.NETWORK":         Object.freeze([]),
+  "akiva.permission.CAMERA":          Object.freeze([]),
+});
 
 // Indexed by `LifecycleTransition` wire value from wasm_activity.rs.
 const LIFECYCLE_EXPORTS = [

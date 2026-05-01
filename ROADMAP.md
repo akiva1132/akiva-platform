@@ -549,7 +549,15 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 ### 10.3 Import map לפי capabilities
 **מחולק לשני שלבים:**
 - ✅ **10.3a — Rust-side mapping (source of truth)** — [`framework/src/permissions.rs`](framework/src/permissions.rs) מוסיף `AUTO_IMPORTS` (8 שמות ש-app מקבל תמיד: log, text_width, resource_*, finish, set_result), `imports_for_capability(name) -> &'static [&'static str]` (טבלת mapping מ-`ARCHITECTURE.md §8`), ו-`imports_for_grants(&PermissionController, package_id) -> Vec<&'static str>` (auto + gated לפי grants בפועל). כרגע רק `LAUNCH_ANY_APP` ממפה imports (`akiva_host_start_activity` + `_for_result`); `STORAGE_SANDBOX`/`QUERY_PACKAGES`/`NOTIFICATIONS`/`NETWORK`/`CAMERA` ברשימה אבל empty-slot (ה-HAL של storage/notifications/network לא נגיש לאפליקציות עדיין). 4 unit tests.
-- ⏭️ **10.3b — JS-side enforcement (instantiation filter)** — worker.js יצטרך לשאול את ה-kernel לקבל את רשימת ה-imports המותרים per-package, ולמחוק מה-`env` object כל מה שלא ברשימה לפני `WebAssembly.instantiate`. דורש (א) extern חדש בסגנון `hal_host_imports_for_package` עם 2-phase buffer, ו-(ב) או שה-SDK יצטרך לתמוך ב-conditional imports ברמת ה-build (כרגע ה-`akiva_app!` macro מייצא את כל ה-externs הלא-תנאי, אז app בלי `LAUNCH_ANY_APP` שמקמפל עם ה-macro יגרום ל-LinkError — שזה בעצם ההתנהגות הרצויה). נדחה לעבודת SDK build-tooling עתידית.
+- ✅ **10.3b — JS-side enforcement (soft via deny-stubs)** —
+  - **HAL חדש:** `hal_host_set_grants(pkg_ptr, pkg_len, grants_ptr, grants_len)` ב-[`kernel/src/host.rs`](kernel/src/host.rs); LF-separated UTF-8 על ה-wire (זהה לפורמט הפרסיסטנטי ב-`sys/permissions/{id}`).
+  - **Trait method חדש:** `WasmHost::set_grants(package_id, grants)` עם default no-op; `KernelWasmHost` מממש דרך ה-extern, MockHost מתעד `Call::SetGrants` לטסטים.
+  - **`framework::boot` push:** אחרי `load_granted_permissions`, איטרציה על כל `fw.packages.list()` ו-`host.set_grants(pkg, &grants)`. רץ לפני ה-Shell launch כך שכל instantiation עתידי כבר רואה את ה-grants.
+  - **worker.js bridge:** `hal_host_set_grants` ב-`buildHalImports`, מפענח את ה-LF blob, מעביר ל-`apps.setGrants(pkg, names)`.
+  - **AppRegistry filter ב-`_buildAppImports`:** כל import מסווג ל-AUTO (`AUTO_IMPORTS`, 8 תמיד) / gated+granted (passthrough) / gated+denied (deny-stub). Stub יורה warning log + מחזיר 0. Last-write-wins ב-grants map (תואם upgrade semantics).
+  - **`AUTO_IMPORTS` + `CAPABILITY_IMPORTS` ב-JS:** mirror של ה-Rust constants ב-`framework/src/permissions.rs`. Reserved capabilities (STORAGE_SANDBOX/QUERY_PACKAGES/NOTIFICATIONS/NETWORK/CAMERA) במקום עם empty arrays — tripwire test (`reserved capabilities ... contribute no imports today`) יקרס ביום שה-HAL ינחת.
+  - **Tests:** 1 Rust חדש (`set_grants_delegates_to_host_with_owned_strings`) + 8 Vitest חדשים (setGrants store, last-write-wins, AUTO passthrough, deny-stub fires warning, granted unlocks, per-package isolation, reserved-slot tripwire). 129 framework tests + 42 Vitest tests.
+  - **לא נכלל (defer מוצהר):** True LinkError-at-instantiation (ARCHITECTURE.md §8 ideal). דורש SDK build-tooling שמפיק externs מותנים לפי ה-manifest. כרגע ה-soft enforcement (deny-stub) זה מה שנשלח.
 
 ### 10.4 תיעוד ABI לפי capability
 - ✅ **סעיף 2.3.1 חדש ב-[`docs/abi.md`](docs/abi.md)** — "Imports by Capability" עם טבלת mapping מלאה (auto set + כל אחת מהשש permissions). ה-slots הlead-reserved (STORAGE_SANDBOX / QUERY_PACKAGES / NOTIFICATIONS / NETWORK / CAMERA) מסומנים כ-"reserved — post-MVP" כך שמפתח יודע שהם ב-mapping אבל עדיין לא מחוברים. עיקרון האכיפה מוסבר: "link error, not runtime error."
@@ -602,10 +610,7 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 לפני שמתחילים את ה-rewrite הגדול כדאי לסגור שתי חזיתות קצרות:
 
 ### Stone 10.3b — JS-side permission filter
-- worker.js מסנן את ה-`env` object לפני `WebAssembly.instantiate` לפי ה-mapping של Stone 10.3a
-- דורש (א) extern חדש בסגנון `hal_host_imports_for_package` (2-phase buffer, LF-separated) ו-(ב) ב-SDK `akiva_app!` macro emission מותנה לפי ה-manifest
-- **למה לפני Phase 11:** ברגע ש-workers נפרדים, ההגדרה של "אילו imports ה-app מקבל" עוברת למנגנון של per-worker setup. עדיף לסגור זאת פעם אחת ב-sync world ואז רק להעביר ל-worker context; אחרת שני שינויים אינטראקטיביים באותו זמן.
-- **הערכת זמן:** ~1 שבוע.
+- ✅ **נחת.** ראה Phase 10 לעיל לפירוט המלא. Soft enforcement דרך deny-stubs (warning log + return 0); true LinkError-at-instantiation מחכה ל-SDK build-tooling.
 
 ### Stone 11.0 — הוצאת Shell ל-`apps/shell/` כ-wasm app
 - Shell חי היום ב-[`framework/src/shell.rs`](framework/src/shell.rs) עם גישה ישירה ל-`fw.packages.list()` ו-`boot_count` דרך closure. זה privileged, לא אפליקציה.

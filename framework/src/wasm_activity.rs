@@ -162,6 +162,25 @@ pub trait WasmHost {
     ) {
         let _ = (handle, request_code, bytes);
     }
+
+    /// Stone 10.3b — push a package's granted-permission list to the
+    /// host so it can filter the `akiva_host_*` import map at
+    /// instantiation time (soft enforcement via stub replacement; see
+    /// [`docs/abi.md §2.3.1`](../../docs/abi.md)).
+    ///
+    /// Called once per package from `framework::boot` after
+    /// `PackageManager::load_granted_permissions`, before the first
+    /// activity is launched — so the host has the grant list on hand
+    /// the first time `hal_app_register` triggers `_instantiateProcess`.
+    /// On upgrade via `PackageManager::install`, the framework issues a
+    /// second call with the new full set; the host applies last-write-
+    /// wins semantics.
+    ///
+    /// Default is a no-op so in-kernel hosts (Shell / test harnesses)
+    /// and MockHost can ignore the push without breaking.
+    fn set_grants(&self, package_id: &str, grants: &[&str]) {
+        let _ = (package_id, grants);
+    }
 }
 
 // ── Proxy activity ───────────────────────────────────────────────────────
@@ -490,6 +509,7 @@ mod tests {
         RestoreState(u32, Vec<u8>),
         NewIntent(u32, Vec<u8>),
         ActivityResult(u32, u32, Vec<u8>),
+        SetGrants(String, Vec<String>),
     }
 
     /// Mock that records every call and lets tests pre-seed encoded paint
@@ -596,6 +616,12 @@ mod tests {
             self.calls.borrow_mut().push(
                 Call::ActivityResult(handle.get(), request_code, bytes.to_vec()),
             );
+        }
+        fn set_grants(&self, package_id: &str, grants: &[&str]) {
+            self.calls.borrow_mut().push(Call::SetGrants(
+                package_id.into(),
+                grants.iter().map(|s| (*s).to_string()).collect(),
+            ));
         }
     }
 
@@ -748,6 +774,38 @@ mod tests {
     #[test]
     fn app_handle_is_niche_packed() {
         assert_eq!(core::mem::size_of::<Option<AppHandle>>(), core::mem::size_of::<u32>());
+    }
+
+    #[test]
+    fn set_grants_delegates_to_host_with_owned_strings() {
+        // Stone 10.3b — the framework boot loop calls
+        // `host.set_grants(pkg, &[grant1, grant2, ...])` once per
+        // installed package after rehydration. MockHost captures the
+        // payload so a regression in the boot wiring (wrong package
+        // id, missing iteration, lost grants) shows up here rather
+        // than at first-app-launch.
+        let host = MockHost::new();
+        host.take_calls();
+        host.set_grants("com.akiva.calculator", &[
+            "akiva.permission.STORAGE_SANDBOX",
+        ]);
+        host.set_grants("com.akiva.shell", &[
+            "akiva.permission.QUERY_PACKAGES",
+            "akiva.permission.LAUNCH_ANY_APP",
+        ]);
+        assert_eq!(host.take_calls(), vec![
+            Call::SetGrants(
+                "com.akiva.calculator".into(),
+                vec!["akiva.permission.STORAGE_SANDBOX".into()],
+            ),
+            Call::SetGrants(
+                "com.akiva.shell".into(),
+                vec![
+                    "akiva.permission.QUERY_PACKAGES".into(),
+                    "akiva.permission.LAUNCH_ANY_APP".into(),
+                ],
+            ),
+        ]);
     }
 
     #[test]
