@@ -27,7 +27,11 @@ pub mod intent;
 pub mod manifest;
 pub mod package_manager;
 pub mod permissions;
-pub mod pkgs_wire;
+pub mod wire;
+/// Stone 11.0a wire format kept reachable at its old path so call sites
+/// outside this crate (`kernel`, `sdk-rust` doc comments) don't have to
+/// move at the same time as the Stone 11.3a refactor.
+pub use wire::pkgs as pkgs_wire;
 pub mod resources;
 pub mod result;
 pub mod storage;
