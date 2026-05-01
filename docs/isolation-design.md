@@ -1,680 +1,794 @@
-# Phase 11 — Process / Fault Isolation
+# Phase 11 — Process / Fault Isolation (Design v2)
 
-מסמך התכנון של עמוד 1 ב-v0.3. **זה המסמך המנחה לכל ששת השבועות הקרובים.** כל החלטה שלא תיסגר כאן — תילקח בחיפזון בזמן הקוד, וקרוב לוודאי תיגרר חזרה לתכנון אחרי שבוע-שבועיים.
+> **Design v2** — שכתוב מקיף של v1 בעקבות עדכון החזון: **חוויית מפתח ברמת Android/iOS, תחושת ריצה כמה שיותר native, ובניית תשתיות יסודיות לטווח הארוך.** המסמך הזה הוא הסמך המנחה לכל Phase 11 (≈12-20 שבועות).
 
-המסמך לא מתאר את המצב הסופי באופן מלא. הוא מתאר את **המודל**, את ה-**trade-offs שנבחרו**, ואת ה-**מסלול** — לא כל פרט קוד. פרטי קוד נכתבים ב-stones.
+מסמך התכנון של עמוד 1 ב-v0.3. כל החלטה שלא תיסגר כאן — תילקח בחיפזון בזמן הקוד.
 
----
-
-## 1. למה Phase 11 קיים
-
-### 1.1 הבעיה במשפט אחד
-
-כל אפליקציה ב-Akiva רצה ב-**אותו Web Worker**, על אותו event loop. אפליקציה אחת שתקועה, מתפוצצת, או מקצה זיכרון בלי גבול — מפילה את כל המערכת.
-
-### 1.2 שלושת התרחישים שבהם המערכת קורסת היום
-
-```rust
-// תרחיש 1: infinite loop
-fn on_pointer(&mut self, _ctx: &mut Context, _ev: PointerEvent) {
-    loop {}
-}
-// תוצאה: ה-Worker חסום. Shell, kernel, frame loop — כולם מוקפאים.
-//        אין דרך לסגור את האפליקציה. רק סגירת ה-tab עוזרת.
-```
-
-```rust
-// תרחיש 2: panic / wasm trap
-fn on_render(&mut self, _ctx: &mut Context, _c: &mut Canvas) {
-    panic!("nope");
-}
-// תוצאה: ה-trap נבלע ב-host call (worker.js לוכד). אבל ה-ActivityRecord
-//        נשאר ב-Resumed; ה-state machine של framework מבולבל; ניסיון נוסף
-//        לקרוא ל-on_pointer שוב traps. אין mechanism לחזור ל-Shell.
-```
-
-```rust
-// תרחיש 3: memory leak
-fn on_create(&mut self, _ctx: &mut Context) {
-    let mut v: Vec<u8> = Vec::new();
-    loop { v.extend(std::iter::repeat(0).take(1_000_000)); }
-}
-// תוצאה: ה-Worker מקצה memory בלי גבול עד שהדפדפן הורג את ה-tab כולו.
-//        אין למערכת attribution לפי app — היא לא יודעת מי האשם.
-//        אין policy ל-"הרוג את האפליקציה הכי פחות חשובה".
-```
-
-### 1.3 איך OS אמיתי פותר את זה
-
-ב-Android, Linux, macOS — לכל app יש **process משלו**. ה-OS יכול:
-- להרוג process בודד בלי לפגוע באחרים
-- למדוד CPU/memory לפי PID
-- להמתין ל-process עם timeout, ואם לא מגיב — `kill -9`
-
-הדפדפן לא נותן לנו processes, אבל הוא **כן** נותן Workers. כל Worker הוא thread נפרד, עם heap נפרד, שאפשר להרוג עם `worker.terminate()`. זה ה-equivalent הקרוב ביותר ל-process בסביבת הדפדפן.
-
-### 1.4 המטרה של Phase 11 בשורה אחת
-
-**כל אפליקציה רצה ב-Worker משלה. ה-kernel יושב ב-Worker הראשי. כשל באפליקציה לא מפיל את המערכת.**
+המסמך לא מתאר את המצב הסופי באופן מלא. הוא מתאר את **המודל**, את ה-**trade-offs שנבחרו על בסיס מחקר**, ואת ה-**מסלול** — לא כל פרט קוד. פרטי קוד נכתבים ב-stones.
 
 ---
 
-## 2. המצב הנוכחי בפירוט
+## 1. החזון (priorities לפי סדר)
 
-לפני שנדבר על הפתרון, צריך להבין מדויק מה קיים.
+1. **DX ברמת Android/iOS.** מפתחי app כותבים `async fn on_create(&mut self) { ... }`, מקבלים lifecycle scopes שמבטלים tasks אוטומטית, ו-API שמרגיש מוכר. זמן ramp-up: דקות, לא שעות.
+2. **native-feel ריצה** בתוך מגבלות הדפדפן. 60fps יציב, lifecycle transitions חלקים, host calls < 1ms בwarm path. אנחנו מקבלים שזה דפדפן — לא ננסה להגיע ל-100,000 syscall/s כמו Linux.
+3. **תשתית יסודית** — שכבות שמ-100 אפליקציות עתידיות יוכלו להישען עליהן. Documentation מקיף, primitives שמרכיבים יפה, error messages מעולים.
 
-### 2.1 המבנה הנוכחי
-
-```
-Browser tab
-└── Web Worker (יחיד) — runtime/web/worker.js
-    ├── kernel wasm                          (akiva-kernel.wasm)
-    │   └── framework בתוך ה-kernel
-    │       ├── ActivityManager
-    │       ├── PackageManager
-    │       ├── IntentRouter
-    │       └── PermissionController
-    └── App registry — runtime/web/app_registry.js
-        └── pool של WebAssembly.Instance per package:
-            ├── sys.shell                    instantiated, exports.akiva_app_*
-            ├── com.akiva.calculator         instantiated, exports.akiva_app_*
-            ├── com.akiva.hello              instantiated, exports.akiva_app_*
-            └── com.akiva.tictactoe          instantiated, exports.akiva_app_*
-```
-
-### 2.2 איך call זורם היום
-
-לחיצת עכבר על השעון ב-Shell:
-
-```
-Canvas pointerdown                   (main thread, tab.js)
-  │
-  └─► postMessage → worker.js
-       │
-       └─► kernel.akiva_on_event(...)            (sync call into wasm)
-            │
-            └─► EventQueue.push                  (rust)
-                 │
-                 └─► next frame:
-                      Kernel.handle_event
-                       └─► ActivityManager.dispatch_pointer
-                            └─► AppRegistry.onPointer(handle, x, y, ...)   (rust → js callback)
-                                 │
-                                 └─► proc.instance.exports.akiva_app_pointer(handle, x, y, ...)
-                                      │
-                                      └─► Shell on_pointer (rust, wasm)
-                                           │
-                                           └─► ctx.start_activity(&intent)
-                                                │
-                                                └─► akiva_host_start_activity   (host import)
-                                                     │
-                                                     └─► AppRegistry resolves intent
-                                                          └─► framework launches calculator
-                                                               └─► calculator.akiva_app_create(handle, ...)
-                                                                    │ (sync: returns when done)
-                                                                    └─► ...
-```
-
-ה-flow הזה הוא **sync לחלוטין מקצה לקצה**. שורה אחרונה לא חוזרת עד שכל ה-tree של calls מסתיים. זאת הסיבה שאם calculator תקועה ב-loop, ה-pointerdown של Shell לא חוזר — וה-event loop של ה-Worker חסום.
-
-### 2.3 שלושת ה-coupling points הקריטיים
-
-הסיבה שקשה לפצל היום:
-
-1. **`ctx.start_activity(&intent)` הוא sync.** ה-app מצפה ש-call יחזור (אם כי בלי ערך). היום זה עובד כי ה-host call נכנס מיידית ל-framework code שרץ באותו thread.
-
-2. **`pkgs::list()` מחזיר Vec.** ה-app קורא, מקבל buffer, decoder, vector. זה sync round-trip.
-
-3. **lifecycle callbacks הם sync.** framework קורא `on_create`, ה-call לא חוזר עד ש-on_create גמרה. אז framework קורא ל-`on_start`. אם ה-app רץ ב-Worker אחר, postMessage היא inherently async — הקריאה הבאה צריכה להמתין ל-ack.
+הבר: כל מפתח חדש שמתחיל כותב app שעובד בתוך 5 דקות מ-`akiva new`.
 
 ---
 
-## 3. ההחלטה הקריטית — sync facade vs async API
+## 2. למה Phase 11 קיים — תזכורת קצרה
 
-זאת **ההחלטה המכרעת** של Phase 11. כל החלטה אחרת נגזרת ממנה.
+כל אפליקציה ב-Akiva רצה היום ב-**אותו Web Worker**, על אותו event loop. אפליקציה שתקועה / מתפוצצת / מקצה memory בלי גבול — מפילה את כל המערכת.
 
-### 3.1 שלוש האופציות
+שלושה תרחישי כשל:
+- **infinite loop** ב-`on_pointer` → ה-Worker חסום, ה-Shell קופאת.
+- **panic** ב-`on_render` → ה-`ActivityRecord` נשאר ב-Resumed, framework מבולבל.
+- **memory leak** → ה-tab כולו נהרג, אין attribution לאפליקציה.
 
-#### אופציה A — Pure async API
+ב-OS אמיתי כל אפליקציה ב-process משלה: ניתן להרוג, למדוד, להחליט מי הכי פחות חשוב. הדפדפן לא נותן processes ישירות, אבל **Web Workers** הם thread-isolation ברמה דומה לprocess-isolation מבחינת user-space.
 
-כל host call ב-SDK מחזיר Future. App code:
-
-```rust
-// היום
-fn on_pointer(&mut self, ctx: &mut Context, ev: PointerEvent) {
-    ctx.start_activity(&intent);
-}
-
-// אופציה A
-async fn on_pointer(&mut self, ctx: &mut Context, ev: PointerEvent) {
-    ctx.start_activity(&intent).await;
-}
-```
-
-**בעד:** clean. נכון מלמעלה למטה. אין hidden blocking.
-
-**נגד:** כל ה-SDK משתנה. כל אפליקציה צריכה rewrite. ה-`Activity` trait הופך ל-async trait — שזה לא טריוויאלי ב-no_std wasm. התרגום `Future` → polling ב-rust no_std ידרוש executor פנימי. אנחנו מוסיפים ~3-5kb למשקל wasm לכל אפליקציה רק כדי שיכלו לקרוא ל-`.await`.
-
-#### אופציה B — Sync facade עם `Atomics.wait` (SharedArrayBuffer)
-
-ה-API ל-app נשאר sync. מתחת, host call כותב request ל-SharedArrayBuffer, שולח notification ל-main worker, וקורא ל-`Atomics.wait` עד שהתשובה כתובה.
-
-```rust
-// API נשאר זהה לגמרי
-fn on_pointer(&mut self, ctx: &mut Context, ev: PointerEvent) {
-    ctx.start_activity(&intent);
-}
-
-// מתחת:
-// host import akiva_host_start_activity:
-//   1. write intent bytes to SAB at offset
-//   2. set "request type" = START_ACTIVITY
-//   3. Atomics.notify(sab, control_offset)
-//   4. Atomics.wait(sab, ack_offset, 0)        ← worker חוסם פה
-//   5. main worker מתחזק את ה-call, כותב תשובה, Atomics.notify
-//   6. host import חוזר
-```
-
-**בעד:** API ל-apps לא משתנה. 4 האפליקציות הקיימות + SDK ממשיכים לעבוד עם binary compatibility מלא לאחר re-build. ה-mental model של מפתחי app נשאר identicall.
-
-**נגד:** דורש cross-origin isolation (COOP `same-origin` + COEP `require-corp`) כדי ש-SharedArrayBuffer יהיה זמין. זה משמעותי — צריך headers בdevserver וב-production. גם: blocking ב-Worker עצמו טבעי, אבל יש מי שיטען ש-"`Atomics.wait` ב-app worker זה anti-pattern".
-
-#### אופציה C — Hybrid (sync facade עם split)
-
-Calls "fire-and-forget" (אין ערך החזרה) הם async תחת המכסה — ה-app שולח message, חוזר מיידית, ה-call יבוצע מאוחר יותר. Calls "result-bearing" (`pkgs::list`, `read_file`) משתמשים ב-`Atomics.wait` כמו אופציה B.
-
-**בעד:** 90% מה-calls הם fire-and-forget (logging, start_activity, set_result). על השאר אנחנו משלמים את העלות של SAB. ההפרדה מבהירה לעצמה את ה-cost model.
-
-**נגד:** שתי roads ל-call. אם app מצפה לסדר temporal, fire-and-forget יכולים להגיע out-of-order. צריך per-app FIFO ordering בכל מקרה — זה מבטל חלק מה-saving.
-
-### 3.2 ההחלטה: **אופציה B** — sync facade עם `Atomics.wait`
-
-**הסיבות:**
-
-1. **שמירה על ה-API לאפליקציות.** יש לנו SDK עם 4 אפליקציות עובדות. כל אחת מהן 100-300 שורות. שבירת ה-API דורשת לעדכן 4 crates + sdk-rust + כל ה-tests. עלות גבוהה ללא תועלת ארכיטקטונית — באמת הרי האפליקציה רוצה שהcall יחזור (היא רוצה לדעת שה-activity התחילה, או שה-pkgs רשימה הגיעה).
-
-2. **`Atomics.wait` הוא בדיוק מה ש-OS עושה.** ב-Linux, syscall זה user→kernel context switch שחוסם את ה-userspace thread עד שה-kernel חוזר. אין הבדל מהותי בין `Atomics.wait` ב-app worker לבין `int 0x80` ב-Linux process. ה-app worker הוא user thread, main worker הוא kernel.
-
-3. **COOP/COEP הם ממילא דרישה לעתיד.** אם נרצה אי-פעם `precise high-resolution timer` (`performance.now()` עם microsecond precision), `Worker.terminate` שעובד מהר, או high-precision shared memory — נצטרך אותם. עדיף לשלם עכשיו.
-
-4. **C כאופטימיזציה אחרי שמודדים.** אם נמצא שbursts של `log_info!` מציפים את ה-Atomics path, נוכל להוסיף fast-path async-fire-and-forget רק עבור log calls. אבל זה אופטימיזציה, לא ארכיטקטורה.
-
-### 3.3 מה זה אומר טכנית
-
-עבור כל app worker יש:
-
-- **SAB אחד** של גודל קבוע (נניח 64KB). Layout:
-  - bytes 0-3:   request type (u32, 0 = idle)
-  - bytes 4-7:   ack flag (u32, 0 = pending, 1 = done)
-  - bytes 8-11:  response length (u32)
-  - bytes 12-15: response status (u32, 0 = ok, !=0 = error)
-  - bytes 16-32K: request payload buffer (caller writes here)
-  - bytes 32K-64K: response payload buffer (callee writes here)
-
-- **MessagePort** בין main worker ל-app worker:
-  - notifications של "request ready" אם רוצים פלטפורמה גם בלי SAB (fallback path, אופציונלי)
-  - lifecycle commands (create/start/resume/pause/stop/destroy) שאינם host calls
-
-- **בproject conventions:**
-  - `akiva_host_*` imports ב-app — נשארים בשמותיהם, אבל המימוש ב-app worker הופך ל-write-to-SAB + wait
-  - `hal_host_*` externs ב-kernel — נשארים sync (kernel ב-main worker, אין barrier)
+המטרה של Phase 11 בשורה אחת: **כל אפליקציה ב-Worker משלה, ה-kernel ב-Worker הראשי, כשל באפליקציה לא מפיל את המערכת.** אבל בנוסף — ה-API שמפתחים יראו חייב להיות async, מודרני, ו-foundational ל-100 האפליקציות הבאות.
 
 ---
 
-## 4. המודל: worker-per-app
+## 3. ממצאי מחקר (May 2026)
 
-### 4.1 ההחלטה: package = unit of isolation
+לפני ההחלטות, הממצאים שמדריכים אותן.
+
+### 3.1 WASI 0.3 / Component Model — **לא מוכן עדיין**
+
+WASI 0.3 (native async, `future<T>`, `stream<T>`) שוחרר preview ב-Wasmtime 37 (פברואר 2026). WASI 1.0 stable מתוכנן ל-late 2026 / early 2027. **דפדפנים לא תומכים ב-Component Model native** — נדרש transpilation דרך `jco`. `wit-bindgen` Rust async API עדיין משתנה (לדוגמה issue 1152 מינואר 2025 על mapping של `stream<T>`).
+
+**מסקנה:** Component Model הוא ה-future, אבל אנחנו לא ב-future. לאמץ אותו עכשיו = לחיות עם spec churn ל-12-18 חודשים. **נחליט: roll-our-own ABI ל-Phase 11, planned migration ל-Component Model ב-v0.5+.** ה-design של ה-ABI שלנו ייקח השראה מ-Component Model semantics (futures, streams) כך ש-migration יהיה straight-forward.
+
+### 3.2 OPFS — multiple readonly handles **כן** נתמכים
+
+הממצא שמשנה את ה-design: ב-Chrome 121+ (ובFirefox/Safari עוקבים), `FileSystemSyncAccessHandle` תומך ב-3 modes:
+- **`readwrite`** (default) — exclusive lock. Handle יחיד.
+- **`read-only`** — multiple handles allowed simultaneously.
+- **`readwrite-unsafe`** (Chrome 121+) — multiple handles, caller manages locking.
+
+**מסקנה:** apps יכולות לקבל readonly handles ישירים לקבציהן (קריאה מהירה, ב-app-worker עצמו, אין round-trip). writes ממשיכים דרך kernel-worker (sandbox enforcement, atomic).
+
+### 3.3 Document Isolation Policy (Chrome 137+) — **COI הפך פשוט**
+
+Chrome 137 (יצא ~אמצע 2025, עכשיו ב-production) הוסיף `Document-Isolation: ...` header שנותן `crossOriginIsolated === true` ב-per-frame בלי לדרוש COEP-cascade על subframes. SharedArrayBuffer זמין ללא ה-headache של COEP.
+
+**מסקנה:** SAB ו-Atomics זמינים בקלות. אנחנו לא תקועים עם COEP גרורים בכל iframe.
+
+### 3.4 postMessage performance (2026) — **מהיר מספיק**
+
+מדידות מודרניות:
+- Simple message: 0-1ms round-trip
+- Transferables: 80kB/ms throughput
+- structuredClone: 5-40% מהיר יותר מ-2024 (אופטימיזציות ב-V8/SpiderMonkey)
+
+**מסקנה:** postMessage לא bottleneck. SAB+Atomics רק כשבאמת צריך blocking (מקרים בודדים — synchronous storage reads מתוך wasm function שלא יכולה להחזיר Future).
+
+### 3.5 Worker spawn cost — **~40ms**
+
+יציב מאז 2015. אומר: לא לעשות spawn-per-activity-launch. אסטרטגיה: lazy-spawn-per-package, או pre-spawn במקרים קריטיים (Shell).
+
+### 3.6 Modern app frameworks — **scope-based async cancellation**
+
+הממצאים החשובים ביותר ל-DX:
+
+**Android (Kotlin Coroutines + Compose):**
+- `lifecycleScope.launch { ... }` — coroutine שמבוטל אוטומטית כש-Activity נהרסת.
+- `viewModelScope.launch { ... }` — coroutine שמבוטל כש-ViewModel נהרסת.
+- `LaunchedEffect(key) { ... }` — coroutine שמבוטל אם ה-key משתנה או ה-Composable יוצא.
+- `repeatOnLifecycle(STARTED) { flow.collect { ... } }` — collection רק כש-UI נראה.
+
+**SwiftUI:**
+- `.task { await load() }` — task שmotor automatically מתבטל ב-`onDisappear`.
+- `.task(id: someValue) { ... }` — task שמתבטל אם `someValue` משתנה.
+- structured concurrency: child tasks מתבטלים עם parent.
+
+**הדפוס המשותף:** **המפתח לא מנהל cancellation ידנית.** ה-API נותן scope, ה-scope מבטל אוטומטית. אין `if (mounted)` checks, אין memory leak מ-orphaned listeners.
+
+**מסקנה:** SDK-rust חייב לחשוף scope-based primitives:
+- `&mut Context` חושף `task!` macro: `task!(self, async { ... })` — task scoped ל-activity, מבוטל ב-`on_destroy`.
+- `task_until!(self, state == Resumed, async { ... })` — task שמבוטל ביציאה מ-Resumed.
+- כל ה-async I/O בSDK מ honored cancellation tokens.
+
+### 3.7 embassy executor — **מתאים ל-Akiva**
+
+Embassy הוא executor async/await ל-no_std embedded. תומך ב-wasm. yes alloc, yes nightly, אבל ב-stable עם feature flags. גודל: 5-10KB code per app, scales to 1000s of tasks. **זה ה-runtime שאפליקציות Akiva ירוצו עליו** — מקביל ל-Tokio, אבל מתאים לסביבת no_std-friendly של app וסם.
+
+### 3.8 cross-origin iframe-per-app — **דחוי**
+
+לקבל "Spectre-grade" isolation, צריך כל app על registered domain שונה (לא subdomain — Chrome מתעלם מ-subdomains). זה דורש DNS infrastructure שלא רלוונטית ל-MVP. Worker isolation מספקת thread+heap isolation מלא, וזה sufficient עד שיש exposure לdata-leak attacks (לא רלוונטי לפלטפורמה שמריצה apps של המשתמש בלבד).
+
+**מסקנה:** worker-per-app עכשיו, document/iframe-per-app נשאר future-work אם יום אחד נריץ untrusted third-party apps.
+
+### 3.9 WebContainers (StackBlitz) כ-precedent
+
+WebContainers מריצים Node.js שלם בdoubrar בעזרת SAB+SW+wasm. זה מוכיח שאפשר להריץ OS-grade workloads במודל הזה. ה-architecture שלהם דומה למה שאנחנו בונים: wasm + linear memory isolation + virtual networking. **אנחנו לא לבד.**
+
+---
+
+## 4. ההחלטות הקריטיות
+
+### 4.1 ה-ABI יהיה **async-native**, לא sync facade
+
+**הבחירה:** ה-ABI של app↔host יהיה async ברמה הסמנטית. host calls לא חוזרים בעם ערך מיידית — הם מחזירים `Future`. ה-app יריץ executor (embassy) שמטפל ב-await.
+
+```rust
+// SDK לאפליקציה — חתימה חדשה
+pub trait Activity {
+    async fn on_create(&mut self, ctx: &mut Context<'_>);
+    async fn on_resume(&mut self, ctx: &mut Context<'_>);
+    async fn on_pause(&mut self, ctx: &mut Context<'_>);
+    async fn on_pointer(&mut self, ctx: &mut Context<'_>, ev: PointerEvent);
+    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>);
+    // ...
+}
+
+// host calls
+impl Context<'_> {
+    pub async fn start_activity(&mut self, intent: &Intent);
+    pub async fn read_storage(&self, key: &str) -> Option<Vec<u8>>;
+    pub async fn list_packages(&self) -> Vec<PackageInfo>;
+}
+```
+
+**הבחירה הזאת מנצחת את אופציה B של v1** מהסיבות:
+
+1. **DX זהה לAndroid/iOS modern.** מפתח שכותב `async fn on_create` ב-Akiva יודע מה הוא עושה אם הוא הגיע מ-Compose/SwiftUI.
+2. **לא נדרש `Atomics.wait`** ב-app worker. ה-worker נשאר event-driven; ה-executor mid await עוצר את ה-task ומשחרר ה-event loop. אין blocking.
+3. **structured concurrency באה בחינם.** `task!` macro spawns child task, שמתבטל אם parent task (`on_create`) cancelled.
+4. **migration ל-Component Model נקי.** WIT `future<T>` ימופה ל-Rust `impl Future<Output=T>` ב-`wit-bindgen`. אנחנו כבר באותה semantic.
+
+**העלות:**
+- כל app הקיים (4) ייצריך rewrite ל-async. אבל ה-rewrite שטחי — רק לחתום על ה-API החדש. הלוגיקה הפנימית לא משתנה.
+- embassy executor מוסיף ~5-10KB ל-binary של app.
+- Framework-side צריך לnavigate state machine async (כמו ב-v1, אבל עכשיו טבעי כי ה-app גם async).
+
+### 4.2 isolation: **worker-per-app**
 
 יש שלוש granularities אפשריות:
+- worker-per-activity: יותר מדי — overhead של 40ms × N activities.
+- worker-per-task: לא משקף את ה-pkg boundary שהמשתמש מצפה לו.
+- **worker-per-app: package = unit of isolation.**
 
-- **worker-per-activity** — כל activity ב-Worker משלו. פתרון אקדמי לטוב ולרע: container אבטחתי מקסימלי, overhead מקסימלי.
-- **worker-per-task** — task הוא back-stack. activities מאותו task באותו worker. הבעיה: tasks יכולים לכלול activities מ-packages שונים (cross-app intent). שיתוף heap בין packages חוזר להיות פגיע.
-- **worker-per-app** — package הוא unit. כל ה-activities של calculator באותו worker. אין שיתוף heap בין packages.
+**הבחירה: worker-per-app.** מתואם ל-mental model של המשתמש ("הרוג את calculator"), ל-storage sandbox (`{package_id}/...`), ול-permission model (grants per package).
 
-**ההחלטה: worker-per-app.**
+### 4.3 transport: **postMessage primary, SAB אופציונלי**
 
-זה גם מה ש-Android עושה (מתוך תיאוריה — בפועל אפשר לחלק אבל ברירת המחדל היא process-per-app), וזה מה שהמשתמש מצפה: "תהרוג את calculator" → ההצפנה של calculator נמחקת, השאר חי.
+ב-v1 בחרתי SAB+Atomics. ה-research מוכיח ש-postMessage ב-Chrome 2026 הוא 0-1ms — לא bottleneck. ה-SAB נדרש רק כש-wasm function חייב להחזיר ערך *לפני שהוא חוזר ל-event loop*.
 
-### 4.2 ה-topology המבוקש
+עם async ABI **אין מקרה כזה** — wasm function תמיד יכולה לחזור (`Poll::Pending`) ולהמתין. ה-host כותב את התוצאה לbuffer וקורא ל-app worker שוב, app worker resumes את ה-future.
 
-```
-Browser tab
-├── tab.js (main thread)              ─── שכבת DOM/canvas
-│
-└── kernel-worker (main Web Worker)   ─── kernel wasm + framework
-    │
-    ├──► port-MessagePort + SAB ────► app-worker-shell                    (Shell)
-    │                                  └── sys.shell wasm instance
-    │
-    ├──► port-MessagePort + SAB ────► app-worker-calculator
-    │                                  └── com.akiva.calculator wasm instance
-    │
-    ├──► port-MessagePort + SAB ────► app-worker-hello
-    │                                  └── com.akiva.hello wasm instance
-    │
-    └──► port-MessagePort + SAB ────► app-worker-tictactoe
-                                       └── com.akiva.tictactoe wasm instance
-```
+**מסקנה: postMessage כתחבורה ראשית.** SAB יישמר בidiom של "shared memory עבור frame buffer" (אם נרצה zero-copy rendering בעתיד) או "live state observer" (subscriptions ל-state changes), אבל **לא ל-blocking RPC**.
 
-**התפקידים:**
+### 4.4 OPFS: **hybrid**
 
-- **tab.js** — כמו היום, אין שינוי. כל input/output עובר דרך kernel-worker.
-- **kernel-worker** — מחזיק את kernel wasm. גם מחזיק את framework (ActivityManager וכו'). הוא ה-"system process".
-- **app-worker** — Web Worker שטעון את `app_worker_shell.js`. בתוכו טעון wasm instance של app אחד. הוא לא ניגש ישירות ל-DOM, ל-OPFS, או לkernel — הכל עובר דרך SAB+postMessage ל-kernel-worker.
+עם הממצא של multiple readonly handles:
 
-### 4.3 mapping של callbacks
+- **קריאות של app מקבציה:** ה-app-worker פותח `readonly` handle. round-trip ישיר ל-disk, אין round-trip ל-kernel.
+- **כתיבות:** ה-app-worker שולח ל-kernel-worker, kernel writes (יש לו `readwrite` exclusive). ה-kernel אוכף sandbox prefix `{package_id}/`.
+- **gone-system files (sys/):** kernel-worker בלבד.
+- **uninstall:** kernel-worker מורה ל-app-worker לסגור readonly handles, ממתין ack, ואז writes/deletes.
 
-```
-ב-kernel-worker (framework):                      ב-app-worker-X:
-─────────────────────────────────                ──────────────────────────────────
-launch(intent):                                  worker שומר wasm instance טעון
-  spawn app-worker (אם לא קיים)                  ולא עושה כלום עד שמגיע command
-  send LIFECYCLE("create", handle, intent_blob)  ◄────────────► postMessage
-  wait for LIFECYCLE_ACK                                          │
-                                                                  ▼
-                                                        akiva_app_create(handle, ...)
-                                                        sync run inside wasm
-                                                                  │
-  send LIFECYCLE("start", handle)               ◄──── postMessage LIFECYCLE_ACK("create")
-  wait for LIFECYCLE_ACK                                ...
-  ...
-```
+זה נותן fast read path עבור apps (calc, hello — בעיקר reads ב-`on_create`), עם safety של write-through-kernel.
 
-ה-framework לא קורא יותר `proc.instance.exports.akiva_app_create(...)` ישירות. במקום זה:
-1. שולח message ל-app worker
-2. ממתין ל-ack
-3. ממשיך ל-callback הבא
+**עלות:** קצת יותר logic ב-app-worker (פתיחה+מעקב אחרי handles). אבל בdoument'ed ב-storage layer של ה-SDK.
 
-### 4.4 host calls
+### 4.5 Component Model: **נדחה ל-v0.5+, ה-ABI שלנו ייקח השראה ממנו**
 
-ה-flow המלא של `ctx.start_activity(&intent)` מתוך אפליקציה:
+קל לדמיין rewrite גדול ל-Component Model — אבל ספירת המחיר:
+- WASI 0.3 stable: late 2026
+- Browser support דרך jco (transpile step)
+- wit-bindgen Rust async עדיין משתנה
+- אנחנו צריכים את Phase 11 working **עכשיו**
 
-```
-[app-worker-shell]
-├── Shell::on_pointer רץ ב-wasm
-└── ctx.start_activity(&intent)
-     ├── encode intent → bytes
-     ├── write to SAB request buffer
-     ├── SAB[0] = REQ_START_ACTIVITY
-     ├── SAB[4] = 0 (ack pending)
-     ├── postMessage({type:"req"}) → kernel-worker (notification)
-     └── Atomics.wait(sab, 4, 0)            ← חוסם פה
-                  │
-[kernel-worker]   │
-├── onmessage("req") from shell-port
-├── read SAB[0] → REQ_START_ACTIVITY
-├── read intent bytes from SAB
-├── frameworks.intents.resolve(intent) → (target_pkg, class)
-├── ActivityManager.launch(target_pkg, class)
-│    └── (recursively talks to app-worker-calculator the same way)
-├── write response to SAB
-├── SAB[4] = 1 (ack)
-├── Atomics.notify(sab, 4)
-                  │
-                  │
-                  ▼ ← woken
-[app-worker-shell]
-├── read response from SAB
-└── return from start_activity
-```
+**הבחירה:** roll-our-own ABI עם semantics שמהדהדות Component Model:
+- `request_id: u64` per host call — שכפול של "task" ב-Canonical ABI.
+- "future" = future ID שה-app polls; "stream" = stream ID + chunked notifications.
+- כששדורגים ל-Component Model ב-v0.5, ה-host translation layer תהיה straightforward — הסמנטיקה כבר תואמת.
 
-**critical detail:** ה-Atomics.wait ב-app worker חוסם **רק את ה-app worker**. ה-kernel-worker חופשי לטפל ב-events של apps אחרים. אם calculator מבקשת `read_file` במקביל ל-`start_activity` של Shell, kernel-worker מטפל בשניהם בseries (עם FIFO order לכל port), ושני האפליקציות רצות במקביל ב-CPU.
+### 4.6 async runtime באפליקציה: **embassy**
 
----
+`embassy-executor` היא ה-runtime שיריץ אפליקציות Akiva. בחירה זו על פני אלטרנטיבות (`futures-executor`, `smol`):
+- **no_std-friendly** — חשוב לwasm bundle size.
+- **deterministic** — תזמון task-stealing דטרמיניסטי, חשוב לreproducibility בtests.
+- **ecosystem רחב** — `embassy-time`, `embassy-sync` נותנים primitives שאנחנו צריכים (mutex, channel, signal).
+- **WASM target נתמך** — ראה [embassy.dev/book](https://embassy.dev/book/).
 
-## 5. OPFS — האילוץ הקשה ביותר
+ה-SDK יחביא את embassy תחת abstraction (`akiva_sdk::task::spawn`), אבל מתחת — embassy.
 
-### 5.1 הבעיה
+### 4.7 lifecycle scopes (Android/iOS-inspired)
 
-OPFS `SyncAccessHandle` הוא הדרך היחידה לעשות **synchronous I/O** ב-OPFS. הוא חיוני ל-`StorageEngine` שיש לנו (calculator קוראת/כותבת ב-`on_create`/`on_save_state` — sync). אבל יש מגבלה:
-
-> Only one `SyncAccessHandle` per file can exist at a time.
-
-נגיד kernel-worker פתח `sys/permissions/com.akiva.calculator`. עכשיו calculator app-worker רוצה לפתוח את הקובץ שלה `com.akiva.calculator/savedstate`. זה קובץ אחר — אפשר. אבל:
-
-- כל app-worker צריך לפתוח את **קבציו הוא**
-- אם app-worker מנסה לפתוח קובץ שhandle שלו פתוח ב-kernel-worker, נכשל
-
-עוד מסובכות:
-- אם app-worker נסגר (`worker.terminate()` או failure), ה-handles שלו לא מתרוקנים אוטומטית בזרימה רגילה. ה-browser בסוף משחרר אבל יש חלון שבו handle "תקוע".
-- מערכת הבדיקה של `kernel-worker` (boot scan, install, uninstall) דורשת גישה ל-storage של אפליקציות אחרות.
-
-### 5.2 שלוש אופציות
-
-#### אופציה I: כל ה-storage עובר דרך kernel-worker
-
-ה-app קורא `storage.write(key, value)` → host call → SAB → kernel-worker → kernel-worker מחזיק את ה-handle → returns OK.
-
-**בעד:** מודל פשוט. Single source of truth. kernel-worker יכול לאכוף sandbox prefix (`{package_id}/...`) באופן אטומי.
-
-**נגד:** כל write עובר Atomics.wait. אם calculator שומרת state ב-`on_pause`, זה round-trip ל-kernel-worker. עלות: ~0.1ms-1ms פר call.
-
-#### אופציה II: app-worker מחזיק handles משלו, kernel-worker מתואם
-
-ה-app-worker פותח SyncAccessHandles בעצמו. kernel-worker יודע שיש partition של handles ולא נוגע בקבצים של apps פעילות.
-
-**בעד:** storage I/O מהיר.
-
-**נגד:** מורכב. אם kernel-worker רוצה לעשות `uninstall(calculator)`, הוא חייב לקרוא ל-app-worker "תשחרר את ה-handles", להמתין, ואז למחוק. כל שגיאה ב-protocol הזה משאירה לnefarious states.
-
-#### אופציה III: hybrid
-
-קבצים של ה-app בלבד (`{package_id}/*`) — handle ב-app-worker. קבצים של מערכת (`sys/*`) — kernel-worker בלבד.
-
-**בעד:** המסלול המהיר עבור user data, kernel נשאר authoritative על system data.
-
-**נגד:** עדיין יש את בעיית uninstall. ועוד בעיה: הצורך לוודא שבזמן שapp פעיל, kernel-worker לא נוגע בקבציה — אבל מה אם ה-kernel-worker צריך לעשות migration?
-
-### 5.3 ההחלטה: **אופציה I** — הכל עובר דרך kernel-worker
-
-**הסיבות:**
-
-1. **הbenchmarks שלנו לא צריכים את אופציה II.** Calculator שומרת state פעם בכל `on_pause` (פעם בליצוץ). 1ms latency לא מורגש. אם נמצא ש-app אמיתי דורש high-throughput storage, נוכל לחזור — אבל בלי data, optimization premature.
-
-2. **uninstall הופך טריוויאלי.** kernel מחזיק את ה-handles, יודע מה פתוח, יכול לסגור-ולמחוק.
-
-3. **enforcement חזק.** ה-sandbox prefix `{package_id}/` נאכף ב-kernel-worker רגעי לפני ה-write. ב-app-worker אין דרך לבקש מפתח שלא מתחיל ב-`{package_id}/`.
-
-4. **לא דורש מצב חדש.** kernel-worker היום עושה את זה (כל ה-storage עובר דרכו). השינוי הוא רק ש-host call עובר דרך SAB במקום call ישיר.
-
-### 5.4 implication על ה-storage API
-
-ה-`akiva_sdk::storage` API נשאר זהה. תחת המכסה, כל פונקציה הופכת ל-host call עם round-trip ל-kernel.
-
-Latency budget: storage call ≤ 2ms (round-trip + serialization). אם נמצא ש-app אמיתי משוחק חרוצה storage לטעינה ראשונית (`on_create` עם 50 reads), נוכל להוסיף `bulk_read(keys: &[&str]) → Vec<Result<Vec<u8>>>` ל-API.
-
----
-
-## 6. Lifecycle כ-state machine async
-
-### 6.1 הבעיה
-
-היום (sync):
+ה-SDK יחשוף 3 scopes:
 
 ```rust
-// framework/src/activity_manager.rs (ב-kernel-worker)
-pub fn drive_to_resumed(&mut self, handle: ActivityHandle) {
-    self.dispatch(handle, "create");   // sync — חוזר אחרי שה-app גמרה
-    self.dispatch(handle, "start");
-    self.dispatch(handle, "resume");
+// 1. activity scope — בuto-cancelled at on_destroy
+impl Context<'_> {
+    pub fn activity_scope(&self) -> &TaskScope;  // tied to ActivityHandle
+}
+
+// 2. resumed scope — auto-cancelled at on_pause
+impl Context<'_> {
+    pub fn resumed_scope(&self) -> &TaskScope;
+}
+
+// 3. one-shot — מתבטל מיד אחרי שהפונקציה הקוראת חוזרת
+// (זה ה-default אם משתמשים ב-await ישירות)
+```
+
+```rust
+// דוגמה: app טוענת data ב-resume, מבטל אם user navigates back
+async fn on_resume(&mut self, ctx: &mut Context<'_>) {
+    ctx.resumed_scope().spawn(async {
+        let data = fetch_from_storage("config").await;
+        // אם user יוצא לפני שזה חוזר → cancelled, אין panic
+        update_ui(data);
+    });
 }
 ```
 
-מחר (async):
+זה שכפול 1:1 ל-`lifecycleScope` ב-Android. **DX זהה.**
 
-```rust
-// כל dispatch הוא postMessage. אנחנו לא יכולים להמשיך מיד.
-// אנחנו צריכים state machine שיודע "ה-create עוד לא חזר, אל תקרא ל-start".
-```
+### 4.8 watchdog: ping/pong ב-JS-level (ללא שינוי מ-v1)
 
-### 6.2 המודל
+V1 ההחלטה הזו הייתה נכונה ועוברת. ה-pong handler ב-`app_worker_shell.js` הוא JS-level — לא wasm — כך ש-`loop {}` ב-app code לא חוסם heartbeat.
 
-הכוונה לאמץ את אותו מודל שLooper של Android משתמשת בו: **המגיש מחזיק את ה-state, ה-app רק מודיע "סיימתי שלב X"**.
-
-```
-ActivityRecord:
-  state:           Created | Started | Resumed | Paused | Stopped | Destroyed
-  pending:         Option<{ target: state, request_id: u64 }>
-  inflight_at:     Option<Timestamp>     ← לwatchdog
-```
-
-```
-פונקציה drive_to(target_state):
-  match (current, target):
-    Created, Resumed → pending = (target=Created, ...); send "create";
-                       on ack → pending = (target=Started, ...); send "start";
-                                on ack → pending = (target=Resumed, ...); send "resume";
-                                         on ack → state = Resumed; pending = None
-```
-
-זאת מכונת מצב. ה-framework לא מתבייש שהיא async — היא חיה ב-tick של kernel frame loop. כל frame, היא בודקת:
-
-1. האם יש pending transition שעבר timeout? → trapped
-2. האם יש queued lifecycle requests מ-IntentRouter? → התחל transition חדש
-
-### 6.3 implication על ה-API של framework
-
-הפונקציות שכותבי framework הקיימות מצפות:
-
-```rust
-// היום
-let result = activity_manager.dispatch_pointer(handle, ev);
-
-// מחר
-activity_manager.queue_pointer(handle, ev);  // queue ב-app-worker port
-// ה-result מגיע ב-frame הבא דרך onmessage; framework מטפל
-```
-
-`queue_pointer` הוא fire-and-forget. אם ה-app לא מטפל ב-event, מודלית — הוא יאבד אחרי X frames של queueing. ה-framework לא צריך לחכות.
-
-### 6.4 implication על tests
-
-ה-test suite היום (141 framework tests) רץ עם `MockHost` שmocks את ה-host calls. עם async lifecycle:
-
-- ה-`MockHost` ימשיך לעבוד **כי הוא לא Worker.** הוא mock — קורא ל-callbacks ישירות.
-- tests ש-assert ש-after `drive_to_resumed`, ה-state הוא `Resumed` — ימשיכו לעבור, כי ב-MockHost ה-acks באים בו ברגע.
-- tests חדשים נצטרכו עבור: timeout, dropped messages, out-of-order delivery (אם יקרה).
-
-ה-עיקרון: **MockHost נשאר sync עבור unit tests של framework.** התקצירו async-or-sync הוא אובחנת ה-WasmHost trait — ה-Worker implementation הוא async (postMessage), MockHost sync. ה-framework עצמו הוא async-aware: אם השcallback לא קורה מיידית, הוא ממתין. ב-MockHost הוא מיידית, אז הוא לא ממתין. ב-Worker host הוא לא מיידית, אז הוא ממתין.
+עם async, יש פעם אחת ש-pong אינטראקטיבי באמת:
+- אם ה-executor ב-app stuck (לא מספק callback ל-pong handler ב-due time) — זה bug ב-runtime שלנו, או memory exhaustion. גם אז watchdog יזהה.
 
 ---
 
-## 7. fault containment — מצב Trapped
+## 5. ה-SDK החדש — חוויית מפתח
 
-### 7.1 שלוש דרכי כשל
+זה הסעיף המנחה לא רק ל-Phase 11 אלא לעמוד שלם בעצמו. הנקודה: מפתח חדש שכתב Android/iOS צריך להרגיש בבית.
 
-1. **wasm trap** (panic, unreachable, out-of-bounds) — ה-call ל-`exports.akiva_app_*` זורק. ב-app-worker, נתפס ב-`try { ... } catch (e) { postMessage("trap", e) }`.
-2. **app-worker crash** — exception לא נתפסת ב-app worker top-level. `worker.onerror` ב-kernel-worker יורה.
-3. **app-worker hang** — `loop {}` או `while(true) {}`. ה-worker לא מגיב ל-postMessage. נתפס ב-watchdog (סעיף 8).
+### 5.1 hello-world
 
-### 7.2 מצב חדש: `LifecycleState::Trapped`
+```rust
+use akiva_sdk::prelude::*;
+
+#[derive(Default)]
+struct HelloActivity {
+    name: String,
+}
+
+impl Activity for HelloActivity {
+    async fn on_create(&mut self, ctx: &mut Context<'_>) {
+        // קריאת config, התחלת fetch, ניהול state — הכל async טבעי
+        self.name = ctx.storage().get("user_name").await
+            .unwrap_or_else(|| "World".to_string());
+    }
+
+    async fn on_render(&mut self, _ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+        c.clear(0xff202020);
+        c.draw_text(20.0, 80.0, 32.0, 0xffffffff, &format!("Hello, {}!", self.name));
+    }
+}
+
+akiva_app!(HelloActivity);
+```
+
+הקוד הזה יוצא 70KB wasm (אחרי `wasm-opt`). הוא יותר ארוך מהגרסה הסינכרונית הנוכחית בכ-3 שורות, וה-ergonomics זהים ל-Android Compose `LaunchedEffect`.
+
+### 5.2 lifecycle scopes — דוגמה מורחבת
+
+```rust
+struct WeatherActivity {
+    state: WeatherState,
+}
+
+impl Activity for WeatherActivity {
+    async fn on_resume(&mut self, ctx: &mut Context<'_>) {
+        // Listener שחי כל זמן ש-Activity ב-Resumed
+        ctx.resumed_scope().spawn(async {
+            loop {
+                let report = fetch_weather().await;
+                update_ui(report);
+                sleep(Duration::from_secs(60)).await;
+            }
+        });
+        // אין צורך ב-on_pause cleanup — ה-scope מטפל
+    }
+
+    async fn on_pointer(&mut self, ctx: &mut Context<'_>, ev: PointerEvent) {
+        if ev.is_refresh_button() {
+            // task חיים שזורם רק עד ש-activity נהרסת
+            ctx.activity_scope().spawn(async {
+                let force = fetch_weather_force_refresh().await;
+                update_ui(force);
+            });
+        }
+    }
+}
+```
+
+זה דפוס Compose/SwiftUI מדויק. אין "cleanup pattern" — ה-scopes עושים cleanup.
+
+### 5.3 storage API — async first
+
+```rust
+// היום (sync)
+let value: Option<Vec<u8>> = ctx.storage().get("key");
+
+// מחר (async)
+let value: Option<Vec<u8>> = ctx.storage().get("key").await;
+
+// reads מקומיים מהירים ב-app-worker (readonly handle direct)
+// writes עוברים round-trip לkernel (atomic, sandboxed)
+let _ = ctx.storage().set("key", b"value").await;
+```
+
+API שטוח. הblocking הסמוי שב-v1 (Atomics.wait מתחת) נעלם — `await` מסביר את הזמן.
+
+### 5.4 channels & signals (embassy-sync wrappers)
+
+אפליקציות מורכבות יותר ירצו channel-based architecture. SDK יחשוף:
+
+```rust
+use akiva_sdk::sync::{Channel, Signal};
+
+let (tx, rx) = Channel::new(16);  // bounded MPSC
+ctx.activity_scope().spawn(async move {
+    while let Some(msg) = rx.recv().await {
+        handle(msg);
+    }
+});
+```
+
+זה אותו דפוס של Kotlin `Channel` או Swift `AsyncStream`.
+
+### 5.5 dev tooling — onboarding ב-5 דקות
+
+```bash
+$ akiva new my-app
+Created my-app/
+$ cd my-app
+$ akiva run
+[akiva] devserver: http://127.0.0.1:4173
+[akiva] my-app installed, ready
+```
+
+ה-`akiva new` יוצר:
+- `Cargo.toml` עם ה-SDK pinned
+- `manifest.toml` עם defaults הגיוניים
+- `src/lib.rs` עם hello-world async
+- `README.md` עם התוויית פיתוח
+
+זה ה-**`create-react-app`** של Akiva. בלעדיו ה-DX לא מתחיל.
+
+---
+
+## 6. ABI החדש — איך wasm app מדבר עם host
+
+### 6.1 הקונספט: future IDs עם polling
+
+ה-app מבקש פעולה async, מקבל future ID, ועושה poll עד שיש תשובה.
+
+```
+app:                          host:
+─────                         ─────
+akiva_host_io_start(           
+  op_kind: u32,
+  args_ptr: *const u8,
+  args_len: u32,
+) -> u64 (future_id)          ◄──── allocates future, returns id
+                               
+akiva_host_io_poll(            
+  future_id: u64,
+  out_ptr: *mut u8,
+  out_cap: u32,
+) -> u32 (status)             ◄──── 0 = pending, 1 = ready, 2 = error
+                               (if ready: writes bytes to out_ptr, returns u32 length encoded in status' top bits or via separate akiva_host_io_status query)
+```
+
+ה-app worker (ב-`app_worker_shell.js`) מקשיב לpostMessage `{type: "future_ready", id}`. כשמגיע, executor (embassy) wake's את הtask המבטל מהtoken המקושר ל-id, ובdraft הback ל-`akiva_host_io_poll` של ה-future.
+
+### 6.2 fire-and-forget calls
+
+לcalls בלי result (`log_info!`, `start_activity`, `set_result`):
+
+```
+akiva_host_fire(
+  op_kind: u32,
+  args_ptr: *const u8,
+  args_len: u32,
+) -> u32 (0 = ok, !=0 = error)
+```
+
+חוזר מיידית, אין future. ה-args מועתקים ל-host queue, ולא משנה אם ה-app ממשיך לרוץ. דוגמה:
+
+```rust
+// SDK:
+pub fn log_info(msg: &str) {
+    unsafe { akiva_host_fire(OP_LOG_INFO, msg.as_ptr(), msg.len() as u32); }
+}
+```
+
+### 6.3 lifecycle dispatch
+
+ה-host (kernel-worker) קורא ל-app-worker עם lifecycle command:
+
+```
+app exports:
+akiva_app_dispatch(
+  cmd_kind: u32,        // 0 = create, 1 = start, 2 = resume, ..., 6 = pointer, 7 = render, ...
+  payload_ptr: *const u8,
+  payload_len: u32,
+) -> u64 (lifecycle_future_id)
+```
+
+ה-host מחזיק `pending` slot ב-`ActivityRecord`; כל frame בודק אם ה-future ready. ה-state machine async (כמו ב-v1) ימשיך ל-frame הבא רק אחרי ack.
+
+### 6.4 wire format — דמיון ל-Component Model
+
+כל op_kind יקבל encoder/decoder ב-WIT-style:
+
+```
+// היום, ב-pkgs_wire.rs
+pub fn encode(refs: &[PackageRef]) -> Vec<u8> { ... }
+pub fn decode(bytes: &[u8]) -> Result<Vec<PackageEntry>> { ... }
+```
+
+ב-Phase 11 נכליל את הדפוס לבונדל פרוטוקול:
+
+```
+framework/src/wire/
+├── op_kinds.rs        // u32 constants per op
+├── log.rs            // op encoder/decoder
+├── start_activity.rs
+├── storage.rs
+├── pkgs.rs            // already exists
+└── lifecycle.rs
+```
+
+כשנעבור ל-Component Model ב-v0.5, ה-encoders/decoders האלה ייהפכו ל-WIT-generated code אוטומטית.
+
+---
+
+## 7. lifecycle כ-state machine async
+
+### 7.1 ה-state machine
 
 ```rust
 pub enum LifecycleState {
     Initialized,
+    Creating,    // pending: create future ID
     Created,
+    Starting,
     Started,
+    Resuming,
     Resumed,
+    Pausing,
     Paused,
+    Stopping,
     Stopped,
+    Destroying,
     Destroyed,
-    Trapped,   // ← new
+    Trapped,    // terminal: wasm trap, panic, or watchdog timeout
+}
+
+pub struct ActivityRecord {
+    pub handle: ActivityHandle,
+    pub state: LifecycleState,
+    pub pending: Option<PendingTransition>,
+    pub trapped_reason: Option<String>,
+    // ...
+}
+
+pub struct PendingTransition {
+    pub target: LifecycleState,
+    pub future_id: u64,
+    pub started_at: Timestamp,
+    pub deadline: Timestamp,  // for watchdog
 }
 ```
 
-`Trapped` הוא **terminal**. אין transition out. הוא מסמן: "ה-activity הזה מת ולא יחזור."
+### 7.2 frame loop
 
-### 7.3 cleanup flow
+ב-kernel-worker בכל frame:
 
-כש-activity עוברת ל-Trapped:
+```rust
+fn drive_lifecycle_transitions(&mut self, now: Timestamp) {
+    for record in &mut self.activities {
+        if let Some(pending) = &record.pending {
+            if let Some(result) = self.workers.poll_future(pending.future_id) {
+                record.state = pending.target;
+                record.pending = None;
+                self.advance_to_next_state(record);
+            } else if now > pending.deadline {
+                self.mark_trapped(record, "lifecycle timeout".into());
+            }
+        }
+    }
+}
 
-1. ה-framework כבר הספיק לקבל `worker.onerror` או `Atomics.wait` timeout.
-2. `ActivityManager.mark_trapped(handle)` מעדכן את ה-state.
-3. כל activity אחרת של אותו package שהיא ב-Resumed/Paused/Stopped — גם הן **חייבות** לעבור ל-Trapped (heap משותף — ה-Worker הוא אחד).
-4. `worker.terminate()` נקרא על ה-app-worker.
-5. אם המ-Trapped activity הייתה ב-foreground task → ActivityManager pop's אותה, מקדם את ה-activity הקודמת ב-stack ל-Resumed (זה Shell ברוב המקרים).
-6. event log: `[kernel] app com.akiva.calculator trapped: <reason>`.
+fn advance_to_next_state(&mut self, record: &mut ActivityRecord) {
+    let next = match record.state {
+        Created => Some(Started),
+        Started => Some(Resumed),
+        Pausing => Some(Paused),
+        // ...
+        _ => None,
+    };
+    if let Some(target) = next {
+        let future_id = self.workers.dispatch_lifecycle(record.handle, target);
+        record.pending = Some(PendingTransition { target, future_id, ... });
+    }
+}
+```
 
-### 7.4 re-launch
+### 7.3 testing — MockHost נשארת sync
 
-אחרי Trapped, אם המשתמש בוחר את האפליקציה שוב מ-Shell:
+כמו ב-v1: `WasmHost` trait מצהיר על async methods, `MockHost` מימוש sync (resolve immediately), `WorkerHost` מימוש async דרך postMessage.
 
-1. ActivityManager.launch(intent) — נקרא רגיל.
-2. AppRegistry בודק: יש app-worker חי ל-`com.akiva.calculator`? **לא** (terminated).
-3. מקים app-worker חדש.
-4. טוען wasm מ-OPFS.
-5. עובר ל-state machine רגיל (Initialized → Created → ...).
+ב-tests:
+```rust
+let host = MockHost::new();
+let mut fw = framework::boot(storage, host);
+fw.activities.drive_to_resumed(handle).await;  // immediate in MockHost
+assert_eq!(fw.activities.state_of(handle), Resumed);
+```
 
-ה-app מתחיל מאפס. saved state מ-OPFS אם יש. **משאירים זאת בדיוק ככה — אין fallback "trapped recovery".** הסיבה: אם ה-app trapped בגלל bug ב-on_create, recovery יציאה ל-trap מיידי שוב. עדיף clean restart.
+ה-141 tests הקיימים ייבנו מחדש עם `.await` בכל מקום שצריך, אבל הסמנטיקה תישמר.
 
 ---
 
-## 8. watchdog
+## 8. fault containment
 
-### 8.1 מודל
+### 8.1 דרכי כשל
 
-ה-kernel-worker מחזיק שעון. כל N frames (נניח N=60, כלומר פעם בשנייה ב-60fps), הוא:
+1. **wasm trap** (panic / unreachable / OOB): `try { exports.akiva_app_dispatch(...) } catch (e) { ... }` ב-`app_worker_shell.js` → postMessage ל-kernel "trapped" עם reason.
+2. **app-worker JS-level error**: `worker.onerror` ב-kernel-worker → trap.
+3. **app-worker hang**: watchdog ping timeout → terminate → trap.
+4. **executor panic** (embassy panics בתוך ה-wasm — אם user spawns task שpanics): גם נתפס כ-trap.
 
-1. עבור כל app-worker חי, שולח message `{type: "ping", id: <counter>}`.
-2. שומר `last_ping_sent_at[worker_id] = now()`.
-3. ב-app-worker, יש handler שאינו עובר דרך wasm: `if (msg.type === "ping") postMessage({type:"pong", id})`. זאת JS-level callback ב-`app_worker_shell.js`. **אין wasm involvement.**
-4. כש-pong מגיע, kernel-worker מעדכן `last_pong_at[worker_id] = now()`.
+### 8.2 cleanup
 
-אם בbroadcast הבא (frame N=60 + עוד 60 = N=120), ה-`last_pong_at` עדיין ישן יותר מ-`last_ping_sent_at` הקודם — ה-worker לא ענה ב-1 שנייה. → trap.
+```rust
+fn mark_trapped(&mut self, record: &mut ActivityRecord, reason: String) {
+    record.state = Trapped;
+    record.trapped_reason = Some(reason.clone());
+    record.pending = None;
+    
+    // 1. כל activities של אותו package — Trapped (heap משותף)
+    let pkg = record.package_id.clone();
+    for other in &mut self.activities {
+        if other.package_id == pkg && !matches!(other.state, Trapped | Destroyed) {
+            other.state = Trapped;
+            other.trapped_reason = Some(format!("co-located trap in {}", reason));
+        }
+    }
+    
+    // 2. terminate worker
+    self.workers.terminate(&pkg);
+    
+    // 3. activity הקודם ב-back-stack מקודם ל-Resumed
+    self.tasks.pop_trapped_from_foreground();
+}
+```
 
-### 8.2 למה JS-level pong, לא wasm
+### 8.3 re-launch
 
-זה מפתח. אם ה-app רץ ב-`loop {}` בתוך `on_pointer`, ה-wasm לא חוזר. אבל:
+App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel יראה שאין worker, יspawn worker חדש, יטען wasm מ-OPFS, יתחיל clean. saved state נשמר בOPFS אם היה.
 
-- ה-wasm **לא מקבל** את ה-postMessage event — postMessage נכנס ל-event loop של ה-Worker, וה-event loop חסום על ידי הקריאה ל-wasm function (`exports.akiva_app_pointer`) שלא חזרה.
-- אז ה-pong handler לא רץ.
-- watchdog ב-kernel-worker מזהה.
+**אין retry אוטומטי.** אם ה-app crashed ב-`on_create`, retry יחזור ל-trap. עדיף clean restart גרידא.
 
-**זה בדיוק מה שאנחנו רוצים.** ה-watchdog detects busy-loops ב-app בלי להזדקק לטריגר נוסף.
+---
 
-### 8.3 קצב
+## 9. watchdog
+
+ללא שינוי מ-v1:
 
 - ping פעם בשנייה (60 frames @ 60fps).
-- timeout: 1 שנייה.
-- אם user app נחסם 1 שנייה — אנחנו הורגים אותו. זה מותאם למחשבה: אנחנו OS, לא debugger. אם 1 שנייה של app אומרת "תקועה", אנחנו לא מצפים ש-on_pointer יצא ל-CPU thrashing.
+- pong handler ב-`app_worker_shell.js` ב-JS-level — לא עובר דרך wasm.
+- timeout: 1 שנייה. עברה — `worker.terminate()` + `Trapped`.
 
-אפשרות עתידית: hierarchy של timeouts — 100ms warning ("האפליקציה איטית"), 1s trap ("האפליקציה תקועה"). MVP: רק trap.
+הסעיף הזה נשמר זהה כי ה-design הזה הוא orthogonal ל-async ABI.
 
 ---
 
-## 9. סדר הbuild — סטונים
+## 10. Stones (revised)
 
-מסלול ה-implementation:
+### Stone 11.1 — Design doc (זה) ✅
+**Done.** מסמך זה.
 
-### Stone 11.1 — Design doc (זה)
-**Definition of Done:** מסמך זה מאושר.
+### Stone 11.2 — async SDK + Activity trait (3-4 שבועות)
+**מטרה:** SDK חדש עם async API. עדיין רץ ב-single worker (לא isolation עדיין).
+- `embassy-executor` integration ב-SDK.
+- `Activity` trait async.
+- `Context` async methods.
+- 3 lifecycle scopes (`activity_scope`, `resumed_scope`, one-shot).
+- migration של 4 האפליקציות הקיימות (calc, hello, shell, tic-tac-toe) ל-async API.
+- כל ה-141 framework tests ממשיכים לעבור.
 
-### Stone 11.2 — Async ABI prototype
-- כותב `runtime/web/app_worker_shell.js` — ה-shell של app worker.
-- `hello` רץ ב-app-worker שלו עם host calls מינימליים (`log_info!` בלבד).
-- מודד overhead: כמה ms פר log call? כמה frames drops?
-- אם overhead > 1ms — חזרה ל-design (אולי SAB layout שונה).
+**Definition of Done:** כל 4 האפליקציות רצות עם async API, אין regressions.
 
-**Definition of Done:** hello מופיע על המסך, הוא רץ ב-Worker נפרד (ראיה: `console.log` מתוך הworker), overhead מתועד.
+### Stone 11.3 — async ABI + future registry (2-3 שבועות)
+**מטרה:** ה-host calls לא חוזרים מיידית. ה-app polls future IDs.
+- `akiva_host_io_start`, `akiva_host_io_poll`, `akiva_host_fire` imports.
+- `FutureRegistry` ב-kernel-worker.
+- wire encoders ב-`framework/src/wire/`.
+- `runtime/web/app_registry.js` משתנה ל-future-based dispatch.
+- עדיין single worker — אבל ה-flow הוא כבר async-ready.
 
-### Stone 11.3 — Framework lifecycle async
-- `WasmHost` trait עם async lifecycle methods.
-- `ActivityRecord` מקבל `pending` slot.
-- `MockHost` ממשיכה sync.
-- `WorkerHost` (חדש) ממשמת async דרך SAB.
-- 141 tests עוברים.
+**Definition of Done:** host calls עוברות דרך future registry ב-single worker; latency benchmark ≤ 1ms.
 
-**Definition of Done:** כל 4 האפליקציות רצות ב-Workers נפרדים, ה-test suite עובר.
+### Stone 11.4 — worker-per-app (3-4 שבועות)
+**מטרה:** **ה-isolation**. כל app ב-Worker משלה.
+- `runtime/web/app_worker_shell.js` חדש.
+- `WorkerPool` ב-`runtime/web/app_registry.js` — lifecycle של workers.
+- lifecycle dispatch via postMessage.
+- pong handler ב-JS-level.
+- 4 האפליקציות רצות ב-4 Workers נפרדים.
+- log breadcrumbs מוכיחים את ה-isolation (`[worker:com.akiva.calculator] ...`).
 
-### Stone 11.4 — SDK adjustments
-- ה-host imports ב-SDK עוברים ל-SAB protocol (`runtime.rs` בלבד; ה-API של app נשאר זהה).
-- בדיקות: אפליקציה שכותבת `ctx.start_activity` ב-`on_pointer` באמת מפעילה את calc/hello/וכו'.
+**Definition of Done:** 4 apps ב-4 workers; פעולות end-to-end (Shell → calc → back) עובדות.
 
-**Definition of Done:** Shell launching apps עובד end-to-end ב-isolated workers.
-
-### Stone 11.5 — Fault containment
+### Stone 11.5 — fault containment + watchdog (2 שבועות)
+**מטרה:** Trapped state, cleanup flow, ping/pong watchdog.
 - `LifecycleState::Trapped`.
 - `worker.onerror` → mark Trapped.
-- `try/catch` סביב כל call ל-wasm exports ב-app-worker-shell → mark Trapped.
-- `ActivityManager.cleanup_trapped(handle)`.
-- Integration test: app שעושה `panic!("test")` ב-`on_pointer`, Shell ממשיכה לעבוד.
+- Try/catch ב-app_worker_shell → mark Trapped.
+- ping/pong ב-JS-level, 1s timeout.
+- Integration tests: panic-app, infinite-loop-app, OOM-app — כולן מטופלות.
 
-**Definition of Done:** ה-test הנ"ל עובר; manual smoke: לחיצה ב-calc-pointer-panic מחזירה ל-Shell, calculator לא רץ יותר.
+**Definition of Done:** test app שעושה `loop {}` ב-`on_pointer` נהרגת ב-≤ 1.5s, Shell חיה.
 
-### Stone 11.6 — Watchdog
-- ping/pong loop ב-kernel-worker.
-- termination אחרי timeout.
-- log + Trapped mark.
-- Integration test: app עם `loop {}` ב-on_pointer, ה-system מזהה, הורג, חוזר ל-Shell. סה"כ ≤ 1.5s.
+### Stone 11.6 — OPFS hybrid + storage SDK (1-2 שבועות)
+**מטרה:** readonly handles ישירות ב-app-worker; writes through kernel.
+- `akiva_sdk::storage` API — async, transparent.
+- app-worker storage layer — readonly handles, fallback ל-kernel ב-error.
+- kernel-worker מנהל close-on-uninstall protocol.
+- benchmark: read latency comparison (direct vs kernel-routed).
 
-**Definition of Done:** ה-test עובר; כל 4 האפליקציות הקיימות נשארות פונקציונליות.
+**Definition of Done:** read benchmarks מראים improvement; uninstall flow lockdown מאומת.
 
----
+### Stone 11.7 — `akiva new` + dev tooling polish (1-2 שבועות)
+**מטרה:** onboarding ב-5 דקות.
+- `akiva new <name>` — scaffold app חדש.
+- Templates: `default`, `compose-style`, `game`.
+- README.md generated עם dev steps.
+- `akiva docs` — מציג דוקומנטציה רלוונטית של SDK.
+- Documentation pass: כל ה-public API ב-`akiva-sdk` עם `///` doc comments + דוגמאות.
 
-## 10. Exit criteria של Phase 11
+**Definition of Done:** מפתח חדש (אדם זר) יכול לעקוב אחרי README ולהריץ hello-world ב-≤ 5 דקות.
 
-- [ ] hello + calculator + Shell + tic-tac-toe רצים ב-4 Workers נפרדים. אישור: `console.log` מ-`app_worker_shell.js` עם packageId.
-- [ ] App עם `loop {}` ב-`on_pointer` לא מקפיא את המערכת; הוא מת ב-≤ 1.5s.
-- [ ] App שעושה `panic!()` ב-`on_render` — ActivityRecord עובר ל-Trapped, framework cleanup, Shell ממשיכה ב-resumed.
-- [ ] `141 framework tests + 146 sdk tests + 68 kernel tests + 50 vitest` כולם עוברים. ייתכן שיתווספו tests חדשים (10-20 לcontainment, watchdog, async lifecycle). אין regressions.
-- [ ] Host call overhead ≤ 1ms בדפדפן סטנדרטי (Chrome/Firefox latest על Linux x86_64). מדידה תועד ב-`docs/perf-baseline.md`.
-- [ ] storage roundtrip עבור `set/get` בודדים ≤ 2ms. אם > 2ms — לתעד ולא לחסום.
+### Stone 11.8 — performance pass + benchmarks doc (1 שבוע)
+**מטרה:** מדידת overhead, תיעוד baseline.
+- `docs/perf-baseline.md` — מדידות לפני/אחרי isolation.
+- Optimizations critical paths (אם נמצאו): batching של logs, transferable for canvas operations.
+- p99 frame time עם 3 apps ב-foreground.
 
-**הערכת זמן:** 6-10 שבועות.
+**Definition of Done:** 60fps יציב עם 3 apps רצים; כל metric מתועד.
 
----
-
-## 11. סיכונים וtrade-offs ידועים
-
-### 11.1 סיכון: COOP/COEP headers
-
-`SharedArrayBuffer` דורש cross-origin isolation:
-- `Cross-Origin-Opener-Policy: same-origin`
-- `Cross-Origin-Embedder-Policy: require-corp`
-
-זה עלול להיכשל אם משתמש מפעיל את Akiva מ-context שאוסר אחד מהם (extension content-script, certain iframes). ה-mitigation:
-- ה-devserver של Akiva CLI ייצא את ה-headers מתחילה.
-- `runtime/web/index.html` יבדוק אם `crossOriginIsolated === true`. אם לא — banner מפורש "Akiva requires cross-origin isolation."
-- ב-MVP אין fallback ל-MessageChannel-only. אם נצטרך, נוסיף מאוחר יותר.
-
-### 11.2 סיכון: הגישה ל-OPFS מאט את כל ה-storage
-
-כל read/write עוברים round-trip ל-kernel. אם נמצא בעיה — נוסיף batching בעתיד. לא חוסם MVP.
-
-### 11.3 סיכון: `worker.terminate()` לא מנקה הכל
-
-הדפדפן בדרך כלל משחרר את ה-resources של Worker שterminated, אבל לא מבטיח timing. אם ה-app אחז SyncAccessHandle לקובץ של עצמו (אופציה II שדחינו) זה יכול להיות בעיה. תחת אופציה I (שבחרנו) זה לא בעיה — kernel מחזיק handles.
-
-### 11.4 trade-off: complexity vs throughput
-
-המודל שבחרנו (sync facade + Atomics.wait + worker-per-app + storage-via-kernel) מוסיף complexity מהותית למערכת. אם בעוד שנה נחליט שהיינו רוצים async לעומק (אופציה A) — נצטרך rewrite שני. אבל:
-- אופציה A דורשת שינוי SDK שובר תאימות. עדיף לעשות פעם אחת בעתיד עם 4+ אפליקציות מ-בpאזרס מ-100+ אפליקציות.
-- אופציה B נותנת isolation מיידית עם זברה minimal לאפליקציות קיימות.
-
-החלטה: **לקבל את ה-complexity. תיעוד מקיף ב-stones כדי שתהיה revisable.**
-
-### 11.5 סיכון לא-מתועד: BroadcastChannel cross-tab
-
-היום יש leader election בין tabs. עם פיצול ל-workers, מה קורה אם follower-tab רוצה לשלוח event ל-leader-tab? ב-leader-tab, ה-event מגיע ל-tab.js → kernel-worker → איך מגיע ל-app-worker?
-
-**תשובה:** ה-event flow לא משתנה. tab.js שולח ל-kernel-worker. kernel-worker (framework) מחליט לאיזה app-worker זה הולך, ושולח. ה-cross-tab BroadcastChannel נשאר בין tabs, לא בין workers בתוך tab. ראה [`runtime-web.md §3-4`](runtime-web.md).
-
-### 11.6 סיכון: ה-bundle הולך ויגדל
-
-עוד JS file (`app_worker_shell.js`), עוד SAB layouts, עוד protocols. צופים תוספת של ~5-10KB ל-`runtime/web/`. בbenchmark של גודל מערכת — אנחנו עדיין מתחת ל-100KB total bundle (תוספת זו לא תוציא אותנו מאותו order).
+**הערכת זמן Total: 13-19 שבועות.** משלב 11.2 (החל מהיום).
 
 ---
 
-## 12. מה מסמך זה **לא** מטפל בו
+## 11. Exit criteria של Phase 11
+
+- [ ] 4 אפליקציות (Shell, calc, hello, tictactoe) רצות ב-4 Workers נפרדים. console.log מוכיח.
+- [ ] App שעושה `loop {}` ב-`on_pointer` לא מקפיא; נהרגת ב-≤ 1.5s.
+- [ ] App שעושה `panic!()` ב-`on_render` — Trapped, framework cleanup, Shell ב-Resumed.
+- [ ] **141 framework + 146 sdk + 68 kernel + 50 vitest tests** עוברים. צפויה תוספת של ~30-50 tests חדשים.
+- [ ] host call overhead ≤ 1ms ב-Chrome/Firefox latest על Linux x86_64.
+- [ ] storage read (direct readonly) ≤ 0.5ms; storage write (through kernel) ≤ 2ms.
+- [ ] `akiva new my-app && cd my-app && akiva run` — hello-world על המסך תוך 30 שניות מקבלת command ראשונה.
+- [ ] `docs/sdk-rust.md` מעודכן עם async API, 3 דוגמאות מקיפות (`Activity` בסיסית, lifecycle-scoped task, channel-based architecture).
+- [ ] `docs/perf-baseline.md` קיים עם מדידות before/after.
+
+---
+
+## 12. סיכונים וtrade-offs
+
+### 12.1 סיכון: embassy executor — wasm bundle bloat
+
+embassy-executor + embassy-sync = ~10KB code overhead per app אחרי `wasm-opt`. 4 apps × 10KB = 40KB extra. אם בעתיד נרצה 100 apps זה לא נורא, אבל worth להחליט.
+
+**Mitigation:** dynamic-link ה-runtime — wasm Component Model מאפשר shared modules. ב-v0.5 (כשנעבור ל-Component Model) זה ייפתר. בינתיים בכל app `embassy` היא static.
+
+### 12.2 סיכון: rewrite של 4 apps + SDK
+
+זה היקף המאמץ ב-Stone 11.2. ה-mitigation: ה-rewrite שטחי (חתימות נשתנו, לוגיקה לא). מומלץ לעבור על app-by-app, לא bulk.
+
+### 12.3 סיכון: spec churn ב-embassy
+
+embassy מתפתחת. ייתכנו breaking changes ב-API שלה ב-12 חודשים הקרובים.
+
+**Mitigation:** pin version, plan upgrade reviews. רוב ה-API stabilized ב-2024-2025 — סיכון ירד.
+
+### 12.4 trade-off: עזב Component Model עכשיו
+
+אם נעבור ל-Component Model ב-v0.5, נצטרך migration. כתבנו את ABI שלנו עם semantics קרובות (futures, streams), אבל זה לא automatic.
+
+**Mitigation:** החלטה שקולה לעלות ה-spec churn. נחזור לבדוק את WASI 0.3 stability ב-Phase 14 review.
+
+### 12.5 סיכון: ה-watchdog הורג app שעובדת על task כבד "חוקי"
+
+App שעושה `for i in 0..1_000_000` — לא loop infinity, אבל לא חוזרת ל-event loop ל-1.2s. תיהרג בטעות.
+
+**Mitigation:** SDK guidance: heavy work ב-`task!` חיצוני, אינו חוסם ה-main thread של הapp. embassy executor יבטיח שגם בתוך task גדול ה-yield-points (await של channel/timer) משחרר ל-event loop. לתעד ב-`docs/sdk-rust.md`.
+
+### 12.6 סיכון: documentation debt
+
+הסיכון הגדול ביותר ל-DX. אם מסיימים את הקוד אבל לא מתעדים — ה-vision (DX זהה ל-Android/iOS) נופל.
+
+**Mitigation:** Stone 11.7 פרק נפרד; ה-Definition of Done שלו תלוי בdocumentation מקיפה. לא lol-bypass אם הזמן נגמר.
+
+### 12.7 סיכון: rabbit-hole של "ergonomic perfectionism"
+
+`task!`, `task_until!`, channels, signals, streams — כל אחד יכול להיות פרק שלם של מימוש. ה-bar הוא Android/iOS, אבל לא להעתיק את כל ה-API surface — לקחת את ה-80% הראשונים.
+
+**Mitigation:** explicit list ב-Stone 11.2 של מה ה-MVP scope. השאר נדחה.
+
+---
+
+## 13. מה Phase 11 **לא** מטפל בו
 
 נשמר ל-Phase 12 (Resource Governance):
+- memory accounting per app
+- CPU attribution per worker
+- Low-Memory Killer policy
+- App suspension (CACHED state)
 
-- **memory accounting per app.** Phase 12 משלב מדידה.
-- **CPU attribution.** דורש את ה-Worker isolation שPhase 11 בונה — Phase 12 מודד עליו.
-- **Low-Memory Killer.** Policy של "מי מת ראשון" — Phase 12.
-- **App suspension** (CACHED state). Phase 12.
+נשמר ל-Phase 13 (WindowManager):
+- multi-window
+- frame budget arbitration בין apps
+- focus routing
 
-נשמר ל-Phase 13 (WindowManager completion):
+נשמר ל-Phase 14+:
+- Component Model migration
+- jco-style transpilation pipeline
+- WIT-defined ABI
+- background services
 
-- **ויסות frames בין apps.** היום כל app מצייר על surface משלו ב-resume. עם isolation, frame budget בין apps יידרש management. Phase 13.
-
-נשמר לפינ דחוי לחלוטין:
-
-- **`async fn` ב-Activity trait.** ראה סעיף 3.1 אופציה A.
-- **`Future`-based SDK API.** ראה סעיף 3.1 אופציה A.
-
----
-
-## 13. references
-
-- [`ROADMAP.md` Phase 11](../ROADMAP.md) — סטונים ברמה גבוהה.
-- [`docs/runtime-web.md`](runtime-web.md) — מבנה current של HAL ב-JS, leader election, event pipeline.
-- [`docs/abi.md`](abi.md) — ABI חתום של app↔host. סעיף 11.4 ימשיך להיות תואם.
-- [`docs/activity-model.md`](activity-model.md) — lifecycle states. ייתוסף `Trapped`.
-- [`docs/storage.md`](storage.md) — OPFS layout. ימשיך להיות תקף; הגישה אליו תעבור דרך SAB.
-- [`framework/src/wasm_activity.rs`](../framework/src/wasm_activity.rs) — `WasmHost` trait. ייתוסף async behavior במימוש Worker host.
-- [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) — ה-current process pool. ייפצל ל-`app_worker_shell.js` חדש + מנהל workers ב-`app_registry.js`.
+נשמר ל-future-future:
+- iframe-per-app (Spectre-grade isolation, דורש DNS)
+- third-party app store with untrusted code
+- code signing
 
 ---
 
-**מצב המסמך:** Draft 1. דורש review לפני התחלת Stone 11.2.
+## 14. references
+
+### מסמכי Akiva
+- [`ROADMAP.md` Phase 11](../ROADMAP.md)
+- [`docs/runtime-web.md`](runtime-web.md)
+- [`docs/abi.md`](abi.md)
+- [`docs/activity-model.md`](activity-model.md)
+- [`docs/storage.md`](storage.md)
+- [`docs/sdk-rust.md`](sdk-rust.md)
+- [`framework/src/wasm_activity.rs`](../framework/src/wasm_activity.rs)
+- [`runtime/web/app_registry.js`](../runtime/web/app_registry.js)
+
+### חיצוני — research basis
+- **WASI 0.3 / Component Model:**
+  - [WASI Roadmap](https://wasi.dev/roadmap)
+  - [WASI 0.3 Native Async (byteiota)](https://byteiota.com/wasi-0-3-native-async-webassembly-gets-concurrent-i-o/)
+  - [Component Model status (eunomia)](https://eunomia.dev/blog/2025/02/16/wasi-and-the-webassembly-component-model-current-status/)
+- **Browser isolation:**
+  - [Chromium Site Isolation](https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md)
+  - [Document Isolation Policy (Chrome 137+)](https://developer.chrome.com/blog/document-isolation-policy)
+  - [Cross-Origin Isolation Guide](https://web.dev/articles/cross-origin-isolation-guide)
+- **OPFS:**
+  - [FileSystemSyncAccessHandle (MDN)](https://developer.mozilla.org/en-US/docs/Web/API/FileSystemFileHandle/createSyncAccessHandle)
+  - [Multiple readonly handles support](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system)
+- **postMessage performance:**
+  - [Is postMessage slow? (Surma 2019)](https://surma.dev/things/is-postmessage-slow/)
+  - [Web Worker messages 2026 benchmarks](https://copyprogramming.com/howto/how-fast-are-web-worker-s-messages)
+- **Modern app frameworks:**
+  - [Android: Kotlin coroutines + lifecycle](https://developer.android.com/topic/libraries/architecture/coroutines)
+  - [Compose: side-effects](https://developer.android.com/develop/ui/compose/side-effects)
+  - [SwiftUI: .task modifier](https://medium.com/@sarathiskannan/mastering-task-modifier-in-swiftui-89c0e3d53667)
+  - [Swift: structured concurrency](https://medium.com/@sraavanchevireddy/mastering-concurrency-in-swiftui-a-deep-dive-into-async-await-and-structured-concurrency-74b2f00a2a24)
+- **embassy:**
+  - [Embassy book](https://embassy.dev/book/)
+  - [embassy-executor on docs.rs](https://docs.rs/embassy-executor)
+- **WebContainers (precedent):**
+  - [WebContainers intro](https://blog.stackblitz.com/posts/introducing-webcontainers/)
+
+---
+
+**מצב המסמך:** Design v2, מאושר. Stone 11.2 רשאי להתחיל.

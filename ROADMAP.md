@@ -619,56 +619,87 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 ---
 
-## שלב 11 — Process / Fault Isolation
+## שלב 11 — Process / Fault Isolation + Modern Async SDK
 
-**מטרה:** פעילות של app אחד — trap, infinite loop, alloc של הרבה memory — לא יכולה להשפיע על apps אחרים או על ה-kernel.
+**מטרה:** הקפצת Akiva ל-OS-grade. שני יעדים שלובים:
+1. **Isolation:** פעילות של app אחד — trap, infinite loop, alloc זיכרון — לא יכולה להשפיע על אחרים או על kernel.
+2. **DX ברמת Android/iOS:** SDK async-native עם lifecycle scopes, structured concurrency, ו-onboarding ב-5 דקות.
 
 **תלוי ב:** Stone 10.3b + Stone 11.0 (Shell extraction).
 
-**רכיבים שנבנים:**
+**מסמך תכנון מלא:** [`docs/isolation-design.md`](docs/isolation-design.md) (Design v2 — מבוסס מחקר על WASI 0.3, OPFS, Chrome Site Isolation, Android Coroutines, SwiftUI structured concurrency, embassy executor).
 
-### 11.1 Design doc ל-`docs/isolation-design.md` ✅
-- ✅ **נחת (מאי 2026)** — [`docs/isolation-design.md`](docs/isolation-design.md). 13 סעיפים מקיפים:
-  - **מודל:** worker-per-app (לא -task ולא -activity).
-  - **ABI:** sync facade עם `Atomics.wait` על `SharedArrayBuffer` — אופציה B נבחרה. ה-API ל-apps לא משתנה; כל host call כותב ל-SAB וחוסם עד תשובה. דורש COOP/COEP headers.
-  - **OPFS:** כל ה-storage עובר דרך kernel-worker (אופציה I). uninstall/migration נשמרים פשוטים, sandboxing אטומי, latency budget 2ms.
-  - **lifecycle:** state machine ב-`ActivityRecord` עם `pending` slot — ה-framework לא חוסם, מחכה ל-ack ב-frame הבא. MockHost נשארת sync לטובת unit tests.
-  - **Trapped:** `LifecycleState::Trapped` חדש (terminal). worker.terminate() מנקה. כל activities של אותו package עוברות יחד ל-Trapped (שיתוף heap).
-  - **watchdog:** ping/pong פעם בשנייה ב-JS-level (לא wasm) ל-detect busy-loop. timeout = 1s → terminate.
-  - **6 stones מוגדרים:** 11.1 (זה) → 11.2 prototype → 11.3 framework lifecycle → 11.4 SDK → 11.5 fault containment → 11.6 watchdog.
+### 11.1 Design doc ✅
+- ✅ **נחת (מאי 2026)** — [`docs/isolation-design.md`](docs/isolation-design.md) Design v2. 14 סעיפים. 8 stones מוגדרים.
+- **החלטות מרכזיות:**
+  - **ABI async-native:** `Activity` trait עם `async fn on_create/...`, host calls מחזירים `Future`. embassy executor רץ בתוך כל app.
+  - **Worker-per-app:** package = unit of isolation. `app_worker_shell.js` חדש.
+  - **transport postMessage primary** (מהיר מספיק ב-Chrome 2026: 0-1ms). SAB אופציונלי לעתיד.
+  - **OPFS hybrid:** apps פותחות readonly handles ישירות (multiple readonly נתמכים מ-Chrome 121+); writes עוברים דרך kernel.
+  - **lifecycle scopes:** `activity_scope`, `resumed_scope` — מקבילים ל-Android `lifecycleScope` ו-SwiftUI `.task`.
+  - **Component Model נדחה ל-v0.5+** (WASI 0.3 עוד preview, jco transpile required); ה-ABI שלנו עם semantics קרובות ל-future migration.
+  - **iframe-per-app נדחה** (דורש DNS infrastructure ל-Spectre-grade); Worker isolation מספקת thread+heap isolation שמספיקה למודל המאיים שלנו.
 
-### 11.2 Async ABI prototype
-- hello-app ב-worker נפרד, עם כל ה-imports מעבירים דרך postMessage
-- מודד את ה-overhead: כמה ms נוסף לכל host call? כמה frames drops?
-- אם ה-overhead לא סביר — חוזרים לתכנון (אולי SharedArrayBuffer + Atomics לקריאות pure-read?)
+### 11.2 Async SDK + Activity trait (3-4 שבועות)
+- `embassy-executor` integration ב-`akiva-sdk`.
+- `Activity` trait async (`async fn on_create`, `on_resume`, ...).
+- `Context` async methods (`start_activity().await`, `storage.get().await`, `pkgs::list().await`).
+- 3 lifecycle scopes — `activity_scope`, `resumed_scope`, one-shot.
+- `task!` + `task_until!` macros.
+- Migration של 4 האפליקציות הקיימות ל-async (calc, hello, shell, tic-tac-toe).
+- 141 framework tests ממשיכים לעבור (עם `.await`).
+- **עדיין רץ ב-single worker** — שלב הproof שה-async API עובד.
 
-### 11.3 Framework הופך ל-async lifecycle driver
-- `drive_to_resumed`, `drive_to_paused`, `finish_top` הופכים למכונת מצב שממתינה ל-acks מה-worker של ה-app
-- `pending_result_for` ו-`task_history` עוברים התאמה לעולם שבו callback לא מחזיר ערך מיידית
-- מבחן הכושר: ה-test suite הקיים (141 tests) ממשיך לעבור עם harness async
+### 11.3 Async ABI + future registry (2-3 שבועות)
+- `akiva_host_io_start`, `akiva_host_io_poll`, `akiva_host_fire` imports.
+- `FutureRegistry` ב-kernel-worker — מנהל future IDs.
+- wire encoders ב-`framework/src/wire/` (op_kinds, lifecycle, storage, pkgs).
+- `runtime/web/app_registry.js` עובר ל-future-based dispatch.
+- benchmark: host call latency ≤ 1ms.
 
-### 11.4 SDK adjustments
-- `Context::start_activity(intent)` עדיין נראה sync ל-app, אבל ה-dispatch של ה-intent קורה אחרי ה-callback מסתיים — שומר על semantics קיים
-- MockHost שדה ל-testing של async behavior (Rust side)
+### 11.4 Worker-per-app (3-4 שבועות) — **ה-isolation בפועל**
+- `runtime/web/app_worker_shell.js` — shell של app worker.
+- `WorkerPool` ב-`runtime/web/app_registry.js` — lifecycle management.
+- lifecycle dispatch via postMessage.
+- pong handler ב-JS-level (לא עובר דרך wasm).
+- 4 apps ב-4 workers נפרדים; log breadcrumbs מוכיחים.
 
-### 11.5 Fault containment
-- Worker crash → kernel מזהה דרך port.onerror → ActivityRecord → Trapped → finish_top aggressive
-- `ActivityManager::destroy` עובד גם על activities ב-Trapped state (לא דורש on_pause/on_stop fire)
-- Integration test: app שהורג את עצמו ב-panic, Shell ממשיכה לעבוד
+### 11.5 Fault containment + watchdog (2 שבועות)
+- `LifecycleState::Trapped` (terminal).
+- `worker.onerror` + try/catch ב-`app_worker_shell.js` → mark Trapped.
+- ping/pong watchdog: 1s interval, 1s timeout.
+- Integration tests: panic-app, infinite-loop-app, OOM-app.
 
-### 11.6 Watchdog loop
-- Kernel (ב-worker הראשי) שולח pings ל-workers של ה-apps כל N frames
-- אם worker לא עונה בתוך timeout (say 500ms) → same Trapped flow
-- מגן מפני infinite loop
+### 11.6 OPFS hybrid (1-2 שבועות)
+- `akiva_sdk::storage` API async, transparent.
+- app-worker storage layer פותח readonly handles ישירות (multiple readonly נתמכים).
+- writes routed through kernel-worker (atomic, sandboxed by package_id).
+- close-on-uninstall protocol.
+- benchmark: read latency direct vs kernel-routed.
+
+### 11.7 `akiva new` + dev tooling polish (1-2 שבועות) — **DX foundation**
+- `akiva new <name>` — scaffold app (Cargo.toml, manifest.toml, src/lib.rs hello-world async, README).
+- 3 templates: `default`, `compose-style`, `game`.
+- `akiva docs` — מציג SDK docs רלוונטיים.
+- Documentation pass: כל public API ב-`akiva-sdk` עם `///` doc comments + example.
+
+### 11.8 Performance pass + benchmarks (1 שבוע)
+- `docs/perf-baseline.md` — מדידות before/after isolation.
+- Optimizations critical paths אם נחוצות (batching של logs, transferable canvas ops).
+- 60fps יציב עם 3 apps ב-foreground.
 
 **Exit criteria:**
-- [ ] hello app + calculator + Shell רצים ב-3 workers נפרדים
-- [ ] app שעושה `loop {}` ב-`on_pointer` לא מקפיא את המערכת; הוא מתים בתוך 500ms
-- [ ] wasm trap → activity state Trapped → framework cleanup → Shell ממשיכה
-- [ ] 141 tests ממשיכים לעבור על async harness
-- [ ] overhead של host call מתחת ל-1ms בדפדפן סטנדרטי
+- [ ] 4 apps רצים ב-4 workers נפרדים. console.log מוכיח.
+- [ ] App עם `loop {}` ב-`on_pointer` נהרגת ב-≤ 1.5s; Shell חי.
+- [ ] App עם `panic!()` → Trapped → cleanup → Shell ב-Resumed.
+- [ ] **141 framework + 146 sdk + 68 kernel + 50 vitest tests** עוברים. צפויה תוספת של 30-50.
+- [ ] host call overhead ≤ 1ms.
+- [ ] storage read direct ≤ 0.5ms; write through kernel ≤ 2ms.
+- [ ] `akiva new my-app && cd my-app && akiva run` — hello על המסך תוך 30 שניות.
+- [ ] `docs/sdk-rust.md` מעודכן עם async API + 3 דוגמאות מקיפות.
+- [ ] `docs/perf-baseline.md` קיים.
 
-**הערכת זמן:** 6-10 שבועות. **זה ה-fight הגדול ביותר בפרויקט.** אם זה נכשל, יש limitation ארכיטקטוני.
+**הערכת זמן:** 13-19 שבועות. **זה ה-foundation rebuild הגדול של הפרויקט.** אם זה מתבצע איכותי — Akiva מרגישה כמו OS אמיתי גם למפתחים וגם לאפליקציות. אם נחפף — לא נדע אם נצליח לבנות 100 apps עליו.
 
 ---
 
