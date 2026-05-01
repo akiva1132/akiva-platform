@@ -21,8 +21,8 @@ Consequences: infinite loop in any app freezes the whole OS (no preemption); was
 - [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) — `_instantiateProcess` moves to a worker-per-app model; error-catch paths become message-handler paths.
 - [`runtime/web/worker.js`](../runtime/web/worker.js) — frame loop + event dispatch go through `postMessage` to app workers.
 - [`framework/src/activity_manager.rs`](../framework/src/activity_manager.rs) — new `Trapped` lifecycle state (Phase 11.5).
-- [`framework/src/wasm_activity.rs`](../framework/src/wasm_activity.rs) — `WasmHost` trait becomes async-capable (Phase 11.3).
-- [`sdk-rust/src/runtime.rs`](../sdk-rust/src/runtime.rs) — every host-import extern wrapped in the new message seam.
+- [`framework/src/wasm_activity.rs`](../framework/src/wasm_activity.rs) — `WasmHost` trait becomes async-capable (Phase 11.4a). Stone 11.3 made the **upward** direction (`akiva_host_*`) async via the unified-ABI futures; the downward direction (kernel→app `lifecycle`/`render`/etc.) is still inline-sync and falls to 11.4a.
+- [`sdk-rust/src/runtime.rs`](../sdk-rust/src/runtime.rs) — host-import externs collapsed to three multiplexers in 11.3b/c (`akiva_host_fire`, `akiva_host_io_start`, `akiva_host_io_poll`); per-op extern wrappers gone. The Worker seam in 11.4c becomes JS-side only — Rust extern signatures don't change.
 
 ---
 
@@ -107,11 +107,13 @@ When the first app needs a real text field, the `on_key` path has to grow focus 
 
 ## 6. Premature-abstraction temptation: consolidating "many small protocols"
 
-**Concern noted, rejected for now.** A design review flagged that the host now implements 11 independent protocols (paint, save_state, restore, finish drain, intent drain, new_intent, resources × 4, log, text_width) and suggested consolidation into "a few strong primitives" — e.g. a single typed message bus.
+**Originally raised pre-11.3, partially superseded.** A design review flagged that the host implemented 11 independent `akiva_host_*` protocols (paint, save_state, restore, finish drain, intent drain, new_intent, resources × 4, log, text_width) and suggested consolidation into "a few strong primitives" — e.g. a single typed message bus.
 
-**Why rejected.** Each protocol maps 1:1 to a user-visible capability. Consolidating now would invent an abstraction layer (message-bus dispatch, typed routing, error mapping) before we've seen the third new primitive. The "rule of three" isn't met. Stone 9.4's work **did** consolidate the two _byte-transfer patterns_ (alloc-copy-call vs 2-phase read) into shared helpers in `AppRegistry._copyAppToKernel` / `_callAppWithBytes`, which is the real duplication. Protocol count is a symptom of feature breadth, not a complexity we should disguise.
+**Status after Stone 11.3.** Six of those protocols (log, text_width, finish, start_activity{,_for_result}, set_result, query_packages) collapsed into three multiplexers (`akiva_host_fire` / `akiva_host_io_start` / `akiva_host_io_poll`) routed by `op_kind`. The "rule of three" was met during the async-ABI redesign, and the consolidation paid for itself in 11.4 prep — one async seam to plumb cross-worker, not eleven.
 
-**Trigger to revisit.** If we hit ~20 protocols or if a third byte-transfer pattern appears. Neither is near.
+**What stayed separate.** Resource lookups (4 functions: color, string, has_color, has_string) — readonly per-package queries with no async, no handle context, no side effect. Not worth the encode/decode overhead. `hal_app_*` (kernel→app side) is unchanged — different concern, different shape.
+
+**Trigger to revisit anything further.** A third byte-transfer pattern beyond `_copyAppToKernel` / `_callAppWithBytes`, or a streaming surface that doesn't fit the future_id model. Neither is near.
 
 ---
 

@@ -95,126 +95,134 @@ extern "C" fn akiva_app_restore_state(handle: u32, bytes_ptr: *const u8, bytes_l
 
 ### 2.3 Imports (host → app)
 
-ה-host מייצא ל-wasm של האפליקציה imports תחת module name `env`. המינימום המונח ב-Phase 2b.3:
+ה-host מייצא ל-wasm של האפליקציה imports תחת module name `env`. נכון ל-Stone 11.3 ה-import surface מכוון ל-**unified ABI** של שלוש פונקציות multiplexer + ארבע פונקציות resource lookup. כל פעולה host-mediated עוברת דרך `akiva_host_fire` (fire-and-forget), `akiva_host_io_start` + `akiva_host_io_poll` (async עם future ID), או דרך אחת מ-resource lookup הקלים. ה-mapping ל-`op_kind` הקבוע מתועד ב-§2.3.2.
+
+#### 2.3.1 Resource lookups (legacy, נשארים)
+
+ארבע פונקציות readonly per-package שלא משתלבות יפה ב-fire/io shape (אין side effect, אין handle context, אין async). מועברות אוטומטית בלי gating:
 
 ```rust
-// Write a UTF-8 string to the host log with per-app prefix.
-// level: 0=trace 1=debug 2=info 3=warn 4=error (מקביל ל-hal_log של ה-kernel).
-// ptr/len: תוך ה-memory של ה-app; ה-host קורא אותן inline.
-extern "C" fn akiva_host_log(level: u32, ptr: *const u8, len: u32);
-
-// Measure the rendered width of a UTF-8 string at the given font size,
-// in the same font the renderer uses (system-ui stack). Height is
-// deterministic from `size` (line-height ratio), so the host only
-// returns width; the SDK computes height locally.
-extern "C" fn akiva_host_text_width(ptr: *const u8, len: u32, size: f32) -> f32;
-
 // Resolve @color/name for the calling package. Returns 0xAARRGGBB.
 // Undefined names return 0xFFFF00FF (magenta) and log a host-side
 // warning — missing refs surface visually, not silently.
 extern "C" fn akiva_host_resource_color(name_ptr: *const u8, name_len: u32) -> u32;
 
-// Resolve @string/name for the calling package. Writes UTF-8 bytes into
-// [out_ptr, out_ptr + out_cap) and returns the *actual* length. If the
-// returned length exceeds out_cap, nothing was written — caller
-// reallocates to that size and calls again. Undefined names write
-// "⟨missing:NAME⟩" and return its length.
+// Resolve @string/name. Writes UTF-8 bytes into [out_ptr, out_ptr+out_cap)
+// and returns the *actual* length. If the returned length exceeds
+// out_cap, nothing was written — caller reallocates to that size and
+// calls again. Undefined names write "⟨missing:NAME⟩".
 extern "C" fn akiva_host_resource_string(
     name_ptr: *const u8, name_len: u32,
     out_ptr: *mut u8, out_cap: u32,
 ) -> u32;
 
-// Probes: 1 if the ref is registered, 0 otherwise. Used by call sites
-// that need to distinguish "undefined" from "happens to equal the
-// placeholder". Optional for most apps — the AKML inflater doesn't
-// probe; it just renders the placeholder when a ref misses.
+// Probes: 1 if the ref is registered, 0 otherwise.
 extern "C" fn akiva_host_resource_has_color(name_ptr: *const u8, name_len: u32) -> u32;
 extern "C" fn akiva_host_resource_has_string(name_ptr: *const u8, name_len: u32) -> u32;
 ```
 
-כל app מקבל את ה-set הבסיסי הזה אוטומטית ללא הצהרה. הרחבות נוספות (finish, start_activity, storage read/write, intent dispatch) תיכנסנה כשאפליקציות אמיתיות יצטרכו אותן, ובכפוף למבחני §1.2 — כל הרחבה דורשת use case מוכח ו-mapping ל-WIT interface ב-§5.
+#### 2.3.2 Unified ABI multiplexers (Stone 11.3)
 
-**Stone 9.3 + 9.4 — מיושם:**
+שלושה imports שמעבירים את כל הפעולות host-mediated (log, finish, start_activity, set_result, text_width, query_packages, storage…) דרך ה-`op_kind` integer. ה-args layout לכל op_kind ידוע ב-side של ה-SDK ושל ה-host; ה-encoder/decoder מוצמד 1:1 בין `framework/src/wire/op_kinds.rs` (kernel side) ל-`sdk-rust/src/op_kinds.rs` (app side, mirror) — מבחן unit cross-crate מאמת equality.
 
 ```rust
-// אפליקציה מסיימת את עצמה (מקביל ל-Android Activity.finish()).
-// ה-host מפעיל את אותו finish_requested flag שה-Shell framework-side
-// משתמש בו היום. handle מזהה את ה-activity; קריאה מ-on_create תגרום
-// ל-Created→Destroyed shortcut (skip על Start/Resume/Pause/Stop).
-extern "C" fn akiva_host_finish(handle: u32);
+// Fire-and-forget — ה-host מבצע את הפעולה ולא מחזיר נתונים. ערך החזרה:
+// 0 = הצליח, !=0 = שגיאה (op_kind לא ידוע, args malformed, capability
+// not granted). אופייני ל-LOG, FINISH, START_ACTIVITY, START_ACTIVITY
+// _FOR_RESULT, SET_RESULT.
+extern "C" fn akiva_host_fire(
+    op_kind: u32,
+    args_ptr: *const u8,
+    args_len: u32,
+) -> u32;
 
-// Stone 9.4 — app-initiated start_activity. intent_ptr/len מצביעים
-// ל-blob ב-memory של ה-app שנוצר ע"י `Intent::encode` (ראה §2.6).
-// ה-host מעתיק מייד החוצה, ה-framework מוציא אותו דרך
-// `hal_app_drain_intent` בסוף ה-callback, ה-IntentRouter פותר.
-// קריאות מרובות באותו dispatch — האחרון מנצח (single slot, מתאים
-// ל-`ctx.launch_requested` הבודד בצד ה-framework).
-extern "C" fn akiva_host_start_activity(handle: u32, intent_ptr: *const u8, intent_len: u32);
+// Async start — ה-host מקצה future_id ומתחיל לעבד. ערך החזרה: future_id
+// non-zero בהצלחה, 0n בכישלון (op_kind לא ידוע, capability not granted,
+// args malformed). אופייני ל-TEXT_WIDTH, QUERY_PACKAGES, STORAGE_GET/SET.
+extern "C" fn akiva_host_io_start(
+    op_kind: u32,
+    args_ptr: *const u8,
+    args_len: u32,
+) -> u64;
+
+// Poll עד שה-future מתממש. ערך החזרה packed (status: u32 low, length:
+// u32 high). status: 0=PENDING (לא מוכן עדיין, עוד לא חוקי ב-11.3
+// single-worker אבל יקרה ב-11.4+), 1=READY (length bytes נכתבו ל-out_ptr),
+// 2=ERROR. אם length > out_cap — שום דבר לא נכתב; ה-caller מקצה buffer
+// בגודל הנדרש ומנסה שוב (two-phase contract — ה-future נשמר עד שהקריאה
+// מצליחה). אחרי קריאה מוצלחת ה-future evicted מה-registry.
+extern "C" fn akiva_host_io_poll(
+    future_id: u64,
+    out_ptr: *mut u8,
+    out_cap: u32,
+) -> u64;
 ```
 
-**מתוכננות ל-Phase 9+** (לא מיושמות עדיין):
+**op_kind layout** (פרטים מלאים ב-`framework/src/wire/op_kinds.rs`):
+
+| Range            | Transport       | קבועים                                                                                              |
+|------------------|-----------------|-----------------------------------------------------------------------------------------------------|
+| `0x0001..0x00FF` | `fire`          | `LOG=0x01`, `FINISH=0x02`, `START_ACTIVITY=0x03`, `START_ACTIVITY_FOR_RESULT=0x04`, `SET_RESULT=0x05` |
+| `0x0101..0x01FF` | `io_start`/poll | `TEXT_WIDTH=0x101`, `QUERY_PACKAGES=0x102`, `STORAGE_GET=0x103`, `STORAGE_SET=0x104`                 |
+| `0x0200..`       | reserved        | streams / pushed events ל-Stone 11.4+                                                              |
+
+Args layout per op_kind (LE byte-stream — encoded inline ב-dispatcher):
+
+| op_kind                       | args                                                       | result                                  |
+|-------------------------------|-----------------------------------------------------------|-----------------------------------------|
+| `FIRE::LOG`                   | `[level: u32 LE \| msg_bytes…]`                            | —                                       |
+| `FIRE::FINISH`                | `[handle: u32 LE]`                                         | —                                       |
+| `FIRE::START_ACTIVITY`        | `[handle: u32 LE \| intent_bytes…]`                        | —                                       |
+| `FIRE::START_ACTIVITY_FOR_RESULT` | `[handle: u32 LE \| request_code: u32 LE \| intent_bytes…]` | —                                       |
+| `FIRE::SET_RESULT`            | `[handle: u32 LE \| result_bytes…]`                        | —                                       |
+| `IO::TEXT_WIDTH`              | `[size: f32 LE \| text_bytes…]`                            | `[width: f32 LE]`                       |
+| `IO::QUERY_PACKAGES`          | `[]`                                                       | `pkgs_wire blob` (ראה `wire/pkgs.rs`)    |
+| `IO::STORAGE_GET`             | TBD (Stone 11.6)                                           | TBD                                     |
+| `IO::STORAGE_SET`             | TBD (Stone 11.6)                                           | TBD                                     |
+
+**Capability gating moved into the dispatcher.** עד Stone 10.3b ה-gating קרה בזמן instantiate (LinkError על import חסר). מאז Stone 11.3 ה-gating קורה per-call: ה-import עצמו תמיד מותקן, אבל ה-dispatcher בודק את ה-grants לפני שהוא מבצע op_kind שדורש capability. App ללא הרשאה → return code שגיאה (1 או 2 לפי הנתיב), warning בלוג. הצדק לבחירה: import אחד משרת ~250 op_kinds, חלקם auto חלקם gated; מסננים ב-call site, לא ב-link.
+
+**Exports שה-app חושף עבור delivery של intent / result** (אלה לא מולטיפלקסר — נשארים separate exports):
 
 ```rust
-// Stone 9.3 follow-up — system-wide Back (pops stack top אם לא root;
-// אחרת no-op). שונה מ-akiva_host_finish רק בסמנטיקה: Back הוא Shell
-// policy, finish הוא כוונה מפורשת של ה-app. נדחה כרגע — ה-Framework
-// כבר קוצר על Esc מ-key events, אין קריאה מ-app שצריכה זאת.
-extern "C" fn akiva_host_back();
-
-// Stone 9.5 — אותו דבר עם request code שה-framework יזכור וימסור חזרה
-// דרך akiva_app_activity_result.
-extern "C" fn akiva_host_start_activity_for_result(
-    intent_ptr: *const u8, intent_len: u32, request_code: u32,
-);
-extern "C" fn akiva_host_set_result(result_ptr: *const u8, result_len: u32);
-```
-
-Exports חדשים בצד ה-app שה-host קורא להם (מיושמים):
-
-```rust
-// Stone 9.4 — SingleTop (ו-Phase 9.2 SingleTask/SingleInstance) reuse
-// fires this with the fresh intent. handle מזהה את ה-activity הקיימת;
-// ptr/len — blob של `Intent::encode` שה-host מעתיק לתוך app memory לפני
-// הקריאה (symmetric עם `akiva_app_restore_state`). ה-activity נשארת
-// `Resumed` ולא עוברת דרך on_create/on_start/on_resume.
+// Stone 9.4 — SingleTop / SingleTask / SingleInstance reuse fires this
+// with the fresh intent. handle מזהה את ה-activity הקיימת; ptr/len —
+// blob של `Intent::encode` שה-host מעתיק לתוך app memory לפני הקריאה
+// (symmetric עם `akiva_app_restore_state`). ה-activity נשארת `Resumed`
+// ולא עוברת דרך on_create/on_start/on_resume.
 extern "C" fn akiva_app_new_intent(handle: u32, ptr: *const u8, len: u32);
-```
 
-**Stone 9.5 — מיושם:**
-
-```rust
-// Callee sees — set the result bytes that will be delivered when it
-// finishes. Idempotent; last call wins. Silently dropped if the
-// activity wasn't launched via start_activity_for_result.
-extern "C" fn akiva_host_set_result(handle: u32, result_ptr: *const u8, result_len: u32);
-
-// Caller sees — result hand-off from a for-result launch. bytes encode
-// an ActivityResult (see §2.5.2). Fires AFTER the callee's on_destroy,
-// BEFORE the caller's Paused→Resumed edge (Android parity).
+// Stone 9.5 — caller sees — result hand-off from a for-result launch.
+// bytes encode an ActivityResult (see §2.5.2). Fires AFTER the callee's
+// on_destroy, BEFORE the caller's Paused→Resumed edge (Android parity).
 extern "C" fn akiva_app_activity_result(
     handle: u32, request_code: u32, ptr: *const u8, len: u32,
 );
 ```
 
-ב-v1 כל ה-imports יתמפו ל-interfaces המובנים של ה-world `akiva:app/host`: `log`, `activity-api`, `storage`, `intent`, וכו'. נקודת ה-mapping: `akiva_host_log` ⇔ `log.log(level, msg)`, `akiva_host_text_width` ⇔ `text.measure-width(text, size)`.
+**ב-v1 (Component Model)** כל ה-op_kinds ימופו ל-WIT interfaces: `LOG` → `log.write`, `TEXT_WIDTH` → `text.measure-width`, `START_ACTIVITY` → `activity-api.start-activity`, וכו'. ה-multiplexers נעלמים — אבל ה-sematics זהות (futures, fire-and-forget, status codes) כך שה-translation layer נקייה.
 
-### 2.3.1 Imports by Capability (Stone 10.3)
+#### 2.3.3 Capability gating (Stone 10.3 → 11.3)
 
-האם ה-host מספק לאפליקציה import ספציפי נקבע לפי ה-permissions ש-ה-`PermissionController` הקצה לה ב-install time. ה-Rust-side mapping ב-[`framework/src/permissions.rs`](../framework/src/permissions.rs) הוא ה-source of truth; worker.js שואל את ה-kernel (ב-Stone 10.3b, עדיין לא ב-wiring) ומסנן את ה-`env` object לפני `WebAssembly.instantiate`. אפליקציה שמנסה לייבא פונקציה לא מורשה — `LinkError` ב-instantiation, לא runtime panic.
+ה-`PermissionController` מקצה ל-package הרשאות ב-install time וה-framework דוחף אותן ל-host דרך `hal_host_set_grants`. ה-Rust-side source of truth ב-[`framework/src/permissions.rs`](../framework/src/permissions.rs) (`AUTO_IMPORTS` + `imports_for_capability`) ומקבילו ב-`runtime/web/app_registry.js` (`AUTO_IMPORTS` + `CAPABILITY_IMPORTS`); מבחני vitest + Rust מאמתים את ה-symmetry.
 
-| Capability                          | Host imports mounted                                  |
-|-------------------------------------|-------------------------------------------------------|
-| `auto` (ללא הצהרה)                  | `akiva_host_log`, `akiva_host_text_width`, `akiva_host_resource_color`, `akiva_host_resource_string`, `akiva_host_resource_has_color`, `akiva_host_resource_has_string`, `akiva_host_finish`, `akiva_host_set_result` |
-| `akiva.permission.LAUNCH_ANY_APP`   | `akiva_host_start_activity`, `akiva_host_start_activity_for_result` |
-| `akiva.permission.STORAGE_SANDBOX`  | *(reserved — `akiva_host_storage_*` לא נחת ב-HAL של ה-app עדיין; framework-side save/restore עובר דרך `hal_app_save_state` / `hal_app_restore_state` ב-§2.4)* |
-| `akiva.permission.QUERY_PACKAGES`   | *(reserved — `akiva_host_query_packages` post-MVP)* |
-| `akiva.permission.NOTIFICATIONS`    | *(reserved — post-MVP)* |
-| `akiva.permission.NETWORK`          | *(reserved — post-MVP)* |
-| `akiva.permission.CAMERA`           | *(reserved — post-MVP)* |
+| Capability                          | Imports mounted at link time           | op_kinds gated at dispatch time           |
+|-------------------------------------|----------------------------------------|-------------------------------------------|
+| `auto` (ללא הצהרה)                  | 4 resource lookups + 3 multiplexers    | `FIRE::LOG`, `FIRE::FINISH`, `FIRE::SET_RESULT`, `IO::TEXT_WIDTH` |
+| `akiva.permission.LAUNCH_ANY_APP`   | —                                      | `FIRE::START_ACTIVITY`, `FIRE::START_ACTIVITY_FOR_RESULT` |
+| `akiva.permission.QUERY_PACKAGES`   | —                                      | `IO::QUERY_PACKAGES`                      |
+| `akiva.permission.STORAGE_SANDBOX`  | —                                      | `IO::STORAGE_GET`, `IO::STORAGE_SET` (Stone 11.6 wires) |
+| `akiva.permission.NOTIFICATIONS`    | —                                      | *(reserved — post-MVP)*                   |
+| `akiva.permission.NETWORK`          | —                                      | *(reserved — post-MVP)*                   |
+| `akiva.permission.CAMERA`           | —                                      | *(reserved — post-MVP)*                   |
 
-ה-auto set כולל את `akiva_host_set_result` למרות שהוא "app writing to host" — כי כל activity שקריאו לה-`start_activity_for_result` חייבת יכולת להחזיר תוצאה, גם אם ה-caller ההוא משייך לאפליקציה אחרת. הגדרת ה-mapping מפורשת ב-Rust: `AUTO_IMPORTS` ו-`imports_for_capability` (ראה [permissions.rs](../framework/src/permissions.rs)).
+**שני שלבי האכיפה:**
 
-**עיקרון האכיפה:** "link error, not runtime error." ה-permission check לא קורה בזמן call-site; הוא קורה פעם אחת ב-instantiation. אם ה-host לא סיפק את ה-import, ה-wasm module לא הצליח בכלל להיטען — ה-app לא יכול להגיע ל-code path שמשתמש ב-permission שאין לו.
+1. **Link time** — ה-import set מוגבל ל-7 פונקציות (4 resource + 3 multiplexers). ה-`AUTO_IMPORTS` הוא הסט שכל app מקבל; שום capability היום לא מוסיפה imports נוספים. אם wasm app מנסה לייבא שם שלא נמצא → `LinkError` ב-instantiation. זה תופס שמות שגויים מאחר ש-(אסור) או imports שכבר לא קיימים אחרי refactor.
+
+2. **Dispatch time** — בתוך `akiva_host_fire` / `akiva_host_io_start` ה-dispatcher בודק את ה-grants לפני ביצוע op_kind שצריך capability. App ללא הרשאה → `fire` מחזיר `2` (denied), `io_start` מחזיר `0n` (couldn't start). ה-warning בלוג מאפשר למפתח לראות את ה-deny.
+
+**הצדק לחלוקה.** עד 11.3 ה-gating היה בלעדית link-time (כל capability מיפתה לקבוצת imports); אחרי 11.3 import אחד משרת ~250 op_kinds, רובם auto, חלקם gated. gating ב-link time היה מצריך מולטיפלקסר נפרד לכל capability — מסבך את ה-ABI מבלי להשיג שום דבר. ה-dispatch-time gating משאיר את ה-import surface קטן (7 ערכים) ומרכז את הלוגיקה במקום אחד שקל לבדוק.
 
 ### 2.4 Imports (kernel → host) — `hal_app_*`
 
@@ -241,13 +249,14 @@ fn hal_app_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32) -> u
 // ^ 0 on success, non-zero on handle miss / alloc failure / host error.
 
 // Stone 9.3 — read + clear the per-handle "finish requested" flag the
-// app raised via `akiva_host_finish`. Called by `WasmActivity` at the
+// app raised via `akiva_host_fire(FIRE::FINISH, …)`. Called by
+// `WasmActivity` at the
 // end of every ctx-bearing callback; return 1 flips
 // `ActivityContext.finish_requested = true` in the active dispatch.
 fn hal_app_drain_finish(handle: u32) -> u32;
 
 // Stone 9.4 — read + clear the per-handle pending intent blob staged
-// via `akiva_host_start_activity`. Two-phase buffer: the return value
+// via `akiva_host_fire(FIRE::START_ACTIVITY, …)`. Two-phase buffer: the return value
 // is the total encoded size; if it exceeds `out_cap` nothing is copied
 // and the blob stays armed so the kernel can retry with a larger
 // buffer (same shape as `hal_app_render` / `hal_app_save_state`).
@@ -273,7 +282,7 @@ fn hal_app_drain_start_for_result(
     handle: u32, out_ptr: *mut u8, out_cap: u32, rc_out: *mut u32,
 ) -> u32;
 
-// Drain whatever bytes the app stashed via akiva_host_set_result.
+// Drain whatever bytes the app stashed via `akiva_host_fire(FIRE::SET_RESULT, …)`.
 // Same two-phase contract; payload is an encoded ActivityResult
 // (see §2.5.2). Zero return = nothing stashed.
 fn hal_app_drain_set_result(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
@@ -304,7 +313,7 @@ fn hal_app_activity_result(
 
 ### 2.5.1 Intent wire format (Stone 9.4)
 
-פורמט שטוח שה-SDK מ-encode עם `Intent::encode` וה-framework מ-decode עם `Intent::decode`. ה-blob נוסע ב-שני הכיוונים — app→kernel דרך `akiva_host_start_activity` + `hal_app_drain_intent`, ו-kernel→app דרך `hal_app_new_intent` + `akiva_app_new_intent`.
+פורמט שטוח שה-SDK מ-encode עם `Intent::encode` וה-framework מ-decode עם `Intent::decode`. ה-blob נוסע ב-שני הכיוונים — app→kernel דרך `akiva_host_fire(FIRE::START_ACTIVITY, …)` + `hal_app_drain_intent`, ו-kernel→app דרך `hal_app_new_intent` + `akiva_app_new_intent`.
 
 ```
 u32  action_len + <action_len> UTF-8 bytes
@@ -326,7 +335,7 @@ u32  extras_count       (v0.2: חייב להיות 0 — reserved ל-Stone 9.5)
 
 ### 2.5.2 ActivityResult wire format (Stone 9.5)
 
-הקטן ביותר משני פורמטי ה-wire של ה-stone: קוד `i32` + בלוב bytes אטום באורך משתנה. נוסע משני הכיוונים — app→kernel דרך `akiva_host_set_result` + `hal_app_drain_set_result`, ו-kernel→app דרך `hal_app_activity_result` + `akiva_app_activity_result`.
+הקטן ביותר משני פורמטי ה-wire של ה-stone: קוד `i32` + בלוב bytes אטום באורך משתנה. נוסע משני הכיוונים — app→kernel דרך `akiva_host_fire(FIRE::SET_RESULT, …)` + `hal_app_drain_set_result`, ו-kernel→app דרך `hal_app_activity_result` + `akiva_app_activity_result`.
 
 ```
 i32  code           (little-endian — RESULT_OK=0, RESULT_CANCELED=1, שאר הערכים app-defined)
@@ -350,9 +359,10 @@ u32  data_len + <data_len> bytes
 
 ### 2.7 מה לא כלול ב-v0
 
-- **Imports מלאים** — רק `akiva_host_log` זמין ב-Phase 2b.3. `finish`, `start_activity`, `storage`, notifications — כל אלה ידרשו PR נפרד ויעברו את מבחני §1.2.
-- **Intents** — routing בין apps מופעל ב-Phase 3.
-- **Permissions** — ה-host טוען כל wasm עם ה-imports הבסיסיים בלבד. PermissionController נכנס ב-v1 כשה-imports נהיים conditional.
+- **Storage** — `IO::STORAGE_GET` ו-`IO::STORAGE_SET` יש להם op_kind מוקצה, אבל ה-handler עדיין מחזיר ERROR (Stone 11.6 ימפה אל OPFS readonly handles ב-app-worker + write-through דרך ה-kernel). **השם וה-args layout נמצאים בתהליך תכנון** — אל תסתמך עליהם עד 11.6.
+- **Notifications** — אין op_kind עדיין; ה-capability `akiva.permission.NOTIFICATIONS` reserved.
+- **Network / Camera** — אין op_kind, אין HAL ב-host. post-MVP, יחתכו את §2.7 כשהם נוחתים.
+- **Streams / pushed events** — range `0x0200..` reserved; ה-shape ייעקב ב-Stone 11.4+ (worker-per-app מאפשר push events מ-host ל-app בלי polling).
 
 ---
 
