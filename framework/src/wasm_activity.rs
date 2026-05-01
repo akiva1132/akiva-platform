@@ -60,7 +60,22 @@ pub trait WasmHost {
     fn register(&self, package_id: &str, class: &str) -> Option<AppHandle>;
     fn unregister(&self, handle: AppHandle);
 
-    fn lifecycle(&self, handle: AppHandle, transition: LifecycleTransition);
+    /// Fire a lifecycle transition on the app. Returns a `future_id` the
+    /// framework can pass to [`Self::poll_future`] to await completion.
+    ///
+    /// Stone 11.4a contract:
+    /// - **`0`** — resolved synchronously inside this call. The framework
+    ///   does not record a `PendingTransition` and advances state right
+    ///   away. Every existing impl (KernelWasmHost, MockHost,
+    ///   BootMockHost) returns `0` because the wasm app runs in the same
+    ///   worker as the kernel today.
+    /// - **non-zero** — the host accepted the dispatch but the app
+    ///   hasn't acked yet. The framework records `PendingTransition`,
+    ///   skips further dispatches at this activity, and polls each
+    ///   frame via `poll_future`. Stone 11.4c WorkerHost returns
+    ///   non-zero when the app lives in a separate Worker and the
+    ///   ack travels back via `postMessage`.
+    fn lifecycle(&self, handle: AppHandle, transition: LifecycleTransition) -> u64;
     fn pointer(&self, handle: AppHandle, ev: PointerEvent, ts_ms: f64);
     fn key(&self, handle: AppHandle, ev: KeyEvent, ts_ms: f64);
     fn resize(&self, handle: AppHandle, metrics: SurfaceMetrics);
@@ -284,9 +299,36 @@ impl WasmActivity {
     }
 }
 
+impl WasmActivity {
+    /// Stone 11.4a — fire a lifecycle transition and assert the host
+    /// resolved it synchronously. Today every `WasmHost` impl
+    /// (KernelWasmHost, MockHost, BootMockHost) returns `0` from
+    /// `lifecycle` because the wasm app runs in the same worker as
+    /// the kernel; the `WasmActivity` shim still drives transitions
+    /// inline through the `Activity` trait.
+    ///
+    /// 11.4c moves the deferred path out of this helper: the framework
+    /// state machine will dispatch lifecycle directly to `WasmHost`
+    /// (skipping the `Activity` trait) and own the `PendingTransition`
+    /// slot. Until then a non-zero `future_id` here is a wiring bug —
+    /// the host returned a future_id but no caller is set up to poll
+    /// it. We panic loudly rather than silently dropping the dispatch.
+    fn fire_lifecycle_sync(&self, transition: LifecycleTransition) {
+        let future_id = self.host.lifecycle(self.handle, transition);
+        debug_assert_eq!(
+            future_id, 0,
+            "Stone 11.4a: lifecycle on the Activity-trait path expects sync resolution. \
+             Host returned future_id={future_id:#x} for transition {transition:?} on \
+             handle {handle:?}; the deferred path lands when 11.4c routes WorkerHost \
+             through framework state machine instead of WasmActivity.",
+            handle = self.handle,
+        );
+    }
+}
+
 impl Activity for WasmActivity {
     fn on_create(&mut self, ctx: &mut ActivityContext<'_>) {
-        self.host.lifecycle(self.handle, LifecycleTransition::Create);
+        self.fire_lifecycle_sync(LifecycleTransition::Create);
         // Prime the app's slot with the live surface metrics right after
         // construction. The SDK's `on_create` builds the slot with
         // `Metrics::default()` (zeros) because the `lifecycle(Create)`
@@ -300,25 +342,25 @@ impl Activity for WasmActivity {
         self.drain_post(ctx);
     }
     fn on_start(&mut self, ctx: &mut ActivityContext<'_>) {
-        self.host.lifecycle(self.handle, LifecycleTransition::Start);
+        self.fire_lifecycle_sync(LifecycleTransition::Start);
         self.drain_post(ctx);
     }
     fn on_resume(&mut self, ctx: &mut ActivityContext<'_>) {
-        self.host.lifecycle(self.handle, LifecycleTransition::Resume);
+        self.fire_lifecycle_sync(LifecycleTransition::Resume);
         self.drain_post(ctx);
     }
     fn on_pause(&mut self, ctx: &mut ActivityContext<'_>) {
-        self.host.lifecycle(self.handle, LifecycleTransition::Pause);
+        self.fire_lifecycle_sync(LifecycleTransition::Pause);
         self.drain_post(ctx);
     }
     fn on_stop(&mut self, ctx: &mut ActivityContext<'_>) {
-        self.host.lifecycle(self.handle, LifecycleTransition::Stop);
+        self.fire_lifecycle_sync(LifecycleTransition::Stop);
         self.drain_post(ctx);
     }
     fn on_destroy(&mut self, _ctx: &mut ActivityContext<'_>) {
         // No drain_post — destroy is terminal, a finish flag here would
         // be nonsense anyway (can't finish a destroying activity).
-        self.host.lifecycle(self.handle, LifecycleTransition::Destroy);
+        self.fire_lifecycle_sync(LifecycleTransition::Destroy);
         self.host.unregister(self.handle);
     }
 
@@ -616,8 +658,10 @@ mod tests {
         fn unregister(&self, handle: AppHandle) {
             self.calls.borrow_mut().push(Call::Unregister(handle.get()));
         }
-        fn lifecycle(&self, handle: AppHandle, t: LifecycleTransition) {
+        fn lifecycle(&self, handle: AppHandle, t: LifecycleTransition) -> u64 {
             self.calls.borrow_mut().push(Call::Lifecycle(handle.get(), t));
+            // Sync-resolve sentinel — see WasmHost::lifecycle docs.
+            0
         }
         fn pointer(&self, handle: AppHandle, ev: PointerEvent, ts: f64) {
             self.calls.borrow_mut().push(Call::Pointer(handle.get(), ev.x, ev.y, ts));

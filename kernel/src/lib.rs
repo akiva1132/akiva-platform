@@ -223,8 +223,13 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         &self,
         handle: akiva_framework::wasm_activity::AppHandle,
         t: akiva_framework::wasm_activity::LifecycleTransition,
-    ) {
+    ) -> u64 {
         unsafe { host::hal_app_lifecycle(handle.get(), t as u32) }
+        // Stone 11.4a: single-worker — the host ran the wasm app's
+        // export inline before returning. No future to track.
+        // 11.4c flips this to a non-zero `future_id` once the app
+        // lives in a per-package Worker.
+        0
     }
 
     fn pointer(

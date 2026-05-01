@@ -2029,7 +2029,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
         fn lifecycle(
             &self, _h: wasm_activity::AppHandle,
             _t: wasm_activity::LifecycleTransition,
-        ) {}
+        ) -> u64 { 0 }
         fn pointer(
             &self, _h: wasm_activity::AppHandle,
             _ev: activity::PointerEvent, _ts: f64,
