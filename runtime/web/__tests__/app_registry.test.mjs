@@ -16,6 +16,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { AppRegistry, AUTO_IMPORTS, CAPABILITY_IMPORTS } from "../app_registry.js";
+import { FIRE, IO, STATUS, packPoll } from "../op_kinds.mjs";
 
 // ── Test harness ──────────────────────────────────────────────────────
 
@@ -704,58 +705,304 @@ describe("_buildAppImports — capability filter", () => {
   });
 });
 
-describe("Stone 11.3b — unified-ABI multiplexer stubs", () => {
-  // The three multiplexers (`fire`, `io_start`, `io_poll`) are declared
-  // on both sides of the wasm boundary in 11.3b but no app calls them
-  // yet — call sites still go through the per-op imports. These tests
-  // pin the stub shape so 11.3c's real dispatcher can land without a
-  // silent regression: every stub MUST log a warning AND return an
-  // unmistakable error-shaped value (so an accidental call from a
-  // pre-11.3c app surfaces immediately rather than silently no-oping).
+describe("Stone 11.3c — unified-ABI dispatcher", () => {
+  // The three multiplexers (`fire` / `io_start` / `io_poll`) route every
+  // host-mediated op through a single switch on op_kind. Per-op behavior
+  // matches the legacy per-op imports — same internal state mutation
+  // for fire ops (pendingFinish/pendingIntent/etc), same payload shape
+  // for io ops. These tests pin both that the dispatch routes correctly
+  // and that capability gating happens *inside* the dispatcher (since
+  // one import serves many op_kinds).
 
-  it("akiva_host_fire stub returns non-zero error code and logs", () => {
-    const { registry, log } = makeRegistry();
-    const fireFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
-    expect(typeof fireFn).toBe("function");
-    // Fire LOG (op_kind 0x0001) — irrelevant args; stub doesn't decode.
-    const rc = fireFn(0x0001, 0, 0);
-    expect(rc).toBe(1);  // non-zero = error
-    const warnCalls = log.mock.calls.filter(([lvl]) => lvl === "warn");
-    expect(warnCalls.some(([, msg]) =>
-      msg.includes("akiva_host_fire") && msg.includes("0x1"))).toBe(true);
-  });
+  /**
+   * Allocate a region in the fake proc's memory and write `bytes` into
+   * it. Returns the pointer for the dispatcher to read. Mirrors the
+   * "host writes args into app memory before calling the import" flow
+   * — except in tests we drive both ends, so this is just a memory
+   * write.
+   */
+  function writeArgs(fakeProc, bytes) {
+    const ptr = fakeProc.exports.akiva_app_alloc(bytes.length);
+    new Uint8Array(fakeProc.proc.memory.buffer, ptr, bytes.length).set(bytes);
+    return { ptr, len: bytes.length };
+  }
 
-  it("akiva_host_io_start stub returns 0 future_id and logs", () => {
-    const { registry, log } = makeRegistry();
-    const startFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_io_start;
-    // QUERY_PACKAGES (op_kind 0x0102) — stub ignores it.
-    const futureId = startFn(0x0102, 0, 0);
-    expect(futureId).toBe(0n);  // 0 = couldn't start
-    const warnCalls = log.mock.calls.filter(([lvl]) => lvl === "warn");
-    expect(warnCalls.some(([, msg]) =>
-      msg.includes("akiva_host_io_start") && msg.includes("0x102"))).toBe(true);
-  });
+  function u32le(n) {
+    const out = new Uint8Array(4);
+    new DataView(out.buffer).setUint32(0, n >>> 0, true);
+    return out;
+  }
+  function f32le(n) {
+    const out = new Uint8Array(4);
+    new DataView(out.buffer).setFloat32(0, n, true);
+    return out;
+  }
+  function concat(...arrs) {
+    const total = arrs.reduce((s, a) => s + a.length, 0);
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const a of arrs) { out.set(a, off); off += a.length; }
+    return out;
+  }
 
-  it("akiva_host_io_poll stub resolves to ERROR with empty payload", () => {
-    const { registry, log } = makeRegistry();
-    const pollFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_io_poll;
-    // packed return: low 32 bits = status, high 32 = length. Status 2
-    // (ERROR) with length 0 → 2n.
-    const packed = pollFn(123n, 0, 0);
-    expect(packed).toBe(2n);
-    const warnCalls = log.mock.calls.filter(([lvl]) => lvl === "warn");
-    expect(warnCalls.some(([, msg]) =>
-      msg.includes("akiva_host_io_poll"))).toBe(true);
-  });
+  // ── multiplexers are AUTO imports ──
 
-  it("multiplexers are AUTO imports (no permission gating at the import surface)", () => {
+  it("multiplexers are AUTO imports (no gating at import surface)", () => {
     // Mirrors the Rust-side `unified_abi_trio_is_in_auto_imports` test.
-    // Capability gating moves into the dispatcher in 11.3c — the import
-    // itself is always available because one function serves many
-    // op_kinds, some always-available, some gated.
     for (const name of ["akiva_host_fire", "akiva_host_io_start", "akiva_host_io_poll"]) {
       expect(AUTO_IMPORTS).toContain(name);
     }
+  });
+
+  // ── fire dispatch ──
+
+  describe("fire dispatch", () => {
+    it("LOG forwards to the registry logger", () => {
+      const fake = makeFakeProc();
+      const { registry, log } = makeRegistry({ fakeProc: fake });
+      const fire = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
+      const text = "hello from app";
+      const args = concat(u32le(2 /* info */), new TextEncoder().encode(text));
+      const { ptr, len } = writeArgs(fake, args);
+      expect(fire(FIRE.LOG, ptr, len)).toBe(0);
+      expect(log).toHaveBeenCalledWith("info", `[${PACKAGE_ID}] ${text}`);
+    });
+
+    it("FINISH stages the handle for drainFinish", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      const fire = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
+      const { ptr, len } = writeArgs(fake, u32le(7));
+      expect(fire(FIRE.FINISH, ptr, len)).toBe(0);
+      expect(registry.drainFinish(7)).toBe(true);
+      expect(registry.drainFinish(7)).toBe(false);  // single-shot
+    });
+
+    it("START_ACTIVITY without LAUNCH_ANY_APP grant is denied", () => {
+      const fake = makeFakeProc();
+      const { registry, log } = makeRegistry({ fakeProc: fake });
+      const fire = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
+      const args = concat(u32le(1), new Uint8Array([0xab, 0xcd]));
+      const { ptr, len } = writeArgs(fake, args);
+      expect(fire(FIRE.START_ACTIVITY, ptr, len)).toBe(2);  // 2 = denied
+      expect(log.mock.calls.some(([lvl, msg]) =>
+        lvl === "warn" && msg.includes("denied — no LAUNCH_ANY_APP"))).toBe(true);
+      expect(registry.drainIntent(1)).toBe(null);
+    });
+
+    it("START_ACTIVITY with the grant stages intent bytes", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      registry.setGrants(PACKAGE_ID, ["akiva.permission.LAUNCH_ANY_APP"]);
+      const fire = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
+      const intentBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+      const args = concat(u32le(1), intentBytes);
+      const { ptr, len } = writeArgs(fake, args);
+      expect(fire(FIRE.START_ACTIVITY, ptr, len)).toBe(0);
+      const drained = registry.drainIntent(1);
+      expect(drained).not.toBe(null);
+      expect(Array.from(drained)).toEqual(Array.from(intentBytes));
+    });
+
+    it("START_ACTIVITY_FOR_RESULT carries request_code", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      registry.setGrants(PACKAGE_ID, ["akiva.permission.LAUNCH_ANY_APP"]);
+      const fire = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
+      const intentBytes = new Uint8Array([1, 2, 3]);
+      const args = concat(u32le(5 /* handle */), u32le(42 /* request_code */), intentBytes);
+      const { ptr, len } = writeArgs(fake, args);
+      expect(fire(FIRE.START_ACTIVITY_FOR_RESULT, ptr, len)).toBe(0);
+      const drained = registry.drainStartForResult(5);
+      expect(drained).not.toBe(null);
+      expect(drained.requestCode).toBe(42);
+      expect(Array.from(drained.bytes)).toEqual([1, 2, 3]);
+    });
+
+    it("SET_RESULT stashes result bytes for drain", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      const fire = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
+      const result = new Uint8Array([9, 8, 7]);
+      const args = concat(u32le(3), result);
+      const { ptr, len } = writeArgs(fake, args);
+      expect(fire(FIRE.SET_RESULT, ptr, len)).toBe(0);
+      expect(Array.from(registry.drainSetResult(3))).toEqual([9, 8, 7]);
+    });
+
+    it("rejects unknown fire op_kind in range", () => {
+      const fake = makeFakeProc();
+      const { registry, log } = makeRegistry({ fakeProc: fake });
+      const fire = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
+      const { ptr, len } = writeArgs(fake, new Uint8Array([0]));
+      expect(fire(0x00FE, ptr, len)).toBe(1);
+      expect(log.mock.calls.some(([lvl, msg]) =>
+        lvl === "warn" && msg.includes("unknown op_kind"))).toBe(true);
+    });
+
+    it("rejects op_kind from the wrong range (io kind passed to fire)", () => {
+      const fake = makeFakeProc();
+      const { registry, log } = makeRegistry({ fakeProc: fake });
+      const fire = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
+      const { ptr, len } = writeArgs(fake, new Uint8Array([0]));
+      expect(fire(IO.TEXT_WIDTH, ptr, len)).toBe(1);
+      expect(log.mock.calls.some(([lvl, msg]) =>
+        lvl === "warn" && msg.includes("not a fire op_kind"))).toBe(true);
+    });
+  });
+
+  // ── io dispatch + FutureRegistry ──
+
+  describe("io dispatch + FutureRegistry", () => {
+    it("TEXT_WIDTH resolves Ready on first poll with f32 LE width", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      // Force a deterministic width measurement: stub measureTextWidth.
+      registry.measureTextWidth = (text, size) => text.length * size * 0.6;
+      const env = registry._buildAppImports(PACKAGE_ID).env;
+      const args = concat(f32le(20.0), new TextEncoder().encode("abcd"));
+      const { ptr, len } = writeArgs(fake, args);
+      const futureId = env.akiva_host_io_start(IO.TEXT_WIDTH, ptr, len);
+      expect(futureId).not.toBe(0n);
+
+      const outBuf = fake.exports.akiva_app_alloc(4);
+      const packed = env.akiva_host_io_poll(futureId, outBuf, 4);
+      expect(packed).toBe(packPoll(STATUS.READY, 4));
+      const width = new DataView(fake.proc.memory.buffer).getFloat32(outBuf, true);
+      expect(width).toBeCloseTo(4 * 20.0 * 0.6);
+    });
+
+    it("QUERY_PACKAGES without grant returns 0 future_id and logs", () => {
+      const fake = makeFakeProc();
+      const { registry, log } = makeRegistry({ fakeProc: fake });
+      const env = registry._buildAppImports(PACKAGE_ID).env;
+      const { ptr, len } = writeArgs(fake, new Uint8Array(0));
+      const futureId = env.akiva_host_io_start(IO.QUERY_PACKAGES, ptr, len);
+      expect(futureId).toBe(0n);
+      expect(log.mock.calls.some(([lvl, msg]) =>
+        lvl === "warn" && msg.includes("denied — no QUERY_PACKAGES"))).toBe(true);
+    });
+
+    it("QUERY_PACKAGES with grant resolves Ready with packagesBlob", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
+      registry.setPackages(new Uint8Array([1, 2, 3, 4, 5]));
+      const env = registry._buildAppImports(PACKAGE_ID).env;
+      const futureId = env.akiva_host_io_start(IO.QUERY_PACKAGES, 0, 0);
+      expect(futureId).not.toBe(0n);
+
+      const outBuf = fake.exports.akiva_app_alloc(16);
+      const packed = env.akiva_host_io_poll(futureId, outBuf, 16);
+      expect(packed).toBe(packPoll(STATUS.READY, 5));
+      const written = Array.from(new Uint8Array(fake.proc.memory.buffer, outBuf, 5));
+      expect(written).toEqual([1, 2, 3, 4, 5]);
+    });
+
+    it("two-phase retry: payload too large returns length, retains entry", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
+      registry.setPackages(new Uint8Array(100));
+      const env = registry._buildAppImports(PACKAGE_ID).env;
+      const futureId = env.akiva_host_io_start(IO.QUERY_PACKAGES, 0, 0);
+
+      // First poll with an undersized buffer — must report required
+      // length, write nothing, and KEEP the entry alive for retry.
+      const undersized = fake.exports.akiva_app_alloc(8);
+      const first = env.akiva_host_io_poll(futureId, undersized, 8);
+      expect(first).toBe(packPoll(STATUS.READY, 100));
+      // Buffer remains zeroed — host did not write.
+      const after = Array.from(new Uint8Array(fake.proc.memory.buffer, undersized, 8));
+      expect(after.every(b => b === 0)).toBe(true);
+
+      // Second poll with sized buffer succeeds and evicts.
+      const sized = fake.exports.akiva_app_alloc(100);
+      const second = env.akiva_host_io_poll(futureId, sized, 100);
+      expect(second).toBe(packPoll(STATUS.READY, 100));
+
+      // Third poll on the same id is now ERROR (entry consumed).
+      const third = env.akiva_host_io_poll(futureId, sized, 100);
+      expect(third).toBe(packPoll(STATUS.ERROR, 0));
+    });
+
+    it("STORAGE_GET/SET resolve Error until storage HAL lands", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
+      const env = registry._buildAppImports(PACKAGE_ID).env;
+      for (const kind of [IO.STORAGE_GET, IO.STORAGE_SET]) {
+        const futureId = env.akiva_host_io_start(kind, 0, 0);
+        expect(futureId).not.toBe(0n);
+        const out = fake.exports.akiva_app_alloc(0);
+        expect(env.akiva_host_io_poll(futureId, out, 0)).toBe(packPoll(STATUS.ERROR, 0));
+      }
+    });
+
+    it("polling an unknown future_id returns ERROR", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      const env = registry._buildAppImports(PACKAGE_ID).env;
+      expect(env.akiva_host_io_poll(99999n, 0, 0)).toBe(packPoll(STATUS.ERROR, 0));
+    });
+
+    it("cross-package poll attempt is rejected", () => {
+      // Two packages share the registry. Package A starts a future,
+      // package B tries to poll it. The dispatcher must refuse without
+      // confirming the future even exists.
+      const fakeA = makeFakeProc();
+      const fakeB = makeFakeProc();
+      const { registry, log } = makeRegistry({ fakeProc: fakeA });
+      registry._processes.set("com.b.app", fakeB.proc);
+      registry._resources.set("com.b.app", { strings: new Map(), colors: new Map() });
+      registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
+      registry.setPackages(new Uint8Array([1]));
+
+      const envA = registry._buildAppImports(PACKAGE_ID).env;
+      const futureId = envA.akiva_host_io_start(IO.QUERY_PACKAGES, 0, 0);
+      const envB = registry._buildAppImports("com.b.app").env;
+      const out = fakeB.exports.akiva_app_alloc(8);
+      expect(envB.akiva_host_io_poll(futureId, out, 8)).toBe(packPoll(STATUS.ERROR, 0));
+      expect(log.mock.calls.some(([lvl, msg]) =>
+        lvl === "warn" && msg.includes("not owned by this package"))).toBe(true);
+
+      // Original package can still poll its own future.
+      const outA = fakeA.exports.akiva_app_alloc(8);
+      expect(envA.akiva_host_io_poll(futureId, outA, 8))
+        .toBe(packPoll(STATUS.READY, 1));
+    });
+
+    it("rejects op_kind from the wrong range (fire kind passed to io_start)", () => {
+      const fake = makeFakeProc();
+      const { registry, log } = makeRegistry({ fakeProc: fake });
+      const env = registry._buildAppImports(PACKAGE_ID).env;
+      expect(env.akiva_host_io_start(FIRE.LOG, 0, 0)).toBe(0n);
+      expect(log.mock.calls.some(([lvl, msg]) =>
+        lvl === "warn" && msg.includes("not an io op_kind"))).toBe(true);
+    });
+
+    it("rejects unknown io op_kind in range", () => {
+      const fake = makeFakeProc();
+      const { registry, log } = makeRegistry({ fakeProc: fake });
+      const env = registry._buildAppImports(PACKAGE_ID).env;
+      expect(env.akiva_host_io_start(0x01FE, 0, 0)).toBe(0n);
+      expect(log.mock.calls.some(([lvl, msg]) =>
+        lvl === "warn" && msg.includes("unknown op_kind"))).toBe(true);
+    });
+
+    it("future_ids are monotonic and unique within a registry", () => {
+      const fake = makeFakeProc();
+      const { registry } = makeRegistry({ fakeProc: fake });
+      registry.measureTextWidth = () => 1.0;
+      const env = registry._buildAppImports(PACKAGE_ID).env;
+      const args = concat(f32le(10.0), new TextEncoder().encode("x"));
+      const { ptr, len } = writeArgs(fake, args);
+      const a = env.akiva_host_io_start(IO.TEXT_WIDTH, ptr, len);
+      const b = env.akiva_host_io_start(IO.TEXT_WIDTH, ptr, len);
+      const c = env.akiva_host_io_start(IO.TEXT_WIDTH, ptr, len);
+      expect(b).toBe(a + 1n);
+      expect(c).toBe(b + 1n);
+    });
   });
 });
 

@@ -15,6 +15,7 @@
 // from within kernel code — no promise juggling needed.
 
 import { fontString } from "./renderer/canvas2d.js";
+import { FIRE, IO, STATUS, packPoll, isFireKind, isIoKind } from "./op_kinds.mjs";
 
 export class AppRegistry {
   /**
@@ -118,6 +119,40 @@ export class AppRegistry {
     this._packagesBlob = new Uint8Array(0);
     this._decoder = new TextDecoder("utf-8");
     this._encoder = new TextEncoder();
+
+    /**
+     * Stone 11.3c — registry of in-flight async ops started via
+     * `akiva_host_io_start`. Single-shot: an entry is removed on the
+     * first `io_poll` that successfully consumes it (READY/ERROR with
+     * a payload that fits in the caller's buffer). If `payload.length
+     * > out_cap` the entry is *retained* so the caller can realloc and
+     * retry, mirroring the two-phase shape of `akiva_host_query_packages`.
+     *
+     * Cross-package ID guessing is prevented by storing `packageId` per
+     * entry and rejecting polls from a different package: even though
+     * future_ids are an opaque monotonic counter, we don't rely on
+     * obscurity for isolation. Stone 11.4 (worker-per-app) drops the
+     * shared map entirely; until then the ownership check is the
+     * boundary.
+     *
+     * In Stone 11.3 single-worker, every io op resolves synchronously
+     * inside `_dispatchIoStart`, so polls never observe `PENDING`. The
+     * shape is async-ready for 11.4+ where the worker can return
+     * before a real cross-thread handler completes.
+     *
+     * @type {Map<bigint, {packageId: string, status: number, payload: Uint8Array}>}
+     */
+    this._futures = new Map();
+    /**
+     * Monotonic future_id allocator. Starts at 1n — `0n` is reserved as
+     * the "couldn't start" sentinel (`io_start` returns it on unknown
+     * op_kind, denied capability, or malformed args). u64 wraps in 2^64
+     * polls which is not a real concern; reuse-after-wrap would still
+     * be guarded by the per-entry `packageId` check anyway.
+     *
+     * @type {bigint}
+     */
+    this._nextFutureId = 1n;
 
     // Dedicated 1×1 context used only for `measureText`. Sharing the
     // renderer's main context would work but ties measurement to display
@@ -649,31 +684,41 @@ export class AppRegistry {
           self._pendingSetResult.set(handle, copy);
         },
 
-        // Stone 11.3b — three multiplexers that subsume the per-op imports
-        // above as 11.3c migrates call sites. They share a single namespace
-        // (`op_kind` u32) defined in `framework/src/wire/op_kinds.rs`. In
-        // 11.3b the dispatcher is a stub: it logs the op_kind and returns
-        // a "not yet implemented" shape. No app calls these yet (the SDK
-        // wrappers are unused — call sites still go through the per-op
-        // imports), so the stubs only fire from synthetic tests. Stone 11.3c
-        // replaces this with a real op_kind → handler dispatcher and a
-        // FutureRegistry; capability gating per op_kind moves *here* (not
-        // the import surface) since one import serves many ops.
-        akiva_host_fire: (opKind, _ptr, _len) => {
-          self._log("warn",
-            `[${packageId}] akiva_host_fire(0x${opKind.toString(16)}) — not implemented in Stone 11.3b (returning error)`);
-          return 1;  // non-zero = error
+        // Stone 11.3c — three multiplexers that route every host-mediated
+        // op through a single dispatch table. The op_kind constants live
+        // in `op_kinds.mjs` (mirror of `framework/src/wire/op_kinds.rs`);
+        // every op_kind has a fixed args layout decoded inside the
+        // dispatcher (no central registry of decoders — keeps the call
+        // graph readable, and a missing case in the switch is a hard
+        // tripwire rather than a silent pass).
+        //
+        // Capability gating moves into the dispatch helpers (one import
+        // serves many op_kinds — some always-available, some gated). The
+        // `_applyPermissionFilter` mechanism above remains for the legacy
+        // per-op imports; both gates stay in sync because the dispatcher
+        // consults the same `_grants` map.
+        //
+        // Args copying: the dispatcher reads `args_ptr..args_ptr+args_len`
+        // out of app memory into a Uint8Array. We copy (`slice()`) rather
+        // than view because the args may be re-read during the op (e.g.
+        // an intent decode) and any subsequent wasm call could grow
+        // memory and detach the underlying ArrayBuffer.
+        akiva_host_fire: (opKind, argsPtr, argsLen) => {
+          const proc = self._processes.get(packageId);
+          if (!proc?.memory) return 1;
+          const args = self._readArgs(proc, argsPtr, argsLen);
+          if (args === null) return 1;
+          return self._dispatchFire(packageId, opKind, args);
         },
-        akiva_host_io_start: (opKind, _ptr, _len) => {
-          self._log("warn",
-            `[${packageId}] akiva_host_io_start(0x${opKind.toString(16)}) — not implemented in Stone 11.3b (returning 0 future_id)`);
-          return 0n;  // 0 = couldn't start
+        akiva_host_io_start: (opKind, argsPtr, argsLen) => {
+          const proc = self._processes.get(packageId);
+          if (!proc?.memory) return 0n;
+          const args = self._readArgs(proc, argsPtr, argsLen);
+          if (args === null) return 0n;
+          return self._dispatchIoStart(packageId, opKind, args);
         },
-        akiva_host_io_poll: (futureId, _outPtr, _outCap) => {
-          self._log("warn",
-            `[${packageId}] akiva_host_io_poll(${futureId}) — not implemented in Stone 11.3b (returning ERROR)`);
-          // Pack: status = ERROR (2), length = 0
-          return 2n;
+        akiva_host_io_poll: (futureId, outPtr, outCap) => {
+          return self._pollFuture(packageId, futureId, outPtr, outCap);
         },
       },
     };
@@ -760,6 +805,236 @@ export class AppRegistry {
         `[${packageId}] permission denied: '${importName}' requires '${capability}' which is not granted. Call returned no-op (0).`);
       return 0;
     };
+  }
+
+  // ── Stone 11.3c — unified ABI dispatcher ─────────────────────────────
+  //
+  // `akiva_host_fire` / `akiva_host_io_start` / `akiva_host_io_poll`
+  // funnel here. Each op_kind has a fixed args layout decoded inside
+  // its branch; results for io ops are stored in the FutureRegistry
+  // (`this._futures`) so `io_poll` can serve them through the same
+  // two-phase buffer protocol as the legacy per-op imports.
+  //
+  // Why a single switch instead of a registry of decoders: the op set
+  // is small (~10 today, capped at ~250 by the disjoint-range layout
+  // in op_kinds.rs) and a missing case is a hard tripwire. A registry
+  // would let an op silently default to "unknown" if the registration
+  // line were ever lost in a merge.
+
+  /**
+   * Copy `len` bytes from `proc`'s memory at `ptr` into a fresh
+   * Uint8Array. Returns `null` on bounds violation (length zero is
+   * legitimate — returns an empty array, not null). Always copies:
+   * the args may outlive subsequent wasm calls that grow memory and
+   * detach the live buffer.
+   */
+  _readArgs(proc, ptr, len) {
+    if (len === 0) return new Uint8Array(0);
+    const bufLen = proc.memory.buffer.byteLength;
+    if (ptr < 0 || ptr + len > bufLen) return null;
+    const copy = new Uint8Array(len);
+    copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
+    return copy;
+  }
+
+  /** True iff `packageId` has been granted `capability`. */
+  _hasGrant(packageId, capability) {
+    return this._grants.get(packageId)?.has(capability) ?? false;
+  }
+
+  /**
+   * Dispatch a fire-and-forget op. Returns 0 on success, non-zero on
+   * any failure — unknown op_kind, malformed args, denied capability.
+   * Side effects (pendingFinish, pendingIntent, etc.) happen inline
+   * and the kernel drains them at the end of the dispatch via the
+   * existing `hal_app_drain_*` HAL bridges, identical to the legacy
+   * per-op imports.
+   */
+  _dispatchFire(packageId, opKind, args) {
+    if (!isFireKind(opKind)) {
+      this._log("warn",
+        `[${packageId}] fire(0x${opKind.toString(16)}): not a fire op_kind (range 0x0001..0x00FF)`);
+      return 1;
+    }
+    switch (opKind) {
+      case FIRE.LOG: {
+        // Args: [level: u32 LE | msg_bytes...]
+        if (args.length < 4) return 1;
+        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+        const level = view.getUint32(0, true);
+        const text = this._decoder.decode(args.subarray(4));
+        this._log(LEVEL_NAMES[level] ?? "info", `[${packageId}] ${text}`);
+        return 0;
+      }
+      case FIRE.FINISH: {
+        // Args: [handle: u32 LE]
+        if (args.length < 4) return 1;
+        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+        const handle = view.getUint32(0, true);
+        this._pendingFinish.add(handle);
+        return 0;
+      }
+      case FIRE.START_ACTIVITY: {
+        // Args: [handle: u32 LE | intent_bytes...]
+        if (!this._hasGrant(packageId, "akiva.permission.LAUNCH_ANY_APP")) {
+          this._log("warn",
+            `[${packageId}] fire(START_ACTIVITY): denied — no LAUNCH_ANY_APP grant`);
+          return 2;
+        }
+        if (args.length < 4) return 1;
+        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+        const handle = view.getUint32(0, true);
+        const intentBytes = args.slice(4);
+        if (intentBytes.length === 0) return 1;
+        this._pendingIntent.set(handle, intentBytes);
+        return 0;
+      }
+      case FIRE.START_ACTIVITY_FOR_RESULT: {
+        // Args: [handle: u32 LE | request_code: u32 LE | intent_bytes...]
+        if (!this._hasGrant(packageId, "akiva.permission.LAUNCH_ANY_APP")) {
+          this._log("warn",
+            `[${packageId}] fire(START_ACTIVITY_FOR_RESULT): denied — no LAUNCH_ANY_APP grant`);
+          return 2;
+        }
+        if (args.length < 8) return 1;
+        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+        const handle = view.getUint32(0, true);
+        const requestCode = view.getUint32(4, true);
+        const intentBytes = args.slice(8);
+        if (intentBytes.length === 0) return 1;
+        this._pendingStartForResult.set(handle, { bytes: intentBytes, requestCode });
+        return 0;
+      }
+      case FIRE.SET_RESULT: {
+        // Args: [handle: u32 LE | result_bytes...]
+        if (args.length < 4) return 1;
+        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+        const handle = view.getUint32(0, true);
+        const resultBytes = args.slice(4);
+        if (resultBytes.length === 0) return 1;
+        this._pendingSetResult.set(handle, resultBytes);
+        return 0;
+      }
+      default:
+        this._log("warn",
+          `[${packageId}] fire(0x${opKind.toString(16)}): unknown op_kind`);
+        return 1;
+    }
+  }
+
+  /**
+   * Dispatch an async op. In Stone 11.3 single-worker every op resolves
+   * synchronously inside this method and the result is staged in
+   * `_futures` for the imminent `io_poll`. Stone 11.4 (worker-per-app)
+   * lets some branches return a real `PENDING` future the kernel
+   * resolves on a later turn of the event loop.
+   *
+   * Returns the future_id on success, `0n` on failure (unknown op_kind,
+   * denied capability, malformed args). `0n` is the only sentinel —
+   * real future_ids are non-zero.
+   */
+  _dispatchIoStart(packageId, opKind, args) {
+    if (!isIoKind(opKind)) {
+      this._log("warn",
+        `[${packageId}] io_start(0x${opKind.toString(16)}): not an io op_kind (range 0x0101..0x01FF)`);
+      return 0n;
+    }
+    let payload;
+    let status = STATUS.READY;
+    switch (opKind) {
+      case IO.TEXT_WIDTH: {
+        // Args: [size: f32 LE | text_bytes...] -> [width: f32 LE]
+        if (args.length < 4) return 0n;
+        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+        const size = view.getFloat32(0, true);
+        const text = this._decoder.decode(args.subarray(4));
+        const width = this.measureTextWidth(text, size);
+        const out = new Uint8Array(4);
+        new DataView(out.buffer).setFloat32(0, width, true);
+        payload = out;
+        break;
+      }
+      case IO.QUERY_PACKAGES: {
+        // Args: [] -> [pkgs_wire blob...]
+        if (!this._hasGrant(packageId, "akiva.permission.QUERY_PACKAGES")) {
+          this._log("warn",
+            `[${packageId}] io_start(QUERY_PACKAGES): denied — no QUERY_PACKAGES grant`);
+          return 0n;
+        }
+        // Slice so a later setPackages reassignment can't mutate the
+        // staged payload out from under a pending poll.
+        payload = this._packagesBlob.slice();
+        break;
+      }
+      case IO.STORAGE_GET:
+      case IO.STORAGE_SET:
+        // Stone 11.6 wires storage onto OPFS handles. Until then, ERROR.
+        // Keeping the op_kind reachable (rather than rejecting) means
+        // the SDK wrapper can be written today and naturally start
+        // working when the handler lands.
+        if (!this._hasGrant(packageId, "akiva.permission.STORAGE_SANDBOX")) {
+          this._log("warn",
+            `[${packageId}] io_start(0x${opKind.toString(16)}): denied — no STORAGE_SANDBOX grant`);
+          return 0n;
+        }
+        status = STATUS.ERROR;
+        payload = new Uint8Array(0);
+        break;
+      default:
+        this._log("warn",
+          `[${packageId}] io_start(0x${opKind.toString(16)}): unknown op_kind`);
+        return 0n;
+    }
+    const futureId = this._nextFutureId++;
+    this._futures.set(futureId, { packageId, status, payload });
+    return futureId;
+  }
+
+  /**
+   * Resolve a future started via `io_start`. Returns the packed
+   * `(status, length)` u64 the SDK side decodes. Behaviour matrix:
+   *
+   *   - unknown future_id, or owned by a different package → ERROR, len 0.
+   *   - payload fits in `outCap` → write it, status=READY/ERROR, len=actual,
+   *     evict the entry (single-shot).
+   *   - payload too large → don't write, status=READY, len=actual,
+   *     KEEP the entry so the caller can realloc and retry. Same shape
+   *     as `akiva_host_query_packages`'s legacy two-phase contract.
+   *   - PENDING (not used in 11.3 single-worker; reserved for 11.4+)
+   *     → status=PENDING, len 0, KEEP the entry.
+   */
+  _pollFuture(packageId, futureId, outPtr, outCap) {
+    const entry = this._futures.get(futureId);
+    if (!entry) return packPoll(STATUS.ERROR, 0);
+    if (entry.packageId !== packageId) {
+      // Cross-package poll attempt. Treat as unknown — don't even
+      // confirm the future exists. The originator can still poll;
+      // log once so the attempt is observable.
+      this._log("warn",
+        `[${packageId}] io_poll(${futureId}): not owned by this package — ignored`);
+      return packPoll(STATUS.ERROR, 0);
+    }
+    if (entry.status === STATUS.PENDING) {
+      return packPoll(STATUS.PENDING, 0);
+    }
+    const len = entry.payload.length;
+    if (len > outCap) {
+      // Two-phase retry: keep the entry, return the required length.
+      return packPoll(entry.status, len);
+    }
+    if (len > 0) {
+      const proc = this._processes.get(packageId);
+      if (!proc?.memory) {
+        // Process gone — drop the future. Don't try to write to a
+        // detached buffer.
+        this._futures.delete(futureId);
+        return packPoll(STATUS.ERROR, 0);
+      }
+      new Uint8Array(proc.memory.buffer, outPtr, len).set(entry.payload);
+    }
+    // Single-shot consume.
+    this._futures.delete(futureId);
+    return packPoll(entry.status, len);
   }
 
   _lookup(handle) {
