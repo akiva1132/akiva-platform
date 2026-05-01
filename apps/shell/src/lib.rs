@@ -66,7 +66,15 @@ impl ShellActivity {
         // host serves whatever order `PackageManager::list()` produces
         // (HashMap insertion order, undefined) — sorting here is the
         // app's choice, not a system invariant.
+        //
+        // Filter out our own id: the Shell is the HOME app, so listing
+        // itself in its own launcher is dead weight (clicking it would
+        // re-launch HOME which is already underneath). A future
+        // `pkgs::list()` filter on intent category (LAUNCHER && !HOME)
+        // would express this more cleanly, but the wire format doesn't
+        // carry intent filters yet.
         let mut apps = pkgs::list();
+        apps.retain(|a| a.id != "sys.shell");
         apps.sort_by(|a, b| a.id.cmp(&b.id));
         self.apps = apps;
     }
