@@ -142,11 +142,11 @@ pub extern "C" fn akiva_boot() {
     k.scheduler.init();
     k.display.init();
 
-    let boot_count = bump_boot_counter();
+    bump_boot_counter();
     let kstore: Box<dyn akiva_framework::storage::Storage> = Box::new(KernelStorage);
     let host: std::rc::Rc<dyn akiva_framework::wasm_activity::WasmHost> =
         std::rc::Rc::new(KernelWasmHost);
-    let (mut fw, report) = framework::boot(boot_count, kstore, host);
+    let (mut fw, report) = framework::boot(kstore, host);
     log::info(&format!("packages: {} loaded", report.packages_loaded));
     for (id, err) in &report.package_errors {
         log::warn(&format!("package '{id}' failed to load: {err}"));
@@ -506,12 +506,25 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
             );
         }
     }
+
+    // ── Stone 11.0a ───────────────────────────────────────────────────────
+
+    fn set_packages(&self, bytes: &[u8]) {
+        // Pass the framework's already-encoded blob straight through.
+        // The host doesn't decode it — it serves the same bytes back to
+        // any app that calls `akiva_host_query_packages`.
+        unsafe {
+            host::hal_host_set_packages(bytes.as_ptr(), bytes.len());
+        }
+    }
 }
 
 /// Exercises the storage HAL end-to-end: read a u32 counter under
-/// `sys/boot_count`, increment it, write it back. The returned value is
-/// the post-increment count, fed into `framework::boot` so the Shell can
-/// display it.
+/// `sys/boot_count`, increment it, write it back. Stone 11.0c — the
+/// returned value used to feed `framework::boot` so the in-framework
+/// Shell could display "boot #N". With Shell now an installed wasm
+/// app, the value is just a kernel-side log line — visible breadcrumb
+/// that storage I/O survived a reboot, no longer threaded into UI.
 fn bump_boot_counter() -> u32 {
     const KEY: &str = "sys/boot_count";
     let prev = match storage::read(KEY) {

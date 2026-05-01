@@ -137,12 +137,19 @@ pub fn imports_for_capability(name: &str) -> &'static [&'static str] {
             "akiva_host_start_activity",
             "akiva_host_start_activity_for_result",
         ],
+        // Stone 11.0a — QUERY_PACKAGES unlocks `akiva_host_query_packages`,
+        // the two-phase reader for the framework's package-list snapshot
+        // pushed at boot via `WasmHost::set_packages`. Without the grant
+        // the JS deny-stub returns 0 (== "no packages") — same shape an
+        // app sees on a freshly-booted system with nothing installed.
+        QUERY_PACKAGES => &[
+            "akiva_host_query_packages",
+        ],
         // Storage HAL surface hasn't reached apps yet (framework-side
         // persistence goes through WasmHost::save/restore on the
         // kernel side, not app-visible imports). The mapping slot is
         // reserved for when `akiva_host_storage_*` lands.
         STORAGE_SANDBOX => &[],
-        QUERY_PACKAGES  => &[],
         NOTIFICATIONS   => &[],
         NETWORK         => &[],
         CAMERA          => &[],
@@ -291,6 +298,26 @@ mod tests {
         // empty slice for anything it doesn't recognise.
         assert!(imports_for_capability("akiva.permission.TYPO").is_empty());
         assert!(imports_for_capability("").is_empty());
+    }
+
+    #[test]
+    fn query_packages_adds_query_import() {
+        // Stone 11.0a — QUERY_PACKAGES must unlock
+        // `akiva_host_query_packages`, the two-phase reader for the
+        // package-list snapshot. Mirrors the JS-side
+        // `CAPABILITY_IMPORTS["akiva.permission.QUERY_PACKAGES"]`
+        // entry; if the two diverge the JS deny-stub will mask a
+        // real call (or expose a gated one), so this test fires the
+        // tripwire on either side.
+        let mut c = PermissionController::new();
+        declare_mvp_permissions(&mut c);
+        let before = imports_for_grants(&c, "test.shell");
+        assert!(!before.contains(&"akiva_host_query_packages"));
+
+        c.grant("test.shell", QUERY_PACKAGES);
+        let after = imports_for_grants(&c, "test.shell");
+        assert!(after.contains(&"akiva_host_query_packages"),
+            "QUERY_PACKAGES must unlock akiva_host_query_packages");
     }
 
     #[test]

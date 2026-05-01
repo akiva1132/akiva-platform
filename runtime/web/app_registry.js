@@ -102,6 +102,20 @@ export class AppRegistry {
      * @type {Map<string, Set<string>>}
      */
     this._grants = new Map();
+    /**
+     * Stone 11.0a — opaque snapshot of the installed-packages list
+     * pushed from `framework::boot` via `hal_host_set_packages`. The
+     * format is the framework's `pkgs_wire::encode` output (length-
+     * prefixed, see framework/src/pkgs_wire.rs); we never decode it on
+     * this side. When an app holding `akiva.permission.QUERY_PACKAGES`
+     * calls `akiva_host_query_packages` we serve these same bytes back
+     * via the standard two-phase HAL pattern.
+     *
+     * Empty Uint8Array on first construction so `query_packages` returns
+     * a clean empty blob if it's ever called before boot finishes.
+     * @type {Uint8Array}
+     */
+    this._packagesBlob = new Uint8Array(0);
     this._decoder = new TextDecoder("utf-8");
     this._encoder = new TextEncoder();
 
@@ -149,6 +163,20 @@ export class AppRegistry {
   setGrants(packageId, permissionNames) {
     this._grants.set(packageId, new Set(permissionNames));
     this._dbg("permissions", `${packageId} grants: [${permissionNames.join(", ")}]`);
+  }
+
+  /**
+   * Stone 11.0a — replace the cached package-list snapshot. Called once
+   * at boot from `hal_host_set_packages`; future install/uninstall flows
+   * will re-push the full set. The bytes are opaque (the framework's
+   * length-prefixed encoding) and served back verbatim to apps via
+   * `akiva_host_query_packages`.
+   *
+   * @param {Uint8Array} bytes  framework's encoded package list, or empty
+   */
+  setPackages(bytes) {
+    this._packagesBlob = bytes instanceof Uint8Array ? bytes : new Uint8Array(0);
+    this._dbg("permissions", `packages snapshot: ${this._packagesBlob.length} bytes`);
   }
 
   /**
@@ -591,6 +619,25 @@ export class AppRegistry {
           self._pendingStartForResult.set(handle, { bytes: copy, requestCode });
         },
 
+        // Stone 11.0a — enumerate installed packages. Two-phase HAL
+        // pattern (same shape as `akiva_host_resource_string`): if the
+        // caller's `outCap` is smaller than the required size, write
+        // nothing and return the required length so the SDK can realloc
+        // and try again. Empty system → returns 0 (zero-length blob,
+        // not "buffer too small"). Gated by `akiva.permission.QUERY_PACKAGES`
+        // — without the grant the deny-stub returns 0, indistinguishable
+        // from "no packages" by design (the app shouldn't have imported
+        // it without declaring the permission).
+        akiva_host_query_packages: (outPtr, outCap) => {
+          const proc = self._processes.get(packageId);
+          if (!proc?.memory) return 0;
+          const blob = self._packagesBlob;
+          if (blob.length === 0) return 0;
+          if (blob.length > outCap) return blob.length;
+          new Uint8Array(proc.memory.buffer, outPtr, blob.length).set(blob);
+          return blob.length;
+        },
+
         // Stone 9.5 — app stashes the result it wants to deliver to
         // whoever launched it. Not drained until the activity's destroy
         // path — store as-is, last call wins.
@@ -824,17 +871,19 @@ export const AUTO_IMPORTS = Object.freeze([
   "akiva_host_set_result",
 ]);
 
-// Capability → gated imports. Only LAUNCH_ANY_APP has concrete imports
-// in v0.2; reserved capabilities (STORAGE_SANDBOX, QUERY_PACKAGES,
-// NOTIFICATIONS, NETWORK, CAMERA) exist in the manifest vocabulary but
-// don't yet map to `akiva_host_*` surface.
+// Capability → gated imports. LAUNCH_ANY_APP and QUERY_PACKAGES have
+// concrete imports today; STORAGE_SANDBOX, NOTIFICATIONS, NETWORK, and
+// CAMERA exist in the manifest vocabulary but don't yet map to
+// `akiva_host_*` surface (reserved slots).
 export const CAPABILITY_IMPORTS = Object.freeze({
   "akiva.permission.LAUNCH_ANY_APP": Object.freeze([
     "akiva_host_start_activity",
     "akiva_host_start_activity_for_result",
   ]),
+  "akiva.permission.QUERY_PACKAGES":  Object.freeze([
+    "akiva_host_query_packages",
+  ]),
   "akiva.permission.STORAGE_SANDBOX": Object.freeze([]),
-  "akiva.permission.QUERY_PACKAGES":  Object.freeze([]),
   "akiva.permission.NOTIFICATIONS":   Object.freeze([]),
   "akiva.permission.NETWORK":         Object.freeze([]),
   "akiva.permission.CAMERA":          Object.freeze([]),

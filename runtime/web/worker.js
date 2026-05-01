@@ -347,6 +347,17 @@ function buildImports() {
       const grants = blob.length === 0 ? [] : blob.split("\n").filter((s) => s.length > 0);
       apps.setGrants(packageId, grants);
     },
+
+    // Stone 11.0a — push the snapshot of installed packages. The kernel
+    // hands us the framework's already-encoded blob (length-prefixed; see
+    // framework/src/pkgs_wire.rs). We don't decode here — we copy the
+    // bytes out of kernel memory and hand them to AppRegistry, which
+    // serves them straight back when an app calls
+    // `akiva_host_query_packages`. Empty payload = "no packages".
+    hal_host_set_packages: (bytesPtr, bytesLen) => {
+      const bytes = bytesLen === 0 ? new Uint8Array(0) : readBytes(bytesPtr, bytesLen);
+      apps.setPackages(bytes);
+    },
   };
   return { env };
 }

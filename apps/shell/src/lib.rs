@@ -1,22 +1,28 @@
-//! System Shell — the home-screen activity.
+//! System Shell — home screen and app launcher (Stone 11.0b).
 //!
-//! A stand-in for the future Shell app (which will be a regular wasm
-//! package like any other). For Phase 2b the Shell is a built-in,
-//! in-framework `Activity` impl so we can exercise the lifecycle + render
-//! path end-to-end without needing the AKML + widget stack yet.
+//! Ported from the in-framework `ShellActivity` (`framework/src/shell.rs`)
+//! to a regular wasm app. Visual semantics are preserved verbatim: same
+//! header, same row layout, same hover/press visual states, same launch
+//! intent (MAIN+LAUNCHER targeted at the picked package). The two
+//! differences are how it gets the launcher list and how it dispatches:
 //!
-//! In Phase 2b.5 the Shell gained a launcher: a column of tappable rows,
-//! one per installed user package. Tapping a row sets `launch_requested`
-//! on the context, and the framework brings the app to the foreground
-//! while pushing the Shell into Paused. Escape pops the app and resumes
-//! the Shell again.
+//!   - List source: `akiva_sdk::pkgs::list()` instead of a `Vec<AppEntry>`
+//!     handed to the framework Shell at construction. The kernel pushes
+//!     a fresh snapshot at boot via `hal_host_set_packages` (Stone 11.0a),
+//!     so calling `pkgs::list()` here just decodes the cached blob.
+//!   - Dispatch: `Context::start_activity` (host import) instead of
+//!     writing `*ctx.launch_requested = Some(...)` on the framework's
+//!     in-process `ActivityContext`. Wired through the standard
+//!     `akiva_host_start_activity` import (gated by LAUNCH_ANY_APP — the
+//!     manifest declares it).
+//!
+//! `boot_count` is dropped from the subtitle: a wasm app has no portable
+//! way to read kernel-side state without inventing a permission for it,
+//! and the counter is a developer breadcrumb that's already logged from
+//! the kernel. Documented in the v0.3 roadmap (Stone 11.0d).
 
-use crate::activity::{Activity, ActivityContext, KeyEvent, PointerEvent, PointerPhase, SurfaceMetrics};
-use crate::compositor::{FrameCommands, PaintTarget};
-use crate::intent::{self, Intent};
-
-pub const PACKAGE_ID: &str = "sys.shell";
-pub const ENTRY_CLASS: &str = "ShellActivity";
+use akiva_sdk::pkgs::{self, PackageEntry};
+use akiva_sdk::prelude::*;
 
 const BG: u32             = 0xff101418;
 const FG: u32             = 0xffe0e0e0;
@@ -37,19 +43,9 @@ const ROW_PAD_X: f32       = 24.0;
 const ROW_INSET_LEFT: f32  = 20.0;
 const LIST_MAX_WIDTH: f32  = 640.0;
 
-/// One launcher row: what to show + what to launch. Cloned into the Shell
-/// at construction so the Shell doesn't need to keep a live borrow on the
-/// PackageManager.
-#[derive(Debug, Clone)]
-pub struct AppEntry {
-    pub package_id: String,
-    pub class: String,
-    pub name: String,
-}
-
-pub struct ShellActivity {
-    boot_count: u32,
-    apps: Vec<AppEntry>,
+#[derive(Default)]
+struct ShellActivity {
+    apps: Vec<PackageEntry>,
     pointer: Option<PointerState>,
     /// Row index of the app whose button is currently pressed, if any.
     /// Cleared on `Up`/`Cancel`; used for the "pressed" visual.
@@ -64,11 +60,17 @@ struct PointerState {
 }
 
 impl ShellActivity {
-    pub fn new(boot_count: u32, apps: Vec<AppEntry>) -> Self {
-        Self { boot_count, apps, pointer: None, pressed_row: None }
+    fn refresh_apps(&mut self) {
+        // Sorted by id for a stable boot-to-boot order, matching the
+        // framework's previous `launcher.sort_by(...)` behaviour. The
+        // host serves whatever order `PackageManager::list()` produces
+        // (HashMap insertion order, undefined) — sorting here is the
+        // app's choice, not a system invariant.
+        let mut apps = pkgs::list();
+        apps.sort_by(|a, b| a.id.cmp(&b.id));
+        self.apps = apps;
     }
 
-    /// Y of the top edge of row `i`, in surface pixels.
     fn row_top(i: usize) -> f32 {
         LIST_TOP + (i as f32) * (ROW_HEIGHT + ROW_GAP)
     }
@@ -92,9 +94,23 @@ impl ShellActivity {
 }
 
 impl Activity for ShellActivity {
-    fn on_create(&mut self, _ctx: &mut ActivityContext<'_>) {}
+    fn on_create(&mut self, _ctx: &mut Context<'_>) {
+        // Pull the package list eagerly so the first frame already has
+        // the launcher rows. The kernel pushed the snapshot before the
+        // first activity launch (Stone 11.0a), so this can't see an
+        // empty list due to ordering.
+        self.refresh_apps();
+        log_info!("ShellActivity created: {} app(s) installed", self.apps.len());
+    }
 
-    fn on_pointer(&mut self, ctx: &mut ActivityContext<'_>, ev: PointerEvent) {
+    fn on_resume(&mut self, _ctx: &mut Context<'_>) {
+        // Rehydrate every time we come back from a launched app — covers
+        // any future install/uninstall flow that re-pushes the snapshot
+        // while we were paused. Cheap (just decodes a few hundred bytes).
+        self.refresh_apps();
+    }
+
+    fn on_pointer(&mut self, ctx: &mut Context<'_>, ev: PointerEvent) {
         let surface_w = ctx.metrics.width_px as f32;
         match ev.phase {
             PointerPhase::Down => {
@@ -107,31 +123,26 @@ impl Activity for ShellActivity {
                 // If the cursor slides off the pressed row while held, drop
                 // the press state so the release doesn't launch. Matches
                 // platform conventions for touch UI.
-                if pressed {
-                    if self.pressed_row != self.hit_row(ev.x, ev.y, surface_w) {
-                        self.pressed_row = None;
-                    }
+                if pressed && self.pressed_row != self.hit_row(ev.x, ev.y, surface_w) {
+                    self.pressed_row = None;
                 }
             }
             PointerPhase::Up => {
                 self.pointer = Some(PointerState { x: ev.x, y: ev.y, pressed: false });
-                // Tap completed: if Up happens on the same row the Down
-                // started on, request a launch.
                 if let Some(row) = self.pressed_row.take() {
                     if self.hit_row(ev.x, ev.y, surface_w) == Some(row) {
                         if let Some(entry) = self.apps.get(row) {
-                            // The Shell knows which package to launch but
-                            // leaves the activity-class choice to the
-                            // router: MAIN+LAUNCHER narrowed to this
-                            // package. If a package ever exposes multiple
-                            // MAIN+LAUNCHER activities the router will
-                            // report AmbiguousMatch — intentional, since
-                            // the Shell has no UI for choosing.
-                            *ctx.launch_requested = Some(
-                                Intent::new(intent::action::MAIN)
-                                    .with_category(intent::category::LAUNCHER)
-                                    .with_target_package(entry.package_id.clone()),
-                            );
+                            // Same intent shape as the in-framework
+                            // Shell: MAIN+LAUNCHER scoped to the picked
+                            // package. Router resolves it; if the
+                            // package exposes multiple LAUNCHER
+                            // activities the resolution surfaces as
+                            // AmbiguousMatch (intentional — the Shell
+                            // has no UI for choosing).
+                            let intent = Intent::new("akiva.intent.action.MAIN")
+                                .with_category("akiva.intent.category.LAUNCHER")
+                                .with_target_package(entry.id.clone());
+                            ctx.start_activity(&intent);
                         }
                     }
                 }
@@ -143,23 +154,19 @@ impl Activity for ShellActivity {
         }
     }
 
-    fn on_key(&mut self, _ctx: &mut ActivityContext<'_>, _ev: KeyEvent) {}
-
-    fn on_resize(&mut self, _ctx: &mut ActivityContext<'_>, _m: SurfaceMetrics) {}
-
-    fn render(&mut self, ctx: &mut ActivityContext<'_>, out: &mut FrameCommands) {
+    fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
         let surface_w = ctx.metrics.width_px as f32;
-        out.push(crate::compositor::PaintOp::Clear { rgba: BG });
+        c.clear(BG);
 
         // Header.
-        PaintTarget::draw_text(out, HEADER_PAD_X, HEADER_TITLE_Y, 24.0, FG, "Akiva");
+        c.draw_text(HEADER_PAD_X, HEADER_TITLE_Y, 24.0, FG, "Akiva");
         let sub = if self.apps.is_empty() {
-            format!("boot #{} — no apps installed", self.boot_count)
+            "no apps installed".to_string()
         } else {
-            format!("boot #{} — {} app{}", self.boot_count, self.apps.len(),
+            format!("{} app{}", self.apps.len(),
                 if self.apps.len() == 1 { "" } else { "s" })
         };
-        PaintTarget::draw_text(out, HEADER_PAD_X, HEADER_SUB_Y, 13.0, FG_DIM, &sub);
+        c.draw_text(HEADER_PAD_X, HEADER_SUB_Y, 13.0, FG_DIM, &sub);
 
         // Launcher list.
         let width = Self::row_width(surface_w);
@@ -175,32 +182,29 @@ impl Activity for ShellActivity {
             } else {
                 BUTTON_BG
             };
-            PaintTarget::fill_rect(out, ROW_PAD_X, top, width, ROW_HEIGHT, bg);
-            // Name + package id subtitle. Text baseline sits at the y arg,
-            // so we offset from `top` into the row, not to its edge.
-            PaintTarget::draw_text(
-                out,
+            c.fill_rect(ROW_PAD_X, top, width, ROW_HEIGHT, bg);
+            // Text baseline sits at the y arg, so we offset from `top`
+            // into the row, not to its edge.
+            c.draw_text(
                 ROW_PAD_X + ROW_INSET_LEFT,
                 top + 24.0,
                 16.0,
                 BUTTON_FG,
                 &app.name,
             );
-            PaintTarget::draw_text(
-                out,
+            c.draw_text(
                 ROW_PAD_X + ROW_INSET_LEFT,
                 top + 44.0,
                 12.0,
                 BUTTON_SUB,
-                &app.package_id,
+                &app.id,
             );
         }
 
-        // Empty state — if no apps are installed, explain what to do so
-        // the "blank screen" below the header doesn't look like a bug.
+        // Empty state — explain what to do so a blank screen below the
+        // header doesn't look like a bug.
         if self.apps.is_empty() {
-            PaintTarget::draw_text(
-                out,
+            c.draw_text(
                 HEADER_PAD_X,
                 LIST_TOP + 24.0,
                 13.0,
@@ -212,8 +216,7 @@ impl Activity for ShellActivity {
         // Back hint — only useful when something is above us, and by
         // definition the Shell is at the bottom, so this is just for the
         // very first launch where the user has no idea Escape pops back.
-        PaintTarget::draw_text(
-            out,
+        c.draw_text(
             HEADER_PAD_X,
             ctx.metrics.height_px as f32 - 16.0,
             11.0,
@@ -222,3 +225,5 @@ impl Activity for ShellActivity {
         );
     }
 }
+
+akiva_sdk::akiva_app!(ShellActivity);

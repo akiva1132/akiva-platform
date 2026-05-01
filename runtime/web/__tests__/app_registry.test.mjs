@@ -669,18 +669,122 @@ describe("_buildAppImports — capability filter", () => {
   it("reserved capabilities (STORAGE_SANDBOX etc.) are accepted but contribute no imports today", () => {
     // Pinning the current shape: v0.2 declares these permissions but
     // the `akiva_host_*` HAL surface for them doesn't exist yet.
-    // Granting them does nothing observable. The day the HAL lands,
-    // `CAPABILITY_IMPORTS` gets non-empty arrays and this test flips
-    // to assert the expected unlocks — tripwire for keeping Rust +
-    // JS mappings in lockstep.
+    // Granting them does nothing observable. The day each HAL lands,
+    // its slot gains a non-empty array and the test moves out of this
+    // group — tripwire for keeping Rust + JS mappings in lockstep.
+    // QUERY_PACKAGES graduated in Stone 11.0a (akiva_host_query_packages).
     for (const cap of [
       "akiva.permission.STORAGE_SANDBOX",
-      "akiva.permission.QUERY_PACKAGES",
       "akiva.permission.NOTIFICATIONS",
       "akiva.permission.NETWORK",
       "akiva.permission.CAMERA",
     ]) {
       expect(CAPABILITY_IMPORTS[cap]).toEqual([]);
     }
+  });
+
+  it("QUERY_PACKAGES unlocks akiva_host_query_packages (Stone 11.0a)", () => {
+    // Mirror of the Rust-side `query_packages_adds_query_import` test in
+    // framework/src/permissions.rs. Both sides must list the import so
+    // a Shell with QUERY_PACKAGES gets a real function instead of the
+    // deny-stub.
+    expect(CAPABILITY_IMPORTS["akiva.permission.QUERY_PACKAGES"])
+      .toEqual(["akiva_host_query_packages"]);
+
+    const { registry } = makeRegistry();
+    registry.setGrants("com.shell", ["akiva.permission.QUERY_PACKAGES"]);
+    const shellImports = registry._buildAppImports("com.shell").env;
+    expect(shellImports.akiva_host_query_packages.name)
+      .not.toBe("permissionDeniedStub");
+
+    // Without the grant, deny-stub is wired up.
+    const otherImports = registry._buildAppImports("com.other").env;
+    expect(otherImports.akiva_host_query_packages.name)
+      .toBe("permissionDeniedStub");
+  });
+});
+
+describe("setPackages — package-list snapshot (Stone 11.0a)", () => {
+  it("stores the bytes verbatim for later query_packages calls", () => {
+    const { registry } = makeRegistry();
+    const blob = new Uint8Array([1, 2, 3, 4]);
+    registry.setPackages(blob);
+    expect(registry._packagesBlob).toBe(blob);
+  });
+
+  it("is last-write-wins (re-push replaces, doesn't merge)", () => {
+    // Reboot or future install/uninstall flow re-pushes the full set.
+    // A naive append-only implementation would leak old entries.
+    const { registry } = makeRegistry();
+    registry.setPackages(new Uint8Array([1, 2, 3]));
+    registry.setPackages(new Uint8Array([9, 9]));
+    expect(Array.from(registry._packagesBlob)).toEqual([9, 9]);
+  });
+
+  it("treats non-Uint8Array as empty (defensive against bridge bugs)", () => {
+    const { registry } = makeRegistry();
+    registry.setPackages(null);
+    expect(registry._packagesBlob.length).toBe(0);
+  });
+});
+
+describe("akiva_host_query_packages — two-phase reader (Stone 11.0a)", () => {
+  it("returns 0 when no packages are pushed yet", () => {
+    const { fakeProc } = (() => {
+      const fp = makeFakeProc();
+      return { fakeProc: fp };
+    })();
+    const { registry } = makeRegistry({ fakeProc });
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
+    const queryFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_query_packages;
+    expect(queryFn(0, 1024)).toBe(0);
+  });
+
+  it("returns required size without writing when outCap is too small", () => {
+    // Two-phase contract — caller passes a small initial guess; if the
+    // host's blob is bigger, we report the required length and leave
+    // the buffer untouched so the SDK can realloc and retry.
+    const fakeProc = makeFakeProc();
+    const { registry } = makeRegistry({ fakeProc });
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
+    const blob = new Uint8Array(20).map((_, i) => i + 1);
+    registry.setPackages(blob);
+
+    const queryFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_query_packages;
+    // outCap=8 is too small for 20-byte blob.
+    const required = queryFn(100, 8);
+    expect(required).toBe(20);
+    // Memory at the offered ptr is still all zeros.
+    const view = new Uint8Array(fakeProc.memory.buffer, 100, 20);
+    expect(Array.from(view)).toEqual(new Array(20).fill(0));
+  });
+
+  it("writes blob and returns its length on a fitting outCap", () => {
+    const fakeProc = makeFakeProc();
+    const { registry } = makeRegistry({ fakeProc });
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
+    const blob = new Uint8Array([0xde, 0xad, 0xbe, 0xef, 0x42]);
+    registry.setPackages(blob);
+
+    const queryFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_query_packages;
+    const written = queryFn(200, 64);
+    expect(written).toBe(blob.length);
+    const view = new Uint8Array(fakeProc.memory.buffer, 200, blob.length);
+    expect(Array.from(view)).toEqual(Array.from(blob));
+  });
+
+  it("deny-stub returns 0 without touching memory when grant is absent", () => {
+    const fakeProc = makeFakeProc();
+    const { registry } = makeRegistry({ fakeProc });
+    // Pretend the framework pushed a snapshot, but the package has no
+    // QUERY_PACKAGES grant.
+    registry.setPackages(new Uint8Array([1, 2, 3, 4]));
+
+    const queryFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_query_packages;
+    expect(queryFn.name).toBe("permissionDeniedStub");
+    // Stub never touches memory regardless of args.
+    expect(queryFn(200, 64)).toBe(0);
+    const view = new Uint8Array(fakeProc.memory.buffer, 200, 4);
+    expect(Array.from(view)).toEqual([0, 0, 0, 0]);
   });
 });

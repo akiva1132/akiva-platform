@@ -1,0 +1,53 @@
+# System Shell manifest (Stone 11.0b).
+#
+# Special properties vs. user apps:
+#  - Reserved package id `sys.shell` matches the constant the framework
+#    used for the built-in Shell. Stays the same so MAIN+HOME resolution
+#    keeps working unchanged through Stone 11.0c.
+#  - Declares both shell-only capabilities (QUERY_PACKAGES,
+#    LAUNCH_ANY_APP). The package manager auto-grants Normal-protection
+#    permissions at install time, so there's no extra wiring needed.
+#  - MAIN+HOME intent filter is what `framework::boot` resolves against
+#    to pick the launcher activity at startup.
+
+[app]
+id = "sys.shell"
+name = "Akiva Shell"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+authors = ["Akiva Team"]
+description = "Home screen and app launcher."
+category = "system"
+
+[runtime]
+wasm = "shell.wasm"
+min_memory_mb = 1
+max_memory_mb = 8
+
+[[activities]]
+id = "main"
+class = "ShellActivity"
+entry = true
+launch_mode = "singleTop"
+exported = true
+
+[[activities.intent_filters]]
+actions = ["akiva.intent.action.MAIN"]
+categories = ["akiva.intent.category.HOME", "akiva.intent.category.LAUNCHER"]
+
+[permissions]
+# QUERY_PACKAGES unlocks `akiva_host_query_packages` so the launcher can
+# enumerate installed apps. LAUNCH_ANY_APP unlocks
+# `akiva_host_start_activity` so tapping a tile fires an intent into a
+# different package. Both auto-granted at install (Normal protection).
+required = [
+    "akiva.permission.QUERY_PACKAGES",
+    "akiva.permission.LAUNCH_ANY_APP",
+]
+optional = []
+
+[display]
+default_width_dp = 800
+default_height_dp = 600
+resizable = true

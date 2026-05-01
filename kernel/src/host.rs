@@ -223,6 +223,27 @@ extern "C" {
         package_id_ptr: *const u8, package_id_len: usize,
         grants_ptr: *const u8, grants_len: usize,
     );
+
+    // ── Package list mirror (Stone 11.0a) ─────────────────────────────────
+    //
+    // Push the snapshot of installed packages to the host so apps that hold
+    // `akiva.permission.QUERY_PACKAGES` can enumerate them via
+    // `akiva_host_query_packages`. Called once at the end of
+    // `framework::boot` after rehydration; future package install/uninstall
+    // flows will re-push the full set (last-write-wins, same shape as
+    // `hal_host_set_grants`).
+    //
+    // `bytes_ptr..bytes_len` is the framework's `pkgs_wire::encode` output:
+    //
+    //   [u32 LE count] then for each record
+    //     [u16 LE id_len][id bytes][u16 LE class_len][class bytes]
+    //     [u16 LE name_len][name bytes]
+    //
+    // All strings are UTF-8. An empty payload (`bytes_len == 0`) means "no
+    // packages installed", and `akiva_host_query_packages` returns an empty
+    // blob to apps. Length-prefixed (rather than LF-separated like grants)
+    // because app names can contain whitespace and arbitrary unicode.
+    pub fn hal_host_set_packages(bytes_ptr: *const u8, bytes_len: usize);
 }
 
 /// Safe wrapper for hal_log that never panics.

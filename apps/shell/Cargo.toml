@@ -1,0 +1,24 @@
+[package]
+name = "akiva-app-shell"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Akiva Team"]
+license = "MIT OR Apache-2.0"
+description = "System Shell as a regular wasm app — home screen + launcher (Stone 11.0b)."
+
+# Excluded from the workspace alongside the other apps. Will be loaded
+# the same way as user apps once Stone 11.0c removes the in-framework
+# Shell built-in.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+akiva-sdk = { path = "../../sdk-rust" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

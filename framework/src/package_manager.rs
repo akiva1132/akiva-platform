@@ -490,14 +490,16 @@ fn read_optional_text(
 
 /// Grant every permission in `required` to `package_id` (they've
 /// already been validated as declared by the caller) and persist the
-/// resulting set to `sys/permissions/{id}`. Called from both the
-/// fresh-install and upgrade branches of [`PackageManager::install`].
+/// resulting set to `sys/permissions/{id}`. Called from the
+/// fresh-install and upgrade branches of [`PackageManager::install`],
+/// and from `framework::boot`'s self-heal pass for packages that were
+/// staged without going through the install path (dev-apps).
 ///
 /// We write the **full** new set rather than appending, so an upgrade
 /// that removed a permission leaves behind only what the new manifest
 /// asks for. The order of lines is stable (iteration over the input
 /// slice) to keep the blob diff-able.
-fn apply_grants(
+pub(crate) fn apply_grants(
     storage: &mut dyn Storage,
     controller: &mut PermissionController,
     package_id: &str,

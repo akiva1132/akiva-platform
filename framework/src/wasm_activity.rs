@@ -101,8 +101,10 @@ pub trait WasmHost {
     ///
     /// Called by [`WasmActivity`] at the end of every method that carries
     /// an `ActivityContext`, so a set flag propagates into the framework
-    /// dispatch exactly as if an in-kernel activity (e.g. Shell) had
-    /// written `*ctx.finish_requested = true` directly.
+    /// dispatch exactly as if an in-kernel activity had written
+    /// `*ctx.finish_requested = true` directly. (Pre-Stone-11.0c the
+    /// Shell was such an in-kernel activity; today the Shell is itself
+    /// a wasm app and routes through this path.)
     fn drain_finish(&self, handle: AppHandle) -> bool {
         let _ = handle;
         false
@@ -176,10 +178,25 @@ pub trait WasmHost {
     /// second call with the new full set; the host applies last-write-
     /// wins semantics.
     ///
-    /// Default is a no-op so in-kernel hosts (Shell / test harnesses)
-    /// and MockHost can ignore the push without breaking.
+    /// Default is a no-op so test harnesses and MockHost can ignore
+    /// the push without breaking.
     fn set_grants(&self, package_id: &str, grants: &[&str]) {
         let _ = (package_id, grants);
+    }
+
+    /// Stone 11.0a — push the encoded snapshot of installed packages to
+    /// the host so apps holding `akiva.permission.QUERY_PACKAGES` can
+    /// enumerate them via `akiva_host_query_packages`. Bytes are the
+    /// output of [`crate::pkgs_wire::encode`]; opaque to the host
+    /// implementation (it just stores the buffer and serves it back).
+    ///
+    /// Called once from `framework::boot` after rehydration, before any
+    /// activity launches. Future install/uninstall flows will re-push
+    /// the full set; the host applies last-write-wins.
+    ///
+    /// Default no-op so MockHost / in-kernel hosts can ignore the push.
+    fn set_packages(&self, bytes: &[u8]) {
+        let _ = bytes;
     }
 }
 
@@ -187,10 +204,8 @@ pub trait WasmHost {
 
 /// Framework-side [`Activity`] that forwards every callback to a hosted
 /// wasm app via a [`WasmHost`]. Owns the `AppHandle` for its lifetime and
-/// releases it in `on_destroy`. Carries an `Rc<dyn WasmHost>` so multiple
-/// activities in the same app package can share one host (e.g. Shell's
-/// host instance and the foreground app's host instance may be different
-/// objects, but two activities of the same package share).
+/// releases it in `on_destroy`. Carries an `Rc<dyn WasmHost>` so two
+/// activities of the same package share one host instance.
 pub struct WasmActivity {
     handle: AppHandle,
     host: Rc<dyn WasmHost>,
@@ -510,6 +525,7 @@ mod tests {
         NewIntent(u32, Vec<u8>),
         ActivityResult(u32, u32, Vec<u8>),
         SetGrants(String, Vec<String>),
+        SetPackages(Vec<u8>),
     }
 
     /// Mock that records every call and lets tests pre-seed encoded paint
@@ -622,6 +638,9 @@ mod tests {
                 package_id.into(),
                 grants.iter().map(|s| (*s).to_string()).collect(),
             ));
+        }
+        fn set_packages(&self, bytes: &[u8]) {
+            self.calls.borrow_mut().push(Call::SetPackages(bytes.to_vec()));
         }
     }
 
@@ -805,6 +824,23 @@ mod tests {
                     "akiva.permission.LAUNCH_ANY_APP".into(),
                 ],
             ),
+        ]);
+    }
+
+    #[test]
+    fn set_packages_delegates_to_host_with_owned_bytes() {
+        // Stone 11.0a — the framework boot loop pushes the encoded
+        // package-list snapshot once after rehydration. MockHost
+        // captures the bytes so a regression in the encode call site
+        // (wrong slice, missed call, double-call) shows up here rather
+        // than as a silently-empty Shell launcher.
+        let host = MockHost::new();
+        host.take_calls();
+        host.set_packages(&[1, 2, 3, 4]);
+        host.set_packages(&[]);
+        assert_eq!(host.take_calls(), vec![
+            Call::SetPackages(vec![1, 2, 3, 4]),
+            Call::SetPackages(vec![]),
         ]);
     }
 

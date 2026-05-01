@@ -27,9 +27,9 @@ pub mod intent;
 pub mod manifest;
 pub mod package_manager;
 pub mod permissions;
+pub mod pkgs_wire;
 pub mod resources;
 pub mod result;
-pub mod shell;
 pub mod storage;
 pub mod wasm_activity;
 pub mod window_manager;
@@ -42,7 +42,6 @@ use activity_manager::{ActivityId, ActivityManager, LaunchMode, LifecycleState, 
 use compositor::{Compositor, FrameCommands};
 use intent::{Intent, IntentFilter};
 use package_manager::LoadError;
-use shell::{AppEntry, ShellActivity};
 use storage::Storage;
 use wasm_activity::{WasmActivity, WasmHost};
 
@@ -73,16 +72,20 @@ pub struct BootReport {
 /// Framework boot. Called once by the kernel during `akiva_boot` after
 /// the display surface is live and persistent storage is loaded.
 ///
-/// `boot_count` feeds the Shell a visible "boot #N" so the kernel's
-/// storage smoke test is observable end-to-end. `storage` is the KV
-/// store the framework uses for the package index and per-package
-/// manifests — borrowed only for the duration of boot; post-boot calls
-/// that need persistence take it explicitly. `host` is the wasm-app
-/// runtime seam: framework-side `WasmActivity` factories call it to
-/// instantiate and drive user-app wasm modules. The framework never
-/// touches app memory directly.
+/// `storage` is the KV store the framework uses for the package index
+/// and per-package manifests — borrowed only for the duration of boot;
+/// post-boot calls that need persistence take it explicitly. `host` is
+/// the wasm-app runtime seam: framework-side `WasmActivity` factories
+/// call it to instantiate and drive user-app wasm modules. The
+/// framework never touches app memory directly.
+///
+/// Stone 11.0c — boot no longer takes `boot_count`. The Shell, now a
+/// regular wasm app, doesn't have a portable way to read kernel-side
+/// counters, and the value was only ever shown in the Shell header
+/// (where it doubled as a smoke test for the storage HAL). The kernel
+/// still increments `sys/boot_count` and logs the value at info level,
+/// keeping the storage round-trip observable end-to-end.
 pub fn boot(
-    boot_count: u32,
     mut storage: Box<dyn Storage>,
     host: Rc<dyn WasmHost>,
 ) -> (Framework, BootReport) {
@@ -109,17 +112,6 @@ pub fn boot(
     // so the order matters: declare first, then rehydrate packages.
     permissions::declare_mvp_permissions(&mut fw.permissions);
 
-    // Stone 10.6 — the Shell is built in (not installed via
-    // PackageManager) so it never goes through the install-time grant
-    // path. Grant it directly here: QUERY_PACKAGES so the app-picker
-    // can enumerate installed apps, and LAUNCH_ANY_APP so tapping a
-    // tile can fire an intent into any package. Without these two
-    // grants the Shell would instantiate without `akiva_host_start_activity`
-    // once 10.3b enforcement lands — the home screen would be a
-    // glass cage.
-    fw.permissions.grant(shell::PACKAGE_ID, permissions::QUERY_PACKAGES);
-    fw.permissions.grant(shell::PACKAGE_ID, permissions::LAUNCH_ANY_APP);
-
     // Rehydrate installed packages from storage. A corrupt manifest is
     // reported but not fatal — the Shell and healthy apps stay usable.
     let mut package_errors: Vec<(String, String)> = Vec::new();
@@ -142,19 +134,70 @@ pub fn boot(
         },
     );
 
+    // Stone 11.0c — self-heal for packages whose `sys/permissions/{id}`
+    // blob is missing. The dev-apps install path in worker.js writes
+    // `manifest.toml` + `app.wasm` directly to OPFS without going
+    // through `PackageManager::install`, so these packages have no
+    // grants file and `load_granted_permissions` finds nothing. Apply
+    // the manifest's `required` list now — same semantics as the
+    // fresh-install branch (Normal-protection auto-grant). Skipping
+    // would leave the Shell (and any future shell-shaped app) with
+    // its capability imports stubbed out at instantiation, producing
+    // an empty launcher with no obvious cause.
+    //
+    // Heal-condition is "no grants currently AND manifest declares
+    // some". A package that legitimately installed with empty perms
+    // still has its (empty) blob written, so it doesn't trip this.
+    // Per-heal failures get folded into `package_errors` rather than
+    // aborting the whole boot.
+    let heal: Vec<(String, Vec<String>)> = fw.packages.list()
+        .filter(|r| {
+            !r.manifest.permissions.required.is_empty()
+                && fw.permissions.granted_to(&r.id).is_empty()
+        })
+        .map(|r| (r.id.clone(), r.manifest.permissions.required.clone()))
+        .collect();
+    for (id, required) in heal {
+        if let Err(e) = package_manager::apply_grants(
+            storage.as_mut(), &mut fw.permissions, &id, &required,
+        ) {
+            package_errors.push((id, format!("grant heal: {e:?}")));
+        }
+    }
+
     // Stone 10.3b — push each package's grants to the wasm host so
     // `_instantiateProcess` can filter the `akiva_host_*` import map
     // at link time (soft enforcement via stub replacement). Must run
-    // AFTER rehydration (so the set is complete) and BEFORE the Shell
-    // launch below — if the Shell were a wasm app (Stone 11.0) its
-    // instantiation would need the grant list already pushed. Shell
-    // isn't a wasm app yet, so its own grants (Stone 10.6) flow through
-    // the direct `fw.permissions.grant` path without needing a host push.
+    // AFTER rehydration (so the set is complete) and BEFORE any
+    // activity launch below — `_instantiateProcess` consults the
+    // grants when wiring imports, including the Shell's own
+    // instantiation since Stone 11.0c (Shell is now a regular wasm
+    // package).
     let package_ids: Vec<String> = fw.packages.list().map(|r| r.id.clone()).collect();
     for pkg in &package_ids {
         let grants = fw.permissions.granted_to(pkg);
         host.set_grants(pkg, &grants);
     }
+
+    // Stone 11.0a — push the snapshot of installed packages so apps with
+    // QUERY_PACKAGES can enumerate them via `akiva_host_query_packages`.
+    // Order is whatever `PackageManager::list()` produces (HashMap
+    // values; insertion order isn't guaranteed); the Shell sorts at the
+    // app layer if it cares about a stable display order.
+    //
+    // Stone 11.0c — Shell is now itself a `sys.shell` package; we
+    // include it in the snapshot. The Shell filters itself out of its
+    // own launcher (so it doesn't offer "launch yourself") inside
+    // `apps/shell/src/lib.rs`. Letting the framework decide that here
+    // would re-introduce the special-casing 11.0c is removing.
+    let pkg_refs: Vec<pkgs_wire::PackageRef<'_>> = fw.packages.list()
+        .map(|r| pkgs_wire::PackageRef {
+            id: r.id.as_str(),
+            class: r.entry_class.as_str(),
+            name: r.name.as_str(),
+        })
+        .collect();
+    host.set_packages(&pkgs_wire::encode(&pkg_refs));
 
     // Read per-package resource tables from storage and register them
     // with the framework's ResourceManager. Resource errors are tracked
@@ -167,8 +210,6 @@ pub fn boot(
     for (id, table) in tables {
         fw.resources.register(&id, table);
     }
-
-    let report = BootReport { packages_loaded, package_errors, resource_errors };
 
     // Register every installed package's entry activity as a
     // `WasmActivity` factory. The host owns the wasm process (one per
@@ -216,57 +257,54 @@ pub fn boot(
         });
     }
 
-    // Build the Shell's launcher entries from whatever user packages we
-    // just rehydrated. Sorted by id for a stable boot-to-boot order.
-    // Skipping the Shell itself so it doesn't offer "launch yourself".
-    let mut launcher: Vec<AppEntry> = fw.packages.list()
-        .filter(|r| r.id != shell::PACKAGE_ID)
-        .map(|r| AppEntry {
-            package_id: r.id.clone(),
-            class: r.entry_class.clone(),
-            name: r.name.clone(),
-        })
-        .collect();
-    launcher.sort_by(|a, b| a.package_id.cmp(&b.package_id));
-
-    // Register + launch the system shell. Must come last so a hypothetical
-    // user package claiming the shell's id can't shadow it. Failure here
-    // is a boot-time bug, not a runtime condition — panic is appropriate.
-    fw.activities.register(shell::PACKAGE_ID, shell::ENTRY_CLASS, LaunchMode::SingleTop, move || {
-        Box::new(ShellActivity::new(boot_count, launcher.clone()))
-    });
-    // Shell has no manifest (it's built in), so synthesise its intent
-    // filter alongside the others. MAIN+HOME is what we resolve against
-    // below; MAIN+LAUNCHER is so a future diagnostics path could list
-    // "all launcher activities" and find the home screen too.
-    fw.intents.register_filter(IntentFilter {
-        package_id: shell::PACKAGE_ID.into(),
-        activity_class: shell::ENTRY_CLASS.into(),
-        actions: vec![intent::action::MAIN.into()],
-        categories: vec![intent::category::HOME.into(), intent::category::LAUNCHER.into()],
-        data_schemes: Vec::new(),
-        mime_types: Vec::new(),
-    });
-    // Resolve MAIN+HOME through the router instead of hardcoding the
-    // entry class — exercises the full intent path at boot and means
-    // swapping the home screen later becomes a router-level concern.
+    // Stone 11.0c — Shell is no longer a built-in. It ships as the
+    // `sys.shell` wasm package (apps/shell/), gets installed via the
+    // standard dev-apps pipeline, and registers MAIN+HOME via its
+    // manifest's intent filter exactly like a user app. The boot path
+    // here is responsible only for *resolving* HOME and bringing the
+    // matching activity to the foreground — we don't know or care that
+    // it's "the shell".
+    //
+    // Resolution failure is no longer a panic: a fresh checkout that
+    // hasn't run `akiva build` yet boots without a Shell installed, and
+    // we'd rather log the gap and continue than crash the kernel. The
+    // display will sit empty until something gets installed, which is a
+    // more honest signal of a misconfigured dev environment than a
+    // wasm trap.
     let home = Intent::new(intent::action::MAIN).with_category(intent::category::HOME);
-    let (shell_pkg, shell_class) = fw.intents.resolve(&home).expect("HOME resolves");
-    let shell_id = fw.activities
-        .launch(&shell_pkg, &shell_class)
-        .expect("shell launch")
-        .id;
-    fw.stack.push(shell_id);
-    // Shell has no saved state to restore — it's built-in and stateless
-    // from the framework's perspective (boot counter + package list are
-    // always recomputed from scratch).
-    fw.drive_to_resumed(shell_id, 0.0);
+    match fw.intents.resolve(&home) {
+        Ok((pkg, class)) => {
+            match fw.activities.launch(&pkg, &class) {
+                Ok(launched) => {
+                    let id = launched.id;
+                    fw.stack.push(id);
+                    fw.drive_to_resumed(id, 0.0);
+                }
+                Err(e) => {
+                    package_errors.push((
+                        pkg,
+                        format!("HOME launch failed: {e:?}"),
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            // Logged by the kernel via the BootReport — no log binding
+            // in framework code, so we surface it as a synthetic
+            // package error. The kernel writes warns from these.
+            package_errors.push((
+                "<home>".into(),
+                format!("no installed package matches MAIN+HOME: {e:?}"),
+            ));
+        }
+    }
 
     // Stash the storage handle for post-boot writes (saved-state
     // persistence on Stop / rehydration on Create). We're done using it
     // locally above — the `Box` can now live on the framework.
     fw.storage = Some(storage);
 
+    let report = BootReport { packages_loaded, package_errors, resource_errors };
     (fw, report)
 }
 
@@ -459,13 +497,14 @@ impl Framework {
         // shot. Callers that need to inject restore_state_bytes between
         // Create and Start use `advance_through_create` +
         // `drive_start_to_resumed` instead; this short-hand stays for
-        // bring-up sites that have nothing to restore (the Shell).
+        // bring-up sites that have nothing to restore (HOME at boot,
+        // before any prior saved state could exist).
         //
         // If the activity finishes from on_create we honour the
-        // `Created → Destroyed` shortcut here too — the Shell, for
-        // example, could self-close at boot. Returning early is enough:
-        // no Start/Resume fire, and our single caller at boot
-        // (`framework::boot`) doesn't re-examine the Shell's state.
+        // `Created → Destroyed` shortcut here too — a HOME app could
+        // self-close at boot, for example. Returning early is enough:
+        // no Start/Resume fire, and the boot caller doesn't re-examine
+        // the activity's state.
         if self.advance_through_create(id, ts) {
             self.destroy_shortcut(id, ts);
             return;
@@ -1893,5 +1932,234 @@ mod tests {
             self.launch_app(&intent, &pkg, &class, ts);
             *self.stack.last().expect("stack non-empty after launch")
         }
+    }
+
+    // ── Stone 11.0c — boot integration tests ─────────────────────────────
+    //
+    // These exercise `framework::boot` end-to-end against a MemoryStorage
+    // pre-populated by a previous PackageManager::install. The point is
+    // to lock in the contract that 11.0c established:
+    //
+    //   - Shell is no longer special. MAIN+HOME resolution comes from
+    //     a regular installed package's manifest.
+    //   - `WasmHost::set_grants` is called for *every* installed package,
+    //     including the one that happens to claim HOME.
+    //   - `WasmHost::set_packages` is called once, with an encoded
+    //     snapshot that includes the HOME-claiming package.
+    //   - HOME launch path drives the activity to Resumed.
+    //   - Missing HOME (no installed package matches) doesn't panic;
+    //     boot returns with an empty stack and a synthetic
+    //     `<home>` package_error so the kernel can warn.
+
+    /// Manifest for a `sys.shell`-shaped package — declares MAIN+HOME +
+    /// LAUNCHER, asks for the two shell-only permissions. The wasm
+    /// bytes don't have to be a real wasm module here: the test never
+    /// instantiates one (MockHost::register hands out a fake handle).
+    const HOME_MANIFEST: &str = r#"
+[app]
+id = "sys.shell"
+name = "Akiva Shell"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+[runtime]
+wasm = "shell.wasm"
+[[activities]]
+id = "main"
+class = "ShellActivity"
+entry = true
+launch_mode = "singleTop"
+exported = true
+[[activities.intent_filters]]
+actions = ["akiva.intent.action.MAIN"]
+categories = ["akiva.intent.category.HOME", "akiva.intent.category.LAUNCHER"]
+[permissions]
+required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"]
+"#;
+
+    /// Pre-install a package into a fresh MemoryStorage and return the
+    /// storage so `boot()` can rehydrate from it. Mirrors what the
+    /// runtime's dev-apps install path does at startup, just without the
+    /// wasm-bytes round-trip through OPFS.
+    fn storage_with_installed(manifests: &[&str]) -> Box<storage::MemoryStorage> {
+        let mut store = storage::MemoryStorage::new();
+        let mut pm = package_manager::PackageManager::new();
+        let mut pc = permissions::PermissionController::new();
+        permissions::declare_mvp_permissions(&mut pc);
+        for m in manifests {
+            pm.install(&mut store, &mut pc, m, b"\0asm\x01\x00\x00\x00")
+                .expect("install");
+        }
+        Box::new(store)
+    }
+
+    /// Bare-bones MockHost for the boot path. Records `set_grants` and
+    /// `set_packages` calls so tests can assert the boot wiring; every
+    /// other method delegates to a sane default. Distinct from the
+    /// `wasm_activity::tests::MockHost` because that one is not exposed
+    /// outside its module — duplicating the minimum surface here is
+    /// cheaper than restructuring visibility.
+    struct BootMockHost {
+        next_handle: RefCell<u32>,
+        grants: RefCell<Vec<(String, Vec<String>)>>,
+        packages_blob: RefCell<Vec<u8>>,
+    }
+    impl BootMockHost {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                next_handle: RefCell::new(1),
+                grants: RefCell::new(Vec::new()),
+                packages_blob: RefCell::new(Vec::new()),
+            })
+        }
+    }
+    impl WasmHost for BootMockHost {
+        fn register(&self, _pkg: &str, _class: &str)
+            -> Option<wasm_activity::AppHandle>
+        {
+            let mut n = self.next_handle.borrow_mut();
+            let h = *n; *n += 1;
+            wasm_activity::AppHandle::new(h)
+        }
+        fn unregister(&self, _h: wasm_activity::AppHandle) {}
+        fn lifecycle(
+            &self, _h: wasm_activity::AppHandle,
+            _t: wasm_activity::LifecycleTransition,
+        ) {}
+        fn pointer(
+            &self, _h: wasm_activity::AppHandle,
+            _ev: activity::PointerEvent, _ts: f64,
+        ) {}
+        fn key(
+            &self, _h: wasm_activity::AppHandle,
+            _ev: activity::KeyEvent, _ts: f64,
+        ) {}
+        fn resize(
+            &self, _h: wasm_activity::AppHandle,
+            _m: SurfaceMetrics,
+        ) {}
+        fn render(
+            &self, _h: wasm_activity::AppHandle,
+            _ts: f64, _out: &mut compositor::FrameCommands,
+        ) {}
+        fn set_grants(&self, package_id: &str, grants: &[&str]) {
+            self.grants.borrow_mut().push((
+                package_id.to_string(),
+                grants.iter().map(|s| (*s).to_string()).collect(),
+            ));
+        }
+        fn set_packages(&self, bytes: &[u8]) {
+            *self.packages_blob.borrow_mut() = bytes.to_vec();
+        }
+    }
+
+    #[test]
+    fn boot_with_installed_home_app_resolves_and_launches_it() {
+        // Stone 11.0c — the home-screen path no longer goes through a
+        // built-in Shell. A regular installed package that declares
+        // MAIN+HOME is what `boot` resolves against.
+        let storage = storage_with_installed(&[HOME_MANIFEST]);
+        let host = BootMockHost::new();
+        let (fw, report) = boot(storage, host.clone());
+
+        // Boot reports no errors — packages_loaded counts the one we
+        // installed; package_errors is empty (no <home> synthetic
+        // entry, no per-package failures).
+        assert_eq!(report.packages_loaded, 1);
+        assert!(report.package_errors.is_empty(),
+            "no errors expected, got: {:?}", report.package_errors);
+
+        // Stack has exactly one entry — the HOME activity, driven all
+        // the way to Resumed by `drive_to_resumed`.
+        assert_eq!(fw.stack.len(), 1);
+        let home_id = fw.stack[0];
+        assert_eq!(
+            fw.activities.state_of(home_id),
+            Some(activity_manager::LifecycleState::Resumed),
+            "HOME app must reach Resumed on boot",
+        );
+
+        // set_grants was called for sys.shell with both required
+        // permissions. Order isn't guaranteed (Vec from a HashSet),
+        // so compare as sets.
+        let grants = host.grants.borrow();
+        let shell_grants: Vec<&str> = grants.iter()
+            .find(|(pkg, _)| pkg == "sys.shell")
+            .map(|(_, g)| g.iter().map(String::as_str).collect())
+            .expect("sys.shell grants entry");
+        let want: std::collections::HashSet<&str> = [
+            "akiva.permission.QUERY_PACKAGES",
+            "akiva.permission.LAUNCH_ANY_APP",
+        ].into_iter().collect();
+        let got: std::collections::HashSet<&str> = shell_grants.iter().copied().collect();
+        assert_eq!(got, want);
+
+        // set_packages was called with a non-empty blob — the encoded
+        // snapshot should decode back to one record (sys.shell).
+        let blob = host.packages_blob.borrow();
+        let decoded = pkgs_wire::decode(&blob).expect("blob decodes");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].id, "sys.shell");
+        assert_eq!(decoded[0].class, "ShellActivity");
+        assert_eq!(decoded[0].name, "Akiva Shell");
+    }
+
+    #[test]
+    fn boot_self_heals_grants_when_permissions_blob_missing() {
+        // Stone 11.0c — covers the dev-apps install path bug: worker.js
+        // writes manifest.toml + app.wasm directly to OPFS without ever
+        // calling PackageManager::install, so `sys/permissions/{id}` is
+        // never written. Without the self-heal a package's gated host
+        // imports would be stubbed at instantiation and the user would
+        // see a Shell with an empty launcher and no obvious cause.
+        //
+        // Simulate: install via PackageManager (which writes the perms
+        // blob), then delete the blob to mimic the dev-apps shape.
+        let mut store = storage::MemoryStorage::new();
+        let mut pm = package_manager::PackageManager::new();
+        let mut pc = permissions::PermissionController::new();
+        permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HOME_MANIFEST,
+            b"\0asm\x01\x00\x00\x00").expect("install");
+        // Mimic the dev-apps stage: blow away the permissions blob.
+        store.delete("sys/permissions/sys.shell").expect("delete");
+
+        // Boot from this storage — the package list rehydrates, the
+        // permissions blob is missing, the self-heal kicks in.
+        let host = BootMockHost::new();
+        let (_fw, report) = boot(Box::new(store), host.clone());
+
+        assert!(report.package_errors.is_empty(),
+            "self-heal should silently re-grant; got errors: {:?}",
+            report.package_errors);
+
+        // Host received the grant push for sys.shell with the
+        // healed-from-manifest set, not an empty list.
+        let grants = host.grants.borrow();
+        let shell_grants: Vec<&str> = grants.iter()
+            .find(|(pkg, _)| pkg == "sys.shell")
+            .map(|(_, g)| g.iter().map(String::as_str).collect())
+            .expect("sys.shell grants entry");
+        assert_eq!(shell_grants.len(), 2,
+            "self-heal must re-grant both shell-only perms; got {:?}",
+            shell_grants);
+    }
+
+    #[test]
+    fn boot_without_home_app_logs_error_and_continues() {
+        // Pre-Stone-11.0c this path panicked (`expect("HOME resolves")`);
+        // 11.0c relaxed it to a warning so a fresh checkout that hasn't
+        // run `akiva build` yet boots cleanly. Display sits empty, kernel
+        // logs the package_error from the report.
+        let storage = Box::new(storage::MemoryStorage::new());
+        let host = BootMockHost::new();
+        let (fw, report) = boot(storage, host);
+
+        assert_eq!(fw.stack.len(), 0,
+            "no HOME means no foreground activity");
+        assert!(report.package_errors.iter().any(|(id, msg)|
+            id == "<home>" && msg.contains("MAIN+HOME")),
+            "expected synthetic <home> entry in package_errors, got: {:?}",
+            report.package_errors);
     }
 }

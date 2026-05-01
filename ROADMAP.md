@@ -313,10 +313,8 @@
 
 ## שלב 5 — Shell App
 
-**סטטוס (אפריל 2026):**
-- 🟡 **Shell כ-built-in של framework** (לא `apps/shell/`) — [framework/src/shell.rs](framework/src/shell.rs) מממש `ShellActivity` שנרשם ב-`framework::boot` עם `package_id = "sys.shell"`. ה-UI מרונדר ידנית על `PaintTarget` (לא דרך AKML) ומציג header + רשימת כפתורי launcher לכל package. לחיצה → `ctx.launch_requested = Some(LaunchRequest { package_id, class })` → framework דוחף את ה-app על ה-stack ו-pause את Shell. Escape בראש stack של יותר מ-1 → pop + resume Shell.
-
-> **הימרה של MVP — לא apps/shell:** ROADMAP מייעד את Shell כ-app רגיל עם `intent_filter: category=HOME`. בחרנו לממש אותו built-in כי (1) זה פותר bootstrap (אין דילמה של "מי מפעיל את ה-shell לפני שה-PackageManager מזהה את ה-shell"), (2) אין עדיין IntentRouter wired (intent resolution לא נקרא ב-launch path — ראה Phase 2 deferred), (3) AKML לא היה קיים כשה-Shell נכתב. הוצאה ל-`apps/shell/` כ-wasm package דוחה ל-post-MVP — אחרי ש-IntentRouter מחובר בפועל וה-Shell יכולה להשתמש ב-AKML כמו כל app אחרת.
+**סטטוס (מאי 2026):**
+- ✅ **Shell כ-wasm app רגיל** ([apps/shell/](apps/shell/)) — Stone 11.0a/b/c. Shell מותקנת דרך ה-dev-apps pipeline כמו כל חבילה אחרת, מצהירה על הרשאות `QUERY_PACKAGES + LAUNCH_ANY_APP` ב-manifest שמתקבלות אוטומטית ב-install. ה-launcher list מתקבל דרך `akiva_sdk::pkgs::list()` (Stone 11.0a) שעובר את ה-snapshot שה-framework דוחף ל-host ב-boot. דחיפה של אפליקציה משתמשת ב-`Context::start_activity(&intent)` הסטנדרטי. אין יותר special-casing ב-`framework::boot` ול-`framework/src/shell.rs` נמחק.
 
 **מטרה (post-MVP):** אפליקציית בית שמציגה אפליקציות מותקנות ומאפשרת לפתוח אותן.
 
@@ -568,7 +566,7 @@ v0.1 סגר את ה-MVP: kernel רץ, שתי אפליקציות אמיתיות, 
 ### 10.6 calculator + tic-tac-toe + Shell מצהירים permissions
 - ✅ **calculator** — `[permissions] required = ["akiva.permission.STORAGE_SANDBOX"]` (שמירת display/accumulator state דרך `on_save_state`/`on_restore_state`).
 - ✅ **tic-tac-toe** — אותו `STORAGE_SANDBOX` (שמירת board state).
-- ✅ **Shell** — `QUERY_PACKAGES` + `LAUNCH_ANY_APP` grants נרשמים ישירות ב-`framework::boot` (Shell built-in, לא עובר דרך PackageManager::install). קוד: `fw.permissions.grant(shell::PACKAGE_ID, ...)` אחרי `declare_mvp_permissions`.
+- ✅ **Shell** — מצהירה `QUERY_PACKAGES` + `LAUNCH_ANY_APP` ב-`apps/shell/manifest.toml`. עוברת ב-Stone 11.0c את אותו install-time grant path כמו כל אפליקציה. (לפני Stone 11.0c ה-grants ניתנו ישירות ב-`framework::boot` כי Shell היה built-in.)
 - ✅ **hello** — נשאר בלי `required`. משמש כ-tripwire ל-empty-permissions path (install_with_no_permissions_writes_empty_blob test ב-Stone 10.2).
 
 **Exit criteria:**
@@ -613,15 +611,11 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 - ✅ **נחת.** ראה Phase 10 לעיל לפירוט המלא. Soft enforcement דרך deny-stubs (warning log + return 0); true LinkError-at-instantiation מחכה ל-SDK build-tooling.
 
 ### Stone 11.0 — הוצאת Shell ל-`apps/shell/` כ-wasm app
-- Shell חי היום ב-[`framework/src/shell.rs`](framework/src/shell.rs) עם גישה ישירה ל-`fw.packages.list()` ו-`boot_count` דרך closure. זה privileged, לא אפליקציה.
-- ל-extract:
-  - Manifest + wasm binary עצמאיים ב-`apps/shell/`
-  - ה-Shell קוראת ל-`query_packages` ול-`start_activity` דרך ה-ABI הרגיל (שה-grants הוכנו להם ב-Stone 10.6 + 10.3a: QUERY_PACKAGES + LAUNCH_ANY_APP)
-  - `boot_count` עובר דרך resource (`@string/boot_count`?) או system import חדש
-  - ה-hack של intent filter סינתטי ב-`framework::boot` נהרס; Shell tצהירה intent filter רגיל ב-manifest
-- **למה לפני Phase 11:** אם Shell יישאר framework-internal, ב-Phase 11 הוא יהפוך ל-exception קבוע שדורש ייחוד בכל מנגנון isolation. אם נוציא אותו עכשיו, Phase 11 רואה אותו כ-app רגיל והקוד נשאר אחיד.
-- **Forcing function bonus:** ההפרדה תחשוף חורים ב-ABI שהיום מוסתרים ע"י ה-Shell הפריבילגי — טוב לחשוף אותם עכשיו, לא תחת לחץ של isolation bring-up.
-- **הערכת זמן:** 1-2 שבועות.
+- ✅ **נחת (מאי 2026)**, פוצל ל-3 sub-stones:
+  - **11.0a — `akiva_host_query_packages` HAL.** Length-prefixed wire format ב-[`framework/src/pkgs_wire.rs`](framework/src/pkgs_wire.rs); push בכריכה בoot עם `WasmHost::set_packages` → `hal_host_set_packages` → `AppRegistry.setPackages`; capability `akiva.permission.QUERY_PACKAGES` עכשיו unlocks את ה-import (לא יותר reserved-slot ריק); SDK wrapper ב-[`sdk-rust/src/pkgs.rs`](sdk-rust/src/pkgs.rs) עם `pkgs::list() -> Vec<PackageEntry>`.
+  - **11.0b — `apps/shell/` crate.** Manifest מצהיר `sys.shell` עם `intent_filter: MAIN+HOME+LAUNCHER`; lib.rs מעבר verbatim של ה-rendering/input מ-`framework/src/shell.rs` לשימוש ב-`pkgs::list()` + `Context::start_activity()`; `boot_count` נופל מהכותרת (Stone 11.0d).
+  - **11.0c — boot surgery.** הוסרו `pub mod shell`, ה-grants הידניים ל-`shell::PACKAGE_ID`, ה-intent filter הסינתטי, registration של `ShellActivity::new(...)`, וסינון Shell מ-`pkg_refs`. חתימת `boot()` ירדה מ-`(boot_count, storage, host)` ל-`(storage, host)`. HOME resolution עכשיו tolerates missing Shell (warn דרך `BootReport.package_errors`, לא panic). [`framework/src/shell.rs`](framework/src/shell.rs) נמחק (224 שורות).
+- **למה זה חשוב:** Phase 11 (Process Isolation) עכשיו רואה את Shell כ-app רגיל — אין יותר exception פריבילגי שדורש ייחוד בכל מנגנון isolation.
 
 ---
 
