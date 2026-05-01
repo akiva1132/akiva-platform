@@ -237,7 +237,7 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         handle: akiva_framework::wasm_activity::AppHandle,
         ev: fw_act::PointerEvent,
         ts_ms: f64,
-    ) {
+    ) -> u64 {
         unsafe {
             host::hal_app_pointer(
                 handle.get(),
@@ -247,6 +247,8 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
                 ts_ms,
             )
         }
+        // Stone 11.4a sync sentinel — see `lifecycle` doc above.
+        0
     }
 
     fn key(
@@ -254,7 +256,7 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         handle: akiva_framework::wasm_activity::AppHandle,
         ev: fw_act::KeyEvent,
         ts_ms: f64,
-    ) {
+    ) -> u64 {
         unsafe {
             host::hal_app_key(
                 handle.get(),
@@ -264,14 +266,16 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
                 ts_ms,
             )
         }
+        0
     }
 
     fn resize(
         &self,
         handle: akiva_framework::wasm_activity::AppHandle,
         m: fw_act::SurfaceMetrics,
-    ) {
+    ) -> u64 {
         unsafe { host::hal_app_resize(handle.get(), m.width_px, m.height_px, m.density) }
+        0
     }
 
     fn render(
@@ -330,8 +334,8 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         &self,
         handle: akiva_framework::wasm_activity::AppHandle,
         bytes: &[u8],
-    ) {
-        if bytes.is_empty() { return; }
+    ) -> u64 {
+        if bytes.is_empty() { return 0; }
         let rc = unsafe {
             host::hal_app_restore_state(handle.get(), bytes.as_ptr(), bytes.len() as u32)
         };
@@ -341,6 +345,8 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
                 handle.get(), rc
             ));
         }
+        // Sync sentinel: hal_app_restore_state runs the app inline.
+        0
     }
 
     fn drain_finish(&self, handle: akiva_framework::wasm_activity::AppHandle) -> bool {
@@ -388,8 +394,8 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         &self,
         handle: akiva_framework::wasm_activity::AppHandle,
         bytes: &[u8],
-    ) {
-        if bytes.is_empty() { return; }
+    ) -> u64 {
+        if bytes.is_empty() { return 0; }
         let rc = unsafe {
             host::hal_app_new_intent(handle.get(), bytes.as_ptr(), bytes.len() as u32)
         };
@@ -399,6 +405,7 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
                 handle.get(), rc
             ));
         }
+        0
     }
 
     // ── Stone 9.5 ─────────────────────────────────────────────────────────
@@ -479,8 +486,8 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         handle: akiva_framework::wasm_activity::AppHandle,
         request_code: u32,
         bytes: &[u8],
-    ) {
-        if bytes.is_empty() { return; }
+    ) -> u64 {
+        if bytes.is_empty() { return 0; }
         let rc = unsafe {
             host::hal_app_activity_result(
                 handle.get(), request_code, bytes.as_ptr(), bytes.len() as u32,
@@ -492,6 +499,7 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
                 handle.get(), rc
             ));
         }
+        0
     }
 
     // ── Stone 10.3b ───────────────────────────────────────────────────────

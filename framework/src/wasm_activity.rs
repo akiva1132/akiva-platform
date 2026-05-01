@@ -76,9 +76,14 @@ pub trait WasmHost {
     ///   non-zero when the app lives in a separate Worker and the
     ///   ack travels back via `postMessage`.
     fn lifecycle(&self, handle: AppHandle, transition: LifecycleTransition) -> u64;
-    fn pointer(&self, handle: AppHandle, ev: PointerEvent, ts_ms: f64);
-    fn key(&self, handle: AppHandle, ev: KeyEvent, ts_ms: f64);
-    fn resize(&self, handle: AppHandle, metrics: SurfaceMetrics);
+    /// Same `0` = sync, non-zero = pending contract as
+    /// [`Self::lifecycle`]. Pointer/key/resize each map to their own
+    /// extern (`hal_app_pointer` etc.) today; in 11.4c they collapse
+    /// into the unified `dispatch` Worker channel alongside lifecycle,
+    /// but the trait shape stays the same.
+    fn pointer(&self, handle: AppHandle, ev: PointerEvent, ts_ms: f64) -> u64;
+    fn key(&self, handle: AppHandle, ev: KeyEvent, ts_ms: f64) -> u64;
+    fn resize(&self, handle: AppHandle, metrics: SurfaceMetrics) -> u64;
 
     /// Ask the app to paint one frame. The host is responsible for
     /// fetching the app's encoded paint-op bytes and appending the
@@ -102,9 +107,13 @@ pub trait WasmHost {
     /// its restored state in `on_start`/`on_resume` just like a fresh
     /// launch. Empty bytes = "no saved state", skipped by the framework.
     ///
-    /// Default is a no-op for the same reason as `save_state`.
-    fn restore_state(&self, handle: AppHandle, bytes: &[u8]) {
+    /// Same `0` = sync, non-zero = pending contract as
+    /// [`Self::lifecycle`]. Default returns `0` for the same reason as
+    /// `save_state` — in-process activities (Shell pre-11.0c, mocks)
+    /// have nothing to restore and resolve immediately.
+    fn restore_state(&self, handle: AppHandle, bytes: &[u8]) -> u64 {
         let _ = (handle, bytes);
+        0
     }
 
     /// Pop any "finish requested" signal raised by the app during the
@@ -142,10 +151,14 @@ pub trait WasmHost {
     /// — fires `akiva_app_new_intent(handle, ptr, len)` on the real
     /// host. Called when `ActivityManager::launch` picks a reuse path
     /// (SingleTop; and Phase 9.2's SingleTask/SingleInstance) instead
-    /// of stamping out a fresh instance. Default no-op so in-kernel
-    /// hosts (Shell) that don't expose a new-intent path stay quiet.
-    fn new_intent(&self, handle: AppHandle, bytes: &[u8]) {
+    /// of stamping out a fresh instance.
+    ///
+    /// Same `0` = sync, non-zero = pending contract as
+    /// [`Self::lifecycle`]. Default returns `0` so in-kernel hosts that
+    /// don't expose a new-intent path stay quiet.
+    fn new_intent(&self, handle: AppHandle, bytes: &[u8]) -> u64 {
         let _ = (handle, bytes);
+        0
     }
 
     /// Stone 9.5 — pop any pending `(intent_bytes, request_code)` the app
@@ -169,15 +182,19 @@ pub trait WasmHost {
 
     /// Stone 9.5 — deliver an `ActivityResult` to the caller activity.
     /// Fires `akiva_app_activity_result(handle, request_code, ptr, len)`
-    /// on the real host. Default no-op for activities that don't launch
-    /// for-result.
+    /// on the real host.
+    ///
+    /// Same `0` = sync, non-zero = pending contract as
+    /// [`Self::lifecycle`]. Default returns `0` for activities that
+    /// don't launch for-result.
     fn activity_result(
         &self,
         handle: AppHandle,
         request_code: u32,
         bytes: &[u8],
-    ) {
+    ) -> u64 {
         let _ = (handle, request_code, bytes);
+        0
     }
 
     /// Stone 10.3b — push a package's granted-permission list to the
@@ -300,29 +317,34 @@ impl WasmActivity {
 }
 
 impl WasmActivity {
-    /// Stone 11.4a — fire a lifecycle transition and assert the host
-    /// resolved it synchronously. Today every `WasmHost` impl
-    /// (KernelWasmHost, MockHost, BootMockHost) returns `0` from
-    /// `lifecycle` because the wasm app runs in the same worker as
+    /// Stone 11.4a — assert the host resolved a dispatch synchronously
+    /// (returned the `0` sentinel). Today every `WasmHost` impl
+    /// (KernelWasmHost, MockHost, BootMockHost) returns `0` from every
+    /// dispatch method because the wasm app runs in the same worker as
     /// the kernel; the `WasmActivity` shim still drives transitions
     /// inline through the `Activity` trait.
     ///
     /// 11.4c moves the deferred path out of this helper: the framework
-    /// state machine will dispatch lifecycle directly to `WasmHost`
-    /// (skipping the `Activity` trait) and own the `PendingTransition`
-    /// slot. Until then a non-zero `future_id` here is a wiring bug —
-    /// the host returned a future_id but no caller is set up to poll
-    /// it. We panic loudly rather than silently dropping the dispatch.
-    fn fire_lifecycle_sync(&self, transition: LifecycleTransition) {
-        let future_id = self.host.lifecycle(self.handle, transition);
+    /// state machine will dispatch directly to `WasmHost` (skipping the
+    /// `Activity` trait) and own the `PendingTransition` slot. Until
+    /// then a non-zero `future_id` here is a wiring bug — the host
+    /// returned a future_id but no caller is set up to poll it. We
+    /// `debug_assert!` loudly rather than silently dropping the
+    /// dispatch.
+    fn assert_sync(&self, op: &'static str, future_id: u64) {
         debug_assert_eq!(
             future_id, 0,
-            "Stone 11.4a: lifecycle on the Activity-trait path expects sync resolution. \
-             Host returned future_id={future_id:#x} for transition {transition:?} on \
-             handle {handle:?}; the deferred path lands when 11.4c routes WorkerHost \
-             through framework state machine instead of WasmActivity.",
+            "Stone 11.4a: {op} on the Activity-trait path expects sync resolution. \
+             Host returned future_id={future_id:#x} on handle {handle:?}; the deferred \
+             path lands when 11.4c routes WorkerHost through framework state machine \
+             instead of WasmActivity.",
             handle = self.handle,
         );
+    }
+
+    fn fire_lifecycle_sync(&self, transition: LifecycleTransition) {
+        let future_id = self.host.lifecycle(self.handle, transition);
+        self.assert_sync("lifecycle", future_id);
     }
 }
 
@@ -338,7 +360,7 @@ impl Activity for WasmActivity {
         // "tiny calculator in the top-left until the user resizes the
         // window". One extra round-trip here is worth a much saner
         // first frame.
-        self.host.resize(self.handle, ctx.metrics);
+        self.assert_sync("resize", self.host.resize(self.handle, ctx.metrics));
         self.drain_post(ctx);
     }
     fn on_start(&mut self, ctx: &mut ActivityContext<'_>) {
@@ -365,15 +387,15 @@ impl Activity for WasmActivity {
     }
 
     fn on_pointer(&mut self, ctx: &mut ActivityContext<'_>, ev: PointerEvent) {
-        self.host.pointer(self.handle, ev, ctx.timestamp_ms);
+        self.assert_sync("pointer", self.host.pointer(self.handle, ev, ctx.timestamp_ms));
         self.drain_post(ctx);
     }
     fn on_key(&mut self, ctx: &mut ActivityContext<'_>, ev: KeyEvent) {
-        self.host.key(self.handle, ev, ctx.timestamp_ms);
+        self.assert_sync("key", self.host.key(self.handle, ev, ctx.timestamp_ms));
         self.drain_post(ctx);
     }
     fn on_resize(&mut self, ctx: &mut ActivityContext<'_>, m: SurfaceMetrics) {
-        self.host.resize(self.handle, m);
+        self.assert_sync("resize", self.host.resize(self.handle, m));
         self.drain_post(ctx);
     }
 
@@ -385,7 +407,7 @@ impl Activity for WasmActivity {
         self.host.save_state(self.handle)
     }
     fn restore_state_bytes(&mut self, bytes: &[u8]) {
-        self.host.restore_state(self.handle, bytes);
+        self.assert_sync("restore_state", self.host.restore_state(self.handle, bytes));
     }
 
     fn on_new_intent(&mut self, ctx: &mut ActivityContext<'_>, intent: &Intent) {
@@ -395,7 +417,7 @@ impl Activity for WasmActivity {
         // follows. Keeps the boundary symmetric: framework side owns a
         // decoded `Intent`, wasm side receives an encoded blob.
         let bytes = intent.encode();
-        self.host.new_intent(self.handle, &bytes);
+        self.assert_sync("new_intent", self.host.new_intent(self.handle, &bytes));
         self.drain_post(ctx);
     }
 
@@ -410,7 +432,10 @@ impl Activity for WasmActivity {
         // could itself ask to launch/finish further — drain after the
         // call so those post-callback requests reach apply_post.
         let bytes = result.encode();
-        self.host.activity_result(self.handle, request_code, &bytes);
+        self.assert_sync(
+            "activity_result",
+            self.host.activity_result(self.handle, request_code, &bytes),
+        );
         self.drain_post(ctx);
     }
 }
@@ -663,14 +688,17 @@ mod tests {
             // Sync-resolve sentinel — see WasmHost::lifecycle docs.
             0
         }
-        fn pointer(&self, handle: AppHandle, ev: PointerEvent, ts: f64) {
+        fn pointer(&self, handle: AppHandle, ev: PointerEvent, ts: f64) -> u64 {
             self.calls.borrow_mut().push(Call::Pointer(handle.get(), ev.x, ev.y, ts));
+            0
         }
-        fn key(&self, handle: AppHandle, ev: KeyEvent, ts: f64) {
+        fn key(&self, handle: AppHandle, ev: KeyEvent, ts: f64) -> u64 {
             self.calls.borrow_mut().push(Call::Key(handle.get(), ev.code, ts));
+            0
         }
-        fn resize(&self, handle: AppHandle, m: SurfaceMetrics) {
+        fn resize(&self, handle: AppHandle, m: SurfaceMetrics) -> u64 {
             self.calls.borrow_mut().push(Call::Resize(handle.get(), m.width_px, m.height_px));
+            0
         }
         fn render(&self, handle: AppHandle, ts: f64, out: &mut FrameCommands) {
             self.calls.borrow_mut().push(Call::Render(handle.get(), ts));
@@ -681,8 +709,9 @@ mod tests {
             self.calls.borrow_mut().push(Call::SaveState(handle.get()));
             self.save_bytes.borrow().clone()
         }
-        fn restore_state(&self, handle: AppHandle, bytes: &[u8]) {
+        fn restore_state(&self, handle: AppHandle, bytes: &[u8]) -> u64 {
             self.calls.borrow_mut().push(Call::RestoreState(handle.get(), bytes.to_vec()));
+            0
         }
         fn drain_finish(&self, _handle: AppHandle) -> bool {
             // Read-and-clear, matching AppRegistry.drainFinish in the JS.
@@ -694,8 +723,9 @@ mod tests {
         fn drain_intent(&self, _handle: AppHandle) -> Option<Vec<u8>> {
             self.pending_intent.borrow_mut().take()
         }
-        fn new_intent(&self, handle: AppHandle, bytes: &[u8]) {
+        fn new_intent(&self, handle: AppHandle, bytes: &[u8]) -> u64 {
             self.calls.borrow_mut().push(Call::NewIntent(handle.get(), bytes.to_vec()));
+            0
         }
         fn drain_start_for_result(&self, _handle: AppHandle) -> Option<(Vec<u8>, u32)> {
             self.pending_start_for_result.borrow_mut().take()
@@ -703,10 +733,11 @@ mod tests {
         fn drain_set_result(&self, _handle: AppHandle) -> Option<Vec<u8>> {
             self.pending_set_result.borrow_mut().take()
         }
-        fn activity_result(&self, handle: AppHandle, request_code: u32, bytes: &[u8]) {
+        fn activity_result(&self, handle: AppHandle, request_code: u32, bytes: &[u8]) -> u64 {
             self.calls.borrow_mut().push(
                 Call::ActivityResult(handle.get(), request_code, bytes.to_vec()),
             );
+            0
         }
         fn set_grants(&self, package_id: &str, grants: &[&str]) {
             self.calls.borrow_mut().push(Call::SetGrants(

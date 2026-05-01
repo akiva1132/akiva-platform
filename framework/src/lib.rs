@@ -2033,15 +2033,15 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
         fn pointer(
             &self, _h: wasm_activity::AppHandle,
             _ev: activity::PointerEvent, _ts: f64,
-        ) {}
+        ) -> u64 { 0 }
         fn key(
             &self, _h: wasm_activity::AppHandle,
             _ev: activity::KeyEvent, _ts: f64,
-        ) {}
+        ) -> u64 { 0 }
         fn resize(
             &self, _h: wasm_activity::AppHandle,
             _m: SurfaceMetrics,
-        ) {}
+        ) -> u64 { 0 }
         fn render(
             &self, _h: wasm_activity::AppHandle,
             _ts: f64, _out: &mut compositor::FrameCommands,
