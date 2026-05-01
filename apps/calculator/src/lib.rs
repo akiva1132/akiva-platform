@@ -242,13 +242,14 @@ pub struct CalculatorMain {
     calc: Calculator,
 }
 
-impl Activity for CalculatorMain {
-    fn on_create(&mut self, ctx: &mut Context<'_>) {
+#[async_trait(?Send)]
+impl AsyncActivity for CalculatorMain {
+    async fn on_create(&mut self, ctx: &mut Context<'_>) {
         log_info!("CalculatorMain created ({}x{} @ {:.1}x)",
             ctx.metrics.width_px, ctx.metrics.height_px, ctx.metrics.density);
     }
 
-    fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
+    async fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
         self.ui.feed_pointer(ev);
     }
 
@@ -289,7 +290,7 @@ impl Activity for CalculatorMain {
             self.calc.display, self.calc.acc, self.calc.pending);
     }
 
-    fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
         c.clear(res::color("bg_window"));
 
         // Dynamic values the layout's `{name}` references will consume.
@@ -352,7 +353,7 @@ impl Activity for CalculatorMain {
     }
 }
 
-akiva_sdk::akiva_app!(CalculatorMain);
+akiva_sdk::akiva_async_app!(CalculatorMain);
 
 // ── Tests ──────────────────────────────────────────────────────────────
 

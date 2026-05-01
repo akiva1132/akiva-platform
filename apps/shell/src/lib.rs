@@ -101,8 +101,9 @@ impl ShellActivity {
     }
 }
 
-impl Activity for ShellActivity {
-    fn on_create(&mut self, _ctx: &mut Context<'_>) {
+#[async_trait(?Send)]
+impl AsyncActivity for ShellActivity {
+    async fn on_create(&mut self, _ctx: &mut Context<'_>) {
         // Pull the package list eagerly so the first frame already has
         // the launcher rows. The kernel pushed the snapshot before the
         // first activity launch (Stone 11.0a), so this can't see an
@@ -111,14 +112,14 @@ impl Activity for ShellActivity {
         log_info!("ShellActivity created: {} app(s) installed", self.apps.len());
     }
 
-    fn on_resume(&mut self, _ctx: &mut Context<'_>) {
+    async fn on_resume(&mut self, _ctx: &mut Context<'_>) {
         // Rehydrate every time we come back from a launched app — covers
         // any future install/uninstall flow that re-pushes the snapshot
         // while we were paused. Cheap (just decodes a few hundred bytes).
         self.refresh_apps();
     }
 
-    fn on_pointer(&mut self, ctx: &mut Context<'_>, ev: PointerEvent) {
+    async fn on_pointer(&mut self, ctx: &mut Context<'_>, ev: PointerEvent) {
         let surface_w = ctx.metrics.width_px as f32;
         match ev.phase {
             PointerPhase::Down => {
@@ -150,7 +151,7 @@ impl Activity for ShellActivity {
                             let intent = Intent::new("akiva.intent.action.MAIN")
                                 .with_category("akiva.intent.category.LAUNCHER")
                                 .with_target_package(entry.id.clone());
-                            ctx.start_activity_sync(&intent);
+                            ctx.start_activity(&intent).await;
                         }
                     }
                 }
@@ -162,7 +163,7 @@ impl Activity for ShellActivity {
         }
     }
 
-    fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
         let surface_w = ctx.metrics.width_px as f32;
         c.clear(BG);
 
@@ -234,4 +235,4 @@ impl Activity for ShellActivity {
     }
 }
 
-akiva_sdk::akiva_app!(ShellActivity);
+akiva_sdk::akiva_async_app!(ShellActivity);

@@ -130,13 +130,14 @@ pub struct TicTacToeMain {
     game: Game,
 }
 
-impl Activity for TicTacToeMain {
-    fn on_create(&mut self, ctx: &mut Context<'_>) {
+#[async_trait(?Send)]
+impl AsyncActivity for TicTacToeMain {
+    async fn on_create(&mut self, ctx: &mut Context<'_>) {
         log_info!("TicTacToeMain created ({}x{} @ {:.1}x)",
             ctx.metrics.width_px, ctx.metrics.height_px, ctx.metrics.density);
     }
 
-    fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
+    async fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
         self.ui.feed_pointer(ev);
     }
 
@@ -171,7 +172,7 @@ impl Activity for TicTacToeMain {
             s, self.game.turn, self.game.status);
     }
 
-    fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
         c.clear(res::color("bg_window"));
 
         // Rebuild bindings every frame. The status line and the nine
@@ -211,7 +212,7 @@ impl Activity for TicTacToeMain {
     }
 }
 
-akiva_sdk::akiva_app!(TicTacToeMain);
+akiva_sdk::akiva_async_app!(TicTacToeMain);
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
