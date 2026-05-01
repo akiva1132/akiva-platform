@@ -26,7 +26,7 @@ pub mod storage;
 pub mod ui;
 
 pub use activity::{Activity, ActivityContext, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState};
-pub use activity_async::AsyncActivity;
+pub use activity_async::{AsyncActivity, TaskScope};
 pub use app::{App, AppContext};
 pub use canvas::Canvas;
 pub use intent::{Intent, IntentBuilder};
@@ -35,7 +35,7 @@ pub use result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
 /// Everything a minimal app needs with one `use`.
 pub mod prelude {
     pub use crate::activity::{Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState};
-    pub use crate::activity_async::AsyncActivity;
+    pub use crate::activity_async::{AsyncActivity, TaskScope};
     pub use crate::canvas::Canvas;
     pub use crate::intent::{Intent, IntentBuilder};
     pub use crate::result::{ActivityResult, RESULT_CANCELED, RESULT_OK};

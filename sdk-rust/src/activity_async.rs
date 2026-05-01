@@ -114,6 +114,91 @@ pub fn block_on_ready<F: Future>(f: F) -> F::Output {
     }
 }
 
+// ── Lifecycle scopes ──────────────────────────────────────────────────
+//
+// Three task scopes — `activity_scope`, `resumed_scope`, one-shot —
+// modelled on Android's `lifecycleScope` / `viewModelScope` and
+// SwiftUI's `.task(id:)`. The contract from
+// docs/isolation-design.md §4.7:
+//
+//   - `activity_scope`: tasks live until on_destroy.
+//   - `resumed_scope`:  tasks live until on_pause.
+//   - one-shot:         tasks die when the calling fn returns
+//                       (already the default if you `.await` directly).
+//
+// In Stone 11.2 every spawned future completes in a single poll
+// (host imports still sync), so cancellation is unobservable — there's
+// nothing pending to drop when on_pause / on_destroy fires. The API
+// surface is locked in here so apps can write the right code today;
+// Stone 11.3 puts teeth on it once a real executor holds futures
+// across .await points.
+//
+// Until then `TaskScope::spawn` is just a renamed `block_on_ready` —
+// runs the future to completion right then. That matches what an
+// executor would do anyway when the future is Ready-on-first-poll, so
+// app behaviour will stay identical when 11.3 swaps the body.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    /// Outlives every callback except `on_destroy` — the activity itself.
+    Activity,
+    /// Active only between `on_resume` and the matching `on_pause`.
+    Resumed,
+}
+
+/// Task scope used by [`Context::activity_scope`] /
+/// [`Context::resumed_scope`]. Carries the cancellation policy as
+/// data; in Stone 11.2 it's API surface only (see module comment).
+pub struct TaskScope {
+    kind: ScopeKind,
+}
+
+impl TaskScope {
+    /// Spawn `fut` under this scope's cancellation policy.
+    ///
+    /// In Stone 11.2 this drives `fut` to completion synchronously via
+    /// [`block_on_ready`] (`Pending` panics — every host call still
+    /// resolves on first poll). Stone 11.3 replaces the body with the
+    /// real executor; the signature stays the same so apps don't churn.
+    ///
+    /// The future is bound by the caller's lifetime (whatever borrows
+    /// it captures). 11.3 will tighten this to `+ 'static` to allow
+    /// cross-callback storage; until then a non-static future is fine
+    /// because we poll-to-completion before this fn returns.
+    pub fn spawn<F: Future<Output = ()>>(&self, fut: F) {
+        let _ = self.kind;
+        block_on_ready(fut);
+    }
+}
+
+/// Singletons addressable as `&'static TaskScope`. Cheap, no per-handle
+/// state — fits the 11.2 model where scopes are markers. When 11.3
+/// makes scopes hold a queue of pending tasks they'll move into the
+/// per-handle [`crate::runtime_async::Slot`] and the accessors on
+/// [`Context`] will return non-static refs borrowing from there.
+pub(crate) static ACTIVITY_SCOPE: TaskScope = TaskScope { kind: ScopeKind::Activity };
+pub(crate) static RESUMED_SCOPE:  TaskScope = TaskScope { kind: ScopeKind::Resumed  };
+
+impl<'a> Context<'a> {
+    /// Scope whose tasks live until [`AsyncActivity::on_destroy`].
+    /// Tasks spawned here survive `on_pause` / `on_resume` cycles —
+    /// use this for state that should outlive a brief background trip
+    /// (e.g. an unstarted-yet network request the user will see when
+    /// they come back).
+    pub fn activity_scope(&self) -> &'static TaskScope {
+        &ACTIVITY_SCOPE
+    }
+
+    /// Scope whose tasks live only while the activity is in the
+    /// `Resumed` state. Tasks are cancelled at `on_pause` and a fresh
+    /// scope is opened the next time `on_resume` fires. Use this for
+    /// listeners / polling loops that only make sense when the user
+    /// is actively looking at the activity.
+    pub fn resumed_scope(&self) -> &'static TaskScope {
+        &RESUMED_SCOPE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +231,32 @@ mod tests {
             }
         }
         block_on_ready(Pending);
+    }
+
+    #[test]
+    fn task_scope_spawn_runs_body_before_returning() {
+        // 11.2 contract: spawn drives the future to completion right
+        // there. After this returns the side effect must already be
+        // visible. This anchors the migration story: app code that
+        // works against the 11.2 stub will keep working when 11.3
+        // swaps the executor in (Ready-on-first-poll futures complete
+        // identically either way).
+        let scope = TaskScope { kind: ScopeKind::Activity };
+        let mut fired = false;
+        scope.spawn(async {
+            fired = true;
+        });
+        assert!(fired);
+    }
+
+    #[test]
+    fn context_exposes_distinct_scope_kinds() {
+        // `activity_scope` and `resumed_scope` resolve to different
+        // singletons — they're the same shape today but different
+        // identities, so when 11.3 attaches behaviour the wiring is
+        // already in place.
+        assert_eq!(ACTIVITY_SCOPE.kind, ScopeKind::Activity);
+        assert_eq!(RESUMED_SCOPE.kind,  ScopeKind::Resumed);
+        assert_ne!(ACTIVITY_SCOPE.kind, RESUMED_SCOPE.kind);
     }
 }
