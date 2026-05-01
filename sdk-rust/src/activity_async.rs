@@ -197,6 +197,64 @@ impl<'a> Context<'a> {
     pub fn resumed_scope(&self) -> &'static TaskScope {
         &RESUMED_SCOPE
     }
+
+    // ── Async affordance API ──────────────────────────────────────────
+    //
+    // Counterparts to the `_sync` methods in `activity.rs`. In Stone
+    // 11.2 each one calls the same underlying host import the sync
+    // version does — the `async fn` is degenerate (one synchronous
+    // call wrapped in a future that's Ready on first poll) but the
+    // `.await` is locked into app source today so Stone 11.3's async
+    // wire is a body change, not an API change.
+    //
+    // `&mut self` per docs/isolation-design.md §4.1 — Stone 11.3 will
+    // need to track the in-flight request future on `Context` to
+    // resume the awaiting task when the host acks. Apps already pass
+    // `ctx: &mut Context<'_>` to their callbacks, so the borrow shape
+    // matches.
+
+    /// Ask the platform to tear this activity down. Fires after the
+    /// current callback returns — the framework runs
+    /// `on_pause → on_stop → on_destroy` in order (or, if called from
+    /// inside `on_create`, jumps straight to `on_destroy` via the
+    /// `Created → Destroyed` shortcut documented in
+    /// [docs/activity-model.md §2](../../docs/activity-model.md)).
+    pub async fn finish(&mut self) {
+        crate::runtime::host_finish(self.handle);
+    }
+
+    /// Resolve `intent` through `IntentRouter` and launch the matching
+    /// activity on top of this one. The current activity keeps its
+    /// handle and transitions to `Paused` while the new activity comes
+    /// up. If the resolver picks a reuse path (`SingleTop` on this
+    /// same class, or `SingleTask` / `SingleInstance` for an existing
+    /// instance) the target sees `on_new_intent` rather than a fresh
+    /// bring-up. See [docs/intents.md §8](../../docs/intents.md).
+    pub async fn start_activity(&mut self, intent: &crate::intent::Intent) {
+        crate::runtime::host_start_activity(self.handle, intent);
+    }
+
+    /// Launch `intent` and keep the door open for a result. When the
+    /// callee finishes (either by calling [`Context::set_result`] +
+    /// [`Context::finish`] or by being closed without a result),
+    /// `on_activity_result(ctx, request_code, result)` fires on this
+    /// activity. Pick a `request_code` per call site — the callee
+    /// never sees it; it's only for the caller to disambiguate which
+    /// launch the arriving result belongs to.
+    pub async fn start_activity_for_result(
+        &mut self, intent: &crate::intent::Intent, request_code: u32,
+    ) {
+        crate::runtime::host_start_activity_for_result(self.handle, intent, request_code);
+    }
+
+    /// Stash the result this activity wants to hand back. Only
+    /// meaningful if this activity was launched via
+    /// [`Context::start_activity_for_result`]; otherwise the framework
+    /// silently discards the bytes. Can be called more than once in a
+    /// single lifetime — only the final call's payload is delivered.
+    pub async fn set_result(&mut self, result: &crate::result::ActivityResult) {
+        crate::runtime::host_set_result(self.handle, result);
+    }
 }
 
 #[cfg(test)]
@@ -258,5 +316,33 @@ mod tests {
         assert_eq!(ACTIVITY_SCOPE.kind, ScopeKind::Activity);
         assert_eq!(RESUMED_SCOPE.kind,  ScopeKind::Resumed);
         assert_ne!(ACTIVITY_SCOPE.kind, RESUMED_SCOPE.kind);
+    }
+
+    #[test]
+    fn async_ctx_methods_complete_in_one_poll() {
+        // Stone 11.2 invariant: every `async fn` on Context resolves
+        // synchronously because the underlying host imports are no-ops
+        // on non-wasm and one-shot sync calls on wasm. block_on_ready
+        // would panic on Pending, so this round-trip proves the
+        // current API can't accidentally introduce real awaits.
+        let mut ctx = Context {
+            metrics: Metrics::default(),
+            timestamp_ms: 0.0,
+            pointer: None,
+            class: "",
+            handle: 1,
+        };
+        // The four affordance methods, awaited in sequence. Hosts on
+        // non-wasm fall back to no-ops so this exercises the surface
+        // shape without needing a kernel.
+        block_on_ready(async {
+            ctx.finish().await;
+            ctx.start_activity(&crate::intent::Intent::new("akiva.intent.action.MAIN")).await;
+            ctx.start_activity_for_result(
+                &crate::intent::Intent::new("akiva.intent.action.MAIN"),
+                42,
+            ).await;
+            ctx.set_result(&crate::result::ActivityResult::canceled()).await;
+        });
     }
 }

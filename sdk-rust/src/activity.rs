@@ -73,51 +73,43 @@ pub struct Context<'a> {
 }
 
 impl<'a> Context<'a> {
-    /// Ask the platform to tear this activity down. Fires after the
-    /// current callback returns — the framework runs
-    /// `on_pause → on_stop → on_destroy` in order (or, if called from
-    /// inside `on_create`, jumps straight to `on_destroy` via the
-    /// `Created → Destroyed` shortcut documented in
-    /// [docs/activity-model.md §2](../../docs/activity-model.md)).
+    // ── Sync affordance API (legacy) ──────────────────────────────────
+    //
+    // These four methods are the original synchronous API used by the
+    // sync [`Activity`] trait. Stone 11.2 introduces async
+    // counterparts with the canonical names (see the `impl` in
+    // `activity_async.rs`); the sync versions get an explicit
+    // `_sync` suffix so the names don't collide. Apps still on the
+    // sync trait keep calling these; once Task #4 ports the last
+    // app to `AsyncActivity` we'll delete this whole section and
+    // promote the async variants.
+
+    /// Ask the platform to tear this activity down. See the async
+    /// variant [`Context::finish`] for the same semantics from an
+    /// `async fn` callback.
     ///
     /// No-op on non-wasm targets so unit tests that build with the SDK
     /// can call it without a host.
-    pub fn finish(&self) {
+    pub fn finish_sync(&self) {
         crate::runtime::host_finish(self.handle);
     }
 
     /// Ask the platform to resolve `intent` through `IntentRouter` and
-    /// launch the matching activity on top of this one. The current
-    /// activity keeps its handle and transitions to `Paused` while the
-    /// new activity comes up. If the resolver picks a reuse path
-    /// (`SingleTop` on this same class, or — Stone 9.2 —
-    /// `SingleTask`/`SingleInstance` for an existing instance) the
-    /// target sees `on_new_intent` rather than a fresh bring-up. See
-    /// [docs/intents.md §8](../../docs/intents.md).
-    pub fn start_activity(&self, intent: &crate::intent::Intent) {
+    /// launch the matching activity on top of this one. Sync version;
+    /// see [`Context::start_activity`] for the async variant.
+    pub fn start_activity_sync(&self, intent: &crate::intent::Intent) {
         crate::runtime::host_start_activity(self.handle, intent);
     }
 
-    /// Stone 9.5 — launch `intent` and wait for a result back. When the
-    /// callee finishes (either by calling [`Context::set_result`] +
-    /// [`Context::finish`] or by being closed without a result),
-    /// `on_activity_result(ctx, request_code, result)` fires on this
-    /// activity. Pick a `request_code` per call site — the callee never
-    /// sees it; it's only for the caller to disambiguate which launch
-    /// the arriving result belongs to. See
-    /// [docs/activity-model.md](../../docs/activity-model.md).
-    pub fn start_activity_for_result(
+    /// Sync version of [`Context::start_activity_for_result`].
+    pub fn start_activity_for_result_sync(
         &self, intent: &crate::intent::Intent, request_code: u32,
     ) {
         crate::runtime::host_start_activity_for_result(self.handle, intent, request_code);
     }
 
-    /// Stone 9.5 — stash the result this activity wants to hand back.
-    /// Only meaningful if this activity was launched via
-    /// [`Context::start_activity_for_result`]; otherwise the framework
-    /// silently discards the bytes. Can be called more than once in a
-    /// single lifetime — only the final call's payload is delivered.
-    pub fn set_result(&self, result: &crate::result::ActivityResult) {
+    /// Sync version of [`Context::set_result`].
+    pub fn set_result_sync(&self, result: &crate::result::ActivityResult) {
         crate::runtime::host_set_result(self.handle, result);
     }
 }

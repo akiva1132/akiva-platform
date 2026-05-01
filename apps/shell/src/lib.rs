@@ -150,7 +150,7 @@ impl Activity for ShellActivity {
                             let intent = Intent::new("akiva.intent.action.MAIN")
                                 .with_category("akiva.intent.category.LAUNCHER")
                                 .with_target_package(entry.id.clone());
-                            ctx.start_activity(&intent);
+                            ctx.start_activity_sync(&intent);
                         }
                     }
                 }
