@@ -625,56 +625,19 @@ describe("_buildAppImports — capability filter", () => {
     }
   });
 
-  it("replaces gated imports with deny-stubs when the grant is absent", () => {
-    const { registry, log } = makeRegistry();
-    // No grant for LAUNCH_ANY_APP → start_activity is stubbed.
-    const filtered = registry._buildAppImports(PACKAGE_ID).env;
-    const startFn = filtered.akiva_host_start_activity;
-    expect(startFn.name).toBe("permissionDeniedStub");
-
-    // Calling the stub must NOT fire the real logic; it logs + returns 0.
-    const result = startFn(1, 0, 0);
-    expect(result).toBe(0);
-    // Warning log fired.
-    const warnCalls = log.mock.calls.filter(([lvl]) => lvl === "warn");
-    expect(warnCalls.some(([, msg]) =>
-      msg.includes("permission denied") &&
-      msg.includes("akiva_host_start_activity") &&
-      msg.includes("akiva.permission.LAUNCH_ANY_APP"),
-    )).toBe(true);
-  });
-
-  it("unlocks gated imports when the grant is present", () => {
-    const { registry } = makeRegistry();
-    registry.setGrants(PACKAGE_ID, ["akiva.permission.LAUNCH_ANY_APP"]);
-    const filtered = registry._buildAppImports(PACKAGE_ID).env;
-    for (const name of CAPABILITY_IMPORTS["akiva.permission.LAUNCH_ANY_APP"]) {
-      expect(filtered[name].name).not.toBe("permissionDeniedStub");
-    }
-  });
-
-  it("grants apply per-package, not globally", () => {
-    // Shell gets LAUNCH_ANY_APP; a second package must NOT inherit it.
-    const { registry } = makeRegistry();
-    registry.setGrants("com.shell", ["akiva.permission.LAUNCH_ANY_APP"]);
-
-    const shellImports = registry._buildAppImports("com.shell").env;
-    expect(shellImports.akiva_host_start_activity.name)
-      .not.toBe("permissionDeniedStub");
-
-    const appImports = registry._buildAppImports("com.otherapp").env;
-    expect(appImports.akiva_host_start_activity.name)
-      .toBe("permissionDeniedStub");
-  });
-
-  it("reserved capabilities (STORAGE_SANDBOX etc.) are accepted but contribute no imports today", () => {
-    // Pinning the current shape: v0.2 declares these permissions but
-    // the `akiva_host_*` HAL surface for them doesn't exist yet.
-    // Granting them does nothing observable. The day each HAL lands,
-    // its slot gains a non-empty array and the test moves out of this
-    // group — tripwire for keeping Rust + JS mappings in lockstep.
-    // QUERY_PACKAGES graduated in Stone 11.0a (akiva_host_query_packages).
+  it("every capability list is empty (gating moved into dispatcher in 11.3-final)", () => {
+    // After 11.3-final the per-op imports that LAUNCH_ANY_APP and
+    // QUERY_PACKAGES used to gate (start_activity{,_for_result},
+    // query_packages) are gone — every fire/io op runs through the
+    // unified-ABI multiplexers and capability checks happen inside
+    // `_dispatchFire` / `_dispatchIoStart`. The capability map is
+    // preserved as a tripwire: any future per-op import that doesn't
+    // fit the fire/io shape must register here, and a non-empty list
+    // means we have to update the dispatcher to know about it. The
+    // dedicated dispatcher tests further down enforce the gating.
     for (const cap of [
+      "akiva.permission.LAUNCH_ANY_APP",
+      "akiva.permission.QUERY_PACKAGES",
       "akiva.permission.STORAGE_SANDBOX",
       "akiva.permission.NOTIFICATIONS",
       "akiva.permission.NETWORK",
@@ -682,26 +645,6 @@ describe("_buildAppImports — capability filter", () => {
     ]) {
       expect(CAPABILITY_IMPORTS[cap]).toEqual([]);
     }
-  });
-
-  it("QUERY_PACKAGES unlocks akiva_host_query_packages (Stone 11.0a)", () => {
-    // Mirror of the Rust-side `query_packages_adds_query_import` test in
-    // framework/src/permissions.rs. Both sides must list the import so
-    // a Shell with QUERY_PACKAGES gets a real function instead of the
-    // deny-stub.
-    expect(CAPABILITY_IMPORTS["akiva.permission.QUERY_PACKAGES"])
-      .toEqual(["akiva_host_query_packages"]);
-
-    const { registry } = makeRegistry();
-    registry.setGrants("com.shell", ["akiva.permission.QUERY_PACKAGES"]);
-    const shellImports = registry._buildAppImports("com.shell").env;
-    expect(shellImports.akiva_host_query_packages.name)
-      .not.toBe("permissionDeniedStub");
-
-    // Without the grant, deny-stub is wired up.
-    const otherImports = registry._buildAppImports("com.other").env;
-    expect(otherImports.akiva_host_query_packages.name)
-      .toBe("permissionDeniedStub");
   });
 });
 
@@ -1030,63 +973,9 @@ describe("setPackages — package-list snapshot (Stone 11.0a)", () => {
   });
 });
 
-describe("akiva_host_query_packages — two-phase reader (Stone 11.0a)", () => {
-  it("returns 0 when no packages are pushed yet", () => {
-    const { fakeProc } = (() => {
-      const fp = makeFakeProc();
-      return { fakeProc: fp };
-    })();
-    const { registry } = makeRegistry({ fakeProc });
-    registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
-    const queryFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_query_packages;
-    expect(queryFn(0, 1024)).toBe(0);
-  });
-
-  it("returns required size without writing when outCap is too small", () => {
-    // Two-phase contract — caller passes a small initial guess; if the
-    // host's blob is bigger, we report the required length and leave
-    // the buffer untouched so the SDK can realloc and retry.
-    const fakeProc = makeFakeProc();
-    const { registry } = makeRegistry({ fakeProc });
-    registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
-    const blob = new Uint8Array(20).map((_, i) => i + 1);
-    registry.setPackages(blob);
-
-    const queryFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_query_packages;
-    // outCap=8 is too small for 20-byte blob.
-    const required = queryFn(100, 8);
-    expect(required).toBe(20);
-    // Memory at the offered ptr is still all zeros.
-    const view = new Uint8Array(fakeProc.memory.buffer, 100, 20);
-    expect(Array.from(view)).toEqual(new Array(20).fill(0));
-  });
-
-  it("writes blob and returns its length on a fitting outCap", () => {
-    const fakeProc = makeFakeProc();
-    const { registry } = makeRegistry({ fakeProc });
-    registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
-    const blob = new Uint8Array([0xde, 0xad, 0xbe, 0xef, 0x42]);
-    registry.setPackages(blob);
-
-    const queryFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_query_packages;
-    const written = queryFn(200, 64);
-    expect(written).toBe(blob.length);
-    const view = new Uint8Array(fakeProc.memory.buffer, 200, blob.length);
-    expect(Array.from(view)).toEqual(Array.from(blob));
-  });
-
-  it("deny-stub returns 0 without touching memory when grant is absent", () => {
-    const fakeProc = makeFakeProc();
-    const { registry } = makeRegistry({ fakeProc });
-    // Pretend the framework pushed a snapshot, but the package has no
-    // QUERY_PACKAGES grant.
-    registry.setPackages(new Uint8Array([1, 2, 3, 4]));
-
-    const queryFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_query_packages;
-    expect(queryFn.name).toBe("permissionDeniedStub");
-    // Stub never touches memory regardless of args.
-    expect(queryFn(200, 64)).toBe(0);
-    const view = new Uint8Array(fakeProc.memory.buffer, 200, 4);
-    expect(Array.from(view)).toEqual([0, 0, 0, 0]);
-  });
-});
+// `akiva_host_query_packages` no longer exists post-11.3-final. The
+// equivalent two-phase contract (length-too-small returns required
+// size, fitting size copies and evicts) is exercised by the dispatcher
+// tests in the `Stone 11.3c — unified-ABI dispatcher > io dispatch +
+// FutureRegistry` block above (see "two-phase retry: payload too large
+// returns length, retains entry").

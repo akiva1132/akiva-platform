@@ -559,21 +559,6 @@ export class AppRegistry {
     };
     const full = {
       env: {
-        akiva_host_log: (level, ptr, len) => {
-          const proc = self._processes.get(packageId);
-          if (!proc?.memory) return;
-          const text = self._decoder.decode(new Uint8Array(proc.memory.buffer, ptr, len));
-          self._log(LEVEL_NAMES[level] ?? "info", `[${packageId}] ${text}`);
-        },
-        akiva_host_text_width: (ptr, len, size) => {
-          const proc = self._processes.get(packageId);
-          // A length of 0 is a legitimate call (empty label) and should
-          // return 0 without touching memory.
-          if (len === 0) return 0;
-          if (!proc?.memory) return 0;
-          const text = self._decoder.decode(new Uint8Array(proc.memory.buffer, ptr, len));
-          return self.measureTextWidth(text, size);
-        },
         akiva_host_resource_color: (ptr, len) => {
           const name = readName(ptr, len);
           if (name === null) return MISSING_COLOR;
@@ -613,75 +598,6 @@ export class AppRegistry {
           const name = readName(ptr, len);
           if (name === null) return 0;
           return self._resources.get(packageId)?.strings.has(name) ? 1 : 0;
-        },
-
-        // Stone 9.3 — app-initiated finish. App calls this from inside a
-        // lifecycle or input callback; kernel drains the flag immediately
-        // afterward via `hal_app_drain_finish`. The handle identifies
-        // which activity of this package is asking — two handles for the
-        // same package wouldn't conflate.
-        akiva_host_finish: (handle) => {
-          self._pendingFinish.add(handle);
-        },
-
-        // Stone 9.4 — app-initiated start_activity. `ptr..ptr+len` is
-        // the encoded Intent blob in app memory. Copy it out
-        // immediately: the app's memory buffer can detach on any
-        // subsequent wasm call (including the final drain), and we'll
-        // be serving it back through `drainIntent` which runs on the
-        // kernel's schedule. Overwrites any previously-staged intent
-        // for this handle — a second start_activity in the same
-        // dispatch wins, matching the single-slot `launch_requested`
-        // field on the framework side.
-        akiva_host_start_activity: (handle, ptr, len) => {
-          const proc = self._processes.get(packageId);
-          if (!proc?.memory || len === 0) return;
-          const copy = new Uint8Array(len);
-          copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
-          self._pendingIntent.set(handle, copy);
-        },
-
-        // Stone 9.5 — app-initiated start_activity_for_result. Same
-        // copy-out-immediately discipline as `akiva_host_start_activity`,
-        // but the extra `requestCode` is stored alongside the bytes so
-        // the two-phase HAL drain (`hal_app_drain_start_for_result`)
-        // can return both in one round-trip.
-        akiva_host_start_activity_for_result: (handle, ptr, len, requestCode) => {
-          const proc = self._processes.get(packageId);
-          if (!proc?.memory || len === 0) return;
-          const copy = new Uint8Array(len);
-          copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
-          self._pendingStartForResult.set(handle, { bytes: copy, requestCode });
-        },
-
-        // Stone 11.0a — enumerate installed packages. Two-phase HAL
-        // pattern (same shape as `akiva_host_resource_string`): if the
-        // caller's `outCap` is smaller than the required size, write
-        // nothing and return the required length so the SDK can realloc
-        // and try again. Empty system → returns 0 (zero-length blob,
-        // not "buffer too small"). Gated by `akiva.permission.QUERY_PACKAGES`
-        // — without the grant the deny-stub returns 0, indistinguishable
-        // from "no packages" by design (the app shouldn't have imported
-        // it without declaring the permission).
-        akiva_host_query_packages: (outPtr, outCap) => {
-          const proc = self._processes.get(packageId);
-          if (!proc?.memory) return 0;
-          const blob = self._packagesBlob;
-          if (blob.length === 0) return 0;
-          if (blob.length > outCap) return blob.length;
-          new Uint8Array(proc.memory.buffer, outPtr, blob.length).set(blob);
-          return blob.length;
-        },
-
-        // Stone 9.5 — app stashes the result it wants to deliver to
-        // whoever launched it. Not drained until the activity's destroy
-        // path — store as-is, last call wins.
-        akiva_host_set_result: (handle, ptr, len) => {
-          const proc = self._processes.get(packageId);
-          if (!proc?.memory || len === 0) return;
-          const copy = new Uint8Array(len);
-          copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
-          self._pendingSetResult.set(handle, copy);
         },
 
         // Stone 11.3c — three multiplexers that route every host-mediated
@@ -1162,35 +1078,43 @@ export class AppRegistry {
 // and a Rust test in the same stone pins the canonical list. If you
 // add a new host import, update BOTH sides or the filter will either
 // stub a real function or ship an ungated one.
+// Stone 11.3-final: every fire/io op runs through the unified-ABI
+// multiplexers (`fire`, `io_start`, `io_poll`). The legacy per-op
+// imports (akiva_host_log, akiva_host_finish, akiva_host_text_width,
+// akiva_host_query_packages, akiva_host_set_result, and the
+// `start_activity` pair) are gone from both sides of the boundary.
+//
+// AUTO_IMPORTS is now resource-lookups (4) plus the trio (3). Resource
+// lookups stay legacy intentionally — they're per-package readonly
+// queries that don't fit the fire/io shape (no async, no side effect,
+// no handle context), and consolidating them under op_kinds would
+// just add encode/decode overhead for no benefit.
 export const AUTO_IMPORTS = Object.freeze([
-  "akiva_host_log",
-  "akiva_host_text_width",
   "akiva_host_resource_color",
   "akiva_host_resource_string",
   "akiva_host_resource_has_color",
   "akiva_host_resource_has_string",
-  "akiva_host_finish",
-  "akiva_host_set_result",
-  // Stone 11.3b — three multiplexers (fire / io_start / io_poll). Auto
-  // because capability gating moves *into* the dispatcher (one import
-  // serves many op_kinds). Mirror in framework/src/permissions.rs.
+  // Stone 11.3 unified-ABI multiplexers. Capability gating happens
+  // inside the dispatcher (one import serves many op_kinds), not at
+  // the import surface. Mirror in framework/src/permissions.rs.
   "akiva_host_fire",
   "akiva_host_io_start",
   "akiva_host_io_poll",
 ]);
 
-// Capability → gated imports. LAUNCH_ANY_APP and QUERY_PACKAGES have
-// concrete imports today; STORAGE_SANDBOX, NOTIFICATIONS, NETWORK, and
-// CAMERA exist in the manifest vocabulary but don't yet map to
-// `akiva_host_*` surface (reserved slots).
+// Capability → gated imports. After 11.3 every capability gate lives
+// inside the unified-ABI dispatcher (the multiplexers are auto, but
+// op_kinds like QUERY_PACKAGES and START_ACTIVITY are checked against
+// `_grants` per call). The map is preserved for two reasons:
+//   * If a future capability lands a per-op import that doesn't fit
+//     the fire/io shape (e.g. a streaming surface), it slots in here
+//     without the dispatcher having to know about it.
+//   * Vitest mirror tests assert that no capability has accidentally
+//     re-acquired imports — drift would silently bypass the
+//     in-dispatcher gating.
 export const CAPABILITY_IMPORTS = Object.freeze({
-  "akiva.permission.LAUNCH_ANY_APP": Object.freeze([
-    "akiva_host_start_activity",
-    "akiva_host_start_activity_for_result",
-  ]),
-  "akiva.permission.QUERY_PACKAGES":  Object.freeze([
-    "akiva_host_query_packages",
-  ]),
+  "akiva.permission.LAUNCH_ANY_APP":  Object.freeze([]),
+  "akiva.permission.QUERY_PACKAGES":  Object.freeze([]),
   "akiva.permission.STORAGE_SANDBOX": Object.freeze([]),
   "akiva.permission.NOTIFICATIONS":   Object.freeze([]),
   "akiva.permission.NETWORK":         Object.freeze([]),

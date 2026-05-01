@@ -114,51 +114,35 @@ pub const CAMERA:          &str = "akiva.permission.CAMERA";
 /// the foundational functions the lifecycle / render / input loop
 /// depend on; gating them would mean the app can't even draw.
 pub const AUTO_IMPORTS: &[&str] = &[
-    "akiva_host_log",
-    "akiva_host_text_width",
+    // Resource lookups stay legacy intentionally — they're per-package
+    // readonly queries that don't fit the fire/io shape (no async, no
+    // side effect, no handle context), and consolidating them under
+    // op_kinds would just add encode/decode overhead for no benefit.
     "akiva_host_resource_color",
     "akiva_host_resource_string",
     "akiva_host_resource_has_color",
     "akiva_host_resource_has_string",
-    "akiva_host_finish",
-    "akiva_host_set_result",
-    // Stone 11.3b — three multiplexers that subsume the per-op imports
-    // above as 11.3c migrates call sites. They're auto-granted because
-    // the capability check moves *inside* the dispatcher: a single
-    // function can't be gated by a single permission since it serves
-    // many op_kinds (some always-available, some gated). The dispatcher
-    // in `runtime/web/app_registry.js` consults the same grants table
-    // before running an op_kind that maps to a gated operation.
+    // Stone 11.3 unified-ABI multiplexers. Capability gating moved
+    // entirely into the dispatcher (one import serves many op_kinds —
+    // a single permission can't gate the import surface). Mirror in
+    // `runtime/web/app_registry.js`.
     "akiva_host_fire",
     "akiva_host_io_start",
     "akiva_host_io_poll",
 ];
 
-/// Imports gated behind a specific permission. An app that imports one
-/// of these without the matching grant must fail at instantiation
-/// time — the host simply doesn't provide the function, producing a
-/// wasm `LinkError`. Empty-list capabilities (NOTIFICATIONS, NETWORK,
-/// CAMERA) exist in the catalog for future APIs; gating them now means
-/// manifests can already declare them without a mapping regression
-/// later.
+/// Imports gated behind a specific permission. After Stone 11.3-final
+/// every fire/io op runs through the unified-ABI multiplexers and
+/// capability gating happens *inside* the dispatcher (per op_kind),
+/// not at the import surface. So every entry here is empty today —
+/// the table is preserved as a tripwire: a future per-op import that
+/// doesn't fit the fire/io shape (e.g. a streaming surface) registers
+/// here and the host's `_applyPermissionFilter` plus the JS-side
+/// `CAPABILITY_IMPORTS` mirror pick it up automatically.
 pub fn imports_for_capability(name: &str) -> &'static [&'static str] {
     match name {
-        LAUNCH_ANY_APP => &[
-            "akiva_host_start_activity",
-            "akiva_host_start_activity_for_result",
-        ],
-        // Stone 11.0a — QUERY_PACKAGES unlocks `akiva_host_query_packages`,
-        // the two-phase reader for the framework's package-list snapshot
-        // pushed at boot via `WasmHost::set_packages`. Without the grant
-        // the JS deny-stub returns 0 (== "no packages") — same shape an
-        // app sees on a freshly-booted system with nothing installed.
-        QUERY_PACKAGES => &[
-            "akiva_host_query_packages",
-        ],
-        // Storage HAL surface hasn't reached apps yet (framework-side
-        // persistence goes through WasmHost::save/restore on the
-        // kernel side, not app-visible imports). The mapping slot is
-        // reserved for when `akiva_host_storage_*` lands.
+        LAUNCH_ANY_APP  => &[],
+        QUERY_PACKAGES  => &[],
         STORAGE_SANDBOX => &[],
         NOTIFICATIONS   => &[],
         NETWORK         => &[],
@@ -282,23 +266,25 @@ mod tests {
     }
 
     #[test]
-    fn launch_any_app_adds_start_activity_imports() {
+    fn every_capability_contributes_zero_imports_after_11_3_final() {
+        // After Stone 11.3-final the start_activity pair, query_packages,
+        // log, finish, set_result, and text_width are all gone from the
+        // import surface — they live as op_kinds inside the unified ABI.
+        // Capability gating happens per call inside the host's
+        // `_dispatchFire` / `_dispatchIoStart`, not via the import map.
+        // So granting *any* capability adds nothing to `imports_for_grants`
+        // — the auto set is what every app sees, and the dispatcher
+        // enforces gates from there.
         let mut c = PermissionController::new();
         declare_mvp_permissions(&mut c);
-        // Without the grant, start_activity is NOT in the import set —
-        // an app that imports it will fail instantiation (Stone 10.3b
-        // JS-side enforcement; the mapping here is the source of
-        // truth it will consult).
-        let before = imports_for_grants(&c, "test.shell");
-        assert!(!before.contains(&"akiva_host_start_activity"));
-        assert!(!before.contains(&"akiva_host_start_activity_for_result"));
-
-        c.grant("test.shell", LAUNCH_ANY_APP);
-        let after = imports_for_grants(&c, "test.shell");
-        assert!(after.contains(&"akiva_host_start_activity"),
-            "LAUNCH_ANY_APP must unlock start_activity");
-        assert!(after.contains(&"akiva_host_start_activity_for_result"),
-            "LAUNCH_ANY_APP must unlock start_activity_for_result");
+        let baseline = imports_for_grants(&c, "test.pkg");
+        for &cap in &[LAUNCH_ANY_APP, QUERY_PACKAGES, STORAGE_SANDBOX,
+                      NOTIFICATIONS, NETWORK, CAMERA] {
+            c.grant("test.pkg", cap);
+            let after = imports_for_grants(&c, "test.pkg");
+            assert_eq!(baseline, after,
+                "granting {cap} added imports — capability lists should be empty post-11.3");
+        }
     }
 
     #[test]
@@ -308,26 +294,6 @@ mod tests {
         // empty slice for anything it doesn't recognise.
         assert!(imports_for_capability("akiva.permission.TYPO").is_empty());
         assert!(imports_for_capability("").is_empty());
-    }
-
-    #[test]
-    fn query_packages_adds_query_import() {
-        // Stone 11.0a — QUERY_PACKAGES must unlock
-        // `akiva_host_query_packages`, the two-phase reader for the
-        // package-list snapshot. Mirrors the JS-side
-        // `CAPABILITY_IMPORTS["akiva.permission.QUERY_PACKAGES"]`
-        // entry; if the two diverge the JS deny-stub will mask a
-        // real call (or expose a gated one), so this test fires the
-        // tripwire on either side.
-        let mut c = PermissionController::new();
-        declare_mvp_permissions(&mut c);
-        let before = imports_for_grants(&c, "test.shell");
-        assert!(!before.contains(&"akiva_host_query_packages"));
-
-        c.grant("test.shell", QUERY_PACKAGES);
-        let after = imports_for_grants(&c, "test.shell");
-        assert!(after.contains(&"akiva_host_query_packages"),
-            "QUERY_PACKAGES must unlock akiva_host_query_packages");
     }
 
     #[test]
