@@ -131,7 +131,7 @@ pub struct TicTacToeMain {
 }
 
 #[async_trait(?Send)]
-impl AsyncActivity for TicTacToeMain {
+impl Activity for TicTacToeMain {
     async fn on_create(&mut self, ctx: &mut Context<'_>) {
         log_info!("TicTacToeMain created ({}x{} @ {:.1}x)",
             ctx.metrics.width_px, ctx.metrics.height_px, ctx.metrics.density);
@@ -212,7 +212,7 @@ impl AsyncActivity for TicTacToeMain {
     }
 }
 
-akiva_sdk::akiva_async_app!(TicTacToeMain);
+akiva_sdk::akiva_app!(TicTacToeMain);
 
 // ── Tests ──────────────────────────────────────────────────────────────
 

@@ -243,7 +243,7 @@ pub struct CalculatorMain {
 }
 
 #[async_trait(?Send)]
-impl AsyncActivity for CalculatorMain {
+impl Activity for CalculatorMain {
     async fn on_create(&mut self, ctx: &mut Context<'_>) {
         log_info!("CalculatorMain created ({}x{} @ {:.1}x)",
             ctx.metrics.width_px, ctx.metrics.height_px, ctx.metrics.density);
@@ -353,7 +353,7 @@ impl AsyncActivity for CalculatorMain {
     }
 }
 
-akiva_sdk::akiva_async_app!(CalculatorMain);
+akiva_sdk::akiva_app!(CalculatorMain);
 
 // ── Tests ──────────────────────────────────────────────────────────────
 

@@ -102,7 +102,7 @@ impl ShellActivity {
 }
 
 #[async_trait(?Send)]
-impl AsyncActivity for ShellActivity {
+impl Activity for ShellActivity {
     async fn on_create(&mut self, _ctx: &mut Context<'_>) {
         // Pull the package list eagerly so the first frame already has
         // the launcher rows. The kernel pushed the snapshot before the
@@ -235,4 +235,4 @@ impl AsyncActivity for ShellActivity {
     }
 }
 
-akiva_sdk::akiva_async_app!(ShellActivity);
+akiva_sdk::akiva_app!(ShellActivity);

@@ -7,15 +7,26 @@
 //! a minimal app overrides only what it cares about — typically just
 //! `on_render`.
 //!
-//! The trait is deliberately flat: no sub-traits, no associated types.
-//! More structure (widget-tree composition, retained-mode UI, background
-//! tasks) is a library concern that can be built on top without touching
-//! the ABI.
+//! Stone 11.2 — every callback is `async fn`. The SDK runtime drives
+//! each one with the [`block_on_ready`] poller until host imports
+//! become genuinely async (Stone 11.3); until then every future
+//! resolves on its first poll. The user-facing trait stays the same
+//! when 11.3 lands a real executor.
 //!
-//! See [docs/activity-model.md] for the state-machine rules and [docs/abi.md §2.2]
-//! for how each callback maps to a raw wasm export.
+//! `async_trait` is used to box the returned futures so the runtime
+//! can keep the per-handle slot table polymorphic over the concrete
+//! activity type (`Box<dyn Activity>`). A follow-up will likely make
+//! the slot table generic over the macro's `T` and drop the boxing —
+//! that's a refactor independent of the trait surface.
+//!
+//! See [docs/activity-model.md] for the state-machine rules and
+//! [docs/abi.md §2.2] for how each callback maps to a raw wasm export.
 
+use core::future::Future;
+use core::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 use std::collections::HashMap;
+
+use async_trait::async_trait;
 
 use crate::canvas::Canvas;
 
@@ -72,74 +83,226 @@ pub struct Context<'a> {
     pub(crate) handle: u32,
 }
 
-impl<'a> Context<'a> {
-    // ── Sync affordance API (legacy) ──────────────────────────────────
-    //
-    // These four methods are the original synchronous API used by the
-    // sync [`Activity`] trait. Stone 11.2 introduces async
-    // counterparts with the canonical names (see the `impl` in
-    // `activity_async.rs`); the sync versions get an explicit
-    // `_sync` suffix so the names don't collide. Apps still on the
-    // sync trait keep calling these; once Task #4 ports the last
-    // app to `AsyncActivity` we'll delete this whole section and
-    // promote the async variants.
+// ── block_on_ready driver ─────────────────────────────────────────────
 
-    /// Ask the platform to tear this activity down. See the async
-    /// variant [`Context::finish`] for the same semantics from an
-    /// `async fn` callback.
+/// Drive `f` to completion with a no-op waker.
+///
+/// Sound for Stone 11.2 only: the contract is that every future returned
+/// by an `Activity` callback resolves on its first poll, because every
+/// host import it can `await` is still synchronous underneath. If that
+/// invariant breaks (Stone 11.3 onward, when host calls return real
+/// `Pending`), this driver gets replaced — the panic is the canary
+/// that flags the violation early.
+pub fn block_on_ready<F: Future>(f: F) -> F::Output {
+    static NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        // clone
+        |_| RawWaker::new(core::ptr::null(), &NOOP_VTABLE),
+        // wake
+        |_| {},
+        // wake_by_ref
+        |_| {},
+        // drop
+        |_| {},
+    );
+    let raw = RawWaker::new(core::ptr::null(), &NOOP_VTABLE);
+    // SAFETY: the vtable's clone/drop never deref the data pointer; null
+    // is valid input for a waker that does nothing.
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = TaskContext::from_waker(&waker);
+
+    // Box::pin to dodge the structural-pinning gymnastics on the caller
+    // side. One alloc per poll; cost rounds to noise in 11.2.
+    let mut fut = Box::pin(f);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!(
+            "block_on_ready: Activity future returned Pending — \
+             Stone 11.2 invariant violated. Until 11.3 lands an async wire \
+             every host import resolves synchronously, so callbacks must \
+             complete in a single poll."
+        ),
+    }
+}
+
+// ── Lifecycle scopes ──────────────────────────────────────────────────
+//
+// Three task scopes — `activity_scope`, `resumed_scope`, one-shot —
+// modelled on Android's `lifecycleScope` / `viewModelScope` and
+// SwiftUI's `.task(id:)`. The contract from
+// docs/isolation-design.md §4.7:
+//
+//   - `activity_scope`: tasks live until on_destroy.
+//   - `resumed_scope`:  tasks live until on_pause.
+//   - one-shot:         tasks die when the calling fn returns
+//                       (already the default if you `.await` directly).
+//
+// In Stone 11.2 every spawned future completes in a single poll
+// (host imports still sync), so cancellation is unobservable — there's
+// nothing pending to drop when on_pause / on_destroy fires. The API
+// surface is locked in here so apps can write the right code today;
+// Stone 11.3 puts teeth on it once a real executor holds futures
+// across .await points.
+//
+// Until then `TaskScope::spawn` is just a renamed `block_on_ready` —
+// runs the future to completion right then. That matches what an
+// executor would do anyway when the future is Ready-on-first-poll, so
+// app behaviour will stay identical when 11.3 swaps the body.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeKind {
+    /// Outlives every callback except `on_destroy` — the activity itself.
+    Activity,
+    /// Active only between `on_resume` and the matching `on_pause`.
+    Resumed,
+}
+
+/// Task scope used by [`Context::activity_scope`] /
+/// [`Context::resumed_scope`]. Carries the cancellation policy as
+/// data; in Stone 11.2 it's API surface only (see module comment).
+pub struct TaskScope {
+    kind: ScopeKind,
+}
+
+impl TaskScope {
+    /// Spawn `fut` under this scope's cancellation policy.
     ///
-    /// No-op on non-wasm targets so unit tests that build with the SDK
-    /// can call it without a host.
-    pub fn finish_sync(&self) {
+    /// In Stone 11.2 this drives `fut` to completion synchronously via
+    /// [`block_on_ready`] (`Pending` panics — every host call still
+    /// resolves on first poll). Stone 11.3 replaces the body with the
+    /// real executor; the signature stays the same so apps don't churn.
+    ///
+    /// The future is bound by the caller's lifetime (whatever borrows
+    /// it captures). 11.3 will tighten this to `+ 'static` to allow
+    /// cross-callback storage; until then a non-static future is fine
+    /// because we poll-to-completion before this fn returns.
+    pub fn spawn<F: Future<Output = ()>>(&self, fut: F) {
+        let _ = self.kind;
+        block_on_ready(fut);
+    }
+}
+
+/// Singletons addressable as `&'static TaskScope`. Cheap, no per-handle
+/// state — fits the 11.2 model where scopes are markers. When 11.3
+/// makes scopes hold a queue of pending tasks they'll move into the
+/// per-handle [`crate::runtime::Slot`] and the accessors on [`Context`]
+/// will return non-static refs borrowing from there.
+pub(crate) static ACTIVITY_SCOPE: TaskScope = TaskScope { kind: ScopeKind::Activity };
+pub(crate) static RESUMED_SCOPE:  TaskScope = TaskScope { kind: ScopeKind::Resumed  };
+
+// ── Context impl ──────────────────────────────────────────────────────
+
+impl<'a> Context<'a> {
+    /// Scope whose tasks live until [`Activity::on_destroy`]. Tasks
+    /// spawned here survive `on_pause` / `on_resume` cycles — use this
+    /// for state that should outlive a brief background trip (e.g. an
+    /// unstarted-yet network request the user will see when they come
+    /// back).
+    pub fn activity_scope(&self) -> &'static TaskScope {
+        &ACTIVITY_SCOPE
+    }
+
+    /// Scope whose tasks live only while the activity is in the
+    /// `Resumed` state. Tasks are cancelled at `on_pause` and a fresh
+    /// scope is opened the next time `on_resume` fires. Use this for
+    /// listeners / polling loops that only make sense when the user
+    /// is actively looking at the activity.
+    pub fn resumed_scope(&self) -> &'static TaskScope {
+        &RESUMED_SCOPE
+    }
+
+    // ── Affordance API ────────────────────────────────────────────────
+    //
+    // In Stone 11.2 each one calls the underlying host import
+    // directly — the `async fn` is degenerate (one synchronous call
+    // wrapped in a future that's Ready on first poll) but the
+    // `.await` is locked into app source today so Stone 11.3's async
+    // wire is a body change, not an API change.
+    //
+    // `&mut self` per docs/isolation-design.md §4.1 — Stone 11.3 will
+    // need to track the in-flight request future on `Context` to
+    // resume the awaiting task when the host acks. Apps already pass
+    // `ctx: &mut Context<'_>` to their callbacks, so the borrow shape
+    // matches.
+
+    /// Ask the platform to tear this activity down. Fires after the
+    /// current callback returns — the framework runs
+    /// `on_pause → on_stop → on_destroy` in order (or, if called from
+    /// inside `on_create`, jumps straight to `on_destroy` via the
+    /// `Created → Destroyed` shortcut documented in
+    /// [docs/activity-model.md §2](../../docs/activity-model.md)).
+    ///
+    /// No-op on non-wasm targets so unit tests that build with the
+    /// SDK can call it without a host.
+    pub async fn finish(&mut self) {
         crate::runtime::host_finish(self.handle);
     }
 
-    /// Ask the platform to resolve `intent` through `IntentRouter` and
-    /// launch the matching activity on top of this one. Sync version;
-    /// see [`Context::start_activity`] for the async variant.
-    pub fn start_activity_sync(&self, intent: &crate::intent::Intent) {
+    /// Resolve `intent` through `IntentRouter` and launch the matching
+    /// activity on top of this one. The current activity keeps its
+    /// handle and transitions to `Paused` while the new activity comes
+    /// up. If the resolver picks a reuse path (`SingleTop` on this
+    /// same class, or `SingleTask` / `SingleInstance` for an existing
+    /// instance) the target sees `on_new_intent` rather than a fresh
+    /// bring-up. See [docs/intents.md §8](../../docs/intents.md).
+    pub async fn start_activity(&mut self, intent: &crate::intent::Intent) {
         crate::runtime::host_start_activity(self.handle, intent);
     }
 
-    /// Sync version of [`Context::start_activity_for_result`].
-    pub fn start_activity_for_result_sync(
-        &self, intent: &crate::intent::Intent, request_code: u32,
+    /// Launch `intent` and keep the door open for a result. When the
+    /// callee finishes (either by calling [`Context::set_result`] +
+    /// [`Context::finish`] or by being closed without a result),
+    /// `on_activity_result(ctx, request_code, result)` fires on this
+    /// activity. Pick a `request_code` per call site — the callee
+    /// never sees it; it's only for the caller to disambiguate which
+    /// launch the arriving result belongs to. See
+    /// [docs/activity-model.md](../../docs/activity-model.md).
+    pub async fn start_activity_for_result(
+        &mut self, intent: &crate::intent::Intent, request_code: u32,
     ) {
         crate::runtime::host_start_activity_for_result(self.handle, intent, request_code);
     }
 
-    /// Sync version of [`Context::set_result`].
-    pub fn set_result_sync(&self, result: &crate::result::ActivityResult) {
+    /// Stash the result this activity wants to hand back. Only
+    /// meaningful if this activity was launched via
+    /// [`Context::start_activity_for_result`]; otherwise the framework
+    /// silently discards the bytes. Can be called more than once in a
+    /// single lifetime — only the final call's payload is delivered.
+    pub async fn set_result(&mut self, result: &crate::result::ActivityResult) {
         crate::runtime::host_set_result(self.handle, result);
     }
 }
 
 // ── The trait ─────────────────────────────────────────────────────────
 
+/// What every Akiva app implements. All callbacks are `async fn` —
+/// the SDK runtime polls them via [`block_on_ready`] in Stone 11.2,
+/// and via the embassy executor + worker-per-app dispatch in Stone
+/// 11.3+.
+#[async_trait(?Send)]
 pub trait Activity: 'static {
     // ── Lifecycle (docs/activity-model.md §2) ──────────────────────────
-    fn on_create(&mut self, ctx: &mut Context<'_>)  { let _ = ctx; }
-    fn on_start(&mut self, ctx: &mut Context<'_>)   { let _ = ctx; }
-    fn on_resume(&mut self, ctx: &mut Context<'_>)  { let _ = ctx; }
-    fn on_pause(&mut self, ctx: &mut Context<'_>)   { let _ = ctx; }
-    fn on_stop(&mut self, ctx: &mut Context<'_>)    { let _ = ctx; }
-    fn on_destroy(&mut self, ctx: &mut Context<'_>) { let _ = ctx; }
+    async fn on_create(&mut self, ctx: &mut Context<'_>)  { let _ = ctx; }
+    async fn on_start(&mut self, ctx: &mut Context<'_>)   { let _ = ctx; }
+    async fn on_resume(&mut self, ctx: &mut Context<'_>)  { let _ = ctx; }
+    async fn on_pause(&mut self, ctx: &mut Context<'_>)   { let _ = ctx; }
+    async fn on_stop(&mut self, ctx: &mut Context<'_>)    { let _ = ctx; }
+    async fn on_destroy(&mut self, ctx: &mut Context<'_>) { let _ = ctx; }
 
     // ── Input ───────────────────────────────────────────────────────────
-    fn on_pointer(&mut self, ctx: &mut Context<'_>, ev: PointerEvent) {
+    async fn on_pointer(&mut self, ctx: &mut Context<'_>, ev: PointerEvent) {
         let _ = (ctx, ev);
     }
-    fn on_key(&mut self, ctx: &mut Context<'_>, ev: KeyEvent) {
+    async fn on_key(&mut self, ctx: &mut Context<'_>, ev: KeyEvent) {
         let _ = (ctx, ev);
     }
-    fn on_resize(&mut self, ctx: &mut Context<'_>, metrics: Metrics) {
+    async fn on_resize(&mut self, ctx: &mut Context<'_>, metrics: Metrics) {
         let _ = (ctx, metrics);
     }
 
     // ── Render ──────────────────────────────────────────────────────────
     /// Paint one frame. Called at the runtime's frame rate (rAF, typically
     /// 60 Hz). Must be fast — all ops are serialised immediately.
-    fn on_render(&mut self, ctx: &mut Context<'_>, canvas: &mut Canvas<'_>) {
+    async fn on_render(&mut self, ctx: &mut Context<'_>, canvas: &mut Canvas<'_>) {
         let _ = (ctx, canvas);
     }
 
@@ -150,7 +313,7 @@ pub trait Activity: 'static {
     /// transition through `on_create`/`on_resume` again; it receives
     /// the fresh intent in place. Default is a no-op for apps that
     /// don't distinguish reuse from first-launch.
-    fn on_new_intent(&mut self, ctx: &mut Context<'_>, intent: &crate::intent::Intent) {
+    async fn on_new_intent(&mut self, ctx: &mut Context<'_>, intent: &crate::intent::Intent) {
         let _ = (ctx, intent);
     }
 
@@ -161,7 +324,7 @@ pub trait Activity: 'static {
     /// the callee [`Context::set_result`]-ed or a `RESULT_CANCELED`
     /// synthesis if it finished without producing one. Default no-op
     /// for apps that don't launch for results.
-    fn on_activity_result(
+    async fn on_activity_result(
         &mut self,
         ctx: &mut Context<'_>,
         request_code: u32,
@@ -170,11 +333,12 @@ pub trait Activity: 'static {
         let _ = (ctx, request_code, result);
     }
 
-    // ── Saved state — forward-compat stubs for Phase 3 ─────────────────
-    /// UI-state snapshot called when the system is about to release the
-    /// activity. Budget: 64 KiB — use `storage` for larger data. Not wired
-    /// up in v0; kept so app code can start using it today and keep
-    /// working when the runtime honours it.
+    // ── Saved state — synchronous on purpose ──────────────────────────
+    //
+    // The macro reads/writes the saved-state buffer around the
+    // dispatch path (see crate::runtime::on_save_state); making these
+    // async would force a future-allocation per save without any
+    // benefit. Keep them sync.
     fn on_save_state(&self, out: &mut SavedState) { let _ = out; }
     fn on_restore_state(&mut self, saved: &SavedState) { let _ = saved; }
 }
@@ -397,8 +561,7 @@ impl<'a> Reader<'a> {
 
 // ── Backward-compat alias ─────────────────────────────────────────────
 // The original scaffold called the context `ActivityContext`. Keeping the
-// alias means the old name in `lib.rs`'s prelude still resolves during
-// the transition.
+// alias means existing imports of the old name still resolve.
 pub type ActivityContext<'a> = Context<'a>;
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -406,6 +569,95 @@ pub type ActivityContext<'a> = Context<'a>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::pin::Pin;
+
+    // ── block_on_ready / TaskScope / async ctx methods ────────────────
+
+    #[test]
+    fn block_on_ready_returns_immediate() {
+        let v = block_on_ready(async { 42 });
+        assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn block_on_ready_threads_value_through_await() {
+        // A nested await chain still resolves in one poll because every
+        // step is itself Ready-on-first-poll.
+        async fn inner() -> i32 { 7 }
+        async fn outer() -> i32 { inner().await + 35 }
+        let v = block_on_ready(outer());
+        assert_eq!(v, 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "Stone 11.2 invariant violated")]
+    fn block_on_ready_panics_on_pending() {
+        struct Pending;
+        impl Future for Pending {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<()> {
+                Poll::Pending
+            }
+        }
+        block_on_ready(Pending);
+    }
+
+    #[test]
+    fn task_scope_spawn_runs_body_before_returning() {
+        // 11.2 contract: spawn drives the future to completion right
+        // there. After this returns the side effect must already be
+        // visible. This anchors the migration story: app code that
+        // works against the 11.2 stub will keep working when 11.3
+        // swaps the executor in (Ready-on-first-poll futures complete
+        // identically either way).
+        let scope = TaskScope { kind: ScopeKind::Activity };
+        let mut fired = false;
+        scope.spawn(async {
+            fired = true;
+        });
+        assert!(fired);
+    }
+
+    #[test]
+    fn context_exposes_distinct_scope_kinds() {
+        // `activity_scope` and `resumed_scope` resolve to different
+        // singletons — they're the same shape today but different
+        // identities, so when 11.3 attaches behaviour the wiring is
+        // already in place.
+        assert_eq!(ACTIVITY_SCOPE.kind, ScopeKind::Activity);
+        assert_eq!(RESUMED_SCOPE.kind,  ScopeKind::Resumed);
+        assert_ne!(ACTIVITY_SCOPE.kind, RESUMED_SCOPE.kind);
+    }
+
+    #[test]
+    fn async_ctx_methods_complete_in_one_poll() {
+        // Stone 11.2 invariant: every `async fn` on Context resolves
+        // synchronously because the underlying host imports are no-ops
+        // on non-wasm and one-shot sync calls on wasm. block_on_ready
+        // would panic on Pending, so this round-trip proves the
+        // current API can't accidentally introduce real awaits.
+        let mut ctx = Context {
+            metrics: Metrics::default(),
+            timestamp_ms: 0.0,
+            pointer: None,
+            class: "",
+            handle: 1,
+        };
+        // The four affordance methods, awaited in sequence. Hosts on
+        // non-wasm fall back to no-ops so this exercises the surface
+        // shape without needing a kernel.
+        block_on_ready(async {
+            ctx.finish().await;
+            ctx.start_activity(&crate::intent::Intent::new("akiva.intent.action.MAIN")).await;
+            ctx.start_activity_for_result(
+                &crate::intent::Intent::new("akiva.intent.action.MAIN"),
+                42,
+            ).await;
+            ctx.set_result(&crate::result::ActivityResult::canceled()).await;
+        });
+    }
+
+    // ── SavedState ────────────────────────────────────────────────────
 
     #[test]
     fn empty_state_roundtrips() {

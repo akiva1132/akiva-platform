@@ -20,7 +20,7 @@ struct HelloMain {
 }
 
 #[async_trait(?Send)]
-impl AsyncActivity for HelloMain {
+impl Activity for HelloMain {
     async fn on_create(&mut self, ctx: &mut Context<'_>) {
         log_info!("HelloMain created ({}x{} @ {:.1}x)",
             ctx.metrics.width_px, ctx.metrics.height_px, ctx.metrics.density);
@@ -66,4 +66,4 @@ impl AsyncActivity for HelloMain {
     }
 }
 
-akiva_sdk::akiva_async_app!(HelloMain);
+akiva_sdk::akiva_app!(HelloMain);
