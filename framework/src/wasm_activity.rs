@@ -198,6 +198,37 @@ pub trait WasmHost {
     fn set_packages(&self, bytes: &[u8]) {
         let _ = bytes;
     }
+
+    /// Stone 11.4a — poll a `future_id` previously returned from a host
+    /// dispatch. Returns:
+    ///
+    /// - `None` — future is still in flight; the framework should leave
+    ///   the activity in its [`crate::activity_manager::PendingTransition`]
+    ///   slot and try again next frame.
+    /// - `Some(Ok(bytes))` — resolved successfully. `bytes` is empty for
+    ///   ops that don't carry a payload (lifecycle, pointer, key,
+    ///   resize, restore_state, new_intent, activity_result), or the
+    ///   produced blob for ops that do (render, save_state).
+    /// - `Some(Err(reason))` — the dispatch trapped or the host
+    ///   detected a protocol violation. The framework treats this as a
+    ///   trap and (Stone 11.5) marks the activity `Trapped`.
+    ///
+    /// The default impl is a "resolves immediately to empty bytes"
+    /// shim — every existing `WasmHost` (KernelWasmHost, MockHost,
+    /// BootMockHost) returns `0` from its dispatch methods today, so
+    /// the framework never actually polls. The default exists so test
+    /// mocks that *want* to exercise the deferred path can opt in by
+    /// returning a non-zero `future_id` and overriding `poll_future`,
+    /// without forcing every existing mock to add a method.
+    ///
+    /// `future_id == 0` is reserved as the "resolved synchronously"
+    /// sentinel and must never be passed in here; the framework calls
+    /// `poll_future` only when a recorded `PendingTransition` carries a
+    /// non-zero id.
+    fn poll_future(&self, future_id: u64) -> Option<Result<Vec<u8>, String>> {
+        let _ = future_id;
+        Some(Ok(Vec::new()))
+    }
 }
 
 // ── Proxy activity ───────────────────────────────────────────────────────
@@ -1069,5 +1100,27 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Stone 11.4a scaffolding — every existing `WasmHost` impl
+    /// (production `KernelWasmHost`, in-process tests' `MockHost`,
+    /// `BootMockHost` in `framework::lib`) currently resolves dispatches
+    /// synchronously and the framework never opens a future. The default
+    /// `poll_future` shim is the safety net for that — if a polluted
+    /// pending slot ever pointed at it, returning `Some(Ok(empty))` makes
+    /// the caller unblock cleanly rather than spin forever.
+    ///
+    /// 11.4c flips the default: the WorkerHost overrides `poll_future`
+    /// to track per-package message responses, and dispatch methods
+    /// start returning real future_ids. Until then this shim is the
+    /// only impl, so it deserves a pin so a future refactor doesn't
+    /// turn it into a real `unimplemented!` and silently break tests
+    /// that opt into the deferred path with a custom mock.
+    #[test]
+    fn default_poll_future_resolves_immediately_to_empty_payload() {
+        let host = MockHost::new();
+        let resolved = WasmHost::poll_future(&host, 1234);
+        assert!(matches!(resolved, Some(Ok(ref bytes)) if bytes.is_empty()),
+            "default poll_future is the immediate-resolve shim until 11.4c WorkerHost overrides it");
     }
 }

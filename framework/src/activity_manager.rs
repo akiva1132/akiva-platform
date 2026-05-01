@@ -77,6 +77,33 @@ pub struct LaunchOutcome {
     pub popped: Vec<ActivityId>,
 }
 
+/// A lifecycle/input/render dispatch the host is still working on.
+///
+/// The framework records one of these on `ActivityRecord` whenever a
+/// `WasmHost` method returns a non-zero `future_id` — the call hasn't
+/// finished yet (Stone 11.4c onwards: the host had to round-trip to
+/// the package's worker). Until the framework polls the future and
+/// gets a `Some(...)` back, no further dispatch may target the same
+/// activity. When the future resolves the framework drains it,
+/// advances `state` to `target`, and clears the slot.
+///
+/// In Stone 11.4a the slot is wired up but never populated — every
+/// host method still resolves synchronously and returns `0`. The
+/// scaffolding ships now so the deferred path can be exercised and
+/// tested before 11.4c flips real workers on.
+#[derive(Debug, Clone)]
+pub struct PendingTransition {
+    /// State the activity should reach once the future resolves.
+    pub target: LifecycleState,
+    /// `WasmHost::poll_future` key. Non-zero by construction — `0` is
+    /// the "resolved synchronously" sentinel from `WasmHost` calls.
+    pub future_id: u64,
+    /// Frame timestamp at which the future was opened. The watchdog in
+    /// Stone 11.5 compares this against `now` to decide when to mark
+    /// the activity `Trapped`.
+    pub started_at_ms: f64,
+}
+
 /// Metadata + lifecycle slot for a single activity instance. The
 /// `Activity` trait object is stored in a sibling map so the record can
 /// remain `Debug` and trivially-`Clone`-less.
@@ -88,6 +115,13 @@ pub struct ActivityRecord {
     pub class: String,
     pub state: LifecycleState,
     pub launch_mode: LaunchMode,
+    /// Set when the most recent dispatch into the host hasn't resolved
+    /// yet (Stone 11.4a scaffolding; populated by 11.4c). The framework
+    /// polls and drains this each frame via
+    /// [`Framework::drive_pending_transitions`] (Stone 11.4a), and
+    /// declines to fire fresh dispatches at this activity until it
+    /// clears.
+    pub pending: Option<PendingTransition>,
 }
 
 #[derive(Debug)]
@@ -239,6 +273,7 @@ impl ActivityManager {
             class: class.into(),
             state: LifecycleState::Initial,
             launch_mode,
+            pending: None,
         });
         self.instances.insert(id, instance);
         Ok(LaunchOutcome { id, reused: false, popped: Vec::new() })
