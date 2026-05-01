@@ -75,6 +75,52 @@ extern "C" {
     /// `akiva.permission.QUERY_PACKAGES`. See [`crate::pkgs`] for the
     /// safe wrapper.
     pub fn akiva_host_query_packages(out_ptr: *mut u8, out_cap: u32) -> u32;
+
+    // ── Stone 11.3 unified ABI ────────────────────────────────────────
+    //
+    // Three multiplexers that, in v0.5+, replace the per-operation
+    // imports above. Every host-mediated op gets a stable `op_kind`
+    // (see `framework::wire::op_kinds`) and routes through one of
+    // these three transports:
+    //
+    //   * `fire`     — fire-and-forget, sync return code.
+    //   * `io_start` — start an async op, returns a future_id.
+    //   * `io_poll`  — poll a future_id for status + payload.
+    //
+    // Stone 11.3b just declares the symbols on both sides of the ABI
+    // so a future stone can migrate call sites one op at a time
+    // without the SDK and host disagreeing on what's available.
+    // The kernel-side handlers in `runtime/web/app_registry.js` are
+    // stubs in 11.3b — calling them returns "not implemented" until
+    // 11.3c wires the dispatcher.
+
+    /// Fire a side-effecting op identified by `op_kind`. The args blob
+    /// layout is op-specific (see `framework::wire::*` encoders). Returns
+    /// `0` on success or a non-zero error code; no result data flows back.
+    pub fn akiva_host_fire(op_kind: u32, args_ptr: *const u8, args_len: u32) -> u32;
+
+    /// Start an async op identified by `op_kind`. Returns a `u64`
+    /// `future_id` the caller polls via [`akiva_host_io_poll`] until it
+    /// resolves, or `0` if the op couldn't be started (unknown kind,
+    /// malformed args, denied capability). `0` is the only sentinel —
+    /// real future ids are non-zero.
+    pub fn akiva_host_io_start(op_kind: u32, args_ptr: *const u8, args_len: u32) -> u64;
+
+    /// Poll a future started by [`akiva_host_io_start`]. Returns a
+    /// packed `u64`:
+    ///
+    ///   * Low 32 bits: status code (`PENDING` / `READY` / `ERROR` —
+    ///     see `framework::wire::op_kinds::status`).
+    ///   * High 32 bits: payload length in bytes when status is `READY`
+    ///     or `ERROR`; zero when `PENDING`.
+    ///
+    /// On `READY`/`ERROR`, if `payload_len <= out_cap` the host has
+    /// written the payload to `out_ptr`; otherwise the buffer is
+    /// untouched and the caller should realloc to `payload_len` bytes
+    /// and poll again — same two-phase shape as
+    /// [`akiva_host_query_packages`]. Polling an unknown / freed
+    /// future_id resolves as `ERROR` with a zero-length payload.
+    pub fn akiva_host_io_poll(future_id: u64, out_ptr: *mut u8, out_cap: u32) -> u64;
 }
 
 /// Request the framework finish this activity. Safe to call from any
@@ -139,6 +185,62 @@ pub fn host_set_result(handle: u32, result: &ActivityResult) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = (handle, bytes);
+    }
+}
+
+// ── Stone 11.3 unified-ABI thin wrappers ───────────────────────────────
+//
+// These keep the unsafe `extern "C"` calls quarantined here. No SDK
+// call site uses them in 11.3b — the wrappers exist so the imports
+// compile into the wasm without dead-code stripping and so 11.3c can
+// migrate operations one by one (e.g. `pkgs::list` flips from
+// `akiva_host_query_packages` to `host_io(QUERY_PACKAGES, &[])`).
+
+/// Fire a side-effecting op. See [`akiva_host_fire`]. Non-wasm builds
+/// return `0` (success) so unit tests link without a real host.
+#[allow(dead_code)]
+pub(crate) fn host_fire(op_kind: u32, args: &[u8]) -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        akiva_host_fire(op_kind, args.as_ptr(), args.len() as u32)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (op_kind, args);
+        0
+    }
+}
+
+/// Start an async op, returning a future_id. See [`akiva_host_io_start`].
+/// Non-wasm builds return `0` ("couldn't start") so unit tests don't
+/// pretend to have an async result waiting.
+#[allow(dead_code)]
+pub(crate) fn host_io_start(op_kind: u32, args: &[u8]) -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        akiva_host_io_start(op_kind, args.as_ptr(), args.len() as u32)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (op_kind, args);
+        0
+    }
+}
+
+/// Poll an async op. See [`akiva_host_io_poll`]. Non-wasm builds
+/// resolve to `ERROR` with empty payload so the caller can exercise
+/// its error path in unit tests without a host.
+#[allow(dead_code)]
+pub(crate) fn host_io_poll(future_id: u64, out: &mut [u8]) -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        akiva_host_io_poll(future_id, out.as_mut_ptr(), out.len() as u32)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (future_id, out);
+        // status = ERROR (2), length = 0
+        2
     }
 }
 

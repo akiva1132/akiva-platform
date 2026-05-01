@@ -704,6 +704,61 @@ describe("_buildAppImports — capability filter", () => {
   });
 });
 
+describe("Stone 11.3b — unified-ABI multiplexer stubs", () => {
+  // The three multiplexers (`fire`, `io_start`, `io_poll`) are declared
+  // on both sides of the wasm boundary in 11.3b but no app calls them
+  // yet — call sites still go through the per-op imports. These tests
+  // pin the stub shape so 11.3c's real dispatcher can land without a
+  // silent regression: every stub MUST log a warning AND return an
+  // unmistakable error-shaped value (so an accidental call from a
+  // pre-11.3c app surfaces immediately rather than silently no-oping).
+
+  it("akiva_host_fire stub returns non-zero error code and logs", () => {
+    const { registry, log } = makeRegistry();
+    const fireFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_fire;
+    expect(typeof fireFn).toBe("function");
+    // Fire LOG (op_kind 0x0001) — irrelevant args; stub doesn't decode.
+    const rc = fireFn(0x0001, 0, 0);
+    expect(rc).toBe(1);  // non-zero = error
+    const warnCalls = log.mock.calls.filter(([lvl]) => lvl === "warn");
+    expect(warnCalls.some(([, msg]) =>
+      msg.includes("akiva_host_fire") && msg.includes("0x1"))).toBe(true);
+  });
+
+  it("akiva_host_io_start stub returns 0 future_id and logs", () => {
+    const { registry, log } = makeRegistry();
+    const startFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_io_start;
+    // QUERY_PACKAGES (op_kind 0x0102) — stub ignores it.
+    const futureId = startFn(0x0102, 0, 0);
+    expect(futureId).toBe(0n);  // 0 = couldn't start
+    const warnCalls = log.mock.calls.filter(([lvl]) => lvl === "warn");
+    expect(warnCalls.some(([, msg]) =>
+      msg.includes("akiva_host_io_start") && msg.includes("0x102"))).toBe(true);
+  });
+
+  it("akiva_host_io_poll stub resolves to ERROR with empty payload", () => {
+    const { registry, log } = makeRegistry();
+    const pollFn = registry._buildAppImports(PACKAGE_ID).env.akiva_host_io_poll;
+    // packed return: low 32 bits = status, high 32 = length. Status 2
+    // (ERROR) with length 0 → 2n.
+    const packed = pollFn(123n, 0, 0);
+    expect(packed).toBe(2n);
+    const warnCalls = log.mock.calls.filter(([lvl]) => lvl === "warn");
+    expect(warnCalls.some(([, msg]) =>
+      msg.includes("akiva_host_io_poll"))).toBe(true);
+  });
+
+  it("multiplexers are AUTO imports (no permission gating at the import surface)", () => {
+    // Mirrors the Rust-side `unified_abi_trio_is_in_auto_imports` test.
+    // Capability gating moves into the dispatcher in 11.3c — the import
+    // itself is always available because one function serves many
+    // op_kinds, some always-available, some gated.
+    for (const name of ["akiva_host_fire", "akiva_host_io_start", "akiva_host_io_poll"]) {
+      expect(AUTO_IMPORTS).toContain(name);
+    }
+  });
+});
+
 describe("setPackages — package-list snapshot (Stone 11.0a)", () => {
   it("stores the bytes verbatim for later query_packages calls", () => {
     const { registry } = makeRegistry();

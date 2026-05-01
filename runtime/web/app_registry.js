@@ -648,6 +648,33 @@ export class AppRegistry {
           copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
           self._pendingSetResult.set(handle, copy);
         },
+
+        // Stone 11.3b — three multiplexers that subsume the per-op imports
+        // above as 11.3c migrates call sites. They share a single namespace
+        // (`op_kind` u32) defined in `framework/src/wire/op_kinds.rs`. In
+        // 11.3b the dispatcher is a stub: it logs the op_kind and returns
+        // a "not yet implemented" shape. No app calls these yet (the SDK
+        // wrappers are unused — call sites still go through the per-op
+        // imports), so the stubs only fire from synthetic tests. Stone 11.3c
+        // replaces this with a real op_kind → handler dispatcher and a
+        // FutureRegistry; capability gating per op_kind moves *here* (not
+        // the import surface) since one import serves many ops.
+        akiva_host_fire: (opKind, _ptr, _len) => {
+          self._log("warn",
+            `[${packageId}] akiva_host_fire(0x${opKind.toString(16)}) — not implemented in Stone 11.3b (returning error)`);
+          return 1;  // non-zero = error
+        },
+        akiva_host_io_start: (opKind, _ptr, _len) => {
+          self._log("warn",
+            `[${packageId}] akiva_host_io_start(0x${opKind.toString(16)}) — not implemented in Stone 11.3b (returning 0 future_id)`);
+          return 0n;  // 0 = couldn't start
+        },
+        akiva_host_io_poll: (futureId, _outPtr, _outCap) => {
+          self._log("warn",
+            `[${packageId}] akiva_host_io_poll(${futureId}) — not implemented in Stone 11.3b (returning ERROR)`);
+          // Pack: status = ERROR (2), length = 0
+          return 2n;
+        },
       },
     };
     return this._applyPermissionFilter(packageId, full);
@@ -869,6 +896,12 @@ export const AUTO_IMPORTS = Object.freeze([
   "akiva_host_resource_has_string",
   "akiva_host_finish",
   "akiva_host_set_result",
+  // Stone 11.3b — three multiplexers (fire / io_start / io_poll). Auto
+  // because capability gating moves *into* the dispatcher (one import
+  // serves many op_kinds). Mirror in framework/src/permissions.rs.
+  "akiva_host_fire",
+  "akiva_host_io_start",
+  "akiva_host_io_poll",
 ]);
 
 // Capability → gated imports. LAUNCH_ANY_APP and QUERY_PACKAGES have

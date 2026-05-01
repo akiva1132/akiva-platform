@@ -122,6 +122,16 @@ pub const AUTO_IMPORTS: &[&str] = &[
     "akiva_host_resource_has_string",
     "akiva_host_finish",
     "akiva_host_set_result",
+    // Stone 11.3b — three multiplexers that subsume the per-op imports
+    // above as 11.3c migrates call sites. They're auto-granted because
+    // the capability check moves *inside* the dispatcher: a single
+    // function can't be gated by a single permission since it serves
+    // many op_kinds (some always-available, some gated). The dispatcher
+    // in `runtime/web/app_registry.js` consults the same grants table
+    // before running an op_kind that maps to a gated operation.
+    "akiva_host_fire",
+    "akiva_host_io_start",
+    "akiva_host_io_poll",
 ];
 
 /// Imports gated behind a specific permission. An app that imports one
@@ -318,6 +328,21 @@ mod tests {
         let after = imports_for_grants(&c, "test.shell");
         assert!(after.contains(&"akiva_host_query_packages"),
             "QUERY_PACKAGES must unlock akiva_host_query_packages");
+    }
+
+    #[test]
+    fn unified_abi_trio_is_in_auto_imports() {
+        // Stone 11.3b — the three multiplexers must be available to every
+        // app regardless of grants. Capability gating moves into the
+        // dispatcher (in `runtime/web/app_registry.js`) since a single
+        // import serves many op_kinds. If this test fails, the JS side
+        // and Rust side have drifted and an app will either fail to
+        // instantiate (LinkError on a missing import) or silently lose
+        // capability gating (an ungated dispatcher).
+        for name in ["akiva_host_fire", "akiva_host_io_start", "akiva_host_io_poll"] {
+            assert!(AUTO_IMPORTS.contains(&name),
+                "{name} must be in AUTO_IMPORTS — Stone 11.3b unified ABI");
+        }
     }
 
     #[test]
