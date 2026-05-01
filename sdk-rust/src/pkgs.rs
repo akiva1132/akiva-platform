@@ -42,29 +42,52 @@ pub fn list() -> Vec<PackageEntry> {
     decode(&bytes).unwrap_or_default()
 }
 
-/// Two-phase buffer dance: ask once with a 1 KiB guess, retry with the
-/// reported size if it didn't fit. 1 KiB covers ~25 packages with
-/// average id+class+name lengths of ~30 bytes each, which is well above
-/// any plausible MVP install count.
+/// Two-phase buffer dance: poll once with a 1 KiB guess; if the host
+/// reports a longer payload, realloc and poll again. The host's
+/// FutureRegistry retains the entry across an undersized poll so the
+/// retry sees the same data — single-shot eviction only happens once
+/// the buffer fits. 1 KiB covers ~25 packages with average id+class+name
+/// lengths of ~30 bytes each, which is well above any plausible MVP
+/// install count.
+///
+/// Stone 11.3c-3 — migrated to the unified ABI. Args are empty (`[]`);
+/// a non-zero `future_id` means "started", `0` means denied or unknown
+/// op_kind. ERROR/PENDING from poll degrades to an empty list — same
+/// shape an app sees on a freshly-booted system, matching the existing
+/// "missing grant ⇒ empty list" contract.
 #[cfg(target_arch = "wasm32")]
 fn read_blob() -> Vec<u8> {
-    use crate::runtime::akiva_host_query_packages;
+    use crate::op_kinds::{io, status, unpack_poll};
+    use crate::runtime::{host_io_poll, host_io_start};
 
-    let mut buf = vec![0u8; 1024];
-    let needed = unsafe {
-        akiva_host_query_packages(buf.as_mut_ptr(), buf.len() as u32)
-    } as usize;
-    if needed == 0 {
+    let future_id = host_io_start(io::QUERY_PACKAGES, &[]);
+    if future_id == 0 {
+        // Denied (no grant), unknown op_kind, or malformed args. The
+        // legacy deny-stub returned 0 here; we keep that shape so the
+        // grant-less Shell behaves identically to before the migration.
         return Vec::new();
     }
-    if needed > buf.len() {
-        buf = vec![0u8; needed];
-        let got = unsafe {
-            akiva_host_query_packages(buf.as_mut_ptr(), buf.len() as u32)
-        } as usize;
-        buf.truncate(got.min(buf.len()));
+    let mut buf = vec![0u8; 1024];
+    let packed = host_io_poll(future_id, &mut buf);
+    let (st, len) = unpack_poll(packed);
+    if st != status::READY {
+        return Vec::new();
+    }
+    let len = len as usize;
+    if len == 0 {
+        return Vec::new();
+    }
+    if len > buf.len() {
+        // Host retained the entry; retry with the right-sized buffer.
+        buf = vec![0u8; len];
+        let packed = host_io_poll(future_id, &mut buf);
+        let (st2, len2) = unpack_poll(packed);
+        if st2 != status::READY {
+            return Vec::new();
+        }
+        buf.truncate((len2 as usize).min(buf.len()));
     } else {
-        buf.truncate(needed);
+        buf.truncate(len);
     }
     buf
 }

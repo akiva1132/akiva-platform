@@ -68,15 +68,6 @@ extern "C" {
     /// framework drains via `hal_app_drain_set_result` when this activity
     /// is about to be destroyed.
     pub fn akiva_host_set_result(handle: u32, ptr: *const u8, len: u32);
-    /// Stone 11.0a — enumerate installed packages. Two-phase buffer: if
-    /// the supplied `out_cap` is too small, the host writes nothing and
-    /// returns the required size so the caller can realloc and retry.
-    /// A zero return means "no packages" (or the grant is missing — the
-    /// deny-stub answers identically by design). Gated by
-    /// `akiva.permission.QUERY_PACKAGES`. See [`crate::pkgs`] for the
-    /// safe wrapper.
-    pub fn akiva_host_query_packages(out_ptr: *mut u8, out_cap: u32) -> u32;
-
     // ── Stone 11.3 unified ABI ────────────────────────────────────────
     //
     // Three multiplexers that, in v0.5+, replace the per-operation
