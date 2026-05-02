@@ -225,12 +225,33 @@ function installInputForwarding(canvas) {
 }
 
 function installResizeHandler(canvas) {
-  window.addEventListener("resize", () => {
-    const m = computeMetrics();
+  // Stone 11.6.9 #2 — ResizeObserver + devicePixelContentBoxSize (Baseline
+  // 2022). The plain `resize` window event misses zoom-level changes
+  // (Ctrl+/-) because the viewport CSS size doesn't change, only DPR does;
+  // ResizeObserver fires on both. `devicePixelContentBoxSize` returns the
+  // canvas's physical-pixel box directly — no need to multiply CSS size by
+  // DPR ourselves, and no rounding mismatch on fractional zoom levels.
+  // Fallback path covers the (today vanishingly rare) browser without
+  // devicePixelContentBoxSize support.
+  const ro = new ResizeObserver((entries) => {
+    const entry = entries[0];
+    if (!entry) return;
+    const dprNow = dpr();
+    const dpcb = entry.devicePixelContentBoxSize?.[0];
+    let width_px, height_px;
+    if (dpcb) {
+      width_px  = Math.max(1, dpcb.inlineSize);
+      height_px = Math.max(1, dpcb.blockSize);
+    } else {
+      width_px  = Math.max(1, Math.round(canvas.clientWidth  * dprNow));
+      height_px = Math.max(1, Math.round(canvas.clientHeight * dprNow));
+    }
+    const m = { width_px, height_px, density: dprNow };
     state.metrics = m;
     if (state.ownsCanvas) applyCanvasSize(canvas, m);
     session.send({ type: "resize", tabId, metrics: m });
   });
+  ro.observe(canvas);
 }
 
 function encodeModifiers(e) {
