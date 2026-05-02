@@ -806,33 +806,46 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
    - **סקופ.** 3-5 ימי עבודה — חדש לחלוטין, גם בwasm side וגם בJS side, עם לפחות 2 example streams (frame_ticker, log_tail).
    - **המלצה.** דחה ל-Phase 13 prep (ה-problem domain יהיה ברור יותר אז כשWindowManager צריך event streams). **אל תכלול ב-11.6.5.**
 
+### Stone 11.6.7 — Foundation polish backlog (3-5 ימים) — **חוסם 11.7**
+
+architectural audit פוסט-11.6.5 (May 2026) זיהה חמישה rough edges שאינם lock-in מבני אבל ייכבלו ב-bedrock אם 11.7 (akiva new + public docs) ייצא לפני שהם נסגרים. הdetail המלא של כל פריט (DoD, code surfaces, scope) ב-[ROADMAP.md Stone 11.6.7](../ROADMAP.md):
+
+1. **WriteHandle ל-storage** (~30 דק') — `storage::write` היום fire-and-forget; אפליקציות שדורשות durability לא מקבלות error feedback. Implementation: future-returning API מעל op_kind STORAGE_SET הקיים.
+2. **`pkgs_wire` decoder dedup** (~1-2h) — wire format משוכפל 3x; drift-risk גובר. Implementation: shared crate או refactor של sdk-rust↔framework.
+3. **Storage direct readonly handles** (~1-2 ימים) — design v2 §3.2 קבע hybrid model אבל המימוש kernel-routed-only. Target: ~10x speedup ב-reads (≤0.5ms direct vs ~2ms via kernel).
+4. **Lazy-spawn workers** (~חצי יום) — pre-warm-all היום; עם 100 apps = 100 workers immediately. Implementation: spawn-on-demand, pre-warm רק `sys.shell`.
+5. **Watchdog tunability + warning threshold** (~חצי יום) — single threshold (1500ms terminate); Android יש WARN+TIMEOUT, Akiva הופך לאותו pattern עם `globalThis.__akivaConfig` override + per-package manifest override.
+
+**Gate ל-11.7:** אסור לפתוח את 11.7 לפני ש-11.6.7 ירוק. כל פריט שלא נסגר ייכבל ב-public docs ויחיה לעולם בעיני מפתחים עתידיים.
+
 ### Recommended Order (revised post-2026-05-02 audit)
 
 ```
-P0-1 (save_state)         ✅
-P0-2 (graceful shutdown)  ✅
-P0-3 (Trapped recycle)    ✅
-P0-4 (async executor)     ✅
-P1-2 (config block)       ✅
-P1-3 (drain phase)        ✅
-                            ↓
-P1-1 (storage WriteHandle, ~30 דק') + P1-4 (pkgs_wire dedup, ~1-2h, אופציונלי)
-                            ↓
-🔴 Stone 11.6.5 — SDK API completeness (~3-5 ימים)
-   • #11 TaskScope אמיתי (cardinal)
-   • #12 concurrent host calls per activity (cardinal)
+P0 + P1 (Stone 11.6 foundation)        ✅
+                                          ↓
+Stone 11.6.5 — SDK API completeness    ✅
+   • #11 TaskScope אמיתי
+   • #12 concurrent host calls per activity
    • #13 streams — נדחה ל-Phase 13 prep
-                            ↓
-Stone 11.7 — akiva new + docs (1-2 שבועות) — מתועד על API שעובד
-                            ↓
+                                          ↓
+🔴 Stone 11.6.7 — Foundation polish (~3-5 ימים)
+   • WriteHandle / pkgs_wire / direct readonly /
+     lazy-spawn / watchdog tunability
+                                          ↓
+Stone 11.7 — akiva new + docs (1-2 שבועות) — מתועד על API שעובד וpolished
+                                          ↓
 Stone 11.8 — perf + benchmarks (1 שבוע)
-                            ↓
-Phase 11 done — מעבר ל-Phase 12 (Resource Governance)
+                                          ↓
+Phase 11 done
 ```
 
-**אומדן זמן (revised):** P0 + P1 closed; **11.6.5 = 3-5 ימים**; 11.7 + 11.8 לא השתנו.
+**Phase 12 (Resource Governance)** רץ במקביל — 12.1 (memory accounting) + 12.2 (CPU attribution) כבר נחתו (May 2026). 12.3-12.5 (LMK, suspension, enforcement) ממשיכים — 12.4 (suspension) מסתמך על TaskScope cancellation שכבר ירוק מ-11.6.5.
 
-**Gate ל-Phase 12:** אסור להתחיל את 12.x לפני ש-11.6.5 #11 + #12 ירוקים. ראה [ROADMAP.md שלב 12](../ROADMAP.md) — ה-precondition מתועד שם מפורשות.
+**אומדן זמן (revised):** Foundation work closed except 11.6.7; **11.6.7 = 3-5 ימים**; 11.7 + 11.8 לא השתנו.
+
+**Gates:**
+- ✅ Phase 12 פתוח (11.6.5 ירוק).
+- 🔴 Stone 11.7 חסום עד 11.6.7 ירוק. ראה [ROADMAP.md Stone 11.6.7](../ROADMAP.md) ל-DoD מלא.
 
 ---
 

@@ -700,6 +700,122 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 **הערכת זמן:** 3-5 ימי עבודה.
 
+### 11.6.7 Foundation polish backlog (3-5 ימים) — **חוסם 11.7**
+
+**מטרה:** סגירת חמישה rough edges שזוהו ב-architectural audit 2026-05-02 (post-11.6.5). אף אחד מהם אינו lock-in מבני; כולם פעולות פנימיות / additive APIs / refactor של duplication. **כולם חייבים להיסגר לפני 11.7** — אחרת ה-public docs יבעירו את ה-rough edges לbedrock.
+
+**אופי הקלאסטר:** כל פריט הוא scope קטן ועצמאי. ניתן לעבוד עליהם sequenally או במקביל. אין dependencies בין הפריטים.
+
+#### פריט 1 — `WriteHandle` ל-storage (~30 דק')
+
+**הבעיה.** [`sdk-rust/src/storage.rs`](sdk-rust/src/storage.rs) — `pub fn write(key: &str, value: &[u8])` הוא fire-and-forget. App שכותבת notes / settings / drafts לא יודעת אם ה-write נכשל (quota / IO / denied).
+
+**Implementation.**
+- `pub fn write(key: &str, value: &[u8]) -> WriteHandle` — מחזיר handle.
+- `WriteHandle: Future<Output = Result<(), StorageError>>` — `await` משלים, drop בלי await = fire-and-forget (backward compatible).
+- מנגנון: io_start עם op_kind `STORAGE_SET` (קיים), future נpolled עד שה-host_op_done מגיע.
+- הקוד עובר דרך ה-async-resumable dispatch protocol של P0 #4 (אותו pattern כמו `storage::read`).
+
+**DoD.**
+- [ ] `let _ = storage::write("k", b"v").await?;` עובד באפליקציה אמיתית.
+- [ ] write בלי await — ה-handle מושלך, ה-write עדיין מבוצע (test ב-vitest שמאמת ש-host_op יוצא).
+- [ ] write עם `STORAGE_SANDBOX` denied — `Err(StorageError::Denied)`.
+- [ ] write empty key — `Err(StorageError::InvalidKey)` (ה-host handler כבר מטפל).
+
+**Code surfaces.** `sdk-rust/src/storage.rs`, `sdk-rust/src/runtime.rs` (אם נדרש helper). אין שינוי ב-host handler ([`runtime/web/app_registry.js::_dispatchStorage`](runtime/web/app_registry.js)) — הוא כבר שולח host_op_done.
+
+#### פריט 2 — `pkgs_wire` decoder dedup (~1-2h)
+
+**הבעיה.** wire format זהה decoded ב-3 מקומות: [`framework/src/wire/pkgs.rs`](framework/src/wire/pkgs.rs), [`sdk-rust/src/pkgs.rs`](sdk-rust/src/pkgs.rs), [`runtime/web/app_registry.js::_warmupWorkers`](runtime/web/app_registry.js). drift-risk גובר — כל הוספת שדה ב-`PackageEntry` (icon_ref, version, signing_key) דורשת 3 שינויים מתואמים.
+
+**Implementation (recommended).**
+- `framework/src/wire/pkgs.rs` נשאר ה-canonical source.
+- `sdk-rust/src/pkgs.rs::decode` הופך wrapper דק שcalls ל-`framework::wire::pkgs::decode` (sdk-rust כבר תלויה ב-framework? לא — sdk-rust בנויה לwasm32, framework לא. אז:** לעבור ל-shared crate `akiva-wire` חדש (no_std + no_alloc-friendly) שגם framework וגם sdk-rust מייבאות).
+- ה-JS side ב-`app_registry.js` נשאר נפרד, אבל מקבל schema-comment שmלינק ל-`akiva-wire/src/pkgs.rs` — drift נתפס by reading the comment.
+- alternative פשוט יותר: לקבץ את הDecoder ב-`sdk-rust/src/wire/pkgs.rs` (חדש), framework מייבא משם.
+
+**DoD.**
+- [ ] decoder יחיד ב-Rust side; שני ה-crates מייבאים אותו.
+- [ ] cross_crate parity test הקיים ([framework/src/wire/pkgs.rs](framework/src/wire/pkgs.rs) tests) ממשיך לעבור.
+- [ ] schema comment ב-JS שמלינק ל-Rust source.
+- [ ] טסט חדש: roundtrip `(framework encode) → (sdk decode)` ו-`(sdk encode) → (framework decode)` — ABI invariance.
+
+**Code surfaces.** New crate או refactor של `sdk-rust/src/pkgs.rs` ו-`framework/src/wire/pkgs.rs`. JS-side: comment + reference fix.
+
+#### פריט 3 — Storage direct readonly handles (~1-2 ימים)
+
+**הבעיה.** היום *כל* `storage::read` עובר round-trip: app worker → kernel worker → OPFS → kernel worker → app worker. ~2ms per read. ה-design v2 ([`docs/isolation-design.md` §3.2](docs/isolation-design.md)) קבע hybrid model: readonly handles ישירות ב-app worker (Chrome 121+ תומך multiple readonly), writes דרך kernel. הtarget היה ~10x speedup.
+
+**Implementation.**
+- `runtime/web/app_worker_shell.js` מקבל את ה-`package_id` שלו ב-init (כבר יש).
+- ב-init, ה-shell פותח `navigator.storage.getDirectory()` → mode "readonly" → cache handle as `_readDir`.
+- `STORAGE_GET` op נwhich: אם יש `_readDir` cache → קורא ישירות עם `getFileHandle().createSyncAccessHandle({ mode: "read-only" })`, מחזיר bytes ב-host_op_done שיוצא ל-self.
+- אם הקריאה נכשלת (handle stale, file removed during runtime) — fallback ל-kernel host_op (העתיקה הנוכחית).
+- writes (`STORAGE_SET`, `STORAGE_DELETE`) ממשיכים דרך kernel — sandbox enforcement שם.
+- close-on-uninstall: kernel שולח `{type:"storage_invalidate"}` ל-worker → ה-worker mots את ה-readonly handle.
+
+**DoD.**
+- [ ] benchmark: storage::read direct ≤ 0.5ms; via kernel ≤ 2ms (כפי שמתועד ב-Phase 11 exit criteria).
+- [ ] uninstall in-flight: app A קוראת file. app A uninstalled. ה-read שמתבצע נכשל gracefully (Err, לא panic).
+- [ ] multiple readonly handles: 3 apps באותו זמן קוראות → אין contention (vitest עם mocked OPFS שמדמה multi-handle).
+- [ ] write→read consistency: app SET key, אחר-כך GET key → רואה את הvalue (writes דרך kernel, reads ישירות, הסדר נשמר).
+
+**Code surfaces.** [`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js), [`runtime/web/app_registry.js`](runtime/web/app_registry.js) (storage_invalidate broadcast), [`sdk-rust/src/storage.rs`](sdk-rust/src/storage.rs) (אין שינוי — המעבר שקוף).
+
+#### פריט 4 — Lazy-spawn workers (~חצי יום)
+
+**הבעיה.** [`runtime/web/app_registry.js::_warmupWorkers`](runtime/web/app_registry.js) פותח worker לכל package מותקן ב-boot (Stone 11.4c-6 — pre-warm). עם 4 apps זה fine. עם 100 apps = 100 workers גם אם המשתמש פותח 5. בזבוז זיכרון × 20.
+
+**Implementation.**
+- `_warmupWorkers` הופך לbatching של `sys.shell` בלבד (ה-home, תמיד נחוץ).
+- ראשון `launch_app(package_id)` של package אחר → spawn-on-demand. ה-launch path הקיים כבר מטפל ב-instantiation-if-missing; הצעד היחיד הוא לא לpre-warm.
+- אם performance חשוב לapp-cold-start, אפשר לpre-warm רק apps recently-used (תיעוד ב-OPFS).
+
+**DoD.**
+- [ ] vitest: post-boot, AppRegistry יש active_workers count = 1 (`sys.shell`).
+- [ ] vitest: post-boot + launch_app("calc"), active_workers = 2.
+- [ ] vitest: launch_app + finish + launch_app שוב — worker שתעצמ keep-alive (cache לא נפתחת; ה-worker חי).
+- [ ] integration test: app שכבר פעל, finish, launch אחר — startup time ≤ 50ms (cached) ו-≤ 150ms (cold).
+
+**Code surfaces.** [`runtime/web/app_registry.js`](runtime/web/app_registry.js) (`_warmupWorkers`, `launch_app` paths).
+
+#### פריט 5 — Watchdog tunability + warning threshold (~חצי יום)
+
+**הבעיה.** [`runtime/web/config.js`](runtime/web/config.js) — `WATCHDOG.TIMEOUT_MS = 1500` יחיד. אין warning threshold (Android יש: 5s warning ANR, 60s system_server reboot). אין per-package override (debug app רוצה 100ms; long-task app רוצה 5s). אין dev-mode tunability (testes רוצים 200ms).
+
+**Implementation.**
+- `config.js` מתרחב:
+  ```js
+  WATCHDOG = {
+    HEARTBEAT_MS: 500,        // כבר יש
+    WARN_MS: 1000,            // חדש — log warning
+    TIMEOUT_MS: 1500,         // קיים — terminate
+  }
+  ```
+- `globalThis.__akivaConfig.watchdog` — override hook לdev/tests (כבר מתועד ב-config.js שנקרא ע"י `app_registry.js`).
+- per-package override (אופציונלי, mutually exclusive עם global): `manifest.runtime.watchdog_timeout_ms` ב-`manifest.toml` — נקרא ע"י `package_manager.rs` ומעבר דרך setPackages ל-AppRegistry.
+- ה-watchdog ב-`app_registry.js` פולט `console.warn(...)` ב-`WARN_MS` (רק logged, לא kill); אחרי `TIMEOUT_MS` — הtermination הקיימת.
+
+**DoD.**
+- [ ] vitest fake-timers: hang app, advance 1100ms → warning logged, app חי. advance עוד 500ms → terminate.
+- [ ] `globalThis.__akivaConfig.watchdog.TIMEOUT_MS = 200` — overrides ב-test, terminate ב-200ms.
+- [ ] manifest override: app עם `runtime.watchdog_timeout_ms = 5000` — לא נהרגת ב-1.5s.
+- [ ] backward compat: apps בלי manifest override ממשיכים כ-1500ms.
+
+**Code surfaces.** [`runtime/web/config.js`](runtime/web/config.js), [`runtime/web/app_registry.js`](runtime/web/app_registry.js) (watchdog logic), [`framework/src/manifest.rs`](framework/src/manifest.rs) (parse `runtime.watchdog_timeout_ms`), [`framework/src/wire/pkgs.rs`](framework/src/wire/pkgs.rs) (אם רוצים שזה יעבור ל-app workers דרך setPackages — אופציונלי).
+
+#### Definition of Done — Stone 11.6.7 כולה
+
+- [ ] 5 פריטים סגורים, כל אחד עם tests משלו.
+- [ ] cargo test green: 414+ Rust tests + 54+ vitest tests (תוספת של ~15-20 חדשים).
+- [ ] `docs/sdk-rust.md` §19 מעודכן: §19.3 (WriteHandle) ✅, §19.4 (pkgs_wire) ✅. §19.5/§19.6 כבר ✅ אחרי 11.6.5.
+- [ ] `docs/storage.md` §8 מעודכן: deferred ReadHandle הוסר, ה-readonly direct path מתועד.
+- [ ] `docs/risks.md` §7.6 (pkgs_wire) ו-§7.7 (magic numbers) ניתן לסמן retired/promoted.
+
+**הערכת זמן Total:** 3-5 ימי עבודה.
+
+**Gate ל-11.7:** אסור לפתוח את 11.7 (akiva new + docs מקיפים) לפני ש-11.6.7 ירוק. ה-docs יבעירו את ה-API לbedrock; כל rough edge שלא נסגר עכשיו יחיה לעולם בעיני מפתחים עתידיים.
+
 ### 11.7 `akiva new` + dev tooling polish (1-2 שבועות) — **DX foundation**
 - `akiva new <name>` — scaffold app (Cargo.toml, manifest.toml, src/lib.rs hello-world async, README).
 - 3 templates: `default`, `compose-style`, `game`.

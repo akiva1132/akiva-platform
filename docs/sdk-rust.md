@@ -657,7 +657,8 @@ async fn on_create(&mut self, ctx: &mut Context<'_>) {
 ראה [`docs/isolation-design.md` §10.5 Phase 11 Foundation Gaps](isolation-design.md) לתכנית עבודה מלאה. בקצרה:
 
 - **P0** (סגור): ✅ §19.1 (async executor — cardinal), ✅ §19.2 (save_state pipeline), graceful shutdown, Trapped recycle.
-- **P1** (חלקי): ✅ magic-numbers config, ✅ drain phase separation. **פתוחים:** §19.3 (WriteHandle, ~30 דק'), §19.4 (pkgs_wire dedup, ~1-2h).
-- **🔴 11.6.5 — חוסם Phase 12** (3-5 ימים): §19.5 (TaskScope אמיתי), §19.6 (concurrent host calls per activity).
+- **P1** (חלקי): ✅ magic-numbers config, ✅ drain phase separation. **פתוחים — חבילה ב-11.6.7:** §19.3 (WriteHandle, ~30 דק'), §19.4 (pkgs_wire dedup, ~1-2h).
+- **🔴 Stone 11.6.5 — חוסם Phase 12** (3-5 ימים): ✅ §19.5 (TaskScope אמיתי), ✅ §19.6 (concurrent host calls per activity).
+- **🔴 Stone 11.6.7 — חוסם 11.7** (3-5 ימים): WriteHandle (§19.3) + pkgs_wire dedup (§19.4) + direct readonly storage handles + lazy-spawn workers + watchdog tunability. ראה [ROADMAP.md Stone 11.6.7](../ROADMAP.md) ל-DoD מלא.
 - **P2** (Phase 11.8): e2e tests, worker shell unit tests.
 - **Phase 13 prep:** §19.7 (streams).

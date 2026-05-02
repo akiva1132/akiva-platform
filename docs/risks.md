@@ -197,25 +197,21 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Code.** `framework/src/{activity.rs, wasm_activity.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Tests: `drive_pending_signals_invokes_foreground_with_writable_ctx`, `drive_pending_signals_is_noop_on_empty_stack` (174 framework tests green).
 
-### 7.6 🟡 `pkgs_wire` decoder duplicated 3x
+### 7.6 🔴 `pkgs_wire` decoder duplicated 3x — promoted to Stone 11.6.7
 
 **Concern.** `framework::wire::pkgs::decode`, `sdk-rust::pkgs::decode`, and `runtime/web/app_registry.js::_warmupWorkers` each parse the same length-prefixed binary blob. Adding a field to `PackageEntry` means three coordinated changes.
 
-**Why deferred.** Drift hasn't bitten yet — the format is small (3 strings) and the test suite cross-validates parity.
+**Status.** Promoted from "deferred" to "blocking 11.7" by the May 2026 architectural audit. Stone 11.6.7 owns the fix. See [ROADMAP.md Stone 11.6.7 פריט 2](../ROADMAP.md). Recommended approach: shared `akiva-wire` crate (no_std + no_alloc) re-exported by both framework and sdk-rust; JS side gets a schema-comment pointer.
 
-**Trigger to promote.** First time a field gets added or renamed (e.g., adding `icon_ref` for launcher tiles). Or: introducing a fourth decoder (e.g., a debugger panel that reads the blob).
+**Code surfaces.** New shared crate or refactor of `sdk-rust/src/pkgs.rs` ↔ `framework/src/wire/pkgs.rs`. JS-side: comment + reference fix.
 
-**Code surfaces.** Either switch to JSON for non-perf paths (cheap, debuggable) or introduce a schema-driven generator (real fix but more setup).
+### 7.7 ✅ Magic numbers — fixed (P1 #2, May 2026), tuning gap promoted to 11.6.7
 
-### 7.7 🟢 Magic numbers spread across the codebase
+**Original concern.** Watchdog timeout (1500ms), heartbeat interval (500ms), render initial buf (16KiB), save_state initial buf (4KiB), trap drain buf (256B). All hardcoded at point of use, no central tuning surface.
 
-**Concern.** Watchdog timeout (1500ms), heartbeat interval (500ms), render initial buf (16KiB), save_state initial buf (4KiB), trap drain buf (256B). All hardcoded at point of use, no central tuning surface.
+**Status.** Centralised into `runtime/web/config.js` (JS) + const block at the top of `kernel/src/lib.rs` (Rust). Each constant carries a `Why:` comment explaining the rationale.
 
-**Why deferred.** Defaults are reasonable; no reason to tune them in production yet.
-
-**Trigger to promote.** First time we want to reduce watchdog timeout for tests, or run on a slower device with bigger margins. Probably along with Phase 11.8 (perf baseline).
-
-**Code surfaces.** New `runtime/web/config.js` with documented constants.
+**Remaining gap promoted to Stone 11.6.7.** No warning threshold (single 1500ms terminate; Android has WARN+TIMEOUT split), no per-package override (`manifest.runtime.watchdog_timeout_ms`), no `globalThis.__akivaConfig` runtime override hook. See [ROADMAP.md Stone 11.6.7 פריט 5](../ROADMAP.md).
 
 ### 7.8 🟢 Worker shell has no unit tests
 
@@ -250,6 +246,36 @@ In-process activities are unchanged — they still go through the sync `save_sta
 **Trigger to promote.** First capability where the polling-as-future fake costs us correctness: audio sample streaming, drag/scroll gestures with sub-frame ordering, or WindowManager event fan-out. Also: the WASI 0.3 migration (deferred to v0.5+) is built around `stream<T>` — every day of delay raises the migration cost when we eventually adopt it.
 
 **Code surfaces.** New op_kind `STREAM_OPEN` returning `stream_id`; `stream_poll(stream_id)` returns `Vec<Item>` of values batched since the prior poll; `stream_close(stream_id)`. Wire shape should mirror Component Model `stream<T>` to keep the v0.5 migration mechanical. Detailed plan in [`docs/isolation-design.md` §10.5 #13](isolation-design.md). **Recommended for Phase 13 prep, not 11.6.5.**
+
+### 7.12 🔴 `storage::write` is fire-and-forget — promoted to Stone 11.6.7
+
+**Concern.** [`sdk-rust/src/storage.rs`](../sdk-rust/src/storage.rs) — `pub fn write(key: &str, value: &[u8])` returns `()`. Apps writing notes, settings, or drafts have no way to learn about quota failures, IO errors, or capability denials. Real OSes (iOS NSUserDefaults, Android SharedPreferences) all surface errors.
+
+**Why deferred (until now).** P1 #1 was 30 minutes of work but kept getting bumped by P0 / Stone 11.6.5. The May 2026 architectural audit promoted it to Stone 11.6.7 because shipping public docs in 11.7 with `write(...)` returning `()` would lock the lossy semantics into bedrock.
+
+**Trigger.** Stone 11.6.7 owns this. Implementation: future-returning API on top of the existing `STORAGE_SET` op_kind; `WriteHandle: Future<Output = Result<(), StorageError>>`. Apps that drop the handle without awaiting keep working (backward-compatible fire-and-forget). See [ROADMAP.md Stone 11.6.7 פריט 1](../ROADMAP.md).
+
+**Code surfaces.** [`sdk-rust/src/storage.rs`](../sdk-rust/src/storage.rs); host handler unchanged.
+
+### 7.13 🔴 Storage reads always go via kernel — promoted to Stone 11.6.7
+
+**Concern.** Design v2 §3.2 specified a hybrid storage model: readonly handles opened directly in the app worker (Chrome 121+ supports multiple readonly `SyncAccessHandle` on the same file), writes routed through the kernel for sandbox enforcement. The implementation shipped only the kernel-routed path. Reads pay a full app-worker → kernel-worker → OPFS → kernel-worker → app-worker round-trip (~2ms) for what should be a <0.5ms direct call.
+
+**Why deferred (until now).** Stone 11.6 ABc shipped MVP-quality storage; the direct-handle work was bumped to "11.7+" in the original DoD. The May 2026 audit pulled it back into 11.6.7 because the gap is a 10x perf miss and is documented in the design doc — leaving it open contradicts the design.
+
+**Trigger.** Stone 11.6.7 owns this. Implementation: app worker shell opens its own readonly directory at init; `STORAGE_GET` ops served locally with kernel fallback on stale-handle errors. Writes stay kernel-routed. See [ROADMAP.md Stone 11.6.7 פריט 3](../ROADMAP.md).
+
+**Code surfaces.** [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js), [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) (storage_invalidate broadcast on uninstall). `sdk-rust/src/storage.rs` unchanged — the migration is transparent.
+
+### 7.14 🟡 Pre-warm-all workers — promoted to Stone 11.6.7
+
+**Concern.** [`runtime/web/app_registry.js::_warmupWorkers`](../runtime/web/app_registry.js) (Stone 11.4c-6) spawns a Web Worker for every installed package at boot. With 4 apps it's a one-time ~160ms cost; with 100 apps it's ~4 seconds of boot delay plus 100 idle workers consuming memory. Real OSes spawn lazily; Android's zygote even pre-forks for cheap dispatch but doesn't keep idle apps alive.
+
+**Why deferred (until now).** Pre-warm was the simplest "no first-click latency" fix in 11.4c. The May 2026 audit flagged it as an anti-pattern that won't scale and promoted it to 11.6.7.
+
+**Trigger.** Stone 11.6.7 owns this. Implementation: pre-warm only `sys.shell` (always needed); spawn-on-demand for everything else; cache by package_id once spawned. See [ROADMAP.md Stone 11.6.7 פריט 4](../ROADMAP.md).
+
+**Code surfaces.** [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) — `_warmupWorkers` and `launch_app` paths.
 
 ---
 
