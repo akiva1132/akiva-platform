@@ -108,6 +108,7 @@ pub fn boot(
         pending_result_for: HashMap::new(),
         pending_result: HashMap::new(),
         task_history: Vec::new(),
+        host: host.clone(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -357,6 +358,13 @@ pub struct Framework {
     /// practice — the Shell's task sits at position 0 and is never
     /// popped, so worst-case depth is the number of live tasks.
     task_history: Vec<TaskId>,
+    /// Stone 11.4a-5 — the wasm-app runtime seam. Cloned at boot from
+    /// the `host` argument; held here so the frame loop can call
+    /// `host.poll_future` from `drive_pending_transitions` without
+    /// reaching into per-activity factory closures. In 11.4a every
+    /// dispatch resolves inline so no slot ever opens — the field is
+    /// dormant. 11.4c populates it when WorkerHost defers.
+    host: Rc<dyn WasmHost>,
 }
 
 impl Framework {
@@ -427,6 +435,55 @@ impl Framework {
             self.apply_post(PostCallback { finish, launch, launch_for_result, set_result }, id, ts);
         }
         self.compositor.finish_frame()
+    }
+
+    /// Stone 11.4a-5 — poll every activity with an open
+    /// [`activity_manager::PendingTransition`] slot. Resolved futures
+    /// flip the activity's lifecycle state and clear the slot; pending
+    /// futures stay open until the next call. Errors clear the slot but
+    /// leave the state at its previous value (Stone 11.5 will mark
+    /// `Trapped`).
+    ///
+    /// The kernel's frame loop calls this once per frame, before any
+    /// fresh dispatch — an activity with an open slot must not receive
+    /// a new host call until the prior one resolves. In Stone 11.4a no
+    /// slot ever opens (every host method returns the `0` sentinel),
+    /// so this is a cheap no-op in production today; the path is
+    /// exercised by [`activity_manager::tests`] via
+    /// `ActivityManager::open_pending` directly.
+    pub fn drive_pending_transitions(&mut self) {
+        let host: &dyn WasmHost = &*self.host;
+        for id in self.activities.pending_ids() {
+            // pending_of borrows immutably; copy out the future_id so we
+            // can drop the borrow before calling resolve_pending /
+            // cancel_pending (which need &mut self.activities).
+            let future_id = match self.activities.pending_of(id) {
+                Some(p) => p.future_id,
+                None => continue,
+            };
+            match host.poll_future(future_id) {
+                Some(Ok(_bytes)) => {
+                    // 11.4a-5 ignores the resolved bytes here. Render and
+                    // save_state route their bytes through the
+                    // `WasmActivity::render` / `save_state_bytes` paths,
+                    // which dispatch + poll inline (no `pending` slot).
+                    // Lifecycle-class transitions carry no payload — the
+                    // resolution is just an ack.
+                    self.activities.resolve_pending(id);
+                }
+                None => {
+                    // Still in flight. Leave the slot for next frame.
+                }
+                Some(Err(_e)) => {
+                    // Stone 11.5 will fold this into a `Trapped` mark.
+                    // For now: clear the slot so the activity isn't
+                    // wedged forever, and leave its state at the prior
+                    // value so the next driver call can retry from a
+                    // legal edge.
+                    self.activities.cancel_pending(id);
+                }
+            }
+        }
     }
 
     // ── Internals ─────────────────────────────────────────────────────
@@ -1182,6 +1239,7 @@ mod tests {
             pending_result_for: HashMap::new(),
             pending_result: HashMap::new(),
             task_history: Vec::new(),
+            host: BootMockHost::new(),
         }
     }
 
@@ -2164,5 +2222,154 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             id == "<home>" && msg.contains("MAIN+HOME")),
             "expected synthetic <home> entry in package_errors, got: {:?}",
             report.package_errors);
+    }
+
+    // ── Stone 11.4a-5: deferred-lifecycle driver ────────────────────────
+
+    /// Host where every dispatch returns `0` (sync) but `poll_future`
+    /// gates on an explicit `mark_resolved` — the test arms it between
+    /// `drive_pending_transitions` calls to simulate a real Worker
+    /// taking multiple frames to finish a lifecycle method. The
+    /// production path will use the same trait shape but with an
+    /// `Rc<MessageChannel>` instead of an in-process `HashSet`.
+    struct DeferredMockHost {
+        resolved: RefCell<std::collections::HashSet<u64>>,
+        next_handle: RefCell<u32>,
+    }
+
+    impl DeferredMockHost {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                resolved: RefCell::new(std::collections::HashSet::new()),
+                next_handle: RefCell::new(1),
+            })
+        }
+        fn mark_resolved(&self, future_id: u64) {
+            self.resolved.borrow_mut().insert(future_id);
+        }
+    }
+
+    impl WasmHost for DeferredMockHost {
+        fn register(&self, _: &str, _: &str) -> Option<wasm_activity::AppHandle> {
+            let mut n = self.next_handle.borrow_mut();
+            let h = *n; *n += 1;
+            wasm_activity::AppHandle::new(h)
+        }
+        fn unregister(&self, _: wasm_activity::AppHandle) {}
+        fn lifecycle(&self, _: wasm_activity::AppHandle, _: wasm_activity::LifecycleTransition) -> u64 { 0 }
+        fn pointer(&self, _: wasm_activity::AppHandle, _: activity::PointerEvent, _: f64) -> u64 { 0 }
+        fn key(&self, _: wasm_activity::AppHandle, _: activity::KeyEvent, _: f64) -> u64 { 0 }
+        fn resize(&self, _: wasm_activity::AppHandle, _: SurfaceMetrics) -> u64 { 0 }
+        fn render(&self, _: wasm_activity::AppHandle, _: f64) -> u64 { 0 }
+        fn poll_future(&self, future_id: u64) -> Option<Result<Vec<u8>, String>> {
+            if self.resolved.borrow().contains(&future_id) {
+                Some(Ok(Vec::new()))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Framework with a pre-registered activity and a `DeferredMockHost`
+    /// — bypasses `boot` so the test can drive a single deterministic
+    /// pending slot without rehydrating storage or installing packages.
+    fn deferred_fw() -> (Framework, Rc<DeferredMockHost>, activity_manager::ActivityId) {
+        use crate::activity::Activity;
+        struct Stub;
+        impl Activity for Stub {
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+        }
+        let host = DeferredMockHost::new();
+        let mut fw = Framework {
+            activities: ActivityManager::new(),
+            packages: package_manager::PackageManager::new(),
+            windows: window_manager::WindowManager::new(),
+            resources: resources::ResourceManager::new(),
+            intents: intent::IntentRouter::new(),
+            permissions: permissions::PermissionController::new(),
+            compositor: Compositor::new(),
+            metrics: SurfaceMetrics::default(),
+            pointer: None,
+            stack: Vec::new(),
+            storage: None,
+            pending_result_for: HashMap::new(),
+            pending_result: HashMap::new(),
+            task_history: Vec::new(),
+            host: host.clone(),
+        };
+        fw.activities.register(
+            "test.pkg",
+            "Stub",
+            activity_manager::LaunchMode::Standard,
+            || Box::new(Stub),
+        );
+        let id = fw.activities.launch("test.pkg", "Stub").unwrap().id;
+        (fw, host, id)
+    }
+
+    #[test]
+    fn deferred_lifecycle_drives_through_two_polls() {
+        // Simulates the 11.4c shape: dispatcher fires `lifecycle(Create)`,
+        // host returns future_id=42, framework opens a pending slot, the
+        // worker takes one extra frame to finish. Frame 1's drive sees
+        // None (still in flight) and leaves the activity at Initial;
+        // frame 2's drive sees Some(Ok(_)) and flips to Created.
+        let (mut fw, host, id) = deferred_fw();
+        const FID: u64 = 42;
+
+        assert!(fw.activities.open_pending(
+            id, activity_manager::LifecycleState::Created, FID, 0.0,
+        ));
+        assert_eq!(fw.activities.state_of(id), Some(activity_manager::LifecycleState::Initial));
+
+        // Frame 1: poll returns None (host hasn't resolved yet).
+        fw.drive_pending_transitions();
+        assert_eq!(fw.activities.state_of(id), Some(activity_manager::LifecycleState::Initial),
+            "state must stay Initial while the future is in flight");
+        assert!(fw.activities.pending_of(id).is_some(),
+            "slot must remain open across an unresolved poll");
+
+        // Worker finishes its work; the next `poll_future(42)` will
+        // return Some(Ok(_)).
+        host.mark_resolved(FID);
+
+        // Frame 2: poll resolves, framework flips state and clears the
+        // slot. No Activity callback fires — that's the deferred-path
+        // contract (the work already ran in the worker).
+        fw.drive_pending_transitions();
+        assert_eq!(fw.activities.state_of(id), Some(activity_manager::LifecycleState::Created));
+        assert!(fw.activities.pending_of(id).is_none(),
+            "slot must clear once the future resolves");
+    }
+
+    #[test]
+    fn deferred_lifecycle_clears_slot_on_host_error() {
+        // Stone 11.4a-5 stops here: on Err the slot drops and state
+        // stays at the prior value. Stone 11.5 will fold this into a
+        // `Trapped` mark so the kernel can tear the activity down.
+        struct ErrHost;
+        impl WasmHost for ErrHost {
+            fn register(&self, _: &str, _: &str) -> Option<wasm_activity::AppHandle> {
+                wasm_activity::AppHandle::new(1)
+            }
+            fn unregister(&self, _: wasm_activity::AppHandle) {}
+            fn lifecycle(&self, _: wasm_activity::AppHandle, _: wasm_activity::LifecycleTransition) -> u64 { 0 }
+            fn pointer(&self, _: wasm_activity::AppHandle, _: activity::PointerEvent, _: f64) -> u64 { 0 }
+            fn key(&self, _: wasm_activity::AppHandle, _: activity::KeyEvent, _: f64) -> u64 { 0 }
+            fn resize(&self, _: wasm_activity::AppHandle, _: SurfaceMetrics) -> u64 { 0 }
+            fn render(&self, _: wasm_activity::AppHandle, _: f64) -> u64 { 0 }
+            fn poll_future(&self, _: u64) -> Option<Result<Vec<u8>, String>> {
+                Some(Err("simulated host trap".into()))
+            }
+        }
+        let (mut fw, _host, id) = deferred_fw();
+        fw.host = Rc::new(ErrHost);
+
+        assert!(fw.activities.open_pending(id, activity_manager::LifecycleState::Created, 7, 0.0));
+        fw.drive_pending_transitions();
+        assert_eq!(fw.activities.state_of(id), Some(activity_manager::LifecycleState::Initial),
+            "an Err from poll must leave state at the prior value (Trapped lands in 11.5)");
+        assert!(fw.activities.pending_of(id).is_none(),
+            "slot must clear even on Err so the activity isn't wedged");
     }
 }

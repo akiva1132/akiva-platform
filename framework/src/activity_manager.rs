@@ -474,6 +474,83 @@ impl ActivityManager {
             None => false,
         }
     }
+
+    // ── Stone 11.4a-5: deferred lifecycle plumbing ───────────────────────
+    //
+    // `pending` slots are populated by the deferred dispatch path (Stone
+    // 11.4c WorkerHost) when a host call returns a non-zero `future_id`
+    // instead of resolving inline. The frame loop calls
+    // `drive_pending_transitions` to poll the host and flip the record's
+    // state once the future resolves.
+    //
+    // In Stone 11.4a these methods are exercised only by tests — the
+    // production `WasmActivity` path is still sync (every dispatch returns
+    // 0). The plumbing ships now so 11.4c can wire it up to a real Worker
+    // without churning the public API again.
+
+    /// Mark `id` as awaiting a host-side completion. Returns `true` if the
+    /// slot was opened, `false` if the activity is unknown, missing its
+    /// instance, already has a pending slot, or `target` isn't a legal
+    /// next state. `started_at_ms` is the frame timestamp when the
+    /// dispatch fired — Stone 11.5's watchdog uses it for the deadline.
+    pub fn open_pending(
+        &mut self,
+        id: ActivityId,
+        target: LifecycleState,
+        future_id: u64,
+        started_at_ms: f64,
+    ) -> bool {
+        let Some(rec) = self.records.get_mut(&id) else { return false; };
+        if rec.pending.is_some() { return false; }
+        if !self.instances.contains_key(&id) { return false; }
+        if !legal_transition(rec.state, target) { return false; }
+        rec.pending = Some(PendingTransition { target, future_id, started_at_ms });
+        true
+    }
+
+    /// Read-only view of an activity's pending slot. Used by the
+    /// Framework wrapper to drive the poll loop without holding a `&mut`
+    /// across the borrow.
+    pub fn pending_of(&self, id: ActivityId) -> Option<&PendingTransition> {
+        self.records.get(&id).and_then(|r| r.pending.as_ref())
+    }
+
+    /// Resolve a pending transition: clear the slot and flip the record's
+    /// state to the target. The caller must have observed the host's
+    /// future as resolved before calling. No callback fires — the work
+    /// already ran in the worker; this only updates framework
+    /// bookkeeping.
+    ///
+    /// Returns `Some(prev)` on success, `None` if the slot wasn't open,
+    /// the id is unknown, or the recorded transition isn't legal anymore
+    /// (the latter shouldn't happen — `open_pending` already checked,
+    /// and nothing else mutates state once a slot is open).
+    pub fn resolve_pending(&mut self, id: ActivityId) -> Option<LifecycleState> {
+        let rec = self.records.get_mut(&id)?;
+        let p = rec.pending.take()?;
+        let prev = rec.state;
+        if !legal_transition(prev, p.target) { return None; }
+        rec.state = p.target;
+        Some(prev)
+    }
+
+    /// Cancel a pending slot without advancing state. Used when the host
+    /// reports a trap (Stone 11.5 will follow up with a `Trapped` mark);
+    /// today the slot just clears and the activity stays at its previous
+    /// state.
+    pub fn cancel_pending(&mut self, id: ActivityId) -> Option<PendingTransition> {
+        self.records.get_mut(&id)?.pending.take()
+    }
+
+    /// All ids with an open pending slot, in arbitrary order. Snapshot —
+    /// callers may mutate `pending` while iterating their own copy of
+    /// the result.
+    pub fn pending_ids(&self) -> Vec<ActivityId> {
+        self.records.iter()
+            .filter(|(_, r)| r.pending.is_some())
+            .map(|(id, _)| *id)
+            .collect()
+    }
 }
 
 /// Decide whether `from → to` is one of the legal one-step transitions in
@@ -1098,5 +1175,106 @@ mod tests {
         assert_eq!(am.state_of(second), Some(LifecycleState::Resumed),
             "reused top must still be Resumed");
         assert!(log.borrow().is_empty(), "reuse must not fire any callback");
+    }
+
+    // ── Stone 11.4a-5: pending-transition slot ──────────────────────────
+    //
+    // These tests pin the slot mutators (`open_pending`, `resolve_pending`,
+    // `cancel_pending`, `pending_ids`). The end-to-end driver loop —
+    // which polls a real `WasmHost` and calls these in sequence — lives
+    // in [`crate::tests::deferred_lifecycle_drives_through_two_polls`]
+    // because it needs a Framework + WasmHost.
+
+    #[test]
+    fn open_pending_records_target_and_future_id() {
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        // Initial → Created is the first legal edge; opening the slot
+        // means "the host is working on creating this activity".
+        assert!(am.open_pending(id, LifecycleState::Created, 0xCAFE, 100.0));
+        let p = am.pending_of(id).expect("slot must be set");
+        assert_eq!(p.target, LifecycleState::Created);
+        assert_eq!(p.future_id, 0xCAFE);
+        assert_eq!(p.started_at_ms, 100.0);
+        // State stays at Initial — the work is still in flight.
+        assert_eq!(am.state_of(id), Some(LifecycleState::Initial));
+    }
+
+    #[test]
+    fn open_pending_rejects_when_slot_already_open() {
+        // Two host calls in flight against the same activity is a
+        // dispatcher bug — the framework promises one outstanding op
+        // per activity. Verify the second open is rejected so the bug
+        // surfaces here instead of silently overwriting.
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        assert!(am.open_pending(id, LifecycleState::Created, 1, 0.0));
+        assert!(!am.open_pending(id, LifecycleState::Created, 2, 0.0));
+        assert_eq!(am.pending_of(id).unwrap().future_id, 1);
+    }
+
+    #[test]
+    fn open_pending_rejects_illegal_transition() {
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        // Initial → Resumed isn't a legal one-step edge; guard it the
+        // same way `advance_to` does.
+        assert!(!am.open_pending(id, LifecycleState::Resumed, 1, 0.0));
+        assert!(am.pending_of(id).is_none());
+    }
+
+    #[test]
+    fn resolve_pending_flips_state_and_clears_slot() {
+        let (mut am, log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        assert!(am.open_pending(id, LifecycleState::Created, 1, 0.0));
+        let prev = am.resolve_pending(id);
+        assert_eq!(prev, Some(LifecycleState::Initial));
+        assert_eq!(am.state_of(id), Some(LifecycleState::Created));
+        assert!(am.pending_of(id).is_none());
+        // Critical: no Activity callback fires from resolve. The wasm
+        // app's on_create ran inside the worker — the framework just
+        // updates its bookkeeping. The RecordingActivity log stays
+        // empty for that reason.
+        assert!(log.borrow().is_empty(),
+            "resolve_pending must not fire trait callbacks; got {:?}", *log.borrow());
+    }
+
+    #[test]
+    fn cancel_pending_clears_slot_without_advancing_state() {
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        assert!(am.open_pending(id, LifecycleState::Created, 1, 0.0));
+        let dropped = am.cancel_pending(id);
+        assert_eq!(dropped.unwrap().future_id, 1);
+        // State stayed at Initial — the cancel doesn't promote.
+        assert_eq!(am.state_of(id), Some(LifecycleState::Initial));
+        assert!(am.pending_of(id).is_none());
+    }
+
+    #[test]
+    fn pending_ids_lists_only_open_slots() {
+        let (mut am, _log) = harness();
+        let log_for_factory = Rc::new(RefCell::new(Vec::new()));
+        // Need a second registered class so we can launch two distinct
+        // ids with a Standard launch mode.
+        let log_b = log_for_factory.clone();
+        am.register("test.pkg", "RecMain2", LaunchMode::Standard,
+            move || Box::new(RecordingActivity { log: log_b.clone() }));
+        let a = am.launch("test.pkg", "RecMain").unwrap().id;
+        let b = am.launch("test.pkg", "RecMain2").unwrap().id;
+        assert!(am.pending_ids().is_empty());
+
+        assert!(am.open_pending(a, LifecycleState::Created, 7, 0.0));
+        assert_eq!(am.pending_ids(), vec![a]);
+
+        assert!(am.open_pending(b, LifecycleState::Created, 8, 0.0));
+        let mut ids = am.pending_ids();
+        ids.sort();
+        let mut expected = vec![a, b]; expected.sort();
+        assert_eq!(ids, expected);
+
+        am.resolve_pending(a);
+        assert_eq!(am.pending_ids(), vec![b]);
     }
 }
