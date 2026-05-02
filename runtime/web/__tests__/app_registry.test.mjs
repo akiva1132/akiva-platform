@@ -450,6 +450,57 @@ describe("log + trapped messages from worker", () => {
   });
 });
 
+// ── Stone 11.5: trap drain ────────────────────────────────────────────
+
+describe("drainTrappedPackages — kernel pulls trap notifications", () => {
+  it("returns 0 when nothing trapped", () => {
+    const { registry } = makeRegistry();
+    expect(registry.drainTrappedPackages(0, 1024)).toBe(0);
+  });
+
+  it("trapped message stages the package; drain returns the bytes", () => {
+    const { registry, worker, kernelMemory } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "trapped", reason: "panic" });
+    const ret = registry.drainTrappedPackages(0, 1024);
+    expect(ret).toBe(PACKAGE_ID.length);
+    const got = new TextDecoder().decode(new Uint8Array(kernelMemory.buffer, 0, ret));
+    expect(got).toBe(PACKAGE_ID);
+    // Single-shot consume.
+    expect(registry.drainTrappedPackages(0, 1024)).toBe(0);
+  });
+
+  it("two-phase retry: outCap too small returns needed length, keeps entries", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "trapped", reason: "x" });
+    expect(registry.drainTrappedPackages(0, 5)).toBe(PACKAGE_ID.length);
+    // Entry stays armed for the retry.
+    expect(registry._pendingTraps.has(PACKAGE_ID)).toBe(true);
+    expect(registry.drainTrappedPackages(0, 1024)).toBe(PACKAGE_ID.length);
+    expect(registry._pendingTraps.size).toBe(0);
+  });
+
+  it("LF-separates multiple package_ids and dedupes repeats", () => {
+    const { registry, worker, kernelMemory } = makeRegistry();
+    registry.register("com.a.app", "Main");
+    const otherWorker = makeFakeWorker();
+    // Manually inject a second worker for a second package.
+    registry._processes.set("com.b.app", { worker: otherWorker, packageId: "com.b.app" });
+    otherWorker.addEventListener("message", (e) =>
+      registry._onWorkerMessage("com.b.app", e.data));
+
+    worker._inject({ type: "trapped", reason: "1" });
+    otherWorker._inject({ type: "trapped", reason: "2" });
+    worker._inject({ type: "trapped", reason: "again — should dedupe" });
+
+    const ret = registry.drainTrappedPackages(0, 1024);
+    const got = new TextDecoder().decode(new Uint8Array(kernelMemory.buffer, 0, ret));
+    const parts = got.split("\n").sort();
+    expect(parts).toEqual(["com.a.app", "com.b.app"]);
+  });
+});
+
 // ── Grant + packages updates ──────────────────────────────────────────
 
 describe("setGrants / setPackages — kernel-side caches", () => {

@@ -81,6 +81,18 @@ export class AppRegistry {
      * @type {Uint8Array}
      */
     this._packagesBlob = new Uint8Array(0);
+    /**
+     * Stone 11.5 — packages whose worker reported a trap (uncaught
+     * exception in `akiva_app_dispatch`, `worker.onerror`, or the
+     * watchdog timeout in 11.5c). The kernel pulls this once per
+     * frame via `hal_drain_trapped_packages`; we copy the entries
+     * out and clear on a fitting drain (single-shot). Stored as a
+     * Set so repeated traps from the same package collapse to one
+     * notification — `mark_package_trapped` is idempotent on the
+     * framework side anyway.
+     * @type {Set<string>}
+     */
+    this._pendingTraps = new Set();
     this._decoder = new TextDecoder("utf-8");
     this._encoder = new TextEncoder();
 
@@ -293,6 +305,31 @@ export class AppRegistry {
   }
   _consumeSetResult(handle) { this._pendingSetResult.delete(handle); }
 
+  /**
+   * Stone 11.5 — copy the LF-separated UTF-8 list of package_ids
+   * that have trapped since the last drain into kernel memory at
+   * `outPtr`. Two-phase buffer: returns the *needed* length (so the
+   * kernel can realloc and retry) and only evicts entries on a
+   * fitting copy.
+   *
+   * Called once per frame from `akiva_frame` via the
+   * `hal_drain_trapped_packages` HAL import.
+   */
+  drainTrappedPackages(outPtr, outCap) {
+    if (this._pendingTraps.size === 0) return 0;
+    const entries = [...this._pendingTraps];
+    const blob = this._encoder.encode(entries.join("\n"));
+    if (blob.length > outCap) {
+      // Two-phase retry: keep the entries, report required size.
+      return blob.length;
+    }
+    const kernelBuf = this._kernelMemory().buffer;
+    new Uint8Array(kernelBuf, outPtr, blob.length).set(blob);
+    this._pendingTraps.clear();
+    this._dbg("lifecycle", `drain_trapped_packages → [${entries.join(", ")}]`);
+    return blob.length;
+  }
+
   // ── Stone 11.4c: dispatch / pollFuture / getResult ─────────────────────
 
   /**
@@ -403,9 +440,13 @@ export class AppRegistry {
       return null;
     }
     worker.onerror = (e) => {
-      // Stone 11.5 hooks `LifecycleState::Trapped` here. For 11.4c we
-      // surface the error so a regression is observable.
+      // Stone 11.5 — uncaught error in the worker (typically a
+      // wasm trap that escaped our try/catch in the shell, or a JS
+      // syntax error). Stage the package for the kernel's frame
+      // drain; the framework will mark every activity Trapped on
+      // the next `akiva_frame`.
       this._log("error", `app ${packageId}: worker.onerror: ${e?.message ?? e}`);
+      this._pendingTraps.add(packageId);
     };
     worker.addEventListener("message", (e) => this._onWorkerMessage(packageId, e.data));
 
@@ -507,6 +548,10 @@ export class AppRegistry {
         break;
       case "trapped":
         this._log("error", `${packageId}: app trapped: ${msg.reason}`);
+        // Stage for kernel pickup on next frame. mark_package_trapped
+        // is idempotent on the framework side — if the same trap fires
+        // multiple times before the kernel drains, the Set collapses.
+        this._pendingTraps.add(packageId);
         break;
       default:
         this._log("warn", `${packageId}: unknown worker message type ${msg.type}`);

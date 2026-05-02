@@ -319,6 +319,12 @@ function buildImports() {
     hal_app_get_result:  (futureId, outPtr, outCap) =>
       apps.getResult(futureId, outPtr, outCap),
 
+    // Stone 11.5 — pull the queue of package_ids that trapped since
+    // the last frame. Called by `akiva_frame` before event dispatch
+    // so a click on a trapped activity doesn't try to forward into
+    // a dead worker.
+    hal_drain_trapped_packages: (outPtr, outCap) => apps.drainTrappedPackages(outPtr, outCap),
+
     // Stone 9.3 — read + clear the pending-finish flag for `handle`.
     // Returns 1 if the app called `akiva_host_finish` since the last
     // drain, 0 otherwise.

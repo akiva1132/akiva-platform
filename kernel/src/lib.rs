@@ -630,6 +630,14 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
     k.frame_count = k.frame_count.wrapping_add(1);
     k.last_frame_ms = timestamp_ms;
 
+    // Stone 11.5 — pull any package_ids that trapped since the last
+    // frame and tell the framework to mark every activity in each
+    // bad package as Trapped. Done before event dispatch so a click
+    // on a trapped activity doesn't try to forward into a dead worker.
+    if let Some(fw) = k.framework.as_mut() {
+        drain_trapped_packages_into(fw);
+    }
+
     // Drain all queued events and dispatch.
     while let Some(ev) = k.events.pop() {
         k.handle_event(ev);
@@ -643,6 +651,48 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
     if let Some(fw) = k.framework.as_mut() {
         let frame = fw.render_frame(timestamp_ms);
         k.display.flush(frame);
+    }
+}
+
+/// Stone 11.5 — host → framework bridge for the trapped-packages
+/// queue. Two-phase buffer: peek at the size first, then realloc if
+/// needed. The host evicts the entries on a fitting copy, so this is
+/// always single-shot per frame.
+fn drain_trapped_packages_into(fw: &mut akiva_framework::Framework) {
+    // Most frames the queue is empty (`needed == 0`); the bigger
+    // buffer only kicks in when many apps trap simultaneously. 256
+    // covers ~10 package_ids before the retry branch ever fires.
+    let mut buf = [0u8; 256];
+    let needed = unsafe {
+        host::hal_drain_trapped_packages(buf.as_mut_ptr(), buf.len() as u32)
+    } as usize;
+    if needed == 0 {
+        return;
+    }
+    let bytes: Vec<u8> = if needed > buf.len() {
+        let mut big = vec![0u8; needed];
+        let got = unsafe {
+            host::hal_drain_trapped_packages(big.as_mut_ptr(), big.len() as u32)
+        } as usize;
+        big.truncate(got.min(big.len()));
+        big
+    } else {
+        buf[..needed].to_vec()
+    };
+    let blob = match core::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            log::warn("drain_trapped_packages: non-utf8 blob from host, discarding");
+            return;
+        }
+    };
+    for pkg in blob.split('\n') {
+        let pkg = pkg.trim();
+        if pkg.is_empty() { continue; }
+        let n = fw.mark_package_trapped(pkg);
+        if n > 0 {
+            log::warn(&format!("package '{pkg}' trapped — {n} activity(s) marked Trapped"));
+        }
     }
 }
 

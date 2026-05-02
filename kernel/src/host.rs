@@ -132,6 +132,21 @@ extern "C" {
         out_cap: u32,
     ) -> u32;
 
+    // ── Stone 11.5: trapped-package drain ─────────────────────────────────
+    //
+    // The kernel calls `hal_drain_trapped_packages` once per frame. The
+    // host returns the total bytes needed to encode every package_id
+    // that has trapped since the last drain (LF-separated UTF-8). If
+    // the return value exceeds `out_cap` nothing is copied and the
+    // entries stay queued; the kernel retries with a larger buffer.
+    // A successful copy evicts the staged set — single-shot consume.
+    //
+    // Each drained package_id maps to a `Framework::mark_package_trapped`
+    // call on the kernel side, which transitions every Activity record
+    // in that package to `LifecycleState::Trapped` and clears any
+    // pending future slots.
+    pub fn hal_drain_trapped_packages(out_ptr: *mut u8, out_cap: u32) -> u32;
+
     // ── App → host signals (Stone 9.3) ────────────────────────────────────
     //
     // The app imports `akiva_host_finish()` to ask the platform to tear it
