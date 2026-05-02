@@ -38,11 +38,12 @@ ABI v0 קטן בכוונה — 7 exports app-side ו-7 imports kernel→host. ז
 כל app הוא wasm module עצמאי שה-host (worker.js) טוען לצד ה-kernel wasm. ה-kernel **לא** מזהה את האפליקציה ב-address space שלו — הוא שולח את הבקשות ל-host דרך imports בשם `hal_app_*`, וה-host מנתב אותן ל-instance הנכון של ה-app. יש לכך יתרונות מיידיים: isolation בין apps, memory growth עצמאי, crash containment.
 
 ```
-  Kernel wasm           Worker JS host            App wasm (one per package)
-  ───────────           ──────────────            ─────────────────────────
-  WasmActivity   ──►    hal_app_lifecycle   ──►   akiva_app_on_resume(handle)
-  (framework)           (routes by handle)         (app-side)
-                  ◄──   bytes via hal_app_render  ◄── akiva_app_render → *u8
+  Kernel wasm           Worker JS host             App wasm (one per package)
+  ───────────           ──────────────             ─────────────────────────
+  WasmActivity   ──►    hal_app_dispatch    ──►    akiva_app_dispatch(cmd, payload)
+  (framework)           (routes by handle)          (app-side)
+                  ◄──   bytes via               ◄── akiva_app_get_result → *u8
+                        hal_app_get_result
 ```
 
 ה-`handle` הוא `u32` לא-אפסי שה-host מקצה ב-`hal_app_register` ושומר בו את ה-tuple `(package_id, class, wasm_instance)`. ל-kernel אין מושג מה ה-handle מייצג.
@@ -62,9 +63,9 @@ extern "C" fn akiva_app_dealloc(ptr: *mut u8, size: u32);
 extern "C" fn akiva_app_abi_version() -> *const u8;
 ```
 
-#### 2.2.2 Unified dispatch entry (Stone 11.4b — current)
+#### 2.2.2 Unified dispatch entry (Stone 11.4b)
 
-הExports החדשים שהוצגו ב-Stone 11.4b מכווצים את 13 ה-callback exports הנפרדים (lifecycle / input / render / state / intent) ל-export יחיד שמפענח `cmd_kind`. ה-host (kernel + JS) קורא רק לזוג הזה דרך 11.4b-3 ואילך.
+ה-Exports החדשים שהוצגו ב-Stone 11.4b ושהפכו ב-11.4b-5 ל-canonical מכווצים את 13 ה-callback exports הנפרדים (lifecycle / input / render / state / intent) ל-export יחיד שמפענח `cmd_kind`. ה-host (kernel + JS) קורא **רק** לזוג הזה — ה-`akiva_app_create`/`akiva_app_render`/.../`akiva_app_activity_result` הפר-callback נמחקו ב-11.4b-5.
 
 ```rust
 // Unified dispatch — ה-host מעביר cmd_kind שמזהה את הקריאה (lifecycle
@@ -83,8 +84,7 @@ extern "C" fn akiva_app_dispatch(
 
 // Companion ל-dispatch — מחזיר ptr ל-buffer app-owned שמכיל את ה-bytes
 // שה-dispatch ייצר (paint stream של RENDER, SavedState של SAVE_STATE).
-// ה-buffer תקף עד ה-dispatch הבא שמייצר bytes על אותו handle (שmatches
-// את ה-lifetime של akiva_app_render legacy).
+// ה-buffer תקף עד ה-dispatch הבא שמייצר bytes על אותו handle.
 extern "C" fn akiva_app_get_result(
     future_id: u64,
     out_len_ptr: *mut u32,
@@ -119,48 +119,7 @@ Payload layout פר-cmd (כל אחד מתחיל ב-`[handle: u32 LE, ...]`):
 
 `future_id` ב-11.4b-3+ encoded כ-`handle as u64` ל-RENDER ו-SAVE_STATE; `0` לכל היתר. ב-11.4c (כשה-app יחיה ב-Worker נפרד) ה-future_id יקבל namespace שונה ויהפוך לאמיתי async — ה-API stays identical.
 
-#### 2.2.3 Legacy per-callback exports (Stone 11.4b-5 will remove)
-
-עד שStone 11.4b-5 ינקה אותם, כל app עדיין חייב לייצא גם את ה-13 ה-exports הישנים. ה-host מעדיף את ה-dispatch path אבל REQUIRED_EXPORTS דורש את שני הסטים כדי ש-host באמצע migration לא יפול בשקט. ה-SDK macro `akiva_app!` מייצר את שני הסטים יחד.
-
-```rust
-// Lifecycle — handle הוא per-activity.
-extern "C" fn akiva_app_create(handle: u32, class_ptr: *const u8, class_len: u32);
-extern "C" fn akiva_app_start(handle: u32);
-extern "C" fn akiva_app_resume(handle: u32);
-extern "C" fn akiva_app_pause(handle: u32);
-extern "C" fn akiva_app_stop(handle: u32);
-extern "C" fn akiva_app_destroy(handle: u32);
-
-// Input.
-extern "C" fn akiva_app_pointer(
-    handle: u32, x: f32, y: f32, button: u32, phase: u32, ts_ms: f64,
-);
-extern "C" fn akiva_app_key(
-    handle: u32, code: u32, modifiers: u32, phase: u32, ts_ms: f64,
-);
-extern "C" fn akiva_app_resize(
-    handle: u32, width_px: u32, height_px: u32, density: f32,
-);
-
-// Render — מחזיר את הכתובת של buffer paint-ops ב-memory של ה-app.
-// ה-host קורא את האורך מ-*out_len_ptr, מעתיק, וממשיך.
-extern "C" fn akiva_app_render(handle: u32, ts_ms: f64, out_len_ptr: *mut u32) -> *const u8;
-
-// Saved state — סימטרי ל-render. ה-app מסדר את ה-UI state שלו לפי
-// הפורמט של `SavedState` ([sdk-rust/src/activity.rs]) ומחזיר pointer
-// ל-buffer app-owned שתקף עד הקריאה הבאה ל-save_state עם אותו handle.
-extern "C" fn akiva_app_save_state(handle: u32, out_len_ptr: *mut u32) -> *const u8;
-extern "C" fn akiva_app_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32);
-
-// Intent redelivery + activity result.
-extern "C" fn akiva_app_new_intent(handle: u32, bytes_ptr: *const u8, bytes_len: u32);
-extern "C" fn akiva_app_activity_result(
-    handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
-);
-```
-
-ה-buffer שמוחזר מ-`akiva_app_render` (וגם מ-`akiva_app_get_result` לאחר RENDER) הוא app-owned: ה-app חייב להחזיק אותו בחיים לפחות עד הקריאה הבאה לdata-producing dispatch על אותו handle. ה-convention הוא buffer per-handle שנמחזר כל frame — מקצה פעם אחת, מנקה עם `clear()`, ומחזיר את הכתובת שוב.
+ה-buffer שמוחזר מ-`akiva_app_get_result` הוא app-owned: ה-app חייב להחזיק אותו בחיים לפחות עד הקריאה הבאה ל-data-producing dispatch על אותו handle. ה-convention הוא buffer per-handle שנמחזר כל frame — מקצה פעם אחת, מנקה עם `clear()`, ומחזיר את הכתובת שוב.
 
 ### 2.3 Imports (host → app)
 
@@ -304,7 +263,7 @@ fn hal_app_register(
 ) -> u32;  // 0 = unknown package/class
 fn hal_app_unregister(handle: u32);
 
-// ── Stone 11.4b: unified host→app dispatch ──────────────────────────
+// ── Unified host→app dispatch (Stone 11.4b) ───────────────────────
 //
 // `hal_app_dispatch` is what the framework's `KernelWasmHost` calls
 // for every per-callback transition (lifecycle, input, render, state,
@@ -323,58 +282,32 @@ fn hal_app_dispatch(
 ) -> u64;
 
 // Companion to `hal_app_dispatch`: fetch the bytes for a non-zero
-// future_id (RENDER paint stream, SAVE_STATE encoded state). Same
-// two-phase buffer contract as the legacy `hal_app_render`: returns
-// the *needed* length; truncated copies trigger a retry with a
-// larger buffer.
+// future_id (RENDER paint stream, SAVE_STATE encoded state). Two-phase
+// buffer contract: returns the *needed* length; truncated copies
+// trigger a retry with a larger buffer.
 fn hal_app_get_result(
     future_id: u64, out_ptr: *mut u8, out_cap: u32,
 ) -> u32;
 
-// ── Legacy per-callback imports (Stone 11.4b-5 will remove) ────────
-//
-// Until 11.4b-5 lands, the JS env still wires these — a host or
-// kernel mid-migration must not trap because the other side hasn't
-// switched yet. The Rust `KernelWasmHost` no longer calls them as of
-// 11.4b-3.
-fn hal_app_lifecycle(handle: u32, transition: u32);  // 0=Create .. 5=Destroy
-fn hal_app_pointer(handle: u32, x: f32, y: f32, button: u32, phase: u32, ts_ms: f64);
-fn hal_app_key(handle: u32, code: u32, modifiers: u32, phase: u32, ts_ms: f64);
-fn hal_app_resize(handle: u32, width_px: u32, height_px: u32, density: f32);
-fn hal_app_render(handle: u32, ts_ms: f64, out_ptr: *mut u8, out_cap: u32) -> u32;
-// ^ returns total bytes produced by the app. If > out_cap the kernel's
-//   buffer was truncated; kernel should retry with a larger allocation.
-
-fn hal_app_save_state(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
-// ^ same two-phase buffer contract as render: returns total bytes the
-//   app produced. Truncated blobs trigger a retry with a larger buffer.
-fn hal_app_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32) -> u32;
-// ^ 0 on success, non-zero on handle miss / alloc failure / host error.
-
 // Stone 9.3 — read + clear the per-handle "finish requested" flag the
 // app raised via `akiva_host_fire(FIRE::FINISH, …)`. Called by
-// `WasmActivity` at the
-// end of every ctx-bearing callback; return 1 flips
-// `ActivityContext.finish_requested = true` in the active dispatch.
+// `WasmActivity` at the end of every ctx-bearing callback; return 1
+// flips `ActivityContext.finish_requested = true` in the active
+// dispatch.
 fn hal_app_drain_finish(handle: u32) -> u32;
 
 // Stone 9.4 — read + clear the per-handle pending intent blob staged
-// via `akiva_host_fire(FIRE::START_ACTIVITY, …)`. Two-phase buffer: the return value
-// is the total encoded size; if it exceeds `out_cap` nothing is copied
-// and the blob stays armed so the kernel can retry with a larger
-// buffer (same shape as `hal_app_render` / `hal_app_save_state`).
-// Zero means "nothing pending" — distinct from "empty intent" (which
-// can't happen; the encoder's minimum is 17 bytes).
+// via `akiva_host_fire(FIRE::START_ACTIVITY, …)`. Two-phase buffer:
+// the return value is the total encoded size; if it exceeds `out_cap`
+// nothing is copied and the blob stays armed so the kernel can retry
+// with a larger buffer. Zero means "nothing pending" — distinct from
+// "empty intent" (which can't happen; the encoder's minimum is 17
+// bytes).
 fn hal_app_drain_intent(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
 
-// Deliver an already-resolved intent to a live activity handle (fires
-// the app's `akiva_app_new_intent` export). Symmetric with
-// `hal_app_restore_state`: host copies bytes into app memory via
-// `akiva_app_alloc`, calls the export, frees after return. Returns 0
-// on success; non-zero on handle miss / alloc failure / app trap.
-fn hal_app_new_intent(handle: u32, bytes_ptr: *const u8, bytes_len: u32) -> u32;
-
-// Stone 9.5 — three primitives matching the Stone 9.4 shapes.
+// Stone 9.5 — two drain primitives matching the Stone 9.4 shapes.
+// (Host→app delivery for ACTIVITY_RESULT goes through `hal_app_dispatch`
+// with cmd_kind = ACTIVITY_RESULT; no dedicated import.)
 //
 // Drain a pending start_activity_for_result request. Two-phase buffer:
 // returns total size of the encoded Intent. `rc_out` is always written
@@ -385,17 +318,11 @@ fn hal_app_drain_start_for_result(
     handle: u32, out_ptr: *mut u8, out_cap: u32, rc_out: *mut u32,
 ) -> u32;
 
-// Drain whatever bytes the app stashed via `akiva_host_fire(FIRE::SET_RESULT, …)`.
-// Same two-phase contract; payload is an encoded ActivityResult
-// (see §2.5.2). Zero return = nothing stashed.
+// Drain whatever bytes the app stashed via
+// `akiva_host_fire(FIRE::SET_RESULT, …)`. Same two-phase contract;
+// payload is an encoded ActivityResult (see §2.5.2). Zero return =
+// nothing stashed.
 fn hal_app_drain_set_result(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
-
-// Fire the app's akiva_app_activity_result export with the
-// caller-chosen request_code and the encoded ActivityResult bytes.
-// Same rc convention as hal_app_new_intent.
-fn hal_app_activity_result(
-    handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
-) -> u32;
 ```
 
 ### 2.5 Paint-op wire format

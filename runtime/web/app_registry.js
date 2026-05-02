@@ -306,18 +306,6 @@ export class AppRegistry {
   }
 
   /**
-   * Deliver a freshly-resolved intent blob to an already-existing
-   * activity handle — fires `akiva_app_new_intent`. Same rc convention
-   * as `restoreState`: 0 ok, 1 handle miss, 2 alloc failed, 3 trap.
-   */
-  newIntent(handle, bytesPtr, bytesLen) {
-    if (bytesLen === 0) return this._lookup(handle) ? 0 : 1;
-    const bytes = this._copyKernelSlice(bytesPtr, bytesLen);
-    return this._callAppWithBytes(handle, "new_intent", bytes,
-      (proc, appPtr, len) => proc.instance.exports.akiva_app_new_intent(handle, appPtr, len));
-  }
-
-  /**
    * Stone 9.5 — read the pending `start_activity_for_result` entry for
    * `handle`. Returns `{ bytes, requestCode }` or `null`. Does NOT
    * clear; clearing happens in `_consumeStartForResult` once the HAL
@@ -350,136 +338,18 @@ export class AppRegistry {
     this._pendingSetResult.delete(handle);
   }
 
-  /**
-   * Stone 9.5 — deliver an `ActivityResult` blob to the caller activity.
-   * Fires `akiva_app_activity_result(handle, request_code, ptr, len)`.
-   * Same rc convention as `newIntent` / `restoreState`.
-   */
-  activityResult(handle, requestCode, bytesPtr, bytesLen) {
-    if (bytesLen === 0) return this._lookup(handle) ? 0 : 1;
-    const bytes = this._copyKernelSlice(bytesPtr, bytesLen);
-    return this._callAppWithBytes(handle, "activity_result", bytes,
-      (proc, appPtr, len) => proc.instance.exports.akiva_app_activity_result(
-        handle, requestCode, appPtr, len,
-      ));
-  }
-
-  lifecycle(handle, transition) {
-    const ctx = this._lookup(handle);
-    if (!ctx) return;
-    const { slot, proc } = ctx;
-    const name = LIFECYCLE_NAMES[transition] ?? transition;
-    this._dbg("lifecycle", `${slot.packageId}[handle=${handle}] → ${name}`);
-    try {
-      if (transition === 0 /* Create */) {
-        // Create is the only lifecycle transition that needs extra
-        // payload (the class name). Every other transition is just
-        // (handle) because the app remembers which class a handle
-        // corresponds to from its own on_create call.
-        this._dispatchCreate(slot, proc, handle);
-      } else {
-        const fn = LIFECYCLE_EXPORTS[transition];
-        if (!fn) {
-          this._log("warn", `lifecycle: unknown transition ${transition} for ${slot.packageId}`);
-          return;
-        }
-        proc.instance.exports[fn](handle);
-      }
-    } catch (err) {
-      this._log("error", `app ${slot.packageId}.${name}: ${err?.message ?? err}`);
-    }
-  }
-
-  pointer(handle, x, y, button, phase, tsMs) {
-    const ctx = this._lookup(handle);
-    if (!ctx) return;
-    try {
-      ctx.proc.instance.exports.akiva_app_pointer(handle, x, y, button, phase, tsMs);
-    } catch (err) {
-      this._log("error", `app ${ctx.slot.packageId}.pointer: ${err?.message ?? err}`);
-    }
-  }
-
-  key(handle, code, modifiers, phase, tsMs) {
-    const ctx = this._lookup(handle);
-    if (!ctx) return;
-    try {
-      ctx.proc.instance.exports.akiva_app_key(handle, code, modifiers, phase, tsMs);
-    } catch (err) {
-      this._log("error", `app ${ctx.slot.packageId}.key: ${err?.message ?? err}`);
-    }
-  }
-
-  resize(handle, widthPx, heightPx, density) {
-    const ctx = this._lookup(handle);
-    if (!ctx) return;
-    try {
-      ctx.proc.instance.exports.akiva_app_resize(handle, widthPx, heightPx, density);
-    } catch (err) {
-      this._log("error", `app ${ctx.slot.packageId}.resize: ${err?.message ?? err}`);
-    }
-  }
-
-  /**
-   * Ask the app to paint. Two-phase buffer: app produces a paint-op
-   * stream in its own memory; we copy up to `outCap` bytes into kernel
-   * memory. Return value is the full length the app produced — if it
-   * exceeds `outCap` the kernel retries with a larger buffer and we
-   * copied nothing on this call.
-   */
-  render(handle, tsMs, outPtr, outCap) {
-    const ret = this._copyAppToKernel(handle, "render", outPtr, outCap,
-      (proc, lenPtr) => proc.instance.exports.akiva_app_render(handle, tsMs, lenPtr));
-    // Only emit the "paint" category when a frame actually produced
-    // bytes — `ret === 0` is the idle-app path and every frame would
-    // spam the log with zeros. `ret > outCap` is the retry path (no
-    // copy happened yet); count it too since it's informative.
-    if (ret > 0) this._dbg("paint", `render[handle=${handle}] ${ret} bytes${ret > outCap ? " (retry)" : ""}`);
-    return ret;
-  }
-
-  /**
-   * Ask the app to serialise its UI state. Same two-phase buffer contract
-   * as `render`: returns the number of bytes the app produced.
-   */
-  saveState(handle, outPtr, outCap) {
-    return this._copyAppToKernel(handle, "save_state", outPtr, outCap,
-      (proc, lenPtr) => proc.instance.exports.akiva_app_save_state(handle, lenPtr));
-  }
-
-  /**
-   * Hand previously-persisted bytes back to the app via
-   * `akiva_app_restore_state`. Returns the rc convention shared by every
-   * kernel→app bytes path: 0 on success, 1 = handle miss, 2 = alloc
-   * failed, 3 = app export threw.
-   */
-  restoreState(handle, bytesPtr, bytesLen) {
-    if (bytesLen === 0) {
-      // Fast-path: still fail the handle-miss case so the kernel can
-      // log, but skip every alloc/copy/dealloc step for a no-op restore.
-      return this._lookup(handle) ? 0 : 1;
-    }
-    const bytes = this._copyKernelSlice(bytesPtr, bytesLen);
-    return this._callAppWithBytes(handle, "restore_state", bytes,
-      (proc, appPtr, len) => proc.instance.exports.akiva_app_restore_state(handle, appPtr, len));
-  }
-
   // ── Stone 11.4b: unified host→app dispatch ─────────────────────────────
   //
   // `dispatch(cmdKind, payloadPtr, payloadLen)` is the JS handler for the
-  // `hal_app_dispatch` import the kernel calls instead of the 12 legacy
-  // `hal_app_*` per-callback imports. The kernel-side payload always
-  // starts with `[handle: u32 LE, ...]`, so we read the handle to find
-  // the wasm process, copy the payload into app memory, fire
+  // `hal_app_dispatch` import the kernel calls. The kernel-side payload
+  // always starts with `[handle: u32 LE, ...]`, so we read the handle to
+  // find the wasm process, copy the payload into app memory, fire
   // `akiva_app_dispatch`, and return its u64 future_id.
   //
   // CREATE special case: the kernel only emits `[handle]` (it doesn't
   // know the class string — the class lives on the JS side, set during
   // `register`). We splice the encoded class onto the payload before
-  // forwarding, matching the legacy `_dispatchCreate` path.
-  //
-  // Stone 11.4b coexists with the legacy lifecycle/pointer/.../
-  // activity_result methods above; 11.4b-5 will remove them.
+  // forwarding.
 
   /** Dispatch a host→app command. Returns the u64 future_id (BigInt). */
   dispatch(cmdKind, payloadPtr, payloadLen) {
@@ -1043,32 +913,13 @@ export class AppRegistry {
     return { slot, proc };
   }
 
-  _dispatchCreate(_slot, _proc, handle) {
-    // Class-name passing reuses the generic app-bytes path: the only
-    // quirk is the export takes `(handle, ptr, len)` instead of
-    // `(handle, bytes_ptr, bytes_len)` but that's identical semantics.
-    // rc is ignored — the only recoverable outcome (handle miss) can't
-    // happen here because the slot was just inserted by `register`.
-    this._callAppWithBytes(handle, "create", this._encoder.encode(_slot.class),
-      (proc, appPtr, len) => proc.instance.exports.akiva_app_create(handle, appPtr, len));
-  }
-
-  // ── Shared host ↔ app byte-transfer helpers ────────────────────────────
-  //
-  // Three patterns used to live inline at five call sites each with its
-  // own try/catch/rc convention. They've been hoisted so every
-  // app-memory exchange goes through the same code path — less surface
-  // area for subtle bugs (wrong rc on alloc failure, forgotten
-  // dealloc, mismatched length field handling) and less noise when a
-  // future primitive (e.g. Stone 9.5's `activity_result`) lands.
-
   /**
-   * Two-phase buffer read: the app-side export produces a byte stream
-   * in its own memory; we copy up to `outCap` bytes into kernel memory
-   * at `outPtr`. `invoke(proc, lenPtr)` calls the export and returns
-   * the source pointer in app memory. Returns the total length the app
-   * produced; `len > outCap` means nothing was copied and the caller
-   * should retry with a larger buffer.
+   * Two-phase buffer read for `getResult`. The app-side export produces
+   * a byte stream in its own memory; we copy up to `outCap` bytes into
+   * kernel memory at `outPtr`. `invoke(proc, lenPtr)` calls the export
+   * and returns the source pointer in app memory. Returns the total
+   * length the app produced; `len > outCap` means nothing was copied
+   * and the caller should retry with a larger buffer.
    */
   _copyAppToKernel(handle, opLabel, outPtr, outCap, invoke) {
     const ctx = this._lookup(handle);
@@ -1100,41 +951,6 @@ export class AppRegistry {
     const kernelBuf = this._kernelMemory().buffer;
     new Uint8Array(kernelBuf, outPtr, len).set(src);
     return len;
-  }
-
-  /**
-   * Two-phase buffer write: we have kernel-owned bytes, allocate a
-   * matching region in the app's memory, copy them in, invoke the
-   * export that consumes them, then free. `invoke(proc, appPtr, len)`
-   * fires the export. Returns rc: 0 ok, 1 handle miss, 2 alloc failed,
-   * 3 app export threw. A zero-length `bytes` short-circuits to 0 / 1
-   * without touching the allocator.
-   */
-  _callAppWithBytes(handle, opLabel, bytes, invoke) {
-    const ctx = this._lookup(handle);
-    if (!ctx) return 1;
-    const { slot, proc } = ctx;
-    if (bytes.length === 0) return 0;
-
-    let appPtr;
-    try {
-      appPtr = proc.instance.exports.akiva_app_alloc(bytes.length);
-      if (appPtr === 0) {
-        this._log("warn", `app ${slot.packageId}: alloc(${bytes.length}) for ${opLabel} returned null`);
-        return 2;
-      }
-      new Uint8Array(proc.memory.buffer, appPtr, bytes.length).set(bytes);
-      invoke(proc, appPtr, bytes.length);
-    } catch (err) {
-      this._log("error", `app ${slot.packageId}.${opLabel}: ${err?.message ?? err}`);
-      return 3;
-    } finally {
-      if (appPtr) {
-        try { proc.instance.exports.akiva_app_dealloc(appPtr, bytes.length); }
-        catch (_) { /* best effort */ }
-      }
-    }
-    return 0;
   }
 
   /**
@@ -1203,50 +1019,21 @@ export const CAPABILITY_IMPORTS = Object.freeze({
   "akiva.permission.CAMERA":          Object.freeze([]),
 });
 
-// Indexed by `LifecycleTransition` wire value from wasm_activity.rs.
-const LIFECYCLE_EXPORTS = [
-  "akiva_app_create",   // 0 — handled specially (see _dispatchCreate)
-  "akiva_app_start",    // 1
-  "akiva_app_resume",   // 2
-  "akiva_app_pause",    // 3
-  "akiva_app_stop",     // 4
-  "akiva_app_destroy",  // 5
-];
-const LIFECYCLE_NAMES = ["create", "start", "resume", "pause", "stop", "destroy"];
-
 const LEVEL_NAMES = ["trace", "debug", "info", "warn", "error"];
 
 // Every app MUST expose these — see docs/abi.md §2.2. Missing any of them
 // means the wasm wasn't built against sdk-rust (or was built for a
 // different ABI) and we refuse to load it rather than discovering the
-// gap at first lifecycle call.
+// gap at first dispatch call.
 //
-// Stone 11.4b — `akiva_app_dispatch` and `akiva_app_get_result` joined
-// the list. The 13 legacy per-callback exports
-// (`akiva_app_create`/`..._render`/etc.) stay required until 11.4b-5
-// removes them in lockstep with the legacy `hal_app_*` imports;
-// during the 11.4b-3..4 transition both sets must be present so a
-// host that's mid-migration doesn't silently fall through.
+// Stone 11.4b-5 collapsed the per-callback exports
+// (`akiva_app_create`/`...`/`akiva_app_activity_result`) into the
+// unified `akiva_app_dispatch` + `akiva_app_get_result` pair.
 const REQUIRED_EXPORTS = [
   "memory",
   "akiva_app_alloc",
   "akiva_app_dealloc",
   "akiva_app_abi_version",
-  "akiva_app_create",
-  "akiva_app_start",
-  "akiva_app_resume",
-  "akiva_app_pause",
-  "akiva_app_stop",
-  "akiva_app_destroy",
-  "akiva_app_pointer",
-  "akiva_app_key",
-  "akiva_app_resize",
-  "akiva_app_render",
-  "akiva_app_save_state",
-  "akiva_app_restore_state",
-  "akiva_app_new_intent",
-  "akiva_app_activity_result",
-  // Stone 11.4b — unified dispatch entry point + result fetcher.
   "akiva_app_dispatch",
   "akiva_app_get_result",
 ];

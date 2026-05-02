@@ -72,12 +72,9 @@ extern "C" {
     // kernel reuses for the rest of the activity's lifetime, or `0` if
     // the package/class isn't installed or the wasm failed to instantiate.
     // The handle is only meaningful paired with this host — the kernel
-    // must not persist it.
-    //
-    // `hal_app_render` copies at most `out_cap` paint-op bytes into the
-    // kernel buffer and returns the total number of bytes the app
-    // produced. If the return value exceeds `out_cap` the buffer was
-    // truncated and the kernel should retry with a larger allocation.
+    // must not persist it. All per-callback traffic (lifecycle, input,
+    // render, saved-state, intents, results) flows through
+    // `hal_app_dispatch` / `hal_app_get_result` below.
 
     pub fn hal_app_register(
         package_id_ptr: *const u8, package_id_len: usize,
@@ -85,27 +82,23 @@ extern "C" {
     ) -> u32;
     pub fn hal_app_unregister(handle: u32);
 
-    // ── Stone 11.4b: unified host→app dispatch ────────────────────────────
+    // ── Unified host→app dispatch (Stone 11.4b) ───────────────────────────
     //
-    // `hal_app_dispatch` replaces the 12 per-callback imports
-    // (`hal_app_lifecycle`, `hal_app_pointer`, …, `hal_app_activity_result`)
-    // with a single multiplexer keyed by `cmd_kind`. The JS host reads the
-    // `[handle: u32 LE, ...]` prefix from `payload`, looks up the wasm
-    // process that owns the handle, copies the payload into app memory,
-    // and forwards to the app's `akiva_app_dispatch` export. Returns the
-    // app's `future_id`:
+    // `hal_app_dispatch` is the single multiplexer keyed by `cmd_kind`
+    // that replaced the per-callback `hal_app_lifecycle`/`hal_app_pointer`/
+    // `hal_app_key`/`hal_app_resize`/`hal_app_render`/`hal_app_save_state`/
+    // `hal_app_restore_state`/`hal_app_new_intent`/`hal_app_activity_result`
+    // imports in Stone 11.4b-5. The JS host reads the `[handle: u32 LE, ...]`
+    // prefix from `payload`, looks up the wasm process that owns the handle,
+    // copies the payload into app memory, and forwards to the app's
+    // `akiva_app_dispatch` export. Returns the app's `future_id`:
     //   - `0`        — sync, no result bytes (every ack-only cmd_kind).
     //   - non-zero   — sync result bytes available; kernel calls
     //                  `hal_app_get_result(future_id, ...)` next.
     //
-    // The legacy per-callback imports below are still declared (and the
-    // JS env still maps them) so the migration can land without breaking
-    // mid-air. Stone 11.4b-5 removes them.
-    //
     // CREATE special case: the kernel passes only `[handle]` in the
     // payload; the JS host augments with the slot's class string before
-    // forwarding to `akiva_app_dispatch` — same split as the legacy
-    // path where `_dispatchCreate` looks up the class on the JS side.
+    // forwarding to `akiva_app_dispatch`.
     pub fn hal_app_dispatch(
         cmd_kind: u32,
         payload_ptr: *const u8,
@@ -113,61 +106,14 @@ extern "C" {
     ) -> u64;
 
     /// Companion to `hal_app_dispatch`: fetch the result bytes for a
-    /// non-zero `future_id` returned by a RENDER or SAVE_STATE
-    /// dispatch. Two-phase buffer convention (matches `hal_app_render`
-    /// pre-11.4b): kernel passes `out_ptr` + `out_cap`, host copies up
-    /// to `out_cap` bytes, returns the *needed* length. If the return
-    /// exceeds `out_cap` the kernel reallocates and retries.
+    /// non-zero `future_id` returned by a RENDER or SAVE_STATE dispatch.
+    /// Two-phase buffer convention: kernel passes `out_ptr` + `out_cap`,
+    /// host copies up to `out_cap` bytes, returns the *needed* length.
+    /// If the return exceeds `out_cap` the kernel reallocates and retries.
     pub fn hal_app_get_result(
         future_id: u64,
         out_ptr: *mut u8,
         out_cap: u32,
-    ) -> u32;
-
-    /// `transition` matches `framework::wasm_activity::LifecycleTransition`.
-    pub fn hal_app_lifecycle(handle: u32, transition: u32);
-
-    pub fn hal_app_pointer(
-        handle: u32,
-        x: f32, y: f32,
-        button: u32, phase: u32,
-        ts_ms: f64,
-    );
-    pub fn hal_app_key(
-        handle: u32,
-        code: u32, modifiers: u32, phase: u32,
-        ts_ms: f64,
-    );
-    pub fn hal_app_resize(handle: u32, width_px: u32, height_px: u32, density: f32);
-
-    pub fn hal_app_render(
-        handle: u32,
-        ts_ms: f64,
-        out_ptr: *mut u8,
-        out_cap: u32,
-    ) -> u32;
-
-    // ── Saved state (Phase 6) ─────────────────────────────────────────────
-    //
-    // Symmetric with `hal_app_render`: the app encodes its `SavedState` into
-    // its own wire buffer, the host copies up to `out_cap` bytes into
-    // `out_ptr`, and returns the total length the app produced. If the
-    // return value exceeds `out_cap` the kernel reallocates and retries.
-    //
-    // `hal_app_restore_state` goes the other direction: the kernel hands
-    // previously-persisted bytes back, the host copies them into the app's
-    // memory via `akiva_app_alloc`, and the app decodes inside
-    // `akiva_app_restore_state`. Returns 0 on success, non-zero if the
-    // handle is unknown or the host-side copy failed.
-    pub fn hal_app_save_state(
-        handle: u32,
-        out_ptr: *mut u8,
-        out_cap: u32,
-    ) -> u32;
-    pub fn hal_app_restore_state(
-        handle: u32,
-        bytes_ptr: *const u8,
-        bytes_len: u32,
     ) -> u32;
 
     // ── App → host signals (Stone 9.3) ────────────────────────────────────
@@ -198,19 +144,9 @@ extern "C" {
         out_cap: u32,
     ) -> u32;
 
-    // `hal_app_new_intent` fires the app's `akiva_app_new_intent` export.
-    // Payload is a fresh `Intent::encode` blob the framework produced.
-    // Returns 0 on success, non-zero if the handle is unknown or the
-    // host-side copy failed (same convention as `hal_app_restore_state`).
-    pub fn hal_app_new_intent(
-        handle: u32,
-        bytes_ptr: *const u8,
-        bytes_len: u32,
-    ) -> u32;
-
-    // ── Activity result (Stone 9.5) ───────────────────────────────────────
+    // ── Activity result drain (Stone 9.5) ─────────────────────────────────
     //
-    // Three primitives, same shapes as their Stone 9.4 counterparts:
+    // Two drain primitives mirror the Stone 9.4 shape:
     //
     //   `hal_app_drain_start_for_result` — two-phase drain of a pending
     //   `start_activity_for_result` request. Returns total payload size
@@ -223,10 +159,9 @@ extern "C" {
     //   encoded `ActivityResult` (i32 code + u32 data_len + data).
     //   Zero return = nothing stashed.
     //
-    //   `hal_app_activity_result` — fires the app's
-    //   `akiva_app_activity_result` export with the caller-chosen
-    //   `request_code` and the encoded `ActivityResult` bytes. 0 on
-    //   success, non-zero on handle-miss or host-copy failure.
+    // The host→app delivery (firing the activity_result callback) goes
+    // through `hal_app_dispatch` with cmd_kind ACTIVITY_RESULT, not a
+    // dedicated import.
     pub fn hal_app_drain_start_for_result(
         handle: u32,
         out_ptr: *mut u8,
@@ -237,12 +172,6 @@ extern "C" {
         handle: u32,
         out_ptr: *mut u8,
         out_cap: u32,
-    ) -> u32;
-    pub fn hal_app_activity_result(
-        handle: u32,
-        request_code: u32,
-        bytes_ptr: *const u8,
-        bytes_len: u32,
     ) -> u32;
 
     // ── Permission grants (Stone 10.3b) ───────────────────────────────────

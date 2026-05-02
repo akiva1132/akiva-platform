@@ -309,23 +309,13 @@ function buildImports() {
     // calls this with the cmd_kind that identifies the lifecycle /
     // input / render / state / intent transition. Returns the app's
     // u64 future_id (0 = sync, no bytes; non-zero = bytes available
-    // via `hal_app_get_result`). Coexists with the legacy per-callback
-    // imports below until 11.4b-5 removes them.
+    // via `hal_app_get_result`). Replaced the per-callback
+    // `hal_app_lifecycle/pointer/key/resize/render/save_state/
+    // restore_state/new_intent/activity_result` imports in 11.4b-5.
     hal_app_dispatch:   (cmdKind, payloadPtr, payloadLen) =>
       apps.dispatch(cmdKind, payloadPtr, payloadLen),
     hal_app_get_result: (futureId, outPtr, outCap) =>
       apps.getResult(futureId, outPtr, outCap),
-
-    // Legacy per-callback imports — Stone 11.4b-5 will remove these in
-    // lockstep with the corresponding SDK-macro exports. Until then
-    // they remain wired so a partial-migration host doesn't trap.
-    hal_app_lifecycle:  (handle, transition) => apps.lifecycle(handle, transition),
-    hal_app_pointer:    (handle, x, y, button, phase, ts) => apps.pointer(handle, x, y, button, phase, ts),
-    hal_app_key:        (handle, code, mods, phase, ts) => apps.key(handle, code, mods, phase, ts),
-    hal_app_resize:     (handle, w, h, density) => apps.resize(handle, w, h, density),
-    hal_app_render:     (handle, ts, outPtr, outCap) => apps.render(handle, ts, outPtr, outCap),
-    hal_app_save_state: (handle, outPtr, outCap) => apps.saveState(handle, outPtr, outCap),
-    hal_app_restore_state: (handle, bytesPtr, bytesLen) => apps.restoreState(handle, bytesPtr, bytesLen),
 
     // Stone 9.3 — read + clear the pending-finish flag for `handle`.
     // Returns 1 if the app called `akiva_host_finish` since the last
@@ -339,18 +329,11 @@ function buildImports() {
     // consumes it.
     hal_app_drain_intent: (handle, outPtr, outCap) => halAppDrainIntent(handle, outPtr, outCap),
 
-    // Deliver a fresh intent to an already-existing activity handle
-    // — fires the app's `akiva_app_new_intent` export. Symmetric with
-    // `hal_app_restore_state`: returns 0 on success.
-    hal_app_new_intent: (handle, bytesPtr, bytesLen) => apps.newIntent(handle, bytesPtr, bytesLen),
-
     // Stone 9.5 — two-phase drains for the for-result flow.
     hal_app_drain_start_for_result: (handle, outPtr, outCap, rcOut) =>
       halAppDrainStartForResult(handle, outPtr, outCap, rcOut),
     hal_app_drain_set_result: (handle, outPtr, outCap) =>
       halAppDrainSetResult(handle, outPtr, outCap),
-    hal_app_activity_result: (handle, requestCode, bytesPtr, bytesLen) =>
-      apps.activityResult(handle, requestCode, bytesPtr, bytesLen),
 
     // Stone 10.3b — push per-package permission grants. Called from
     // `framework::boot` after rehydration, once per installed package,

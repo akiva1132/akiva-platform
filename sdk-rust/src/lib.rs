@@ -94,102 +94,13 @@ macro_rules! akiva_app {
             $crate::runtime::ABI_VERSION.as_ptr()
         }
 
-        // ── Lifecycle ──────────────────────────────────────────────────
-        #[no_mangle]
-        pub extern "C" fn akiva_app_create(handle: u32, class_ptr: *const u8, class_len: u32) {
-            $crate::runtime::on_create::<$ty>(handle, class_ptr, class_len);
-        }
-        #[no_mangle]
-        pub extern "C" fn akiva_app_start(handle: u32)   { $crate::runtime::on_start(handle);   }
-        #[no_mangle]
-        pub extern "C" fn akiva_app_resume(handle: u32)  { $crate::runtime::on_resume(handle);  }
-        #[no_mangle]
-        pub extern "C" fn akiva_app_pause(handle: u32)   { $crate::runtime::on_pause(handle);   }
-        #[no_mangle]
-        pub extern "C" fn akiva_app_stop(handle: u32)    { $crate::runtime::on_stop(handle);    }
-        #[no_mangle]
-        pub extern "C" fn akiva_app_destroy(handle: u32) { $crate::runtime::on_destroy(handle); }
-
-        // ── Input ──────────────────────────────────────────────────────
-        #[no_mangle]
-        pub extern "C" fn akiva_app_pointer(
-            handle: u32, x: f32, y: f32, button: u32, phase: u32, ts_ms: f64,
-        ) {
-            $crate::runtime::on_pointer(handle, x, y, button, phase, ts_ms);
-        }
-        #[no_mangle]
-        pub extern "C" fn akiva_app_key(
-            handle: u32, code: u32, modifiers: u32, phase: u32, ts_ms: f64,
-        ) {
-            $crate::runtime::on_key(handle, code, modifiers, phase, ts_ms);
-        }
-        #[no_mangle]
-        pub extern "C" fn akiva_app_resize(
-            handle: u32, width_px: u32, height_px: u32, density: f32,
-        ) {
-            $crate::runtime::on_resize(handle, width_px, height_px, density);
-        }
-
-        // ── Render ─────────────────────────────────────────────────────
-        #[no_mangle]
-        pub extern "C" fn akiva_app_render(
-            handle: u32, ts_ms: f64, out_len_ptr: *mut u32,
-        ) -> *const u8 {
-            $crate::runtime::on_render(handle, ts_ms, out_len_ptr)
-        }
-
-        // ── Saved state ────────────────────────────────────────────────
-        // Same buffer-lives-until-next-call contract as `akiva_app_render`;
-        // see the wire format in [sdk-rust/src/activity.rs].
-        #[no_mangle]
-        pub extern "C" fn akiva_app_save_state(
-            handle: u32, out_len_ptr: *mut u32,
-        ) -> *const u8 {
-            $crate::runtime::on_save_state(handle, out_len_ptr)
-        }
-        #[no_mangle]
-        pub extern "C" fn akiva_app_restore_state(
-            handle: u32, bytes_ptr: *const u8, bytes_len: u32,
-        ) {
-            $crate::runtime::on_restore_state(handle, bytes_ptr, bytes_len)
-        }
-
-        // ── Intent redelivery (Stone 9.4) ───────────────────────────────
-        // Called when an already-existing activity (SingleTop reuse, or
-        // Phase 9.2's SingleTask/SingleInstance) is re-launched via
-        // start_activity. The handle stays the same; the intent blob
-        // carries whatever the launcher sent. See docs/intents.md §8.
-        #[no_mangle]
-        pub extern "C" fn akiva_app_new_intent(
-            handle: u32, bytes_ptr: *const u8, bytes_len: u32,
-        ) {
-            $crate::runtime::on_new_intent(handle, bytes_ptr, bytes_len)
-        }
-
-        // ── Activity result delivery (Stone 9.5) ────────────────────────
-        // Fires on the caller when the callee it launched via
-        // start_activity_for_result finishes. `request_code` is what the
-        // caller passed in; the bytes encode an `ActivityResult` (i32
-        // code + optional data blob). If the callee finishes without
-        // calling set_result, the framework synthesises a CANCELED
-        // result with empty data.
-        #[no_mangle]
-        pub extern "C" fn akiva_app_activity_result(
-            handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
-        ) {
-            $crate::runtime::on_activity_result(handle, request_code, bytes_ptr, bytes_len)
-        }
-
-        // ── Stone 11.4b: unified host→app dispatch ──────────────────────
+        // ── Unified host→app dispatch (Stone 11.4b) ─────────────────────
         // The host packs per-callback args into the payload (every
         // payload starts with `[handle: u32 LE, ...]`) and the app
-        // demuxes by `cmd_kind`. The two new exports coexist with the
-        // legacy per-callback exports above; 11.4b-5 removes the
-        // legacy ones once every host (Rust kernel + JS app_registry)
-        // has switched.
+        // demuxes by `cmd_kind`. See docs/abi.md §2.2.2 for the wire.
         //
         // Return value:
-        //   `0`           — sync, no bytes to fetch.
+        //   `0`             — sync, no bytes to fetch.
         //   `handle as u64` — sync, RENDER/SAVE_STATE bytes available;
         //                     host calls `akiva_app_get_result(this, ...)`.
         //
@@ -202,12 +113,8 @@ macro_rules! akiva_app {
             $crate::runtime::dispatch::<$ty>(cmd_kind, payload_ptr, payload_len)
         }
 
-        /// Companion to `akiva_app_dispatch` — fetches the bytes
-        /// produced by the most recent RENDER or SAVE_STATE on the
-        /// activity identified by `future_id`. Same buffer-lifetime
-        /// contract as the legacy `akiva_app_render` / `akiva_app_save_state`
-        /// exports: pointer stays valid until the next data-producing
-        /// dispatch for the same handle.
+        // Buffer-lifetime contract: pointer stays valid until the next
+        // data-producing dispatch for the same handle.
         #[no_mangle]
         pub extern "C" fn akiva_app_get_result(
             future_id: u64, out_len_ptr: *mut u32,

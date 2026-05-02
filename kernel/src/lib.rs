@@ -245,9 +245,8 @@ impl KernelWasmHost {
     }
 
     /// Stone 11.4b — fetch the bytes for a non-zero `future_id`
-    /// returned by [`Self::dispatch`]. Same two-phase buffer
-    /// convention as the legacy `hal_app_render` (start at
-    /// `initial_cap`, retry once if the app produced more).
+    /// returned by [`Self::dispatch`]. Two-phase buffer convention:
+    /// start at `initial_cap`, retry once if the app produced more.
     fn fetch_result(&self, future_id: u64, initial_cap: usize) -> Vec<u8> {
         let mut buf = vec![0u8; initial_cap];
         let needed = unsafe {
@@ -411,9 +410,8 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         if app_future == 0 {
             return 0;
         }
-        // 4 KiB initial guess matches the legacy `hal_app_save_state`
-        // call; SavedState wire is capped at 64 KiB and the retry
-        // branch handles the larger end.
+        // SavedState wire is capped at 64 KiB; 4 KiB initial guess
+        // covers the common case and the retry branch handles larger.
         let bytes = self.fetch_result(app_future, 4 * 1024);
         if bytes.is_empty() {
             return 0;
