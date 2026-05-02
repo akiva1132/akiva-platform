@@ -1,6 +1,6 @@
 # Storage
 
-> **סטטוס מימוש (מאי 2026 — Stone 11.6a-c):** KV API של ה-kernel + HAL מעל OPFS `SyncAccessHandle` פעילים. שכבת SDK per-app **קיימת** דרך `akiva_sdk::storage` עם sandbox automatic per-package, async-shape API (`ReadHandle::poll`-loop) — ראה §8. **Multi-frame deferred-handle pattern** הוא האילוץ הנוכחי בגלל ה-cross-worker boundary; ראה [`docs/sdk-rust.md` §19.1](sdk-rust.md) לתיקון המתוכנן (embassy executor). Whole-file rewrite לכל write, single-file layout (`akiva-store.v1.bin`). Transactions / prefix scan / quota enforcement / encryption — **Phase 2+ / post-MVP**.
+> **סטטוס מימוש (מאי 2026 — Stone 11.6a-c + 11.6.7 #3):** KV API של ה-kernel + HAL מעל OPFS `SyncAccessHandle` פעילים. שכבת SDK per-app **קיימת** דרך `akiva_sdk::storage` עם sandbox automatic per-package, async-shape API (`ReadHandle::poll`-loop, `WriteHandle::await`) — ראה §8. **Multi-frame deferred-handle pattern** הוא האילוץ הנוכחי בגלל ה-cross-worker boundary; ראה [`docs/sdk-rust.md` §19.1](sdk-rust.md) לתיקון המתוכנן (embassy executor). **Per-key OPFS file layout** (Stone 11.6.7 #3, מאי 2026) — `pkgs/<pkg>/<userKey>` directory tree, app-workers פותחים readonly handles ישירות לקריאות sub-millisecond, kernel-worker בעלים בלעדי על ה-write side עם invalidation broadcast. Migration אוטומטית מ-legacy `akiva-store.v1.bin`. Transactions / prefix scan / quota enforcement / encryption — **Phase 2+ / post-MVP**.
 
 מסמך זה מתעד את שכבת ה-storage של Akiva: הממשק שה-kernel חושף, ה-HAL שמממש אותו מעל OPFS, ומה נכון למצב נוכחי מול מה שיגיע בשלבים הבאים.
 
@@ -23,7 +23,7 @@
 נקודות מפתח:
 - ה-kernel **לא** נוגע ב-filesystem ישירות. כל I/O עובר דרך ה-HAL.
 - ה-HAL רץ ב-Worker בלבד, כי רק שם זמין `createSyncAccessHandle()` שמאפשר API סינכרוני.
-- רק ה-leader מחזיק את ה-handle. OPFS SyncAccessHandle exclusive per-origin-per-file, מה שמבטיח אוטומטית שאין שני workers שכותבים בו-זמנית.
+- ה-kernel-worker מחזיק את הזכות הבלעדית לכתיבה (`readwrite` mode); app-workers פותחים `read-only` handles לקבצים של עצמם בלבד, מהדבריקטוריה `pkgs/<package_id>/`. שני הצדדים מסתנכרנים דרך postMessage `storage_invalidate` (kernel→app) — לפני כל write הkernel סוגר את ה-readwrite, השולח invalidate, ה-app סוגר את ה-readonly. ראה §3.2.
 
 ## 2. ה-API ברמת ה-kernel
 
@@ -43,21 +43,53 @@ pub fn delete(key: &str) -> Result<(), StorageError>;
 
 Keys הם מחרוזות UTF-8 שרירותיות. ברמת ה-kernel אין namespace enforcement — ה-convention שה-SDK מוסיף prefix של `app.id/` לכל key (ראה §4).
 
-## 3. המימוש ב-HAL
+## 3. המימוש ב-HAL (Stone 11.6.7 #3 — per-key files)
 
 [`runtime/web/storage.js`](../runtime/web/storage.js) מחזיק:
 
-- **In-memory map** — `Map<string, Uint8Array>` של כל ה-KV.
-- **Single file at OPFS root** — `akiva-store.v1.bin`.
-- **SyncAccessHandle אחד חי** למשך חיי ה-worker. נפתח ב-`storage.load()` לפני `akiva_boot`.
+- **In-memory map** — `Map<string, Uint8Array>` של כל ה-KV. מקור-אמת לקריאות סינכרוניות.
+- **Per-key OPFS files** — כל key הוא קובץ נפרד; שיני `/` הופכים ל-directory boundaries. דוגמאות:
+  - `packages/sys.shell/manifest.toml` → `OPFS:/packages/sys.shell/manifest.toml`
+  - `pkgs/com.example/notes/2026.txt` → `OPFS:/pkgs/com.example/notes/2026.txt`
+- **Async write queue** — `set/delete` עוברים על ה-mirror בזיכרון מיד (sync return), ה-flush ל-OPFS נעשה בקובץ הספציפי דרך תור async (`_drainQueue`). ה-host_op handler עובר `drain()` לפני שהוא משיב, כדי ש-`WriteHandle::await` יישאר durable.
+- **Lazy SyncAccessHandle** — לא נשמר handle פתוח לאורך זמן ב-kernel; כל write open-write-close, כדי ש-app-workers יוכלו להחזיק `read-only` handles במקביל. Open עם retry-with-backoff מטפל ב-race עם invalidate-handler של ה-app.
 
-### מחזור חיים
+### 3.1 פורמט נתיב (storage_path.mjs — shared)
 
-1. `worker.js::bootKernel` קורא `await storage.load()` לפני `WebAssembly.instantiate` + `akiva_boot`. זה מבטיח שמכל קריאה ל-`hal_storage_*` מתוך `akiva_boot` הלאה, ה-in-memory map מאוכלס ותקף.
-2. הקריאות עצמן (`hal_storage_read/write/delete`) הן סינכרוניות טהורות — `Map.get/set` בזיכרון, ועל write/delete נעשה rewrite של הקובץ כולו דרך `SyncAccessHandle.write()`.
-3. בזמן failover: ה-worker הישן נהרג → הדפדפן משחרר את ה-handle → ה-worker החדש (ב-leader הבא) פותח handle משלו ב-`storage.load()`. אין צורך בסינכרון מפורש.
+הkey מפוצל על `/`, וכל segment עובר percent-encoding. הסט המותר ללא קידוד: `[A-Za-z0-9._-]`. כל תו אחר (כולל non-ASCII) מקודד לפי UTF-8 bytes כ-`%XX...`. הקידוד מוגדר ב-[`runtime/web/storage_path.mjs`](../runtime/web/storage_path.mjs) ומשמש את שני הצדדים — kernel-worker ו-app-worker — כדי שיסכימו על אותו נתיב OPFS לכל key.
 
-### פורמט הקובץ (little-endian)
+### 3.2 Invalidation protocol (kernel → app)
+
+לפני כל write/delete על key מתחת ל-`pkgs/<pkg>/<userKey>`, ה-Storage מפעיל `onInvalidate(packageId, userKey)`. ה-kernel-worker (worker.js) חיבר את ה-callback ל-`AppRegistry.broadcastStorageInvalidate`, ששולח postMessage `{type: "storage_invalidate", userKey}` לעובד של החבילה (אם הוא נטען).
+
+ה-app worker shell ([`app_worker_shell.js`](../runtime/web/app_worker_shell.js)) שומר `Map<userKey, SyncAccessHandle>` של readonly handles. `storage_invalidate` סוגר את ה-handle ל-userKey נתון; `userKey === null` סוגר הכל ומאפס את ה-package directory cache (uninstall path).
+
+### 3.3 Direct readonly read path (Stone 11.6.7 #3)
+
+```
+app worker:
+  STORAGE_GET(key) →
+    cache hit (cached SyncAccessHandle)? ──yes──→ sync read, return future READY  (~0.1ms)
+    cache miss?                          ──→ post host_op to kernel (~2ms)
+                                              + warmStorageHandle(key) async (אופן רקע — ה-handle
+                                                ב-cache לקריאה הבאה)
+```
+
+הdesign target: קריאה רגילה (warm cache) ≤0.5ms; cold read ≤2ms (זהה ל-pre-Stone 11.6.7).
+
+### 3.4 מחזור חיים
+
+1. `worker.js::bootKernel` קורא `await storage.load()` לפני `WebAssembly.instantiate` + `akiva_boot`. ה-`load()` מבצע:
+   - `navigator.storage.getDirectory()` → root handle.
+   - **Migration**: אם `akiva-store.v1.bin` קיים בroot, parsing entry-by-entry → write לכל key לקובץ הנפרד שלו → `removeEntry` של הקובץ הישן.
+   - **Walk**: רקורסיבי על העץ, populate ה-in-memory mirror באמצעות `getFile()` + `arrayBuffer()` (async, no handle lock).
+2. הקריאות עצמן: `get` סינכרוני מה-mirror; `set/delete` סינכרוני על ה-mirror + enqueue flush.
+3. ה-flush pump async opens `SyncAccessHandle` על הקובץ הנדרש (עם retry-with-backoff אם app holding readonly), כותב את הbytes, סוגר.
+4. Failover: leader מת → הדפדפן משחרר handles → leader חדש מבצע `load()` שוב, walks the tree, populates mirror.
+
+### 3.5 פורמט legacy (migration source)
+
+הקובץ הישן `akiva-store.v1.bin` (little-endian):
 
 ```
 offset  size    content
@@ -71,11 +103,11 @@ offset  size    content
                   val:     raw bytes
 ```
 
-קובץ חסר / באורך אפס / פגום → מטופל כ-store ריק, ונדרס ב-write הבא. זה מכוון: העדפת survivability על פני דיוק, כי store פגום בהקשר של MVP אומר "כנראה שינוי פורמט" ולא "איבוד נתונים".
+`Storage._parseLegacyBlob` קורא את הפורמט הזה ב-`load()` ומעביר entry-by-entry ל-layout החדש. אחרי migration מוצלחת ה-legacy מוסר.
 
-### Fallback
+### 3.6 Fallback
 
-אם `navigator.storage.getDirectory()` זורק (למשל בחלק מדפדפנים בלי OPFS) — ה-HAL נכנס למצב **in-memory only**. הקריאות עדיין עובדות, אבל כלום לא שורד רענון. זה מסומן ב-`Storage.persistent = false` ונרשם warning אחד.
+אם `navigator.storage.getDirectory()` זורק (למשל בחלק מדפדפנים בלי OPFS) — ה-HAL נכנס למצב **in-memory only**. הקריאות עדיין עובדות, אבל כלום לא שורד רענון. זה מסומן ב-`Storage.persistent = false` ונרשם warning אחד. ב-mode הזה ה-async write queue פשוט לא רץ.
 
 ## 4. Namespacing לפי חבילה
 
@@ -98,19 +130,21 @@ offset  size    content
 
 ב-Phase 2 (PermissionManager) אכיפה תעבור לשכבת ה-SDK/framework: ה-framework ידחה ניסיון של app לקרוא מפתח שלא מתחיל ב-`{own-app-id}/`.
 
-### Implementation (Phase 1b)
+### Implementation (Phase 1b + 11.6.7 #3)
 
 | יכולת | סטטוס | איפה |
 |---|---|---|
 | `Storage::read/write/delete` trait (framework-side) + `MemoryStorage` לבדיקות | ✅ | [`framework/src/storage.rs`](../framework/src/storage.rs) |
 | `kernel::storage` API סינכרוני string→bytes | ✅ | [`kernel/src/storage.rs`](../kernel/src/storage.rs) |
-| HAL מעל OPFS `SyncAccessHandle` — single-file, in-memory map | ✅ | [`runtime/web/storage.js`](../runtime/web/storage.js) |
-| Magic `"AKSV"` + version-1 binary format | ✅ | ראה §3.1 |
-| `akiva-store.v1.bin` נטען לפני `akiva_boot` (worker.js::bootKernel) | ✅ | |
+| HAL מעל OPFS — per-key files, in-memory mirror, async write queue | ✅ Stone 11.6.7 #3 | [`runtime/web/storage.js`](../runtime/web/storage.js) |
+| Migration `akiva-store.v1.bin` → per-key layout | ✅ Stone 11.6.7 #3 | `Storage._migrateLegacyIfPresent` |
+| Shared path encoding (kernel + apps) | ✅ Stone 11.6.7 #3 | [`runtime/web/storage_path.mjs`](../runtime/web/storage_path.mjs) |
+| `akiva-store.v1.bin` נטען לפני `akiva_boot` (worker.js::bootKernel) | ✅ historical (auto-migrated) | |
 | OPFS unavailable → in-memory fallback + `persistent=false` flag | ✅ | `Storage.persistent` |
-| Leader-only write (exclusive handle) | ✅ | נאכף ע"י OPFS עצמה |
+| Kernel-only write (exclusive readwrite handle, brief acquire-write-close) | ✅ Stone 11.6.7 #3 | `Storage._writeFile` |
+| App-side direct readonly handles (Direct read path) | ✅ Stone 11.6.7 #3 | [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js) |
+| `storage_invalidate` postMessage על write/delete/uninstall | ✅ Stone 11.6.7 #3 | `AppRegistry.broadcastStorageInvalidate` |
 | Framework saved-state writes (`sys/packages/{id}/{class}/saved_state`) | ✅ | `package_manager::key_saved_state` |
-| Whole-file rewrite ב-write | ⚠ by design | §6 — OK ל-KB, לא ל-MB |
 | SDK per-app `Store::open(app)` עם prefix אוטומטי | ❌ Phase 2+ | apps היום לא עושים storage ישיר |
 | `list_keys` / prefix scan | ❌ | יתווסף כשיידרש |
 | Transactions (atomic multi-write) | ❌ | כנ"ל |
@@ -128,13 +162,14 @@ offset  size    content
 
 דרך לאמת שה-storage עובד: לפתוח את ה-devtools, לראות `kernel: boot #1 (prev=0)` בפעם הראשונה, לרענן, ולראות את המספר עולה. לפתוח טאב שני כ-follower — המונה **לא** גדל (רק leader בוטהקר). סגירת ה-leader → הטאב השני מקודם → boot #N+1.
 
-## 6. מגבלות Phase 1b (מה **לא** עובד עדיין)
+## 6. מגבלות (מה **לא** עובד עדיין)
 
-- **Whole-file rewrite ב-write**: O(total bytes). מתאים לעד כמה KB/KV. עבור עשרות MB צריך log-structured או per-key sub-file. יטופל כשתהיה אפליקציה אמיתית שדורשת זאת.
+- ~~**Whole-file rewrite ב-write**~~ — ✅ נסגר ב-Stone 11.6.7 #3. כל key הוא קובץ נפרד; write רק על הקובץ של ה-key הספציפי.
 - **ללא transactions**: שני `write()` עוקבים אפשר שיראו state ביניים אם ה-worker קורס אמצע הרצף. לא שואפים לעקביות מול crashes לפני שיהיה מנוע רציני.
 - **ללא iteration / prefix scan**: אין API ל-`list_keys("com.acme.calc/")`. יתווסף כש-PackageManager ידרוש אותו.
 - **ללא quota enforcement**: ה-MemoryManager של ה-kernel לא חוסם כתיבות לפי חבילה. OPFS עצמו מוגבל ע"י quota של הדפדפן, אבל אין הגבלה per-app.
 - **ללא encryption**: OPFS מוגן ע"י origin isolation בלבד. מפתחות רגישים (tokens, credentials) יעברו ל-credential store נפרד ב-Phase 3.
+- **Async-flush durability gap**: write על key ש-app worker קורס מיידית אחרי שלוקח את ה-status `READY` יכול לאבד את ה-bytes אם ה-tab נסגר לפני ש-`drain()` סיים. ב-host_op channel מבטיח: `_handleHostOp` קורא `await this._storage.drain()` לפני `host_op_done`, כך ש-`WriteHandle::await` חוזר רק אחרי ש-OPFS flush הסתיים.
 
 ## 7. דברים שכן-צריך-לזכור
 
@@ -180,7 +215,17 @@ pkgs/{package_id}/{user_key}
 
 `STORAGE_GET/SET/DELETE` כולם דורשים `akiva.permission.STORAGE_SANDBOX`. ה-grant הזה ב-MVP **autoMatic** לכל manifest שמצהיר עליו (אין UI לconfirmation; ה-app declares ב-manifest, ה-PackageManager grants). אכיפה: `AppRegistry._handleHostOp` בודק לפני שmosbim ל-`_dispatchStorage`. Apps ללא ה-grant מקבלים `STATUS::ERROR` עם UTF-8 reason.
 
-### 8.4 Multi-frame deferred reads (limitation)
+### 8.4 Direct readonly path (Stone 11.6.7 #3)
+
+מ-Stone 11.6.7 #3, `STORAGE_GET` מהו-app יכולה להיענות ישירות מ-OPFS בלי round-trip ל-kernel. ה-app-worker shell פותח `read-only` `SyncAccessHandle` לקובץ של ה-key (תחת `pkgs/<package_id>/<userKey>`) ב-cache lazy:
+
+- **Cache hit** — קריאה sync מה-handle, סופקת את ה-future מיד ב-status READY (~0.1ms).
+- **Cache miss** — fall-through ל-host_op (kernel הוא in-memory mirror); במקביל async open populates the cache לקריאה הבאה.
+- **Invalidation** — אחרי כל write/delete של ה-kernel, נשלח postMessage `storage_invalidate {userKey}` שסוגר את ה-handle ב-cache. הקריאה הבאה אסינכרונית-נפתחת מחדש מקובץ עדכני.
+
+ה-design tradeoff: קריאות חמות הן sub-millisecond; הקריאה הראשונה לכל key (cold) משלמת host_op (~2ms) פעם אחת ואז נשארת מהירה.
+
+### 8.5 Multi-frame deferred reads (limitation)
 
 `storage::read` לא יכול להיות sync תחת cross-worker boundary — ה-app-worker חייב לחזור ל-JS event loop כדי שה-host_op_done יגיע. לכן ה-API:
 
@@ -194,11 +239,11 @@ if let Some(h) = &self.loading {
 
 ראה [`docs/sdk-rust.md` §19.1](sdk-rust.md) לרקע מלא וה-fix המתוכנן (embassy executor, יבטל את ה-handle pattern).
 
-### 8.5 Fire-and-forget writes (limitation)
+### 8.6 Fire-and-forget writes — closed (Stone 11.6.7 #1)
 
-`storage::write` ו-`storage::remove` לא מחזירים Result — אין לאפליקציה דרך לדעת אם הפעולה הצליחה באותה פריים. כשל (quota, IO, denied) נרשם בלוג ה-host אבל ה-app רואה success silent. לקוד שדורש durability — Stone 11.6+ יוסיף `WriteHandle`. ראה [`docs/sdk-rust.md` §19.3](sdk-rust.md).
+מ-Stone 11.6.7 #1, `storage::write` מחזיר `WriteHandle: Future<Output=Result<(), StorageError>>`. אפליקציות שדורשות durability עושות `await`, ה-host_op ב-kernel מחזיר רק אחרי `storage.drain()` שמבטיח שה-OPFS flush הסתיים. Drop של ה-handle ללא await שומר על סמנטיקת fire-and-forget של pre-11.6.7. ראה [`sdk-rust/src/storage.rs::WriteHandle`](../sdk-rust/src/storage.rs).
 
-### 8.6 Updated Implementation status (Stone 11.6a-c)
+### 8.7 Updated Implementation status (Stone 11.6a-c + 11.6.7 #1, #3)
 
 | יכולת | סטטוס | איפה |
 |---|---|---|
@@ -208,8 +253,9 @@ if let Some(h) = &self.loading {
 | Cross-worker `host_op` round-trip | ✅ Stone 11.4c-3 | AppRegistry `_handleHostOp` |
 | `STORAGE_SANDBOX` capability gate | ✅ | per-call check ב-`_handleHostOp` |
 | Multi-frame `ReadHandle` pattern | ⚠ workaround | sdk-rust/src/storage.rs |
-| `WriteHandle` (durability handle) | ❌ Stone 11.6+ | TODO |
+| `WriteHandle` (durability handle) | ✅ Stone 11.6.7 #1 | sdk-rust/src/storage.rs |
+| Direct readonly OPFS handles ב-app-worker | ✅ Stone 11.6.7 #3 | [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js) |
+| Per-key OPFS file layout + migration | ✅ Stone 11.6.7 #3 | [`runtime/web/storage.js`](../runtime/web/storage.js) |
 | `let bytes = storage::read(k).await` (fluent) | ❌ depends on §19.1 | TODO |
-| Direct readonly OPFS handles ב-app-worker | ❌ Stone 11.7+ | original design — נדחה |
 | `list_keys` / prefix scan | ❌ Phase 2+ | |
 | Quota per-app | ❌ Phase 10 | |

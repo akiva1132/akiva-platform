@@ -42,6 +42,7 @@
 // worker host_op + side_effect channels land in 11.4c-4 / 11.4c-5.
 
 import { FIRE, IO, STATUS, packPoll, isFireKind, isIoKind } from "./op_kinds.mjs";
+import { encodeKey, isValidKey } from "./storage_path.mjs";
 
 // ── State (one per worker) ─────────────────────────────────────────────
 
@@ -74,6 +75,34 @@ let nextFutureId = 1n;
 
 const decoder = new TextDecoder("utf-8");
 const encoder = new TextEncoder();
+
+/**
+ * Stone 11.6.7 #3 — direct readonly OPFS handles for `STORAGE_GET`.
+ *
+ * The kernel writes to per-key files under `pkgs/<packageId>/<userKey>`
+ * (see runtime/web/storage.js); we open readonly `SyncAccessHandle`s
+ * to those files lazily and cache them so subsequent reads are
+ * sub-millisecond. The kernel sends `storage_invalidate {userKey}`
+ * after every write/delete so we drop the stale handle; the next
+ * read either re-opens fresh or falls back to the kernel host_op
+ * path. `userKey === null` (uninstall) closes everything.
+ *
+ * State is null until the first GET against a key kicks the lazy
+ * `ensurePkgDir`. `null` after a failed `getDirectoryHandle` means
+ * "no `pkgs/<pkg>/` directory exists yet" — every read falls
+ * through to host_op until the kernel writes the first key.
+ *
+ * @type {FileSystemDirectoryHandle | null | undefined}
+ */
+let pkgDir = undefined;
+/** Cached readonly SyncAccessHandles, keyed by userKey (NOT the
+ *  encoded path — string equality with the kernel's userKey).
+ *  @type {Map<string, FileSystemSyncAccessHandle>} */
+const storageHandles = new Map();
+/** In-flight async opens, keyed by userKey. Lets concurrent reads of
+ *  the same key share a single open Promise instead of racing.
+ *  @type {Map<string, Promise<FileSystemSyncAccessHandle | null>>} */
+const storageOpens = new Map();
 
 /**
  * Phase 12.2 — cumulative CPU time (ms) the worker has spent inside
@@ -195,6 +224,13 @@ self.addEventListener("message", (e) => {
       break;
     case "set_packages":
       packagesBlob = msg.packagesBlob instanceof Uint8Array ? msg.packagesBlob : new Uint8Array(0);
+      break;
+    case "storage_invalidate":
+      // Stone 11.6.7 #3 — kernel just wrote/deleted this key (or the
+      // whole package, if userKey === null). Drop any cached
+      // readonly handle so the next read either re-opens fresh or
+      // falls back to host_op.
+      handleStorageInvalidate(msg.userKey ?? null);
       break;
     case "ping":
       // Stone 11.5c — JS-level heartbeat. Replied to in the message
@@ -626,13 +662,47 @@ function dispatchIoStart(opKind, args) {
       futures.set(fid, { status: STATUS.READY, payload: packagesBlob.slice() });
       return fid;
     }
-    case IO.STORAGE_GET:
-    case IO.STORAGE_SET: {
-      // Storage ops genuinely need the kernel — backed by OPFS the
-      // app-worker can't see directly (Stone 11.6 wires read-only
-      // handles into the worker, but writes still proxy here).
-      // Allocate a local future_id, stage as PENDING, post host_op,
-      // and let host_op_done flip it for the next io_poll.
+    case IO.STORAGE_GET: {
+      // Stone 11.6.7 #3 — direct readonly handle if cached, otherwise
+      // host_op (kernel serves from its in-memory mirror) + an
+      // opportunistic async open that warms the cache for next time.
+      // `args` wire format: `[key utf8...]`.
+      const userKey = decoder.decode(args);
+      if (isValidKey(userKey)) {
+        const cached = storageHandles.get(userKey);
+        if (cached) {
+          try {
+            const out = readFromHandle(cached);
+            const fid = nextFutureId++;
+            futures.set(fid, { status: STATUS.READY, payload: out });
+            return fid;
+          } catch (err) {
+            // Stale or otherwise broken — drop and fall through to
+            // host_op. The next read async-opens cleanly.
+            postLog("warn", `direct read ${userKey} failed: ${err?.message ?? err}; falling back`);
+            try { cached.close(); } catch {}
+            storageHandles.delete(userKey);
+          }
+        }
+        // Cache miss — kick off async open in the background. Failures
+        // here are silent: the host_op below already has the read
+        // covered; we just won't warm the cache this round.
+        warmStorageHandle(userKey);
+      }
+      // Fall through to host_op (cold path, also covers invalid keys).
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
+      postMessage(
+        { type: "host_op", future_id: fid, op_kind: opKind, args },
+        [args.buffer],
+      );
+      return fid;
+    }
+    case IO.STORAGE_SET:
+    case IO.STORAGE_DELETE: {
+      // Writes / deletes always go through the kernel — it owns the
+      // exclusive readwrite lock and is the single source of truth
+      // for sandbox enforcement.
       const fid = nextFutureId++;
       futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
       postMessage(
@@ -658,6 +728,117 @@ function pollFuture(futureId, outPtr, outCap) {
   }
   futures.delete(futureId);
   return packPoll(entry.status, len);
+}
+
+// ── Direct readonly OPFS storage (Stone 11.6.7 #3) ────────────────────
+//
+// `STORAGE_GET` tries to serve from a cached readonly
+// `SyncAccessHandle` opened directly on the kernel-written file at
+// `pkgs/<packageId>/<userKey>`. Cache hits skip the postMessage
+// round-trip to the kernel worker entirely (~0.1ms vs ~2ms). Cache
+// misses fall through to host_op AND start an async open in the
+// background to warm the cache for next time.
+//
+// The kernel sends `storage_invalidate {userKey}` after every write
+// or delete — we drop the matching handle so the next read sees
+// fresh state. `userKey === null` (uninstall) closes everything.
+
+/** Read the full contents of a sync handle and prepend the present
+ *  byte the wire expects. Returns `[1, ...bytes]`. Throws on I/O
+ *  error so callers can fall back to host_op. */
+function readFromHandle(handle) {
+  const size = handle.getSize();
+  const out = new Uint8Array(1 + size);
+  out[0] = 1;
+  if (size > 0) {
+    const view = new Uint8Array(out.buffer, 1, size);
+    const read = handle.read(view, { at: 0 });
+    if (read !== size) throw new Error(`short read ${read}/${size}`);
+  }
+  return out;
+}
+
+/** Lazily open the package's `pkgs/<packageId>/` directory once. The
+ *  result is cached as `pkgDir`; `null` means the directory doesn't
+ *  exist yet (no kernel writes have happened — first GET sees an
+ *  absent key, host_op resolves it correctly). */
+async function ensurePkgDir() {
+  if (pkgDir !== undefined) return pkgDir;
+  if (!packageId) {
+    pkgDir = null;
+    return null;
+  }
+  try {
+    const root = await navigator.storage.getDirectory();
+    const pkgsDir = await root.getDirectoryHandle("pkgs", { create: false });
+    pkgDir = await pkgsDir.getDirectoryHandle(packageId, { create: false });
+  } catch (_) {
+    pkgDir = null;
+  }
+  return pkgDir;
+}
+
+/** Background open + cache for `userKey`. De-duped by `storageOpens`
+ *  so concurrent reads of the same key share one in-flight open. */
+function warmStorageHandle(userKey) {
+  if (storageHandles.has(userKey) || storageOpens.has(userKey)) return;
+  const promise = openStorageHandle(userKey);
+  storageOpens.set(userKey, promise);
+  promise.finally(() => storageOpens.delete(userKey));
+}
+
+async function openStorageHandle(userKey) {
+  if (!isValidKey(userKey)) return null;
+  const dir = await ensurePkgDir();
+  if (!dir) return null;
+  const segments = encodeKey(userKey);
+  // Walk into subdirectories for keys with `/`.
+  let cursor = dir;
+  for (let i = 0; i < segments.length - 1; i++) {
+    try {
+      cursor = await cursor.getDirectoryHandle(segments[i], { create: false });
+    } catch (_) { return null; }
+  }
+  const leaf = segments[segments.length - 1];
+  let fileHandle;
+  try {
+    fileHandle = await cursor.getFileHandle(leaf, { create: false });
+  } catch (_) { return null; }
+  let handle;
+  try {
+    handle = await fileHandle.createSyncAccessHandle({ mode: "read-only" });
+  } catch (err) {
+    // Conflict with an in-flight kernel write (readwrite handle has
+    // exclusive lock until close). Quiet — the next read after the
+    // write completes will succeed.
+    return null;
+  }
+  // Late-arriving invalidation: the kernel may have sent
+  // `storage_invalidate` while our open was in flight. If the cache
+  // entry vanished or another open populated it first, discard ours.
+  if (storageHandles.has(userKey)) {
+    try { handle.close(); } catch {}
+    return storageHandles.get(userKey);
+  }
+  storageHandles.set(userKey, handle);
+  return handle;
+}
+
+/** Dropped cached readonly handles. `userKey === null` means
+ *  uninstall — close everything and forget the package directory. */
+function handleStorageInvalidate(userKey) {
+  if (userKey === null) {
+    for (const [, h] of storageHandles) {
+      try { h.close(); } catch {}
+    }
+    storageHandles.clear();
+    pkgDir = undefined; // re-resolve next time
+    return;
+  }
+  const h = storageHandles.get(userKey);
+  if (!h) return;
+  try { h.close(); } catch {}
+  storageHandles.delete(userKey);
 }
 
 // ── App-memory readers ─────────────────────────────────────────────────

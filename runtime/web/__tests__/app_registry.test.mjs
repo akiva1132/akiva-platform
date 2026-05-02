@@ -994,6 +994,82 @@ describe("lazy-spawn workers — Stone 11.6.7 #4", () => {
   });
 });
 
+// ── Stone 11.6.7 #3: storage_invalidate broadcast ─────────────────────
+
+describe("broadcastStorageInvalidate — kernel→worker cache eviction", () => {
+  it("posts storage_invalidate {userKey} to the matching package's worker", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    // Drop the init message so we only see the invalidate one below.
+    worker._posted.length = 0;
+
+    registry.broadcastStorageInvalidate(PACKAGE_ID, "notes");
+    expect(worker._posted).toEqual([
+      { type: "storage_invalidate", userKey: "notes" },
+    ]);
+  });
+
+  it("passes userKey=null through unchanged for uninstall", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._posted.length = 0;
+
+    registry.broadcastStorageInvalidate(PACKAGE_ID, null);
+    expect(worker._posted).toEqual([
+      { type: "storage_invalidate", userKey: null },
+    ]);
+  });
+
+  it("is a no-op when the package has no spawned worker", () => {
+    const { registry } = makeRegistry();
+    // No register() — _processes is empty.
+    expect(() => registry.broadcastStorageInvalidate("never.spawned", "any")).not.toThrow();
+    expect(registry._processes.size).toBe(0);
+  });
+
+  it("reaches only the targeted package's worker, not peers", () => {
+    // Two registries (each gets its own makeRegistry stub worker)
+    // — exercise the "only this package gets the message" property
+    // by spawning two distinct workers under one registry.
+    const calcWorker = makeFakeWorker();
+    const helloWorker = makeFakeWorker();
+    const workers = new Map([
+      ["com.akiva.calc", calcWorker],
+      ["com.akiva.hello", helloWorker],
+    ]);
+    const { registry } = makeRegistry({
+      fakeWorker: null, // unused — spawnWorker overrides below
+    });
+    // Replace spawnWorker to return per-package fakes.
+    registry._spawnWorker = (pkg) => workers.get(pkg) ?? makeFakeWorker();
+
+    registry.register("com.akiva.calc", "CalcMain");
+    registry.register("com.akiva.hello", "HelloMain");
+    calcWorker._posted.length = 0;
+    helloWorker._posted.length = 0;
+
+    registry.broadcastStorageInvalidate("com.akiva.calc", "settings");
+
+    expect(calcWorker._posted).toEqual([
+      { type: "storage_invalidate", userKey: "settings" },
+    ]);
+    expect(helloWorker._posted).toEqual([]);
+  });
+
+  it("logs a warning if postMessage throws but does not propagate", () => {
+    const log = vi.fn();
+    const { registry, worker } = makeRegistry({ log });
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker.postMessage = () => { throw new Error("disconnected"); };
+
+    expect(() => registry.broadcastStorageInvalidate(PACKAGE_ID, "k")).not.toThrow();
+    // Filter for our specific warning — register itself logs lots.
+    const warns = log.mock.calls.filter(([level, text]) =>
+      level === "warn" && text.includes("storage_invalidate post failed"));
+    expect(warns.length).toBe(1);
+  });
+});
+
 // ── Phase 12.1: per-package memory accounting ─────────────────────────
 
 describe("memoryCurrent — kernel reads last pong-reported byteLength", () => {

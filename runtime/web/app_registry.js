@@ -642,6 +642,33 @@ export class AppRegistry {
   }
 
   /**
+   * Stone 11.6.7 #3 — broadcast a `storage_invalidate` to a package's
+   * worker after a kernel-side write or delete. The worker uses the
+   * message to drop any cached readonly `SyncAccessHandle` it holds
+   * for that key (so its next read either re-opens fresh or falls
+   * back to the kernel host_op channel).
+   *
+   * `userKey === null` means "uninstall — drop everything for this
+   * package". The worker is expected to close its package-directory
+   * handle entirely.
+   *
+   * No-op if the package has no spawned worker yet (lazy-spawn means
+   * a never-launched package has no readers to invalidate).
+   */
+  broadcastStorageInvalidate(packageId, userKey) {
+    const proc = this._processes.get(packageId);
+    if (!proc) return;
+    try {
+      proc.worker.postMessage({
+        type: "storage_invalidate",
+        userKey: userKey ?? null,
+      });
+    } catch (err) {
+      this._log("warn", `[${packageId}] storage_invalidate post failed: ${err?.message ?? err}`);
+    }
+  }
+
+  /**
    * Stone 11.6.7 #5 — register a per-package watchdog timeout
    * override (from `manifest.runtime.watchdog_timeout_ms`). Called
    * by the kernel via the `hal_app_set_watchdog_timeout_ms` HAL
@@ -989,6 +1016,28 @@ export class AppRegistry {
       default:
         this._log("warn", `[${packageId}] host_op unknown op_kind=0x${(msg.op_kind ?? 0).toString(16)}`);
         status = STATUS.ERROR;
+    }
+
+    // Stone 11.6.7 #3 — `Storage.set/delete` is now async-persisted
+    // (in-memory mirror updates sync, OPFS file flush queued for
+    // background drain). To preserve `WriteHandle::await` semantics
+    // ("when this resolves the write is durable"), await the storage
+    // drain for SET / DELETE before posting `host_op_done`. GET and
+    // every other op skip the wait — they have no durability obligation.
+    const needsDrain =
+      (msg.op_kind === IO.STORAGE_SET || msg.op_kind === IO.STORAGE_DELETE) &&
+      typeof this._storage.drain === "function";
+    if (needsDrain) {
+      this._storage.drain().then(() => {
+        // Worker may have died between submit and flush — don't crash on
+        // a stale postMessage call.
+        if (this._processes.get(packageId) !== proc) return;
+        proc.worker.postMessage(
+          { type: "host_op_done", future_id: futureId, status, payload },
+          [payload.buffer],
+        );
+      });
+      return;
     }
 
     proc.worker.postMessage(

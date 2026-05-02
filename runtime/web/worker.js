@@ -35,6 +35,13 @@ const apps = new AppRegistry({
   kernelMemory: () => memory,
   log: (level, text) => self.postMessage({ type: "log", level: levelCode(level), text }),
 });
+// Stone 11.6.7 #3 — wire kernel→app cache invalidation. Whenever the
+// kernel writes or deletes a `pkgs/<pkg>/<userKey>` entry, the
+// matching app worker drops its cached readonly OPFS handle for that
+// file and either re-opens fresh or falls back to host_op for the
+// next read.
+storage.onInvalidate = (packageId, userKey) =>
+  apps.broadcastStorageInvalidate(packageId, userKey);
 /** UTF-8 decoder for host-side reading of kernel strings. */
 const decoder = new TextDecoder("utf-8");
 
