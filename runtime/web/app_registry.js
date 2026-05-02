@@ -608,14 +608,14 @@ export class AppRegistry {
           this._log("warn", `${packageId}: dispatch_done for unknown id ${fid}`);
           return;
         }
-        const futureId = typeof msg.future_id === "bigint" ? msg.future_id : BigInt(msg.future_id ?? 0);
+        // P0 #4 — the worker shell already returns `bytes=null` for
+        // ack-only dispatches and a populated `Uint8Array` for RENDER /
+        // SAVE_STATE. The legacy `future_id` field is unused under the
+        // new protocol; trust `bytes` directly.
         const bytes = msg.bytes instanceof Uint8Array ? msg.bytes
           : (msg.bytes ? new Uint8Array(msg.bytes) : null);
-        // App-side future_id of 0 means "no result bytes" (ack-only
-        // cmd). Any non-zero id and `bytes != null` means RENDER /
-        // SAVE_STATE produced a stream.
         entry.status = STATUS.READY;
-        entry.bytes = futureId !== 0n ? (bytes ?? null) : null;
+        entry.bytes = bytes;
         break;
       }
       case "side_effect":
