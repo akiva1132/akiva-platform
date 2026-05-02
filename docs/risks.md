@@ -117,6 +117,90 @@ When the first app needs a real text field, the `on_key` path has to grow focus 
 
 ---
 
+## 7. Foundation gaps surfaced by Phase 11.4c/11.5 live testing (May 2026)
+
+A self-audit after Stone 11.5 closed (process isolation + fault containment work) surfaced these gaps. Each is documented in detail elsewhere; this section is the single place that lists them so they don't get lost. See [`docs/isolation-design.md` §10.5 Phase 11 Foundation Gaps](isolation-design.md) for the full work plan.
+
+### 7.1 🔴 SDK async executor missing (cardinal)
+
+**Concern.** `Activity` callbacks are `async fn`, but the SDK's executor (`block_on_ready`) calls `.poll()` exactly once and panics on `Pending`. Cross-worker host calls (storage::read, future API like network) take a frame to resolve, so `.await` on them would panic. The deferred-handle workaround (`storage::ReadHandle::poll`) works but is a leaky abstraction — apps must manage state across frames manually.
+
+**Why deferred.** Embassy executor integration is a 1-2 day refactor that would touch the dispatch protocol on both sides of the worker boundary. We shipped MVP-quality storage SDK first, planning to retrofit once the platform is stable.
+
+**Trigger to promote.** First "real" app that needs more than 1-2 awaits (notes, settings, anything reading user data). Or: when the deferred-handle pattern shows up across 3+ SDK modules and the cost of NOT having async surpasses the cost of the embassy integration.
+
+**Code surfaces.** `sdk-rust/src/activity.rs` (replace `block_on_ready`), `sdk-rust/src/runtime.rs` (dispatch glue), `runtime/web/app_worker_shell.js` (resumption protocol), `framework/src/wasm_activity.rs` (lifecycle pipelining). Detailed plan in [`docs/sdk-rust.md` §19.1](sdk-rust.md).
+
+### 7.2 🟡 `on_save_state` degraded under cross-worker
+
+**Concern.** `WasmActivity::save_state_bytes` calls `host.save_state()` + `poll_future()` inline. Post-11.4c the first poll always returns `Pending`; release builds silently fall through to `Vec::new()`. **Phase 6 saved-state is broken in production.**
+
+**Why deferred.** The save_state fix needs the same pipelining trick we used for render but applied to the pause→stop transition (multi-frame). Coupled with the framework state machine. Roughly 30-45 min of focused work but waited on the audit pass.
+
+**Trigger to promote.** ALWAYS — as soon as the first foundation-hardening pass starts. This is P0.
+
+**Code surfaces.** `framework/src/wasm_activity.rs` (`save_state_bytes` signature change), `framework/src/lib.rs` (`drive_to_state(Stopped)` becomes async-aware). Detailed plan in [`docs/sdk-rust.md` §19.2](sdk-rust.md).
+
+### 7.3 🟡 No graceful shutdown signal
+
+**Concern.** Closing a tab terminates the worker(s) without notifying apps. No chance for `on_pause` → `save_state` → `on_stop` to run. Apps lose unflushed state every time the user closes the tab.
+
+**Why deferred.** Out of scope for the isolation work (Stone 11.4-11.5 focused on per-app crash handling, not whole-system shutdown). MVP apps don't have critical unsaved state today.
+
+**Trigger to promote.** First app that produces user-perceptible data loss on close (notes, draft email, etc.). P0 in the Phase 11 closeout work plan.
+
+**Code surfaces.** `runtime/web/tab.js` (intercept beforeunload), `runtime/web/worker.js` (drain message), `framework/src/lib.rs` (`shutdown_all` walking the activity stack with state-saving pause).
+
+### 7.4 🟡 Trapped activities leak ActivityRecord
+
+**Concern.** When the watchdog terminates a worker (or a wasm trap is reported), `ActivityRecord` flips to `Trapped` but never advances to `Destroyed`. Bounded by session length (each crash adds one zombie); unrecycled.
+
+**Why deferred.** Bounded leak — survives a session, doesn't persist. UX recovery (Shell tap-to-restart) was deferred to post-foundation work, so there was no user trigger to recycle the record.
+
+**Trigger to promote.** Foundation closeout work. Add a `Framework::reap_trapped(now_ms, max_age_ms)` walker the kernel calls each frame.
+
+**Code surfaces.** `framework/src/activity_manager.rs` (new method), `framework/src/lib.rs` (call site), `kernel/src/lib.rs` (akiva_frame integration). ~30 min.
+
+### 7.5 🟡 `drain_post` on every render is concept-muddy
+
+**Concern.** Stone 11.4c-5 added `self.drain_post(ctx)` at the start of `WasmActivity::render` to fix the "first click ignored" bug. But render is conceptually "produce a frame", not "process pending app signals." Mixing the two makes the contract harder to reason about.
+
+**Why deferred.** Works correctly today (drain is idempotent). The cleanup is architectural, not functional.
+
+**Trigger to promote.** Either (a) when adding another deferred-signal type that needs the same drain (e.g. notification post-callback), or (b) the foundation polish pass.
+
+**Code surfaces.** `framework/src/lib.rs` (new `drive_pending_signals(ts)` phase in the kernel's frame loop). Move `drain_post` out of `render`.
+
+### 7.6 🟡 `pkgs_wire` decoder duplicated 3x
+
+**Concern.** `framework::wire::pkgs::decode`, `sdk-rust::pkgs::decode`, and `runtime/web/app_registry.js::_warmupWorkers` each parse the same length-prefixed binary blob. Adding a field to `PackageEntry` means three coordinated changes.
+
+**Why deferred.** Drift hasn't bitten yet — the format is small (3 strings) and the test suite cross-validates parity.
+
+**Trigger to promote.** First time a field gets added or renamed (e.g., adding `icon_ref` for launcher tiles). Or: introducing a fourth decoder (e.g., a debugger panel that reads the blob).
+
+**Code surfaces.** Either switch to JSON for non-perf paths (cheap, debuggable) or introduce a schema-driven generator (real fix but more setup).
+
+### 7.7 🟢 Magic numbers spread across the codebase
+
+**Concern.** Watchdog timeout (1500ms), heartbeat interval (500ms), render initial buf (16KiB), save_state initial buf (4KiB), trap drain buf (256B). All hardcoded at point of use, no central tuning surface.
+
+**Why deferred.** Defaults are reasonable; no reason to tune them in production yet.
+
+**Trigger to promote.** First time we want to reduce watchdog timeout for tests, or run on a slower device with bigger margins. Probably along with Phase 11.8 (perf baseline).
+
+**Code surfaces.** New `runtime/web/config.js` with documented constants.
+
+### 7.8 🟢 Worker shell has no unit tests
+
+**Concern.** `runtime/web/app_worker_shell.js` is exercised only via integration through AppRegistry. Direct dispatcher logic (fire / io_start / io_poll), capability gating (the SDK-side mirror of the kernel's check), and the futures registry have no isolated coverage.
+
+**Why deferred.** Vitest doesn't expose real Web Workers; testing requires a fake-Worker harness like the AppRegistry side already has, but with the shell's globals (postMessage, addEventListener) mocked.
+
+**Trigger to promote.** Phase 11.8 (perf + benchmarks) is a natural pairing — both want a real-browser e2e test bed (Playwright). Build the worker-shell harness as a step on the way there.
+
+---
+
 ## Retired / promoted entries
 
 _(none yet)_

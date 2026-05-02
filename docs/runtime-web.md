@@ -207,3 +207,77 @@ python3 -m http.server 8765 --directory runtime/web
 - [ARCHITECTURE.md §10](../ARCHITECTURE.md) — RendererBackend trait (תוכנית ל-Phase 2).
 - [docs/abi.md](abi.md) — ABI של האפליקציה (Component Model). לא קשור ל-HAL הפנימי שמתואר כאן.
 - [kernel/src/host.rs](../kernel/src/host.rs) — רשימת ה-imports שה-kernel דורש מה-HAL.
+
+## 9. WorkerPool + per-app workers (Stone 11.4c — May 2026)
+
+עד Stone 11.4 כל ה-apps רצו בתוך ה-kernel-worker היחיד. מ-11.4c ה-`AppRegistry` הופכת ל-WorkerPool — לכל package (calculator, hello, shell, tic-tac-toe וכו') יש Worker משלו שמארח רק wasm app אחד. ה-kernel-worker שולט בעברה דרך postMessage.
+
+### 9.1 ה-architecture
+
+```
+Main thread (tab.js)              Kernel-worker (worker.js)              App-worker N (app_worker_shell.js)
+─────────────────                 ──────────────────────────              ─────────────────────────────────
+Canvas events       ──postMessage──►  AppRegistry.dispatch  ──postMessage──►  handleDispatch
+                                       ┃                                       ┃
+                                       ┃                                       ↓
+                                       ┃                                  akiva_app_dispatch (wasm app)
+                                       ┃                                       ┃
+                                       ▼                                       ↓
+Canvas2D paint  ◄──postMessage──   apply paint stream  ◄──postMessage──   dispatch_done {bytes}
+```
+
+כל worker:
+- מאזין ל-init / dispatch / set_grants / set_packages / host_op_done / ping
+- יוצר wasm instance עם host imports שלו (resource lookups + fire/io_start/io_poll)
+- שולח dispatch_done / log / trapped / pong / side_effect / host_op
+- מחזיק its own OffscreenCanvas ל-text measurement (TEXT_WIDTH op resolved locally)
+
+### 9.2 פרוטוקול postMessage (kernel ↔ app worker)
+
+| Direction | Type | Payload | תפקיד |
+|---|---|---|---|
+| K→A | `init` | wasmBytes, grants, resources, packagesBlob | bootstrap |
+| K→A | `dispatch` | dispatch_id, cmd_kind, payload | קריאת lifecycle/input/render |
+| K→A | `set_grants` | grants | upgrade-time grant push |
+| K→A | `set_packages` | packagesBlob | install/uninstall snapshot push |
+| K→A | `host_op_done` | future_id, status, payload | reply לhost_op (Stone 11.4c-3) |
+| K→A | `ping` | t | watchdog heartbeat |
+| A→K | `init_ok` | — | wasm ready, heartbeat may start |
+| A→K | `init_failed` | reason | bootstrap failed |
+| A→K | `dispatch_done` | dispatch_id, future_id, bytes | dispatch result |
+| A→K | `side_effect` | op_kind, args | FIRE op forwarded (FINISH/START_ACTIVITY/SET_RESULT) |
+| A→K | `host_op` | future_id, op_kind, args | request kernel-served io op |
+| A→K | `log` | level, text | log line |
+| A→K | `trapped` | reason | wasm trap; kernel marks Trapped |
+| A→K | `pong` | t | watchdog reply |
+
+### 9.3 Watchdog
+
+Stone 11.5c. ה-kernel-worker שולח `ping` לכל app-worker כל 500ms (self-scheduling setTimeout, not setInterval — overlap-safe). אם אין `pong` תוך 1500ms, ה-worker נחשב hung:
+
+1. `worker.terminate()` — ה-browser הורג את ה-thread
+2. הpackage נוסף ל-`_pendingTraps`
+3. `_dispatches` של ה-package הזה נמחקים (Audit fix #2)
+4. ה-kernel קורא ל-`hal_drain_trapped_packages` ב-`akiva_frame` → framework `mark_package_trapped` → activities flipped to Trapped + popped from stack
+
+Why JS-level pong: a wasm `loop {}` blocks the worker's JS event loop too (single-threaded), so ping queues but pong never arrives — exactly the trigger we want.
+
+### 9.4 Pre-warm
+
+Stone 11.4c-6. כש-`setPackages` נקרא (ב-boot ובכל install/uninstall), schedule a `setTimeout(0)` ש-spawns Workers לכל package שלא במ-`_processes` כבר. כל worker מקמפל את ה-wasm שלו במקביל ב-thread שלו. עד שהמשתמש לוחץ — ה-`register()` מוצא את ה-worker ready, מקצה handle בלבד. Launch latency: ~50ms במקום ~2s cold.
+
+### 9.5 איך לדבג
+
+- **DevTools → Application → Service Workers** מציג רק SW (אין ל-Akiva).
+- **DevTools → Sources → Threads** מציג את כל ה-Workers. מצפה לראות 5: `worker.js` (kernel) + 4 `app_worker_shell.js` (per package).
+- **Console** מסומן `[kernel N]` ל-kernel logs, `[worker:com.example.app] ...` לapp logs (prefix של ה-shell).
+- **Network** מציג את ה-fetch הראשון של `app_worker_shell.js` per-worker spawn — אחרי הראשון cached.
+
+לפרטי ה-postMessage protocol המלא ראה [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js) ו-[`runtime/web/app_registry.js`](../runtime/web/app_registry.js).
+
+### 9.6 Foundation gaps relevant to runtime-web
+
+ראה [`docs/risks.md` §7](risks.md) ו-[`docs/isolation-design.md` §10.5](isolation-design.md):
+- §7.1 SDK async executor missing — affects how `host_op` results land in apps
+- §7.3 No graceful shutdown — `tab.js` doesn't intercept beforeunload
+- §7.5 `drain_post` on every render — should be its own framework phase

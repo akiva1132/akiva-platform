@@ -678,14 +678,124 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
 
 **Definition of Done:** test app שעושה `loop {}` ב-`on_pointer` נהרגת ב-≤ 1.5s, Shell חיה.
 
-### Stone 11.6 — OPFS hybrid + storage SDK (1-2 שבועות)
-**מטרה:** readonly handles ישירות ב-app-worker; writes through kernel.
-- `akiva_sdk::storage` API — async, transparent.
-- app-worker storage layer — readonly handles, fallback ל-kernel ב-error.
-- kernel-worker מנהל close-on-uninstall protocol.
-- benchmark: read latency comparison (direct vs kernel-routed).
+### Stone 11.6 — Storage SDK (kernel-routed)
+**מטרה:** apps יכולות לעשות `storage::read/write/remove` על key/value sandboxed per-package.
 
-**Definition of Done:** read benchmarks מראים improvement; uninstall flow lockdown מאומת.
+**מצב נוכחי (2026-05-02): a/b/c הושלמו.**
+- ✅ **11.6a** — wire format (`IO::STORAGE_GET/SET/DELETE`), op_kinds תיעוד, mirror ב-3 crates עם cross_crate parity test
+- ✅ **11.6b** — host handler ב-AppRegistry: `_dispatchStorage` עם sandbox per-package (`pkgs/{package_id}/{user_key}`), קיבולת gate (`STORAGE_SANDBOX`), error-on-empty-key
+- ✅ **11.6c** — SDK API: `storage::read(key) -> Option<ReadHandle>`, `storage::write(key, value)`, `storage::remove(key)`. **Multi-frame deferred-handle pattern** ב-read מוסבר ב-`docs/storage.md` (apps מ-poll ב-on_render עד שה-result נוחת).
+- ⏸ **11.6d** (notes test app) — נדחה. ה-foundation-hardening שלהלן עדיף לפני שמוסיפים capabilities נוספות.
+
+**Definition of Done (a-c):** ה-host_op channel מעביר GET/SET/DELETE עם sandbox enforcement, +5 vitest +3 SDK tests מאמתים. **ה-DoD המקורי** (readonly handles ישירות ב-app-worker, benchmarks before/after) **מועבר ל-Stone 11.7+** — דורש את embassy executor למימוש נקי, נדחה עד שה-foundation hardening מסתיים.
+
+---
+
+## 10.5 Phase 11 Status (snapshot 2026-05-02)
+
+עדכון מצב לאחר השלמת ה-runtime foundation.
+
+### Done — Runtime Foundation Complete
+
+| Stone | Status | מה הושלם |
+|---|---|---|
+| 11.0 | ✅ | PackageManager, install/uninstall, manifest TOML parser |
+| 11.1 | ✅ | Resources (strings/colors), per-package values lookup |
+| 11.2 | ✅ | async-native SDK API (Activity callbacks `async fn`), `block_on_ready` executor |
+| 11.3 | ✅ | Unified ABI multiplexers (`akiva_host_fire/io_start/io_poll`), capability gating dispatcher-side |
+| 11.4a | ✅ | async `WasmHost` trait + framework state machine (`PendingTransition` slots, `drive_pending_transitions`) |
+| 11.4b | ✅ | Single-export ABI (`akiva_app_dispatch` + `akiva_app_get_result`), 13 legacy exports retired |
+| 11.4c-1 | ✅ | `app_worker_shell.js` skeleton, postMessage protocol (init/dispatch/host_op/side_effect/log/trapped/pong) |
+| 11.4c-2 | ✅ | `WorkerPool` ב-AppRegistry, async dispatch, side_effect bridging |
+| 11.4c-3 | ✅ | Cross-worker `host_op` for QUERY_PACKAGES (local) + STORAGE_* (kernel round-trip) |
+| 11.4c-4 | ✅ | Pipeline render (1-frame paint latency) |
+| 11.4c-5 | ✅ | `drain_post` on every render — first-click latency fixed |
+| 11.4c-6 | ✅ | Pre-warm workers ב-boot (`setTimeout(0)` from `setPackages`) |
+| 11.5a | ✅ | `LifecycleState::Trapped` + transition matrix + `mark_trapped` driver |
+| 11.5b | ✅ | Trap routing (`hal_drain_trapped_packages` HAL, `worker.onerror`, `_pendingTraps`) |
+| 11.5c | ✅ | Watchdog (ping/pong, 1.5s timeout, `worker.terminate()`) |
+| 11.5d | ✅ | Auto-pop של Trapped activities חזרה ל-Shell |
+| 11.5e | ✅ | `infinite-loop-app` test app, DoD מאומת חי (1500-1517ms termination, repeatable) |
+| Audit | ✅ | Provenance check on side_effect (Binder-style), `_dispatches` GC, setInterval→setTimeout |
+
+**Test counts (2026-05-02):** 162 framework + 158 sdk + 68 cli + 59 vitest = 447 ירוקים.
+
+**Live demo:** 5 workers (kernel + 4 apps), `loop {}` בtest app נהרג ב-≤1.5s ו-Shell חיה.
+
+### Phase 11 Foundation Gaps (open items)
+
+מה ש-Phase 11 עוד חייב לסגור לפני "OS done":
+
+#### P0 — חייבים לסגור
+
+1. **`save_state` עובר דרך ה-pipeline (Stone 11.6+1)**
+   - **בעיה:** היום `WasmActivity::save_state_bytes` קורא `host.save_state` + `poll_future` באותה פריים. עם cross-worker dispatch ה-poll הראשון תמיד `Pending` → `block_on_ready` panics בdebug, או release מחזיר `Vec::new()` (degraded). ה-Phase 6 saved-state feature לא עובד בפועל אחרי 11.4c.
+   - **תיקון:** לאמץ את אותו דפוס שב-`render` — `pending_save_state: Option<u64>` ב-`WasmActivity`, drained בpause path בthe next frame לפני destroy. מורכבות בינונית: pause/destroy נוזל פעמיים על פני frames.
+   - **DoD:** test שמדמה pause→resume → activity רואה את ה-state שלה.
+   - **סקופ:** ~30-45 דק'.
+
+2. **Graceful shutdown (Stone 11.6+2)**
+   - **בעיה:** סגירת tab או fin שלage הורגת apps בלי הודעה. אין הזדמנות ל-save_state. ה-OS אמיתי יודע "אני נסגר, היכון".
+   - **תיקון:**
+     - `tab.js`/leader.js שולח `{type: "shutdown"}` ל-kernel-worker לפני `terminate()`
+     - kernel-worker drains: לכל activity במצב Resumed → fire pause + save_state pipeline → wait for completion → ack to leader → leader terminates worker
+     - timeout (say 500ms) — אם apps לא ענו, kernel terminates anyway
+   - **DoD:** test app שמראה "shutdown counter" — סוגרים tab + פותחים מחדש, רואים תוספת.
+   - **סקופ:** ~45-60 דק'.
+
+3. **Trapped activity recycle (Stone 11.6+3)**
+   - **בעיה:** Trapped instances מחזיקים `ActivityRecord` + instance לעד. bounded by session length, אבל חסר GC.
+   - **תיקון:**
+     - `Framework::reap_trapped(now_ms, max_age_ms)` שעובר על כל records ב-`Trapped` state, מסיר אם age > threshold.
+     - Kernel קורא ל-reap ב-`akiva_frame` (every N frames or every X seconds) דומה ל-`drive_pending_transitions`.
+     - Threshold קונפיגורבילי (default ~30s — מספיק זמן לdebugger לתפוס; קצר מספיק שהזיכרון לא דולף יותר מדי).
+   - **DoD:** test שמסמן activity Trapped, מקדם זמן, מאמת שה-record נמחק.
+   - **סקופ:** ~30 דק'.
+
+4. **🔴 SDK async executor — embassy או ידני (Stone 11.6+4)**
+   - **בעיה הקרדינלית:** ה-`Activity` trait הוא `async fn`, אבל ה-executor (`block_on_ready` ב-`sdk-rust/src/activity.rs`) panics על `Pending`. כל future שלא נפתר ב-poll הראשון (storage::read, network call עתידי, cross-worker host_op) חייב להיות wrapped ב-deferred-handle pattern מסורבל. ה-API מ"async fn מודרני" → "callback-soup with manual handles".
+   - **תיקון מלא (embassy):**
+     - הוספת `embassy-executor` כdep ל-`sdk-rust`
+     - replace `block_on_ready` עם executor שמכין tasks, מחזיק waker registry
+     - שינוי ב-`akiva_app_dispatch` protocol — מסוגל לחזור עם "future_id mid-callback" — ה-worker shell שומר את ה-future state בין postMessages
+     - kernel poll → worker shell wakes the right task → continues execution → eventually posts `dispatch_done`
+   - **תיקון מינימלי (custom):** writeexecutor של פעולות-Pending-yield שהוא יחסית מצומצם ל-host_io_poll case בלבד. פחות גנרי אבל יספיק ל-storage / future capabilities.
+   - **DoD:** `let bytes = storage::read("k").await;` עובד באפליקציה אמיתית. notes app יוכל לקרוא state באופן fluent.
+   - **סקופ:** 1-2 ימי עבודה לembassy מלאה. ~半ה-day לcustom mini-executor.
+
+#### P1 — אם יש זמן, גם:
+
+5. **`WriteHandle` ל-storage** — היום `storage::write` הוא fire-and-forget. לcritical data app רוצה לדעת אם נכשל. ~30 דק'.
+
+6. **Magic numbers → config block** — 1500ms (watchdog), 16KB (render initial buf), 4KB (save_state initial buf), 256B (trap drain buf). מקובצים ב-`runtime/web/config.js` כdefault const block, dev mode יכול להחליף. ~15 דק'.
+
+7. **`drain_post` separation** — להוציא מ-`render` לframework phase נפרד `drive_pending_signals(ts)` שrun-it כל frame בkernel. clarity in concept. ~30 דק'.
+
+8. **pkgs_wire decoder dedup** — היום משוכפל ב-`framework::wire::pkgs`, `sdk-rust::pkgs`, `runtime/web/app_registry.js::_warmupWorkers`. drift risk כשמוסיפים שדה. אפשרויות: switch to JSON in non-perf paths, or introduce schema-driven generation. ~1-2h.
+
+#### P2 — לכרך כtask future:
+
+9. **e2e tests with Playwright** — Phase 11.8 covers this. real browser, real workers, navigation flows.
+
+10. **worker shell unit tests** — currently tested only via integration. add `app_worker_shell.test.mjs` with mocked `postMessage` that exercises the dispatcher.
+
+### Recommended Order
+
+```
+P0-1 (save_state pipeline)  →  P0-2 (graceful shutdown)
+                            →  P0-3 (Trapped recycle)
+                            →  P0-4 (SDK async executor)
+                                ↓
+                            P1: storage WriteHandle, config block, drain phase
+                                ↓
+                            P2: e2e tests, worker shell tests
+                                ↓
+                            Phase 11 done — מעבר ל-Phase 12 (Resource Governance)
+```
+
+**אומדן זמן:** P0 כולו ~3-4 ימי עבודה, P1 ~חצי יום, P2 ~יום.
+
+---
 
 ### Stone 11.7 — `akiva new` + dev tooling polish (1-2 שבועות)
 **מטרה:** onboarding ב-5 דקות.

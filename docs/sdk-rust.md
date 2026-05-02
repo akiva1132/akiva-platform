@@ -492,3 +492,151 @@ akiva run
 - Custom widgets (ירושה מ-widget בסיסי)
 - Animations API
 - Dependency injection של system services
+
+## 19. Known Limitations (Stone 11.6+ backlog)
+
+מסמך זה מתעד פערים אמיתיים של ה-SDK שזיהינו אחרי 11.4c (worker-per-app) ו-11.5 (fault containment) על ה-platform. ראה [`docs/isolation-design.md` §10.5 Phase 11 Status](isolation-design.md) ל-full work plan.
+
+### 19.1 🔴 The async executor gap (ה-cardinal issue)
+
+**הבעיה.** ה-`Activity` trait הוא `async fn`:
+
+```rust
+async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+    let bytes = storage::read("notes").await;  // ❌ panics
+    ...
+}
+```
+
+אבל ה-executor של ה-SDK הוא [`block_on_ready`](../sdk-rust/src/activity.rs) שעושה `.poll()` פעם אחת בלבד:
+
+```rust
+pub fn block_on_ready<F: Future>(mut fut: F) -> F::Output {
+    match Future::poll(unsafe { Pin::new_unchecked(&mut fut) }, &mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending  => panic!("block_on_ready: future returned Pending"),
+    }
+}
+```
+
+**מה זה אומר בפועל:**
+
+| Operation | Status |
+|---|---|
+| ✅ `async fn` בלי await על futures לא-ready | works |
+| ✅ `await` על future שresolve immediately | works (e.g., a future that returns `Poll::Ready` on first poll) |
+| ❌ `await` על cross-worker host call | panics (release: silent fall-through) |
+| ❌ `await` על channel that hasn't received yet | panics |
+| ❌ `select!`, `join!` עם branch שעוד לא ready | panics |
+
+**למה זה כך נשאר.** הסיבה ההיסטורית — Stone 11.2 הציג את ה-async-shape API כי ה-vision היה Android/iOS parity. הexecutor האמיתי (embassy) נדחה ל-Stone 11.3 וב-11.4 לתת-stones של isolation. בפועל ה-block_on_ready stub שרד — single-worker עבד עם זה. עם cross-worker (11.4c) ה-stub שבר.
+
+**ה-workaround היום: deferred-handle pattern.** ראה [`storage::ReadHandle`](../sdk-rust/src/storage.rs):
+
+```rust
+struct Notes {
+    text: String,
+    loading: Option<storage::ReadHandle>,
+}
+
+impl Activity for Notes {
+    async fn on_create(&mut self, _ctx: &mut Context<'_>) {
+        self.loading = storage::read("notes");  // returns ReadHandle, doesn't await
+    }
+    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+        if let Some(handle) = &self.loading {
+            if let Some(result) = handle.poll() {        // <-- manual polling
+                if let Ok(Some(bytes)) = result {
+                    self.text = String::from_utf8(bytes).unwrap_or_default();
+                }
+                self.loading = None;
+            }
+        }
+        // ... render ...
+    }
+}
+```
+
+זה עובד אבל מאלץ apps לנהל state ידנית בין frames. ככל שה-SDK מתרחב (network, BLE, camera), הדפוס הזה יתפוצץ.
+
+**התיקון המלא.** embassy executor (`embassy-executor` + `embassy-sync`):
+- replace `block_on_ready` ב-real executor שmamper Pending ע"י לחזור ל-host
+- שמירת ה-future state בין dispatches (ה-`akiva_app_dispatch` protocol יצטרך להחזיר future_id mid-callback)
+- waker registry ש-`host_op_done` מעיר
+- `let bytes = storage::read("k").await` יעבוד fluent
+
+**סקופ:** 1-2 ימים. שינויים:
+- `sdk-rust/Cargo.toml` — `embassy-executor`, `embassy-sync` deps
+- `sdk-rust/src/activity.rs` — replace `block_on_ready`
+- `sdk-rust/src/runtime.rs` — dispatch glue ש-supports resumption
+- `runtime/web/app_worker_shell.js` — handle resumption protocol
+- `framework/src/wasm_activity.rs` — pipelined dispatch הופך גם לlifecycle calls (כמו render כבר היום)
+
+**תיקון ביניים (אופציונלי).** mini-executor שmamper רק את ה-`host_io_poll` case — הרבה פחות גנרי אבל יעיל יותר ל-MVP. נבחר רק אם ה-embassy bundle bloat (~10KB per app) הופך לבעיה אמיתית.
+
+### 19.2 🟡 `save_state` degraded under cross-worker
+
+**הבעיה.** ה-`Activity::on_save_state` callback הוא חלק מchain pause→stop. ב-Stone 6 design, ה-bytes נכתבים ל-storage לpersistence.
+
+ב-Stone 11.4c (worker-per-app), `WasmActivity::save_state_bytes` עושה:
+```rust
+let future_id = self.host.save_state(self.handle);
+match self.host.poll_future(future_id) {
+    Some(Ok(bytes)) => bytes,
+    other => { debug_assert!(false, ...); Vec::new() }  // ← release: silent
+}
+```
+
+עם cross-worker, ה-poll הראשון תמיד `None` (Pending) → release fall-through → empty Vec → app loses state.
+
+**מה זה משבר בפועל:**
+- App יוצא מ-foreground (Pause) — saved state ריק
+- App חוזר ל-foreground — `on_restore_state` מקבל empty bytes → app starts from default state
+- **Phase 6 saved-state is broken in production** under 11.4c.
+
+**התיקון.** pipeline בstate משתנה — ראה הדפוס שכבר הוצאנו ל-render:
+- `WasmActivity` שדה חדש `pending_save: Option<u64>`
+- בpause — dispatch save_state, store fid כ-pending
+- בdestroy — drain prior pending_save (poll). אם READY → use bytes. אם PENDING → wait one frame OR timeout.
+- ה-actual write לstorage קורה אחרי ה-drain.
+
+**הexpected complications:** ה-pause→stop chain עובר על הרבה frames מאחר ש-save_state חייב לresolve לפני stop יכול לרוץ. זה יוצר deferred lifecycle path עבור pause-only — דומה ל-render אבל לכל ה-pause/stop edge.
+
+### 19.3 🟡 Multi-frame side-effects (`storage::write` ו-`remove`)
+
+**הבעיה.** היום:
+```rust
+pub fn write(key: &str, value: &[u8]) {
+    let _ = io_start(io::STORAGE_SET, &args);  // fire-and-forget
+}
+```
+
+ה-app אינו מקבל indication אם ה-write נכשל (quota, IO error, denied). ה-host logs את ה-failure אבל ה-app רץ לכאורה successfully.
+
+**מה זה משבר בפועל.** apps שדורשים durability (settings, notes, drafts) לא יכולים לדעת אם ה-write בוצע. ב-OS אמיתי (iOS, Android) ה-API מחזיר Result.
+
+**התיקון (קל יחסית).** `WriteHandle` parallel ל-`ReadHandle`:
+```rust
+pub fn write(key: &str, value: &[u8]) -> Option<WriteHandle>;
+impl WriteHandle {
+    pub fn poll(&self) -> Option<Result<(), StorageError>>;
+}
+```
+
+המעבר ל-async-await (§19.1) ירכז את כל ה-handles הללו ל-`.await` נורמלי.
+
+### 19.4 🟢 Other minor SDK gaps
+
+- **`pkgs_wire` decoder duplicated 3x.** [`framework/src/wire/pkgs.rs`](../framework/src/wire/pkgs.rs), [`sdk-rust/src/pkgs.rs`](../sdk-rust/src/pkgs.rs), ו-`runtime/web/app_registry.js::_warmupWorkers` משתפים את אותו פורמט. drift risk כשmosbim שדה. הפתרון או JSON (לpaths שאינם performance-critical), או schema-driven generation. ~1-2h.
+
+- **No public `ctx.is_trapped(other_handle)` query.** Activity לא יכולה לזהות אם activity אחרת ש-launched להיא קרסה. relevant ל-launcher UI (Stone 11.5d UI נדחה לעת אחרי הבסיס).
+
+- **Activity trait `async fn` הוא קצת שקר ארכיטקטוני** עד שיש executor אמיתי. ה-API חושב כאילו זה async, אבל בפועל הכל single-poll synchronous-with-await-fudge. עם §19.1 השקר נסגר.
+
+### Status & ordering
+
+ראה [`docs/isolation-design.md` §10.5 Phase 11 Foundation Gaps](isolation-design.md) לתכנית עבודה מלאה. בקצרה:
+
+- **P0** (חייבים): §19.2 (save_state pipeline), graceful shutdown, Trapped recycle, **§19.1 (async executor) — cardinal**
+- **P1** (כדאי): §19.3 (WriteHandle), magic-numbers config, drain phase separation, §19.4 (pkgs_wire dedup)
+- **P2** (future): e2e tests, worker shell unit tests

@@ -127,3 +127,53 @@ covered by hand-testing in the browser.
 2. Integration-test sketch earmarked for Stone 9.3 (per §4).
 3. No ROADMAP changes beyond an explicit note that JS tests are deferred
    to Phase 11+.
+
+## 7. Coverage status post-Stone 11.5 / 11.6a-c (May 2026)
+
+### What we have now
+
+| Layer | Tests | Notes |
+|---|---|---|
+| **cli** | 68 | Build/install/uninstall flows |
+| **framework** | 162 | Activity model, intent routing, capability gating, lifecycle state machine, Trapped transitions, watchdog driver, render pipelining |
+| **sdk** | 158 | Codecs (paint, intent, ActivityResult), op_kinds, storage SDK empty-key paths |
+| **vitest** | 59 | AppRegistry: WorkerPool, dispatch, side_effect, host_op routing, watchdog (with fake timers), storage handler, sandbox isolation, provenance check |
+| **Total** | **447** | All green as of 2026-05-02 |
+
+### What's still missing (deferred)
+
+#### 7.1 Worker shell unit tests — pending
+
+`runtime/web/app_worker_shell.js` is currently exercised only indirectly via AppRegistry integration tests. Direct coverage of:
+- `dispatchFire` op-kind routing (LOG / FINISH / START_ACTIVITY / SET_RESULT)
+- `dispatchIoStart` op-kind routing (TEXT_WIDTH / QUERY_PACKAGES local / STORAGE_* via host_op)
+- `pollFuture` two-phase buffer contract
+- `handleHostOpDone` registry update
+- LAUNCH_ANY_APP grant gate inside the shell
+
+Trigger: Phase 11.8 (perf + e2e) is a natural pairing — both want a real-browser test bed. Build a `app_worker_shell.test.mjs` with mocked `postMessage` / `addEventListener` globals as step one toward Playwright.
+
+#### 7.2 Cross-worker boundary tests — pending
+
+The current vitest harness simulates the worker boundary with a fake `Worker` object. Real-browser concerns NOT exercised:
+- `structuredClone` ownership / transfer-list semantics under detached buffers
+- postMessage FIFO ordering with rAF jitter on both ends
+- Worker module fetch + parse latency on cold start
+- `OffscreenCanvas` actually existing in the worker scope (the test stubs `measureTextWidth`)
+- Real `WebAssembly.Module` compile timing with our app sizes
+
+Each of these has bitten us at least once during Stone 11.4c live testing — the regressions are documented inline in the relevant commit messages, but a synthetic test would have caught them earlier. The right venue is Phase 11.8 Playwright suite.
+
+#### 7.3 Lifecycle + pending-transition end-to-end — partial
+
+`framework/src/lib.rs::drive_pending_transitions` is unit-tested with `MockHost` that resolves futures synchronously. The actual flow under cross-worker (futures returning `None` for several frames, then `Some(Ok(...))`) is exercised only by the live demo. A test harness that simulates frame-by-frame poll + reply would close this gap; coupled with §7.1 it becomes natural.
+
+### What we won't try to test
+
+- **Performance** — covered by Phase 11.8 benchmarks, not unit tests.
+- **Real OPFS behavior** — environmental; the in-memory fallback is what tests use.
+- **Browser quirks** (Safari SyncAccessHandle, Firefox postMessage perf) — caught only by the eventual Playwright suite.
+
+### Test-coverage policy moving forward
+
+Each production bug surfaced in a live demo gets a regression test before it can be closed. The `it("rejects side_effect for a handle that doesn't belong to the sender")` and the watchdog timing tests were added under this rule — they pin behavior the existing harness *could* have caught if it had been thorough enough. Shipping a fix without the regression test is acceptable in emergency only.
