@@ -187,10 +187,40 @@ function installInputForwarding(canvas) {
   canvas.addEventListener("keyup", keyEvent("up"));
 
   document.addEventListener("visibilitychange", () => {
+    const visible = document.visibilityState === "visible";
     session.send({
       type: "event", kind: "visibility", tabId,
-      visible: document.visibilityState === "visible",
+      visible,
     });
+    // P0 #2 — graceful shutdown: page going background means the user
+    // is on their way out (tab switch, OS-level swipe-up on mobile,
+    // mid-route through a close). Fire a checkpoint so the foreground
+    // activity's in-memory state has a chance to make it to OPFS
+    // before the tab is throttled or terminated. visibilitychange is
+    // the recommended hook over `beforeunload` — Safari ignores
+    // beforeunload on bfcache transitions, and Chrome on mobile
+    // doesn't always fire it on swipe-close.
+    if (!visible) {
+      session.send({ type: "checkpoint", tabId });
+    }
+  });
+
+  // P0 #2 — last-resort checkpoint when the tab is unloading. `pagehide`
+  // is the modern replacement for `beforeunload` and fires reliably on
+  // tab close, navigation away, and bfcache eviction. The save bytes
+  // travel async over the worker boundary, so on hard close they may
+  // not land before the page dies — the visibilitychange path above
+  // is the one that actually saves state in practice. This handler
+  // exists to cover edge cases where visibility fires "visible" right
+  // before unload (e.g. the user clicks the close button while the
+  // page is foregrounded).
+  window.addEventListener("pagehide", (e) => {
+    // bfcache restore reuses the same Session — only checkpoint when
+    // we're being terminated, not when we're being suspended. The
+    // bfcache path is rare on apps that hold a Web Lock anyway.
+    if (!e.persisted) {
+      session.send({ type: "checkpoint", tabId });
+    }
   });
 }
 

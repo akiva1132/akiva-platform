@@ -279,5 +279,24 @@ Stone 11.4c-6. כש-`setPackages` נקרא (ב-boot ובכל install/uninstall),
 
 ראה [`docs/risks.md` §7](risks.md) ו-[`docs/isolation-design.md` §10.5](isolation-design.md):
 - §7.1 SDK async executor missing — affects how `host_op` results land in apps
-- §7.3 No graceful shutdown — `tab.js` doesn't intercept beforeunload
 - §7.5 `drain_post` on every render — should be its own framework phase
+
+### 9.7 Graceful shutdown checkpoint (P0 #2, May 2026)
+
+`tab.js` שולח `{type: "checkpoint"}` ל-Session על שני triggers:
+
+1. **`visibilitychange` → `hidden`** — הדף עובר לרקע (החלפת tab, swipe-close במובייל, OS-level backgrounding). זה ההוק המומלץ — ה-`beforeunload` המסורתי לא נורה אמין במובייל ובsafari (bfcache). הדף נשאר חי במצב הזה לעשרות שניות → ה-save bytes round-trip cross-worker מסתיים בפועל ו-data persisted.
+2. **`pagehide` עם `persisted=false`** — last-resort על hard tab close כש-page הוא foreground. ה-bytes עלולים לא להגיע (page dies before round-trip completes) — best effort.
+
+ה-worker מקבל את ההודעה, קורא ל-`instance.exports.akiva_checkpoint(performance.now())`. ה-kernel קורא ל-`Framework::checkpoint(ts)` שעושה:
+- מחפש foreground activity (top of stack)
+- בודק שמצבו live (Created/Started/Resumed/Paused — לא Trapped/Destroyed)
+- בודק שאין כבר PendingSave for `(pkg, class)` בטיסה (de-dup)
+- קורא ל-`Activity::dispatch_save_state_async()` — מקבל future_id מ-`host.save_state(handle)`
+- רושם entry ב-`pending_saves`
+
+ה-`drive_pending_saves` הרגיל (running every frame) polls את ה-future, persists את ה-bytes כשה-worker עונה. ה-activity לא משנה lifecycle state — checkpoint הוא read-only מנקודת מבט של ה-state machine.
+
+ה-foreground checkpoint כיסוי הוא MVP — paused activities ב-stack לא מקבלים checkpoint. על מנת ש-paused-activity state ישרוד tab close צריך: או (a) save_state מתבצע על-pause במקום רק על-destroy (אנדרואיד-style), או (b) checkpoint walks the entire stack. שניהם ניתנים להוסיף בלי שינוי בארכיטקטורה כשה-trigger נראה.
+
+**Limitation explicit:** state שנוצר אחרי ה-`visibilitychange` checkpoint האחרון ולפני סגירה — אבד. אפליקציות עם data critical (notes, drafts) צריכות לעשות `storage::write` explicit ב-on-edit ולא להסתמך רק על on_save_state.

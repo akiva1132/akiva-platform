@@ -141,15 +141,19 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Code.** `framework/src/{activity.rs, wasm_activity.rs, activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Two new tests: `drive_pending_saves_persists_when_future_resolves`, `drive_pending_saves_drops_entry_on_host_error`. 391 Rust tests + 54 vitest tests green.
 
-### 7.3 🟡 No graceful shutdown signal
+### 7.3 ✅ Graceful shutdown signal — fixed (P0 #2, May 2026)
 
-**Concern.** Closing a tab terminates the worker(s) without notifying apps. No chance for `on_pause` → `save_state` → `on_stop` to run. Apps lose unflushed state every time the user closes the tab.
+**Was.** Closing a tab terminated the workers without notifying apps. No chance for `save_state` to run; apps lost unflushed in-memory state on every tab close.
 
-**Why deferred.** Out of scope for the isolation work (Stone 11.4-11.5 focused on per-app crash handling, not whole-system shutdown). MVP apps don't have critical unsaved state today.
+**Fix.** Checkpoint hook layered on top of the P0 #1 pipeline:
+- `Framework::checkpoint(ts) -> usize` dispatches `save_state` at the foreground activity (no lifecycle change), records a `PendingSave`, and de-dups against in-flight saves so rapid checkpoints don't pile up dispatches.
+- `akiva_checkpoint(ts: f64) -> u32` kernel export.
+- `worker.js` handles `{type: "checkpoint"}` → calls the export.
+- `tab.js` fires the checkpoint message on `visibilitychange` to `hidden` (the recommended hook — fires reliably on tab switch, swipe-close, OS-level backgrounding) and on `pagehide` with `persisted=false` (last-resort for tab close while foregrounded).
 
-**Trigger to promote.** First app that produces user-perceptible data loss on close (notes, draft email, etc.). P0 in the Phase 11 closeout work plan.
+**Caveat that remains.** The save bytes travel async over the worker boundary. On `visibilitychange` the page stays alive (browsers keep background pages around for tens of seconds) so the round-trip completes. On hard close via `pagehide` the tab may die before bytes land — best effort only. The "last save" is the most-recent `visibilitychange`-triggered checkpoint; data produced after that and before close is lost.
 
-**Code surfaces.** `runtime/web/tab.js` (intercept beforeunload), `runtime/web/worker.js` (drain message), `framework/src/lib.rs` (`shutdown_all` walking the activity stack with state-saving pause).
+**Code.** `framework/src/lib.rs::checkpoint`, `kernel/src/lib.rs::akiva_checkpoint`, `runtime/web/{worker.js, tab.js}`. Tests: `checkpoint_dispatches_save_state_for_foreground_activity` (de-dup + persist), `checkpoint_skips_when_no_foreground` (boot-time edge).
 
 ### 7.4 🟡 Trapped activities leak ActivityRecord
 

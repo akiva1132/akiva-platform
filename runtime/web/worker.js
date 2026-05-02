@@ -78,6 +78,21 @@ self.addEventListener("message", (e) => {
     case "event":
       forwardEvent(msg);
       break;
+    case "checkpoint":
+      // P0 #2 — graceful-shutdown checkpoint. The tab fires this on
+      // `visibilitychange` to `hidden` (user switching tabs / app
+      // backgrounded) and on `pagehide` (last-resort hook). The kernel
+      // dispatches `save_state` at the foreground activity; bytes
+      // arrive cross-worker and get persisted by `drive_pending_saves`.
+      // The state ride-along is async — on visibilitychange the page
+      // stays alive so the round-trip completes; on pagehide it's
+      // best-effort. Drop on the floor before boot — there's nothing
+      // to save yet.
+      if (booted && instance) {
+        try { instance.exports.akiva_checkpoint(performance.now()); }
+        catch (err) { log("warn", `checkpoint failed: ${err?.message ?? err}`); }
+      }
+      break;
     default:
       log("warn", `unknown message type: ${msg?.type}`);
   }

@@ -733,14 +733,14 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
    - **In-process activities** ממשיכים סנכרוני (legacy `save_state_bytes` path) — Framework consults אותו רק כש-`dispatch_save_state_async` החזיר 0.
    - **Code:** `framework/src/{activity.rs, wasm_activity.rs, activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Tests: `drive_pending_saves_persists_when_future_resolves`, `drive_pending_saves_drops_entry_on_host_error` (391 Rust tests + 54 vitest tests green).
 
-2. **Graceful shutdown (Stone 11.6+2)**
-   - **בעיה:** סגירת tab או fin שלage הורגת apps בלי הודעה. אין הזדמנות ל-save_state. ה-OS אמיתי יודע "אני נסגר, היכון".
-   - **תיקון:**
-     - `tab.js`/leader.js שולח `{type: "shutdown"}` ל-kernel-worker לפני `terminate()`
-     - kernel-worker drains: לכל activity במצב Resumed → fire pause + save_state pipeline → wait for completion → ack to leader → leader terminates worker
-     - timeout (say 500ms) — אם apps לא ענו, kernel terminates anyway
-   - **DoD:** test app שמראה "shutdown counter" — סוגרים tab + פותחים מחדש, רואים תוספת.
-   - **סקופ:** ~45-60 דק'.
+2. **✅ Graceful shutdown — תוקן (P0 #2, May 2026)**
+   - **תיקון בפועל (checkpoint hook על-גבי הpipeline של P0 #1):**
+     - `Framework::checkpoint(ts) -> usize` חדש — dispatches save_state ל-foreground activity (לא משנה state), רושם PendingSave, ו-de-dups מול saves שכבר בטיסה.
+     - `akiva_checkpoint(ts: f64) -> u32` kernel export חדש.
+     - `worker.js` מטפל ב-`{type: "checkpoint"}` ↔ קורא ל-export.
+     - `tab.js` שולח checkpoint על `visibilitychange` to `hidden` (ההוק המומלץ — fires reliably ב-tab switch, swipe-close, mobile backgrounding) ועל `pagehide` עם `persisted=false` (last-resort על hard tab close).
+   - **מגבלה שנשארת.** ה-save bytes טסים async דרך גבול ה-worker. ב-`visibilitychange` הדף נשאר חי (browsers שומרים pages ברקע לעשרות שניות) → round-trip מסתיים. ב-`pagehide` hard close ה-tab עלול למות לפני שה-bytes נחתים → best effort. ה"save אחרון" הוא ה-`visibilitychange` checkpoint האחרון; data שנוצר אחריו ולפני הסגירה — אבד.
+   - **Code:** `framework/src/lib.rs::checkpoint`, `kernel/src/lib.rs::akiva_checkpoint`, `runtime/web/{worker.js, tab.js}`. Tests: `checkpoint_dispatches_save_state_for_foreground_activity`, `checkpoint_skips_when_no_foreground`.
 
 3. **Trapped activity recycle (Stone 11.6+3)**
    - **בעיה:** Trapped instances מחזיקים `ActivityRecord` + instance לעד. bounded by session length, אבל חסר GC.

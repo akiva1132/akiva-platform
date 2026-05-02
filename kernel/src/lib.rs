@@ -732,6 +732,33 @@ pub extern "C" fn akiva_shutdown() {
     k.display.shutdown();
 }
 
+/// P0 #2 — graceful-shutdown checkpoint. The HAL calls this when the
+/// browser tab signals "user is leaving" (`visibilitychange` to
+/// `hidden`, `pagehide`). The framework dispatches `save_state` at the
+/// foreground activity; the bytes arrive over the worker boundary and
+/// get persisted by the regular `drive_pending_saves` path. The
+/// activity's lifecycle state is unchanged.
+///
+/// `timestamp_ms` is the same monotonic clock `akiva_frame` uses; we
+/// pass it straight through so the future's `started_at_ms` is on the
+/// same clock as the watchdog's deadline check.
+///
+/// Returns the number of save dispatches issued — 0 means nothing to
+/// checkpoint (no foreground, already in flight, in-process activity).
+/// The HAL logs the value for visibility but doesn't act on it.
+#[no_mangle]
+pub extern "C" fn akiva_checkpoint(timestamp_ms: f64) -> u32 {
+    let k = kernel();
+    let Some(fw) = k.framework.as_mut() else {
+        return 0;
+    };
+    let n = fw.checkpoint(timestamp_ms) as u32;
+    if n > 0 {
+        log::debug(&format!("checkpoint: {n} save dispatched"));
+    }
+    n
+}
+
 // ── Memory ABI: host<->guest transfers ────────────────────────────────
 
 /// Allocate `size` bytes inside kernel memory and return a pointer the host

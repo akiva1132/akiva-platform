@@ -575,6 +575,77 @@ impl Framework {
         }
     }
 
+    /// P0 #2 — graceful-shutdown checkpoint. Triggers a `save_state`
+    /// dispatch on the foreground activity without changing its
+    /// lifecycle state, and queues the resulting bytes through the
+    /// regular `pending_saves` pipeline. Called by the kernel when the
+    /// browser tab signals "user is leaving" — `visibilitychange` to
+    /// `hidden` (page going to background, foreground app should
+    /// preserve its in-flight state) and `pagehide` (last-resort hook
+    /// before the tab closes).
+    ///
+    /// Idempotent on the foreground activity: if a `PendingSave` for
+    /// the foreground (pkg, class) is already in flight, the second
+    /// call is a no-op so we don't pile up duplicate dispatches when
+    /// the user toggles tabs rapidly. The activity stays at `Resumed`
+    /// — checkpoint is read-only from the lifecycle's point of view.
+    ///
+    /// Returns the number of dispatches issued (0 if no foreground
+    /// activity, or the activity's state is non-live, or a checkpoint
+    /// for it is already in flight). The kernel uses the count for
+    /// debug logging — no caller depends on it for correctness.
+    ///
+    /// Cross-worker async caveat: bytes arrive via `drive_pending_saves`
+    /// on a later frame. On `visibilitychange` the page is still alive
+    /// so the round-trip completes normally; on `pagehide` the tab may
+    /// close before the bytes land — best-effort. See
+    /// [`docs/runtime-web.md`] §10 for the full lifecycle picture.
+    pub fn checkpoint(&mut self, ts: f64) -> usize {
+        let Some(id) = self.stack.last().copied() else { return 0; };
+        let (pkg, class) = match self.activities.record(id) {
+            Some(r) => (r.package_id.clone(), r.class.clone()),
+            None => return 0,
+        };
+        // Only checkpoint live activities. A Trapped activity has a
+        // dead worker — dispatching save_state would either time out or
+        // route into a recycled handle slot that belongs to someone
+        // else.
+        if !matches!(
+            self.activities.state_of(id),
+            Some(activity_manager::LifecycleState::Resumed)
+                | Some(activity_manager::LifecycleState::Paused)
+                | Some(activity_manager::LifecycleState::Started)
+                | Some(activity_manager::LifecycleState::Created),
+        ) {
+            return 0;
+        }
+        // De-dup: if the foreground already has a save in flight (from
+        // a recent destroy or a prior checkpoint that hasn't drained
+        // yet) skip the second dispatch. The user's most recent state
+        // is already on its way to disk.
+        if self.pending_saves.iter().any(|ps| ps.package_id == pkg && ps.class == class) {
+            return 0;
+        }
+        let async_save_id = self.activities
+            .with_instance_ret(id, |a| a.dispatch_save_state_async())
+            .unwrap_or(0);
+        if async_save_id == 0 {
+            // In-process activity, or wasm app with nothing to save.
+            // Either way no async write is coming — the in-process
+            // sync `save_state_bytes` path covers the fixture case
+            // during destroy. Return 0 so the kernel can log "no
+            // checkpoint produced" if it cares.
+            return 0;
+        }
+        self.pending_saves.push(PendingSave {
+            future_id: async_save_id,
+            package_id: pkg,
+            class,
+            started_at_ms: ts,
+        });
+        1
+    }
+
     /// Stone 11.5 — every activity belonging to `package_id` is marked
     /// `Trapped` and popped from its task stack so the user lands back
     /// at whatever was below (typically the Shell). Called by the
@@ -2634,6 +2705,141 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             "resolved future must drop from the queue");
         let read = fw.storage.as_ref().unwrap().read(&key).unwrap();
         assert_eq!(read, b"snapshot-bytes");
+    }
+
+    #[test]
+    fn checkpoint_dispatches_save_state_for_foreground_activity() {
+        // P0 #2 — visibilitychange / pagehide trigger the kernel
+        // checkpoint hook; framework dispatches save_state at the
+        // foreground activity, records a PendingSave, and the bytes
+        // get persisted via drive_pending_saves on a later frame.
+        struct CheckpointHost {
+            future_id: RefCell<u64>,
+            armed: RefCell<std::collections::HashMap<u64, Vec<u8>>>,
+            pending: RefCell<std::collections::HashSet<u64>>,
+            save_calls: RefCell<u32>,
+            next_handle: RefCell<u32>,
+        }
+        impl CheckpointHost {
+            fn new() -> Rc<Self> {
+                Rc::new(Self {
+                    future_id: RefCell::new(100),
+                    armed: RefCell::new(std::collections::HashMap::new()),
+                    pending: RefCell::new(std::collections::HashSet::new()),
+                    save_calls: RefCell::new(0),
+                    next_handle: RefCell::new(1),
+                })
+            }
+        }
+        impl WasmHost for CheckpointHost {
+            fn register(&self, _: &str, _: &str) -> Option<wasm_activity::AppHandle> {
+                let mut n = self.next_handle.borrow_mut();
+                let h = *n; *n += 1;
+                wasm_activity::AppHandle::new(h)
+            }
+            fn unregister(&self, _: wasm_activity::AppHandle) {}
+            fn lifecycle(&self, _: wasm_activity::AppHandle, _: wasm_activity::LifecycleTransition) -> u64 { 0 }
+            fn pointer(&self, _: wasm_activity::AppHandle, _: activity::PointerEvent, _: f64) -> u64 { 0 }
+            fn key(&self, _: wasm_activity::AppHandle, _: activity::KeyEvent, _: f64) -> u64 { 0 }
+            fn resize(&self, _: wasm_activity::AppHandle, _: SurfaceMetrics) -> u64 { 0 }
+            fn render(&self, _: wasm_activity::AppHandle, _: f64) -> u64 { 0 }
+            fn save_state(&self, _: wasm_activity::AppHandle) -> u64 {
+                *self.save_calls.borrow_mut() += 1;
+                let mut next = self.future_id.borrow_mut();
+                let id = *next;
+                *next += 1;
+                self.pending.borrow_mut().insert(id);
+                id
+            }
+            fn poll_future(&self, future_id: u64) -> Option<Result<Vec<u8>, String>> {
+                if let Some(b) = self.armed.borrow_mut().remove(&future_id) {
+                    self.pending.borrow_mut().remove(&future_id);
+                    Some(Ok(b))
+                } else if self.pending.borrow().contains(&future_id) {
+                    None
+                } else {
+                    Some(Err(format!("unknown future_id {future_id:#x}")))
+                }
+            }
+        }
+
+        // Build a Framework with a foreground WasmActivity. The factory
+        // hands out a fresh WasmActivity; checkpoint should hit its
+        // dispatch_save_state_async override.
+        let host = CheckpointHost::new();
+        let mut fw = Framework {
+            activities: ActivityManager::new(),
+            packages: package_manager::PackageManager::new(),
+            windows: window_manager::WindowManager::new(),
+            resources: resources::ResourceManager::new(),
+            intents: intent::IntentRouter::new(),
+            permissions: permissions::PermissionController::new(),
+            compositor: Compositor::new(),
+            metrics: SurfaceMetrics::default(),
+            pointer: None,
+            stack: Vec::new(),
+            storage: Some(Box::new(storage::MemoryStorage::new())),
+            pending_result_for: HashMap::new(),
+            pending_result: HashMap::new(),
+            task_history: Vec::new(),
+            host: host.clone(),
+            pending_saves: Vec::new(),
+        };
+        let host_for_factory = host.clone();
+        fw.activities.register(
+            "com.example",
+            "Main",
+            activity_manager::LaunchMode::Standard,
+            move || {
+                let h = host_for_factory.register("com.example", "Main").unwrap();
+                Box::new(WasmActivity::new(h, host_for_factory.clone()))
+            },
+        );
+        let outcome = fw.activities.launch("com.example", "Main").unwrap();
+        // Drive the activity up to Resumed so checkpoint sees a live foreground.
+        fw.stack.push(outcome.id);
+        fw.activities.resume(outcome.id, |_, _| {});
+
+        // No prior checkpoint — call should issue a single save.
+        let n = fw.checkpoint(123.0);
+        assert_eq!(n, 1, "first checkpoint must dispatch one save");
+        assert_eq!(*host.save_calls.borrow(), 1);
+        assert_eq!(fw.pending_saves.len(), 1);
+        let pending_fid = fw.pending_saves[0].future_id;
+
+        // Second checkpoint while the first is still in flight — must
+        // be a no-op (de-dup).
+        let n2 = fw.checkpoint(124.0);
+        assert_eq!(n2, 0, "duplicate checkpoint must be skipped while first is in flight");
+        assert_eq!(*host.save_calls.borrow(), 1, "no extra host.save_state call");
+        assert_eq!(fw.pending_saves.len(), 1);
+
+        // Resolve the future and run drive_pending_saves — bytes get
+        // persisted, queue empties.
+        host.armed.borrow_mut().insert(pending_fid, b"checkpoint-snapshot".to_vec());
+        fw.drive_pending_saves();
+        assert!(fw.pending_saves.is_empty());
+        let key = package_manager::key_saved_state("com.example", "Main");
+        let read = fw.storage.as_ref().unwrap().read(&key).unwrap();
+        assert_eq!(read, b"checkpoint-snapshot");
+
+        // After the checkpoint drained, a fresh checkpoint must
+        // dispatch again (the user did more work since).
+        let n3 = fw.checkpoint(125.0);
+        assert_eq!(n3, 1, "post-drain checkpoint must dispatch a fresh save");
+        assert_eq!(*host.save_calls.borrow(), 2);
+    }
+
+    #[test]
+    fn checkpoint_skips_when_no_foreground() {
+        // No stack → no foreground → nothing to checkpoint. Returns 0
+        // and leaves pending_saves untouched. Covers the boot-still-in-
+        // progress case where the user closes the tab before the Shell
+        // launches.
+        let mut fw = empty_framework();
+        let n = fw.checkpoint(0.0);
+        assert_eq!(n, 0);
+        assert!(fw.pending_saves.is_empty());
     }
 
     #[test]
