@@ -57,39 +57,67 @@
 //! futures' drops before the activity drops, see field declaration
 //! order in `Slot`); #3 is upheld by the framework, not the SDK.
 
+use core::cell::Cell;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 
-/// Single-task waker that does nothing on `wake`. We don't need a real
-/// notification mechanism: the runtime always re-polls a parked future
-/// on `akiva_app_poll_dispatch`, which is driven from outside by the
-/// app worker shell whenever a `host_op_done` reply arrives. The wasm
-/// side has no clock and no thread to schedule against, so a real
-/// waker would be inert anyway.
-fn noop_waker() -> Waker {
+thread_local! {
+    /// Stone 11.6.8 #3 — single global "someone called wake" flag.
+    ///
+    /// Set by `make_waker()` whenever a future calls `.wake()` /
+    /// `.wake_by_ref()`. Read by `drive_spawned` (in `runtime.rs`) so
+    /// it can re-poll while internal coordination is still making
+    /// progress. The single global flag is sufficient because wasm is
+    /// single-threaded and per-task waker fidelity isn't needed —
+    /// `drive_spawned` re-polls ALL spawned tasks anyway, so a single
+    /// "someone is awake" signal triggers the correct behaviour.
+    ///
+    /// Use [`take_wake_flag`] to read-and-reset atomically; do not
+    /// touch the cell directly outside this module.
+    static WAKE_FLAG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Read the wake flag and clear it. Returns `true` if any future
+/// called its waker since the last call to this function.
+///
+/// Called by `drive_spawned` between poll passes; if true, repeat the
+/// pass because at least one task has fresh work to do (e.g. a
+/// channel `recv()` got a value pushed by another spawned task's
+/// `send()`). Called once per dispatch poll cycle from `poll_dispatch`
+/// for the same reason on the callback path.
+pub fn take_wake_flag() -> bool {
+    WAKE_FLAG.with(|f| f.replace(false))
+}
+
+/// Smart waker that sets the wake flag on every `wake` /
+/// `wake_by_ref`. The data pointer is null and is never dereferenced
+/// — the wake side stores its signal in a thread-local, not in the
+/// waker payload, because every waker in this runtime points at the
+/// same single-threaded executor.
+fn make_waker() -> Waker {
     static VTABLE: RawWakerVTable = RawWakerVTable::new(
         |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
+        |_| WAKE_FLAG.with(|f| f.set(true)), // wake
+        |_| WAKE_FLAG.with(|f| f.set(true)), // wake_by_ref
+        |_| {},                              // drop
     );
     let raw = RawWaker::new(core::ptr::null(), &VTABLE);
-    // SAFETY: the vtable is `'static` and never deref's the data
-    // pointer; null is a valid stand-in for a no-op waker.
+    // SAFETY: the vtable is `'static` and never dereferences the data
+    // pointer; null is a safe stand-in.
     unsafe { Waker::from_raw(raw) }
 }
 
-/// Poll a stored future once with a no-op waker. Returns the same
-/// `Poll` the future itself returned, so the caller can decide how
-/// to react (park on Pending, finalise on Ready). Existence of this
-/// helper rather than inlining at the call site makes it easy to
-/// thread an additional concern (logging, metrics) through every
-/// poll later.
+/// Poll a stored future once with the runtime's smart waker. Returns
+/// the same `Poll` the future itself returned, so the caller can
+/// decide how to react (park on Pending, finalise on Ready). If the
+/// future calls `.wake()` during this poll, [`take_wake_flag`] reads
+/// `true` afterward — the caller (`drive_spawned`, `poll_dispatch`)
+/// uses that to decide whether to re-poll.
 pub fn poll_once<T>(
     future: &mut Pin<Box<dyn Future<Output = T> + 'static>>,
 ) -> Poll<T> {
-    let waker = noop_waker();
+    let waker = make_waker();
     let mut cx = TaskContext::from_waker(&waker);
     future.as_mut().poll(&mut cx)
 }
@@ -103,7 +131,7 @@ pub fn poll_once<T>(
 /// in [`crate::runtime`]; this helper is for code paths that don't
 /// participate in that.
 pub fn run_to_ready<F: Future>(f: F) -> F::Output {
-    let waker = noop_waker();
+    let waker = make_waker();
     let mut cx = TaskContext::from_waker(&waker);
     let mut fut = Box::pin(f);
     match fut.as_mut().poll(&mut cx) {

@@ -79,6 +79,12 @@ export const STATUS = Object.freeze({
   PENDING: 0,
   READY:   1,
   ERROR:   2,
+  // Stone 11.6.8 #2 — host backpressure. Returned by io_poll when the
+  // host refused the original io_start because the app's pending
+  // futures map is at MAX_PENDING_PER_SLOT. Apps see this as
+  // `Err(_::Busy)` from the SDK; cooperative apps back off, hostile
+  // ones simply hit the cap on every spam attempt.
+  BUSY:    3,
 });
 
 /** Pack `(status, length)` into the u64 shape `akiva_host_io_poll` returns. */

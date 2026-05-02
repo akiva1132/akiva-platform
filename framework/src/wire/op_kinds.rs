@@ -192,6 +192,11 @@ pub mod status {
     /// Future resolved with an error. Out buffer carries an
     /// encoded error message (UTF-8 string).
     pub const ERROR: u32 = 2;
+    /// Stone 11.6.8 #2 — backpressure: host refused the request
+    /// because the app's slot is at `MAX_PENDING_PER_SLOT`. Distinct
+    /// from `ERROR` so SDK code can branch on it (typically retry
+    /// after a yield) without conflating with permanent failures.
+    pub const BUSY: u32 = 3;
 }
 
 #[cfg(test)]

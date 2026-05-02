@@ -16,15 +16,18 @@ pub mod activity;
 pub mod akml;
 pub mod app;
 pub mod canvas;
+pub mod clock;
 pub mod executor;
 pub mod intent;
 pub mod log;
 pub mod op_kinds;
 pub mod pkgs;
+pub mod random;
 pub mod res;
 pub mod result;
 pub mod runtime;
 pub mod storage;
+pub mod sync;
 pub mod ui;
 
 pub use activity::{

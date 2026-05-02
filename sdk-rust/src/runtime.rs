@@ -68,6 +68,18 @@ extern "C" {
     pub fn akiva_host_fire(op_kind: u32, args_ptr: *const u8, args_len: u32) -> u32;
     pub fn akiva_host_io_start(op_kind: u32, args_ptr: *const u8, args_len: u32) -> u64;
     pub fn akiva_host_io_poll(future_id: u64, out_ptr: *mut u8, out_cap: u32) -> u64;
+    /// Stone 11.6.8 #1 — fill `len` bytes at `out_ptr` with cryptographic
+    /// random data. Maps to `crypto.getRandomValues` in the JS host.
+    /// Ungated — RNG is a primitive, not a capability. Synchronous,
+    /// fast, infallible (the JS host throws only on `len > 65536`,
+    /// which the SDK chunks around).
+    pub fn akiva_host_random_bytes(out_ptr: *mut u8, len: u32);
+    /// Stone 11.6.8 #4 — milliseconds since the UNIX epoch (1970-01-01
+    /// UTC). Wall-clock time. Subject to NTP corrections, manual
+    /// clock changes, daylight savings. For elapsed-time measurements
+    /// use `ctx.timestamp_ms` (monotonic, frame-derived) instead;
+    /// confusing the two is a frequent source of bugs.
+    pub fn akiva_host_wall_clock_ms() -> u64;
 }
 
 // ── Side-effect raisers (Stone 9.x; unchanged across P0 #4) ────────────
@@ -197,7 +209,34 @@ pub fn dealloc(ptr: *mut u8, size: u32) {
     unsafe { std_dealloc(ptr, layout); }
 }
 
-pub const ABI_VERSION: &[u8] = b"0.2.0\0";
+pub const ABI_VERSION: &[u8] = b"0.3.0\0";
+
+/// Stone 11.6.8 #2 — per-slot backpressure cap on concurrent
+/// in-flight dispatches.
+///
+/// `Slot.pending` became a `HashMap<u64, PendingDispatch>` in Stone
+/// 11.6.5 #12 to admit `futures::join!(read("a"), read("b"))` patterns;
+/// the map has been unbounded since. A hostile or buggy app calling
+/// `for _ in 0..1_000_000 { ctx.activity_scope().spawn(slow_io()); }`
+/// could allocate a million `dispatch_id`s before the watchdog catches
+/// the worker at 1.5 s; memory consumption was unbounded.
+///
+/// 256 is wide enough for legitimate `join_all` of 100+ items, narrow
+/// enough to catch spam loops in <50 ms (one dispatch cycle is ~5-50
+/// µs, so 256 dispatches cap memory growth around tens of KiB). The
+/// JS-side mirror lives in `runtime/web/app_worker_shell.js` as
+/// `MAX_PENDING_FUTURES`; the two MUST stay equal.
+///
+/// When a slot hits the cap, `install_and_poll` returns
+/// `Err(REFUSED_BUSY)`; the host surfaces this as `STATUS_BUSY` over
+/// the io_poll channel and the SDK's `StorageError::Busy` covers the
+/// app-visible side.
+pub const MAX_PENDING_PER_SLOT: usize = 256;
+
+/// Refusal code returned by `dispatch` when the slot already has
+/// `MAX_PENDING_PER_SLOT` callbacks in flight. Distinct from `1`
+/// (bad payload) and `2` (slot missing) so host logs can disambiguate.
+pub const REFUSED_BUSY: u32 = 3;
 
 // ── Class string interning ─────────────────────────────────────────────
 //
@@ -392,23 +431,42 @@ fn drain_spawn_queue() {
 /// Returns the count of tasks still pending after the sweep — useful
 /// for the host to back off polling when everything's idle.
 pub fn drive_spawned() -> u32 {
+    // Stone 11.6.8 #3 — re-poll until quiescence, not just once.
+    //
+    // Internal coordination via `crate::sync::{Channel, Mutex,
+    // Signal}` calls `Waker::wake()` to signal "needs another poll."
+    // Without an event loop, `wake` is a thread-local flag
+    // (`executor::take_wake_flag`) — we sweep tasks repeatedly until
+    // no future signals progress. Bounded so a misbehaving future
+    // that wakes itself every poll can't infinite-loop us.
+    const MAX_DRIVE_ITERATIONS: u32 = 64;
     drain_spawn_queue();
+    // Clear any stale wake flag from before this drive call so the
+    // first iteration's flag-check accurately reflects only this
+    // pass's wakes.
+    let _ = executor::take_wake_flag();
     let mut total_remaining: u32 = 0;
-    with_slots(|slots| {
-        for slot in slots.values_mut() {
-            slot.spawned.retain_mut(|task| {
-                match executor::poll_once(&mut task.future) {
-                    Poll::Ready(()) => false,
-                    Poll::Pending => true,
-                }
-            });
-            total_remaining += slot.spawned.len() as u32;
+    for _ in 0..MAX_DRIVE_ITERATIONS {
+        total_remaining = 0;
+        with_slots(|slots| {
+            for slot in slots.values_mut() {
+                slot.spawned.retain_mut(|task| {
+                    match executor::poll_once(&mut task.future) {
+                        Poll::Ready(()) => false,
+                        Poll::Pending => true,
+                    }
+                });
+                total_remaining += slot.spawned.len() as u32;
+            }
+        });
+        // Tasks may have spawned siblings during their poll — drain
+        // before checking the wake flag so freshly-staged tasks get
+        // a chance on the next iteration.
+        drain_spawn_queue();
+        if !executor::take_wake_flag() {
+            break;
         }
-    });
-    // Tasks may have spawned siblings during their poll — drain again
-    // before reporting the residual count so the host's "idle when
-    // 0" check isn't off-by-one.
-    drain_spawn_queue();
+    }
     total_remaining
 }
 
@@ -520,6 +578,17 @@ fn install_and_poll<T: Activity + Default>(
     let exists = with_slots(|s| s.contains_key(&handle));
     if !exists {
         return Err(1);
+    }
+    // Stone 11.6.8 #2 — backpressure: refuse if the slot is at the
+    // pending-dispatch cap. The framework normally serializes
+    // callback dispatches per handle so this is cold-path defense,
+    // but a buggy host injecting many parallel CMDs would otherwise
+    // grow `slot.pending` without bound.
+    let too_many = with_slots(|s| {
+        s.get(&handle).is_some_and(|slot| slot.pending.len() >= MAX_PENDING_PER_SLOT)
+    });
+    if too_many {
+        return Err(REFUSED_BUSY);
     }
 
     // Build the future inside a borrow-scope, then poll separately

@@ -77,6 +77,12 @@ pub mod status {
     pub const PENDING: u32 = 0;
     pub const READY:   u32 = 1;
     pub const ERROR:   u32 = 2;
+    /// Stone 11.6.8 #2 — backpressure. The host returned BUSY because
+    /// the app's slot is at `MAX_PENDING_PER_SLOT` concurrent in-flight
+    /// dispatches; the future resolves immediately to `Err(_::Busy)`
+    /// so the app can back off (e.g. spam-loop) rather than queue
+    /// unbounded.
+    pub const BUSY:    u32 = 3;
 }
 
 /// Decode the packed `(status, length)` u64 returned by

@@ -73,6 +73,20 @@ const futures = new Map();
 /** @type {bigint} */
 let nextFutureId = 1n;
 
+/**
+ * Stone 11.6.8 #2 — backpressure cap on concurrent in-flight io
+ * futures per app worker. Mirrors the `MAX_PENDING_PER_SLOT` constant
+ * in `sdk-rust/src/runtime.rs`. Apps that spam-spawn unbounded host
+ * I/O hit BUSY at exactly this many in-flight ops; the SDK's
+ * `StorageError::Busy` is the user-visible signal to back off.
+ *
+ * 256 is wide enough for `futures::join_all` of 100+ items (legitimate
+ * use), narrow enough to bound a million-iteration spam loop in <50ms
+ * — an io_start cycle (allocate fid + post host_op + sync ack) takes
+ * ~5-50 µs, so 256 entries cap memory growth around tens of KiB.
+ */
+const MAX_PENDING_FUTURES = 256;
+
 const decoder = new TextDecoder("utf-8");
 const encoder = new TextEncoder();
 
@@ -546,6 +560,33 @@ function buildHostImports() {
         return name !== null && resources.strings.has(name) ? 1 : 0;
       },
 
+      // ── Primitives ──────────────────────────────────────────────
+      // Stone 11.6.8 #1 — CSPRNG. Fills `len` bytes at `out_ptr`
+      // with cryptographic random data. Synchronous, ungated; the
+      // host's `crypto.getRandomValues` is sub-millisecond for any
+      // reasonable buffer. The single 64 KiB Web Crypto cap is
+      // chunked here so apps don't have to care.
+      akiva_host_random_bytes: (outPtr, len) => {
+        if (!wasmMemory || len === 0) return;
+        // crypto.getRandomValues caps at 65 536 bytes per call;
+        // chunk to cover larger asks transparently.
+        const CHUNK = 65536;
+        for (let off = 0; off < len; off += CHUNK) {
+          const slice = new Uint8Array(
+            wasmMemory.buffer,
+            outPtr + off,
+            Math.min(CHUNK, len - off),
+          );
+          crypto.getRandomValues(slice);
+        }
+      },
+
+      // Stone 11.6.8 #4 — wall-clock time (ms since UNIX epoch).
+      // Returned as BigInt for u64 transport. Date.now() returns a
+      // Number (53-bit safe int) which fits comfortably until the
+      // year 285_426; cast is loss-less.
+      akiva_host_wall_clock_ms: () => BigInt(Date.now()),
+
       // ── Unified-ABI multiplexers ─────────────────────────────────
       akiva_host_fire: (opKind, argsPtr, argsLen) => {
         const args = readAppBytes(argsPtr, argsLen);
@@ -629,6 +670,16 @@ function dispatchIoStart(opKind, args) {
   if (!isIoKind(opKind)) {
     postLog("warn", `io_start(0x${opKind.toString(16)}): not an io op_kind`);
     return 0n;
+  }
+  // Stone 11.6.8 #2 — backpressure cap. If the futures map is at the
+  // limit, allocate a fid pre-resolved with STATUS::BUSY so the SDK
+  // surfaces `Err(_::Busy)` cleanly. The future entry is added (so
+  // io_poll can find it) and gets drained on the first poll like any
+  // pre-resolved future.
+  if (futures.size >= MAX_PENDING_FUTURES) {
+    const fid = nextFutureId++;
+    futures.set(fid, { status: STATUS.BUSY, payload: new Uint8Array(0) });
+    return fid;
   }
   switch (opKind) {
     case IO.TEXT_WIDTH: {

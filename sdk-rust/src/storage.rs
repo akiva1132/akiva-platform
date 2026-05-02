@@ -67,6 +67,12 @@ pub enum StorageError {
     /// today (the typed enum is the stable bit; raw reason strings
     /// would couple the SDK to host wording).
     Io,
+    /// Stone 11.6.8 #2 — host refused because the app already has
+    /// `MAX_PENDING_PER_SLOT` concurrent in-flight host I/O ops.
+    /// Co-operative apps `yield` (await another resolved future,
+    /// then retry); hostile apps hit the cap on every iteration of
+    /// a spam loop and never grow the host's working set unbounded.
+    Busy,
 }
 
 /// Future returned by [`read`]. Polls `host_io_poll` on each `poll`
@@ -212,6 +218,7 @@ fn poll_read_inner(future_id: u64) -> Option<Result<Option<Vec<u8>>, StorageErro
     match st {
         status::PENDING => None,
         status::ERROR => Some(Err(StorageError::Io)),
+        status::BUSY => Some(Err(StorageError::Busy)),
         status::READY => {
             if len == 0 {
                 return Some(Ok(None));
@@ -269,6 +276,7 @@ fn poll_write_inner(future_id: u64) -> Option<Result<(), StorageError>> {
     match st {
         status::PENDING => None,
         status::ERROR => Some(Err(StorageError::Io)),
+        status::BUSY => Some(Err(StorageError::Busy)),
         status::READY => Some(Ok(())),
         _ => Some(Err(StorageError::Io)),
     }

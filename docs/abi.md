@@ -17,9 +17,85 @@
 
 המעבר מ-v0 ל-v1 יהיה additive, לא breaking: ה-WIT interfaces ב-§5 תוכננו כך שה-raw ABI של v0 נמפה אליהם 1:1 (משפחות הקריאות זהות).
 
-## 1.2 עיקרון: ABI narrow-by-design
+## 1.2 ABI versioning policy (Stone 11.6.8 #5)
 
-ABI v0 קטן בכוונה — 7 exports app-side ו-7 imports kernel→host. זה לא accident; זה policy. ABI רחב מדי מוקדם מדי הופך לעוגן שמאט כל שינוי עתידי, ומכתיב decisions שכבת framework לעוד שנים.
+`ABI_VERSION` מוצהר בשני צדדים — `sdk-rust/src/lib.rs` ו-`framework/src/lib.rs` — ונבדק ב-instantiation. mismatch fails-loudly. הסעיף הזה קובע *איך ומתי* ה-version עולה, מה נחשב breaking, ומי מאשר.
+
+### 1.2.1 In-scope של ה-ABI
+
+הדברים שהשינוי בהם דורש version bump:
+- **Extern function signatures** בשני הצדדים — `akiva_app_*` exports (kernel→app) ו-`akiva_host_*` / `hal_app_*` imports (app→host).
+- **`op_kind` constants** — fire kinds, io kinds (`STORAGE_GET`, `QUERY_PACKAGES`, …), cmd kinds (CREATE, RESIZE, …).
+- **Status code constants** — POLL_STATUS::PENDING/READY/ERROR, future status values, `STATUS_BUSY` (post-11.6.8 #2).
+- **Wire format byte layouts** — intent encoding (§2.5), paint encoding (§2.7), saved-state, pkgs blob, result blob, capability list. שינוי field order, alignment, או prefix length הוא MAJOR.
+- **Capability constants** — `akiva.permission.*` strings ב-manifest.
+- **Public `MAX_*_BYTES` constants** — `Intent::MAX_WIRE_BYTES`, etc. הקטנת המגבלה היא breaking; הגדלה אדיטיבית.
+
+### 1.2.2 NOT in-scope של ה-ABI
+
+שינויים שלא דורשים bump:
+- **SDK Rust ergonomics** — שמות פונקציות, error types, doc comments, helper signatures. `WriteHandle` קיבל `must_use` ב-Stone 11.6.7 #1 בלי bump כי החתימה ה-binary לא השתנתה.
+- **Internal kernel implementation** — kernel internals, framework internal logic, `runtime/web` JS internals, scheduler tweaks, watchdog thresholds.
+- **Test harness** — test fixtures, mock implementations, vitest helpers.
+- **Documentation** — text in `docs/`, README, code comments, log messages.
+
+### 1.2.3 Bump rules
+
+**PATCH** (`0.X.Y` → `0.X.(Y+1)`): bug fix במימוש, contract לא משתנה. חסום בעידן 0.X — לא נשתמש; קיים על נייר ל-1.0+.
+
+**MINOR** (`0.X.Y` → `0.(X+1).0`): additive change. דוגמאות:
+- New op_kind מוסף לטבלה
+- New extern import (apps שלא קוראות אותו ממשיכות לעבוד)
+- New capability string (apps שלא דורשות אותה אינן מושפעות)
+- Field appended ל-wire format שמתועד כ-"may be extended" (decoder ישן מתעלם מ-trailing bytes)
+- Status code חדש (apps שלא בודקות אותו ספציפית מקבלות אותו כ-fallback ERROR)
+
+Apps שנבנו על MINOR-N עובדות על MINOR-(N+k) ללא rebuild. Apps שנבנו על MINOR-(N+k) **לא** מובטחות לעבוד על MINOR-N (יחסר להן primitive).
+
+**MAJOR** (pre-1.0: `0.X` → `0.(X+1).0`; post-1.0: `X.Y` → `(X+1).0.0`): breaking change. דוגמאות:
+- הסרה / שינוי שם של primitive
+- שינוי טיפוס של arg
+- Reorder של field-ים ב-wire format
+- שינוי semantics של op_kind קיים
+- תוספת field ל-wire format שלא מתועד כ-extensible
+
+Apps חייבות rebuild + retest.
+
+### 1.2.4 Promotion ל-1.0
+
+קריטריונים שכולם חייבים להיות ירוקים לפני `1.0.0`:
+- **Phase 11 + 12 + 13 exit criteria** all met (workers, governance, WindowManager).
+- **שלוש apps third-party** באקוסיסטם הציבורי השתמשו ב-ABI ושרדו `MINOR` bump אחד לפחות בלי breakage.
+- **WIT migration plan** מוגדר בכתב (לא ביצוע — תכנון מחייב).
+- **CHANGELOG.md** מקיף עם נימוק לכל MAJOR / MINOR מאז `0.1.0`.
+- **Public docs** ב-`docs/abi.md` סומנו כ"frozen surface" (לא draft).
+
+עד ש-1.0 נופל, MAJOR bumps ב-0.X חופשיים יחסית — אבל כל אחד דורש `CHANGELOG.md` entry ו-PR review מפורש.
+
+### 1.2.5 Review process
+
+- **MINOR / PATCH**: PR אחד; reviewer יחיד; checklist של "הוספתי entry ב-CHANGELOG, הברתי `ABI_VERSION` בשני הצדדים".
+- **MAJOR (pre-1.0)**: PR + design memo קצר ב-`docs/research-*.md` שמסביר למה ה-old shape שגוי. ה-CHANGELOG entry חייב לציין break-compat path.
+- **MAJOR (post-1.0)**: דורש 2 reviewer-im ו-30-day announcement window לפני merge ל-`main`. ה-window מאפשר ל-third-party apps להגיב ולשנות planning.
+
+### 1.2.6 Symbolic source of truth
+
+מערכת מקור-אמת לערך הנוכחי של `ABI_VERSION`:
+
+```
+sdk-rust/src/lib.rs::ABI_VERSION  ←  קנוני
+framework/src/lib.rs::ABI_VERSION ←  חייב להיות שווה; mismatch = panic ב-load
+CHANGELOG.md                       ←  history של כל bump עם הסבר
+docs/abi.md (this section)         ←  policy של איך ומתי לעלות
+```
+
+שינוי של `ABI_VERSION` שלא מתועד ב-CHANGELOG חייב להיתפס ב-CI (TODO: tooling — Stone 11.8 או 12).
+
+---
+
+## 1.3 עיקרון: ABI narrow-by-design
+
+ABI v0 קטן בכוונה. זה לא accident; זה policy. ABI רחב מדי מוקדם מדי הופך לעוגן שמאט כל שינוי עתידי, ומכתיב decisions שכבת framework לעוד שנים.
 
 כל הרחבה ל-ABI — בין אם export חדש ב-app, import חדש ב-host, או שדה חדש ב-wire format — חייבת לעבור על שלושת המבחנים:
 
@@ -27,7 +103,7 @@ ABI v0 קטן בכוונה — 7 exports app-side ו-7 imports kernel→host. ז
 2. **Cross-app justification.** הרחבה שמשרתת app בודד או use case נישתי שייכת ל-framework או ל-sdk, לא ל-ABI. ABI משרת רק את הדברים שכל app, או runtime core, חייבים.
 3. **Forward-compat ל-v1.** יש mapping ברור ל-WIT interface ב-§5. אם ההרחבה לא מתורגמת לצורה נקייה ב-Component Model, זה תמרור אזהרה שה-shape שלה לא נכון.
 
-הכלל המעשי: עדיף פונקציה אחת חסרה היום מאשר שבע פונקציות מיותרות שנצטרך לגרור לנצח. הרחבות נוספות ל-`hal_app_*` או ל-paint-op opcodes עוברות review מפורש ב-PR, ומתועדות בסעיף גרסאות (§10).
+הכלל המעשי: עדיף פונקציה אחת חסרה היום מאשר שבע פונקציות מיותרות שנצטרך לגרור לנצח. הרחבות נוספות ל-`hal_app_*` או ל-paint-op opcodes עוברות review מפורש ב-PR, ומתועדות ב-CHANGELOG (§1.2.6) ובסעיף גרסאות (§10).
 
 ---
 

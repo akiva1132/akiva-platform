@@ -46,17 +46,13 @@ The `research-component-model.md` memo deferred the migration to v0.4+. Meanwhil
 
 ---
 
-## 3. 🔴 JS-side ABI governance / versioning policy — promoted to Stone 11.6.8
+## 3. ✅ JS-side ABI governance / versioning policy — fixed (Stone 11.6.8 #5)
 
-**Concern.** The project has `ABI_VERSION = "0.2.0"` in the SDK, `Intent::MAX_WIRE_BYTES` pinned in abi.md §2.5.1, and a §1.2 "narrow ABI review" clause — but no written rule for:
+**Was.** `ABI_VERSION = "0.2.0"` in the SDK, `Intent::MAX_WIRE_BYTES` pinned in abi.md §2.5.1, and a §1.2 "narrow ABI review" clause — but no written rule for when `0.X` → `1.0` happens, what constitutes a breaking change, or who gates the bump.
 
-- **When does `0.X` → `1.0` happen?** Specifically: what minimum feature set + stability bar?
-- **What constitutes a breaking change?** Adding an import is additive; renaming one is breaking; changing a wire format… depends.
-- **Who gates changes?** Implicit "the design doc" today.
+**Fix in place.** [`docs/abi.md` §1.2](abi.md) now defines an in-scope / out-of-scope split (extern signatures, op_kind constants, status codes, wire layouts, capabilities, public `MAX_*_BYTES` are in; SDK Rust ergonomics, internal kernel logic, runtime/web JS internals, docs are out), PATCH/MINOR/MAJOR bump rules, 1.0 promotion criteria (Phase 11+12+13 exit criteria all met, three third-party apps survived a `MINOR` bump, WIT migration plan in writing, full CHANGELOG, public docs marked frozen), and a review process. New [`CHANGELOG.md`](../CHANGELOG.md) at repo root tracks every bump from `0.1.0` forward.
 
-**Status.** Promoted from "premature to formalise" to Stone 11.6.8 פריט 5. The May 2026 audit determined that policy MUST be written before Stone 11.7 (akiva new + public docs) opens — otherwise the public docs will set an implicit policy by example, and rewinding becomes social, not technical.
-
-**Where policy will live.** New section `## 1.X ABI versioning policy` in [`docs/abi.md`](abi.md), with bump rules (PATCH/MINOR/MAJOR), 1.0 promotion criteria, review process. New `CHANGELOG.md` at repo root. See [ROADMAP.md Stone 11.6.8 פריט 5](../ROADMAP.md) for DoD.
+**ABI bumped to `0.3.0`** as part of Stone 11.6.8 (additive: + `akiva_host_random_bytes`, + `akiva_host_wall_clock_ms`, + `STATUS_BUSY = 3`).
 
 ---
 
@@ -281,47 +277,36 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Code.** [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) — `_warmupWorkers` body + new `HOME_PACKAGE_ID` const. Tests: 5 new vitest cases (warmup pre-spawns shell only, empty snapshot is no-op, snapshot without shell is no-op, register lazily spawns non-shell, repeated register doesn't respawn). 73 vitest green.
 
-### 7.15 🔴 No CSPRNG / entropy primitive — promoted to Stone 11.6.8
+### 7.15 ✅ CSPRNG / entropy primitive — fixed (Stone 11.6.8 #1, May 2026)
 
-**Concern.** `grep -nE "rand|getRandomValues" sdk-rust/` returns nothing. The SDK exposes no host import for entropy. wasm itself has no source of randomness. Apps that need crypto, UUIDs, session tokens, password salts, or anti-CSRF nonces have nowhere to go — they would have to ship their own seeded PRNG, which is unsafe for any security purpose.
+**Was.** `grep -nE "rand|getRandomValues" sdk-rust/` returned nothing. The SDK exposed no host import for entropy. Wasm itself has no source of randomness. Apps that needed crypto, UUIDs, session tokens, password salts, or anti-CSRF nonces had nowhere to go.
 
-**Why deferred (until now).** None of the four MVP apps (calc, hello, tic-tac-toe, infinite-loop) need entropy. The gap is invisible until the first app that does cryptography or session management is written. May 2026 audit caught it before Stone 11.7 docs would have either omitted the primitive entirely or papered over its absence.
+**Fix in place.** New `akiva_host_random_bytes(out_ptr, len)` extern, mapped to `crypto.getRandomValues` in [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js) with internal chunking around the 64 KiB Web Crypto cap. New [`sdk-rust/src/random.rs`](../sdk-rust/src/random.rs) module — `fill_bytes(&mut [u8])`, `u64()`, `u32()`. Ungated. Non-wasm builds get a deterministic xorshift fallback for unit tests; security-sensitive code obviously must not run there.
 
-**Trigger.** Stone 11.6.8 פריט 1 owns this. Implementation: new dedicated extern `akiva_host_random_bytes(out_ptr, len)` that the JS shell maps to `crypto.getRandomValues`, plus a thin `akiva_sdk::random` module. Ungated (RNG is a primitive, not a resource — same as on iOS/Android).
+### 7.16 ✅ Backpressure cap on concurrent in-flight dispatches — fixed (Stone 11.6.8 #2, May 2026)
 
-**Code surfaces.** [`sdk-rust/src/runtime.rs`](../sdk-rust/src/runtime.rs) (extern), `sdk-rust/src/random.rs` (new module), [`sdk-rust/src/lib.rs`](../sdk-rust/src/lib.rs) (re-export), [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js) (host body).
+**Was.** Stone 11.6.5 #12 changed `Slot.pending` from `Option<PendingDispatch>` to `HashMap<u64, PendingDispatch>` to enable `futures::join!(read("a"), read("b"))`. The HashMap was unbounded. A hostile or buggy app calling `for _ in 0..1_000_000 { ctx.activity_scope().spawn(slow_io()); }` could allocate a million `future_id`s and a million `Pin<Box<dyn Future>>`s before the watchdog caught the worker at 1.5 s.
 
-### 7.16 🔴 No bound on concurrent in-flight dispatches per slot — promoted to Stone 11.6.8
+**Fix in place.** Const `MAX_PENDING_PER_SLOT = 256` in [`sdk-rust/src/runtime.rs`](../sdk-rust/src/runtime.rs) caps `Slot.pending`; matching JS-side const `MAX_PENDING_FUTURES = 256` in [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js) caps the per-app worker `futures` map (the practical attack surface — one entry per concurrent host I/O op). On overflow, `dispatchIoStart` allocates a `future_id` pre-resolved with `STATUS::BUSY = 3` instead of forwarding to the kernel. New `StorageError::Busy` variant in `sdk-rust/src/storage.rs`; `poll_read_inner` / `poll_write_inner` map `status::BUSY` to `Err(StorageError::Busy)`. 256 is wide enough for legitimate `join_all` of 100+ items, narrow enough to bound a million-iteration spam loop in <50 ms.
 
-**Concern.** Stone 11.6.5 #12 changed `Slot.pending` from `Option<PendingDispatch>` to `HashMap<u64, PendingDispatch>` to enable `futures::join!(read("a"), read("b"))`. The HashMap is unbounded. A hostile or buggy app calling `for _ in 0..1_000_000 { ctx.activity_scope().spawn(slow_io()); }` allocates a million `future_id`s and a million `Pin<Box<dyn Future>>`s in a burst, before the watchdog catches the worker at 1.5s. Memory consumption is unbounded; the slot's HashMap could pin tens of MB before termination.
+### 7.17 ✅ SDK concurrency primitives — fixed (Stone 11.6.8 #3, May 2026)
 
-**Why deferred (until now).** 11.6.5 #12 prioritised landing the concurrency primitive over hardening it. The bound was deliberately left open with the comment "concurrent entries in the map are now expected to coexist in principle" — true, but "in principle" doesn't include "without limit."
+**Was.** Stone 11.6.5 #11 shipped `TaskScope::spawn`, but two spawned tasks had no way to coordinate. Apps wanting a producer-consumer pattern had to build it from `RefCell<VecDeque<T>>` + manual waker plumbing.
 
-**Trigger.** Stone 11.6.8 פריט 2 owns this. Implementation: const `MAX_PENDING_PER_SLOT = 256` in `runtime.rs`; a new `STATUS_BUSY = 3` op_kind status returned when the slot is full; futures resolve to `Err(_::Busy)` so apps can backoff. 256 is wide enough for legitimate `join_all` of 100+ items, narrow enough to catch spam loops in <50ms.
+**Fix in place.** New module tree [`sdk-rust/src/sync/`](../sdk-rust/src/sync/) with three primitives:
+- `Channel<T, N>` — bounded MPSC ring buffer with async backpressure on `send` and async waiting on `recv`. Cheaply clonable across spawned tasks via `Rc<Channel>`.
+- `Mutex<T>` — futurized exclusive lock with RAII `MutexGuard`. `UnsafeCell<T>` interior + `Cell<bool>` lock flag; safe because wasm is single-threaded.
+- `Signal<T: Clone>` — single-slot, multi-waiter notification (mirror of Compose's `mutableStateOf`). `wait()` resolves only on the next `set()`, not the current value.
 
-**Code surfaces.** [`sdk-rust/src/runtime.rs`](../sdk-rust/src/runtime.rs), op_kinds in `sdk-rust` + `framework` + JS, [`sdk-rust/src/storage.rs`](../sdk-rust/src/storage.rs) (StorageError::Busy variant).
+Custom (not embassy-sync) — single-threaded wasm doesn't need cross-thread atomics; the whole module is ~250 lines. The executor's no-op waker became a smart waker that sets a thread-local flag on `wake()`; [`runtime::drive_spawned`](../sdk-rust/src/runtime.rs) loops over spawned tasks until the flag stays clear (quiescence), bounded at 64 iterations against pathological self-wake loops. 18 unit tests across the three files cover producer-consumer ordering, backpressure, mutex contention, and multi-waiter signal semantics.
 
-### 7.17 🔴 No SDK concurrency primitives (Channel, Mutex, Signal) — promoted to Stone 11.6.8
+**Carry-forward.** Callback dispatches awaiting purely on internal sync primitives (no host op in the chain) may stall — they live in `slot.pending`, which `drive_spawned` doesn't poll. Document and prefer `TaskScope::spawn` for sync-primitive consumers; revisit if a real use case demands callback-side support.
 
-**Concern.** Stone 11.6.5 #11 shipped `TaskScope::spawn`, but two spawned tasks have no way to coordinate. Kotlin Coroutines ship `Channel<T>`, `Mutex`, `Flow<T>`, `StateFlow<T>` out of the box. SwiftUI ships `AsyncStream`, `actor`, `@MainActor`. Akiva ships nothing. An app that wants a producer-consumer pattern between two spawned tasks has to build it from `RefCell<VecDeque<T>>` + manual waker plumbing.
+### 7.18 ✅ Wall-clock time primitive — fixed (Stone 11.6.8 #4, May 2026)
 
-This is a real foundation gap, not DX polish: the vision in [`docs/isolation-design.md` §1](isolation-design.md) explicitly names "DX like Compose/SwiftUI." Without sync primitives, the vision is unmet.
+**Was.** `ctx.timestamp_ms` is monotonic (frame-based, derived from the host's `performance.now()`). There was no wall-clock import. An app writing a note and wanting to stamp it "created at 2026-05-02 14:32" had nowhere to fetch the wall time.
 
-**Why deferred (until now).** 11.6.5 #11 was scoped to "make scope-based cancellation real," not "ship the full Coroutines surface." The audit promoted the gap once it was clear that 11.7's public docs would either ship apps with manual waker plumbing or document a feature absence.
-
-**Trigger.** Stone 11.6.8 פריט 3 owns this. Implementation: new `sdk-rust/src/sync/{channel.rs, mutex.rs, signal.rs}` modules, ~200-300 lines total. Custom (not embassy-sync) for the same reason as the executor: tightly fitted to single-threaded wasm, no cross-thread atomics needed, no runtime dependency.
-
-**Code surfaces.** New: `sdk-rust/src/sync/`. Updated: [`sdk-rust/src/lib.rs`](../sdk-rust/src/lib.rs) (re-export), [`sdk-rust/src/executor.rs`](../sdk-rust/src/executor.rs) (waker registration helpers if needed).
-
-### 7.18 🟡 No wall-clock time primitive — promoted to Stone 11.6.8
-
-**Concern.** `ctx.timestamp_ms` is monotonic (frame-based, derived from the host's `performance.now()`). There is no wall-clock import. An app writing a note and wanting to stamp it "created at 2026-05-02 14:32" has nowhere to fetch the wall time. Real OSes expose CLOCK_MONOTONIC and CLOCK_REALTIME separately because they serve different purposes and are not interchangeable.
-
-**Why deferred (until now).** No MVP app needs the wall clock. Calc, hello, tic-tac-toe, infinite-loop all use only frame timing. A notes-style app would expose the gap immediately.
-
-**Trigger.** Stone 11.6.8 פריט 4 owns this. Implementation: new extern `akiva_host_wall_clock_ms() -> u64` mapped to `Date.now()`, plus `akiva_sdk::clock::wall_clock_ms()`. Ungated (time is a primitive). Doc-comment must explicitly call out the difference from `ctx.timestamp_ms` — confusing the two is a common source of bugs.
-
-**Code surfaces.** [`sdk-rust/src/runtime.rs`](../sdk-rust/src/runtime.rs) (extern), `sdk-rust/src/clock.rs` (new), [`sdk-rust/src/lib.rs`](../sdk-rust/src/lib.rs) (re-export), [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js) (host body).
+**Fix in place.** New extern `akiva_host_wall_clock_ms() -> u64` mapped to `Date.now()` in [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js). New [`sdk-rust/src/clock.rs`](../sdk-rust/src/clock.rs) module with `wall_clock_ms() -> u64` and a doc-comment table that contrasts wall vs. monotonic time so callers don't confuse them. Ungated (time is a primitive). Non-wasm builds use `SystemTime::now()` so unit tests pass on the developer machine.
 
 ---
 
