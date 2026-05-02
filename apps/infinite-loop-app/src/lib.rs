@@ -49,24 +49,25 @@ impl Activity for InfiniteLoopMain {
 
         if ui.was_clicked("hang") {
             log_warn!("Hang requested — entering busy loop. Watchdog should terminate this worker shortly.");
-            // Volatile-style read so the optimiser can't lower the loop
-            // to `unreachable!()` — release builds with LTO are fond
-            // of that. Spin on a counter the compiler can't prove
-            // unobservable; the side effect is the spin itself.
+            // First attempt used a `loop { spin += 1; if spin == MAX
+            // break }` pattern with a tail log_error! to "keep spin
+            // observable". LLVM at `opt-level = "z"` + LTO solved
+            // the loop algebraically (linear counter with constant
+            // termination → replace with `spin = MAX; break;`) and
+            // the loop exited in microseconds — the watchdog never
+            // saw a hang because the worker was never hung.
             //
-            // In a real wasm worker, this hangs the JS event loop in
-            // the app-worker (single-threaded). The kernel-worker
-            // remains alive on its own thread and triggers
-            // `worker.terminate()` once 1.5s of silent ping has
-            // elapsed.
+            // `core::hint::black_box` is the right tool: it laund-
+            // ers a value through an opaque-to-the-optimizer barrier.
+            // The compiler can't prove the side effect doesn't matter,
+            // can't fold across the call, and is forced to emit the
+            // increment + comparison as real work each iteration.
             let mut spin: u64 = 0;
             loop {
-                spin = spin.wrapping_add(1);
-                if spin == u64::MAX {
-                    // Unreachable in any real timeline — this branch
-                    // exists solely to keep `spin` "live" so the
-                    // compiler doesn't constant-fold the loop away.
-                    log_error!("loop counter wrapped (impossible)");
+                spin = core::hint::black_box(spin).wrapping_add(1);
+                // Equally opaque comparison so the loop's exit
+                // condition isn't proven dead either.
+                if core::hint::black_box(spin) == u64::MAX {
                     break;
                 }
             }
