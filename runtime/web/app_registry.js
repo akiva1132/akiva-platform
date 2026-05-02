@@ -450,27 +450,36 @@ export class AppRegistry {
     };
     worker.addEventListener("message", (e) => this._onWorkerMessage(packageId, e.data));
 
-    // wasmBytes ownership: storage hands us a fresh-copy Uint8Array
-    // backed by its own ArrayBuffer (see `Storage.get`), so transferring
-    // is safe and saves a structured-clone of the wasm bytes.
+    // wasmBytes ownership: `Storage.get` returns the SAME Uint8Array
+    // it stored, NOT a fresh copy — transferring its buffer would
+    // detach the live storage entry, and the next register() for
+    // the same package would crash with "ArrayBuffer is already
+    // detached." Slice into a fresh buffer so the transfer only
+    // affects our copy. Cost is one extra wasm-bytes-sized memcpy
+    // per spawn, paid once per package since `_processes` caches.
     //
-    // packagesBlob is sliced (not transferred) because we want to
-    // keep our own copy as well — every worker gets the snapshot.
+    // packagesBlob is also sliced — every worker gets its own
+    // snapshot copy and the kernel keeps the canonical one for
+    // future broadcasts.
+    const wasmCopy = wasmBytes.slice();
     worker.postMessage(
       {
         type: "init",
         packageId,
-        wasmBytes,
+        wasmBytes: wasmCopy,
         grants,
         resources,
         packagesBlob: this._packagesBlob.slice(),
       },
-      [wasmBytes.buffer],
+      [wasmCopy.buffer],
     );
 
-    const proc = { worker, packageId, lastPongAt: performance.now() };
+    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingInterval: null };
     this._processes.set(packageId, proc);
-    this._startHeartbeat(proc);
+    // Heartbeat doesn't start until `init_ok` lands — kicking the
+    // watchdog while the worker is mid-wasm-compile would mean every
+    // cold start trips a false-positive terminate at the first
+    // 1.5s tick.
     return proc;
   }
 
@@ -498,19 +507,16 @@ export class AppRegistry {
         clearInterval(proc.pingInterval);
         try { proc.worker.terminate(); } catch (_) { /* best effort */ }
         this._pendingTraps.add(proc.packageId);
-        // Mark every in-flight dispatch for this package as ERROR
-        // so the kernel's poll_future doesn't wait forever. We
-        // can't tell from _dispatches alone which entries belong
-        // to this worker, so just iterate. Stone 11.5d will
-        // shape the user-facing recovery (tap-to-restart).
-        for (const [fid, entry] of this._dispatches) {
-          if (entry.status === STATUS.PENDING) {
-            entry.status = STATUS.ERROR;
-            entry.bytes = null;
-          }
-          void fid;
-        }
         this._processes.delete(proc.packageId);
+        // _dispatches entries for the dead worker stay PENDING. They
+        // can never resolve (no worker to reply), but they also can't
+        // be polled — `dispatch()` returns 0n for unknown packages and
+        // any in-flight pending_render slot in WasmActivity points at
+        // a future_id that nobody else will create. The framework
+        // marks the activity Trapped on the next frame's drain and
+        // pops it off the stack; the orphaned _dispatches entry is
+        // bounded by the activity count of the terminated worker.
+        // Stone 11.5+1 GC pass will recycle them.
         return;
       }
       proc.worker.postMessage({ type: "ping", t: now });
@@ -558,9 +564,20 @@ export class AppRegistry {
   _onWorkerMessage(packageId, msg) {
     if (!msg || typeof msg.type !== "string") return;
     switch (msg.type) {
-      case "init_ok":
+      case "init_ok": {
         this._dbg("lifecycle", `${packageId}: worker init_ok`);
+        // Stone 11.5c — only now do we arm the heartbeat. Before
+        // init_ok the worker is busy compiling wasm; pings would
+        // queue and the watchdog would terminate a perfectly
+        // healthy worker at the first 1.5s tick.
+        const proc = this._processes.get(packageId);
+        if (proc && !proc.ready) {
+          proc.ready = true;
+          proc.lastPongAt = performance.now();
+          this._startHeartbeat(proc);
+        }
         break;
+      }
       case "init_failed":
         this._log("error", `${packageId}: worker init_failed: ${msg.reason}`);
         break;
