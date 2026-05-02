@@ -53,7 +53,12 @@ fn akiva_getrandom(dest: &mut [u8]) -> Result<(), getrandom::Error> {
     let ret = unsafe {
         crate::runtime::akiva_host_random_bytes(dest.as_mut_ptr(), dest.len())
     };
-    if ret == 0 { Ok(()) } else { Err(getrandom::Error::FAILED) }
+    // `getrandom::Error::UNEXPECTED` is the catch-all "RNG produced
+    // no bytes for an unspecified reason" code in v0.2 — we surface
+    // the host's non-zero return as that. In practice the worker's
+    // `crypto.getRandomValues` body never returns non-zero on a
+    // healthy browser, so this branch is defensive.
+    if ret == 0 { Ok(()) } else { Err(getrandom::Error::UNEXPECTED) }
 }
 
 #[cfg(target_arch = "wasm32")]
