@@ -499,9 +499,11 @@ impl Framework {
     }
 
     /// Stone 11.5 — every activity belonging to `package_id` is marked
-    /// `Trapped`. Called by the kernel when (a) an app worker reports a
-    /// trap via `{type:"trapped"}`, (b) `worker.onerror` fires, or (c)
-    /// the watchdog's ping/pong times out and the worker is terminated.
+    /// `Trapped` and popped from its task stack so the user lands back
+    /// at whatever was below (typically the Shell). Called by the
+    /// kernel when (a) an app worker reports a trap via
+    /// `{type:"trapped"}`, (b) `worker.onerror` fires, or (c) the
+    /// watchdog's ping/pong times out and the worker is terminated.
     /// Idempotent: an already-Trapped activity stays Trapped.
     ///
     /// Returns the number of activities transitioned (only those in a
@@ -515,6 +517,41 @@ impl Framework {
                 n += 1;
             }
         }
+        if n == 0 {
+            return 0;
+        }
+
+        // Stone 11.5d-prelude — pop every Trapped activity from its
+        // task stack so the display isn't stranded on a dead frame.
+        // Without this the user is stuck on a blank screen (the
+        // Trapped activity no longer paints, no longer accepts
+        // input). Auto-pop is the floor — the polished tap-to-
+        // restart UI in the launcher lands later.
+        //
+        // We don't drive the destroy chain (pause/save_state/stop):
+        // those dispatches would land in the dead worker. The
+        // ActivityRecord stays in `Trapped` state with its instance
+        // intact, but the stack no longer references it. Eventual
+        // GC plus a manual `Destroyed` flip via a future API will
+        // recycle the slot — for 11.5 the leak is bounded by the
+        // number of distinct apps the user crashed.
+        let trapped = self.activities.trapped_ids_for_package(package_id);
+        self.activities.evict_from_task_stacks(&trapped);
+        let trapped_set: std::collections::HashSet<_> = trapped.iter().copied().collect();
+        self.stack.retain(|id| !trapped_set.contains(id));
+
+        // Drive whatever's now on top back to Resumed so the user
+        // sees a live screen (typically the Shell).
+        if let Some(new_top) = self.stack.last().copied() {
+            // Use the kernel's last-frame timestamp the framework
+            // knows about — drive_to_resumed needs one but the
+            // exact value only matters for app-visible `ctx.timestamp_ms`
+            // which is inside the lifecycle callbacks, and those
+            // shouldn't be doing anything timestamp-sensitive at
+            // resume-after-trap time.
+            self.drive_to_resumed(new_top, 0.0);
+        }
+
         n
     }
 

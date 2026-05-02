@@ -21,7 +21,7 @@
 //!     boot). User-app wasm activities come through the wasm activity
 //!     proxy on the same path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::activity::Activity;
 
@@ -588,6 +588,30 @@ impl ActivityManager {
             .filter(|(_, r)| r.package_id == package_id)
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// All activity ids in `package_id` whose state is currently `Trapped`.
+    /// Used by `Framework::mark_package_trapped` to auto-pop dead
+    /// activities from their task stacks.
+    pub fn trapped_ids_for_package(&self, package_id: &str) -> Vec<ActivityId> {
+        self.records.iter()
+            .filter(|(_, r)|
+                r.package_id == package_id
+                && matches!(r.state, LifecycleState::Trapped))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Strip a set of activity ids out of every task's stack. Used by
+    /// `Framework::mark_package_trapped` to remove dead activities
+    /// from the foreground without driving the legal destroy chain
+    /// (which would land dispatches in a dead worker).
+    pub fn evict_from_task_stacks(&mut self, ids: &[ActivityId]) {
+        if ids.is_empty() { return; }
+        let set: HashSet<ActivityId> = ids.iter().copied().collect();
+        for task in self.tasks.values_mut() {
+            task.stack.retain(|id| !set.contains(id));
+        }
     }
 }
 
