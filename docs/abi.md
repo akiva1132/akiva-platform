@@ -443,15 +443,16 @@ fn hal_app_drain_set_result(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
 
 ה-app מ-serialize את פקודות הציור שלו ל-stream שטוח של bytes שה-kernel מפרשר חזרה ל-[`FrameCommands`](../framework/src/compositor.rs). כל op מתחיל ב-`u8` opcode:
 
-| Opcode | Op          | Payload (little-endian)                                          |
-|--------|-------------|------------------------------------------------------------------|
-| `0x00` | `Clear`     | `u32 rgba`                                                       |
-| `0x01` | `FillRect`  | `f32 x, f32 y, f32 w, f32 h, u32 rgba`                          |
-| `0x02` | `DrawText`  | `f32 x, f32 y, f32 size, u32 rgba, u32 len, <len> UTF-8 bytes`  |
-| `0x03` | `PushClip`  | `f32 x, f32 y, f32 w, f32 h`                                    |
-| `0x04` | `PopClip`   | —                                                                |
-| `0x05` | `PushTransform` | `f32 dx, f32 dy, f32 scale`                                  |
-| `0x06` | `PopTransform`  | —                                                             |
+| Opcode | Op              | Payload (little-endian)                                          |
+|--------|-----------------|------------------------------------------------------------------|
+| `0x00` | `Clear`         | `u32 rgba`                                                       |
+| `0x01` | `FillRect`      | `f32 x, f32 y, f32 w, f32 h, u32 rgba`                           |
+| `0x02` | `DrawText`      | `f32 x, f32 y, f32 size, u32 rgba, u32 len, <len> UTF-8 bytes`   |
+| `0x03` | `PushClip`      | `f32 x, f32 y, f32 w, f32 h`                                     |
+| `0x04` | `PopClip`       | —                                                                |
+| `0x05` | `PushTransform` | `f32 dx, f32 dy, f32 scale`                                      |
+| `0x06` | `PopTransform`  | —                                                                |
+| `0x07` | `FillRoundRect` | `f32 x, f32 y, f32 w, f32 h, f32 radius, u32 rgba` *(Stone 11.6.9 #1)* |
 
 הקודק המלא ב-[framework/src/wasm_activity.rs](../framework/src/wasm_activity.rs) — `encode_op` / `decode_frame`. תוספות (additive) יקבלו opcodes חדשים ב-continuation של הרצף; ה-decoder דוחה opcodes לא מוכרים כ-error (אי אפשר לדעת את אורך ה-payload כדי לדלג).
 

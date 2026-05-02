@@ -10,6 +10,58 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [0.4.0] — 2026-05 (Stone 11.6.9)
+
+**MINOR** — additive: one new HAL paint op + one new device-config
+export. The qualifier system that backs `values-night/` ships entirely
+inside the framework + SDK + JS runtime; no new ABI surface for that
+piece.
+
+- **Added.** `hal_draw_round_rect(x, y, w, h, radius, rgba)` HAL
+  import (kernel-side) — backs the new `Canvas::fill_round_rect` SDK
+  method. New paint opcode `OP_FILL_ROUND_RECT = 7` joins the v0
+  paint stream; encode/decode is byte-for-byte symmetric (1 opcode
+  byte + 5 × f32 + u32 = 25 bytes total). Maps to `roundRect()` on
+  the Canvas2D backend (Baseline 2023). `radius=0.0` falls back to
+  `fillRect`. Promoted from Stone 11.6.9 #1 — every native OS uses
+  rounded corners as its default UI shape; sharp-cornered Akiva apps
+  looked like late-90s web pages by comparison.
+- **Added.** `akiva_config_change(night: i32)` kernel export — host
+  calls it on boot and on every `prefers-color-scheme` change
+  observed via `matchMedia`. Flips
+  `ResourceManager::set_night_mode(bool)`, which selects the
+  `values-night/` overlay for subsequent `@string/` / `@color/`
+  lookups. Idempotent on the current state. Promoted from Stone
+  11.6.9 #3.
+- **Added (framework — no ABI surface).** Qualifier-aware
+  `ResourceTable` with default + `Option<night>` overlays;
+  `ResourceManager` owns a `DeviceConfig` and resolves through it on
+  every lookup. `PackageManager::read_resource_tables` loads both
+  `res/values/*.toml` and `res/values-night/*.toml` at boot.
+  Uninstall sweeps both qualifier directories. CLI `akiva build` /
+  `akiva package` / dev-apps stage all carry `values-night/`
+  alongside `values/`.
+- **Added (JS runtime — no ABI surface).** `AppRegistry.setNightMode`
+  re-resolves resources for every running app and posts
+  `set_resources` to each app worker; the worker hot-swaps its
+  in-memory strings/colors maps without restarting.
+  `tab.js` installs a `matchMedia('(prefers-color-scheme: dark)')`
+  listener and forwards `config-change` to the kernel-worker.
+- **Changed (JS runtime — no ABI surface).** `tab.js` resize handler
+  switched from `window.addEventListener("resize")` to
+  `ResizeObserver` reading `devicePixelContentBoxSize` (Baseline
+  2022). Catches zoom-level DPR changes (Ctrl+/-) that the plain
+  resize event misses; reports physical-pixel boxes directly so the
+  CSS-px×DPR rounding mismatch on fractional zoom levels is gone.
+  Promoted from Stone 11.6.9 #2.
+- **Changed (apps — no ABI surface).** Calculator and Shell palettes
+  split: `res/values/colors.toml` is now the light-theme default and
+  the previous-default dark palette moved under
+  `res/values-night/colors.toml`. Shell src/lib.rs converted from
+  hardcoded `const u32` constants to per-frame
+  `akiva_sdk::res::color()` lookups so a runtime night-mode flip is
+  visible on the next paint without a respawn.
+
 ## [0.3.0] — 2026-05 (Stone 11.6.8)
 
 **MINOR** — additive: two new host imports, a new status code, and
@@ -79,6 +131,7 @@ First tagged ABI. Includes:
 - Capabilities: `akiva.permission.{LAUNCH_ANY_APP, QUERY_PACKAGES,
   STORAGE_SANDBOX}`.
 
+[0.4.0]: docs/abi.md
 [0.3.0]: docs/abi.md
 [0.2.0]: docs/abi.md
 [0.1.0]: docs/abi.md

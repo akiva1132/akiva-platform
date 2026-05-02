@@ -19,11 +19,11 @@ use crate::activity_manager::LaunchMode;
 
 /// Current framework ABI version string, bumped in lock-step with
 /// `docs/abi.md` major+minor. MVP guests targeting 0.1.x pass the
-/// check; current is `0.3.0` after Stone 11.6.8 added the CSPRNG +
-/// wall-clock + STATUS_BUSY trio. Apps with manifest
-/// `min_abi_version = "0.1.0"` still load — bumping the runtime
-/// is additive and back-compat.
-pub const RUNTIME_ABI_VERSION: &str = "0.3.0";
+/// check; current is `0.4.0` after Stone 11.6.9 added the
+/// `OP_FILL_ROUND_RECT` paint op + `hal_draw_round_rect` HAL import.
+/// Apps with manifest `min_abi_version = "0.1.0"` still load —
+/// bumping the runtime is additive and back-compat.
+pub const RUNTIME_ABI_VERSION: &str = "0.4.0";
 
 // ── Typed model ──────────────────────────────────────────────────────
 
