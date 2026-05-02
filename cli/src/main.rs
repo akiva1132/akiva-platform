@@ -9,10 +9,12 @@
 //!   akiva run               — build + launch the devserver
 //!   akiva devserver         — serve runtime/web/ with the cross-origin
 //!                             isolation headers OPFS + threads need
+//!   akiva docs              — open the akiva-sdk API reference
 
 mod archive;
 mod build;
 mod devserver;
+mod docs;
 mod install;
 mod new;
 mod package;
@@ -38,6 +40,7 @@ fn main() -> ExitCode {
         Some("uninstall") => cmd_uninstall(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("devserver") => cmd_devserver(&args[1..]),
+        Some("docs") => cmd_docs(&args[1..]),
         Some(other) => {
             eprintln!("akiva: unknown subcommand '{other}'. Try 'akiva help'.");
             ExitCode::from(2)
@@ -56,6 +59,7 @@ fn print_help() {
     println!("  uninstall <id>      Remove a staged app from runtime/web/dev-apps/");
     println!("  run                 Build + launch the devserver");
     println!("  devserver           Serve runtime/web with hot reload");
+    println!("  docs                Open the akiva-sdk API reference");
     println!("  version             Print the CLI version");
     println!("  help                Show this message");
 }
@@ -86,4 +90,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
 
 fn cmd_devserver(args: &[String]) -> ExitCode {
     devserver::run(args)
+}
+
+fn cmd_docs(args: &[String]) -> ExitCode {
+    docs::run(args)
 }
