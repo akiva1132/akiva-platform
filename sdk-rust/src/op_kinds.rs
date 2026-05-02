@@ -42,6 +42,14 @@ pub mod io {
     pub const STORAGE_SET: u32 = 0x0104;
     /// Args: `[key: utf8...]` -> `[]`. Idempotent (missing key = no-op success).
     pub const STORAGE_DELETE: u32 = 0x0105;
+    /// Stone 13.0prep — timer arm. Args: `[delay_ms: u32 LE]` -> `[]`.
+    /// The future resolves READY after the host's wall-clock has
+    /// advanced by ≥ `delay_ms` (best-effort; subject to JS event loop
+    /// scheduling). No cancel-on-drop yet — a dropped Sleep future
+    /// leaves a stale entry in the worker's futures map until the
+    /// worker dies. Document as known limitation; revisit if practice
+    /// shows leaking.
+    pub const TIMER_SLEEP: u32 = 0x0106;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds. Mirror of

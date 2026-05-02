@@ -102,6 +102,18 @@ pub mod io {
     /// Args:   `[key_bytes: utf8...]`. Same shape as STORAGE_GET.
     /// Result: empty (STATUS::READY).
     pub const STORAGE_DELETE: u32 = 0x0105;
+
+    /// Stone 13.0prep — Timer sleep. Park a future for `delay_ms` of
+    /// wall-clock time, then resolve READY with empty payload.
+    ///
+    /// Args:   `[delay_ms: u32 LE]`.
+    /// Result: empty (STATUS::READY).
+    ///
+    /// Best-effort: subject to JS event-loop scheduling and tab
+    /// background-throttling. The host caps `delay_ms` at the
+    /// equivalent of one frame (16ms) for backgrounded tabs to avoid
+    /// wakeup storms.
+    pub const TIMER_SLEEP: u32 = 0x0106;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds.

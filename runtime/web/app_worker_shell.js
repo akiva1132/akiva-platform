@@ -791,6 +791,30 @@ function dispatchIoStart(opKind, args) {
       );
       return fid;
     }
+    case IO.TIMER_SLEEP: {
+      // Stone 13.0prep — `delay_ms: u32 LE` → resolves READY after the
+      // setTimeout fires. Resolved locally; no kernel round-trip. Cap
+      // delay_ms at 60s so a malformed (or hostile) ask doesn't hold a
+      // future entry indefinitely; an app that wants longer can chain
+      // sleeps. Backgrounded tabs already throttle the timer to ~1s
+      // resolution per the HTML spec, so this isn't a tight contract.
+      if (args.length < 4) return 0n;
+      const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+      const delay = Math.min(view.getUint32(0, true), 60_000);
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
+      setTimeout(() => {
+        // Worker may have been terminated between arm and fire — bail
+        // cleanly. The futures map is a per-worker WeakMap-like in
+        // effect; a torn-down worker drops it on the floor.
+        const entry = futures.get(fid);
+        if (entry) {
+          entry.status = STATUS.READY;
+          entry.payload = new Uint8Array(0);
+        }
+      }, delay);
+      return fid;
+    }
     default:
       postLog("warn", `io_start(0x${opKind.toString(16)}): unknown op_kind`);
       return 0n;

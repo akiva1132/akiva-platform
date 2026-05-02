@@ -28,6 +28,7 @@ pub mod result;
 pub mod runtime;
 pub mod storage;
 pub mod sync;
+pub mod time;
 pub mod ui;
 
 pub use activity::{
