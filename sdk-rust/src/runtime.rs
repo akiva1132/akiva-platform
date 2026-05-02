@@ -51,6 +51,7 @@ use std::task::Poll;
 
 use crate::activity::{
     Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState,
+    ScopeKind,
 };
 use crate::executor;
 use crate::intent::Intent;
@@ -238,10 +239,20 @@ const INITIAL_PAINT_CAP: usize = 4 * 1024;
 /// via raw pointers and rely on this stability across polls.
 pub(crate) struct Slot {
     /// Field declaration order is load-bearing for drop order: the
-    /// pending future drops FIRST, releasing its raw-pointer borrows
-    /// into `activity` and `ctx`, then those drop in turn. Reordering
-    /// would risk a use-after-free on Drop.
+    /// pending future + spawned tasks drop FIRST (both potentially hold
+    /// raw-pointer borrows into `activity` and `ctx`), then those drop
+    /// in turn. Reordering would risk a use-after-free on Drop.
     pending: Option<PendingDispatch>,
+    /// Stone 11.6.5 (#11) — user-spawned tasks under `activity_scope`
+    /// or `resumed_scope`. Polled by [`drive_spawned`] every host
+    /// wake-up; cancelled selectively when the activity hits the
+    /// matching lifecycle edge.
+    ///
+    /// Each `SpawnedTask` carries `'static` future + a `ScopeKind`. We
+    /// drop in declaration order, so the futures here drop AFTER
+    /// `pending` but BEFORE `activity`/`ctx` — matching the contract
+    /// that pending dispatches resolve before the slot tears down.
+    spawned: Vec<SpawnedTask>,
     activity: Box<dyn Activity>,
     /// The `'static` lifetime here is a local lie: `class` is a
     /// `&'static str` from `intern_class`, which actually IS 'static.
@@ -253,6 +264,14 @@ pub(crate) struct Slot {
     /// Which buffer the last completed dispatch produced bytes into.
     /// Used by `get_result` to pick between `paint_buf` and `save_buf`.
     last_outcome: DispatchOutcome,
+}
+
+/// Stone 11.6.5 (#11) — one user-spawned task tied to a [`ScopeKind`].
+/// Lives in `Slot.spawned` until the future resolves on its own or the
+/// activity hits the cancellation edge for `kind`.
+struct SpawnedTask {
+    future: Pin<Box<dyn Future<Output = ()> + 'static>>,
+    kind: ScopeKind,
 }
 
 /// What kind of result the last (or in-flight) dispatch is producing.
@@ -282,6 +301,11 @@ struct PendingDispatch {
     /// polling. The next `poll_dispatch` call sees `Some(...)` and
     /// returns `READY` without re-driving the future.
     completed: Option<DispatchOutcome>,
+    /// Stone 11.6.5 (#11) — recorded so [`drive_pending`] can apply
+    /// scope-cancellation hooks when this dispatch resolves
+    /// (`PAUSE` drops `Resumed`-scoped spawns; `DESTROY` drops the
+    /// whole slot, which clears spawns naturally on Drop).
+    cmd_kind: u32,
 }
 
 // ── Global registries ──────────────────────────────────────────────────
@@ -293,6 +317,14 @@ thread_local! {
     /// the mapping so `poll_dispatch` and `get_result` can find the
     /// owning slot from just the dispatch_id.
     static DISPATCH_TO_HANDLE: RefCell<HashMap<u64, u32>> = RefCell::new(HashMap::new());
+    /// Stone 11.6.5 (#11) — staging area for `TaskScope::spawn` calls
+    /// made from inside a future poll. Appending directly into
+    /// `slot.spawned` would re-borrow `SLOTS` while we're already
+    /// holding it for the dispatch poll; this queue absorbs the
+    /// spawn, and [`drain_spawn_queue`] flushes it into the right
+    /// slot once the outer borrow has released.
+    static SPAWN_QUEUE: RefCell<Vec<(u32, ScopeKind, Pin<Box<dyn Future<Output = ()> + 'static>>)>> =
+        RefCell::new(Vec::new());
 }
 
 fn with_slots<R>(f: impl FnOnce(&mut HashMap<u32, Box<Slot>>) -> R) -> R {
@@ -301,6 +333,73 @@ fn with_slots<R>(f: impl FnOnce(&mut HashMap<u32, Box<Slot>>) -> R) -> R {
 
 fn with_dispatches<R>(f: impl FnOnce(&mut HashMap<u64, u32>) -> R) -> R {
     DISPATCH_TO_HANDLE.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+/// Stone 11.6.5 (#11) — push a future into the staging queue. Called
+/// from `TaskScope::spawn`, possibly while we're inside a dispatch
+/// poll holding a `SLOTS` borrow.
+pub(crate) fn spawn_in_slot(
+    handle: u32,
+    kind: ScopeKind,
+    future: Pin<Box<dyn Future<Output = ()> + 'static>>,
+) {
+    SPAWN_QUEUE.with(|q| q.borrow_mut().push((handle, kind, future)));
+}
+
+/// Move every staged spawn from `SPAWN_QUEUE` into its owning slot's
+/// `spawned` vec. Called after every dispatch poll and at the start
+/// of [`drive_spawned`] so apps can spawn from inside any callback or
+/// any spawned task.
+fn drain_spawn_queue() {
+    let drained: Vec<_> = SPAWN_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut *q)
+    });
+    if drained.is_empty() {
+        return;
+    }
+    with_slots(|slots| {
+        for (handle, kind, future) in drained {
+            if let Some(slot) = slots.get_mut(&handle) {
+                slot.spawned.push(SpawnedTask { future, kind });
+            }
+            // Slot evicted before drain → drop the future. App that
+            // spawns from inside on_destroy and gets here after slot
+            // teardown should silently no-op rather than panic.
+        }
+    });
+}
+
+/// Stone 11.6.5 (#11) — poll every pending spawned task across every
+/// live slot. Tasks that resolve drop; pending tasks stay armed for
+/// the next sweep. Called by `akiva_app_drive_spawned` from the host
+/// worker shell once per `host_op_done` arrival (and once per dispatch
+/// resolution); apps don't see this directly.
+///
+/// Returns the count of tasks still pending after the sweep — useful
+/// for the host to back off polling when everything's idle.
+pub fn drive_spawned() -> u32 {
+    drain_spawn_queue();
+    let mut total_remaining: u32 = 0;
+    with_slots(|slots| {
+        for slot in slots.values_mut() {
+            slot.spawned.retain_mut(|task| {
+                match executor::poll_once(&mut task.future) {
+                    Poll::Ready(()) => false,
+                    Poll::Pending => true,
+                }
+            });
+            total_remaining += slot.spawned.len() as u32;
+        }
+    });
+    // Tasks may have spawned siblings during their poll — drain again
+    // before reporting the residual count so the host's "idle when
+    // 0" check isn't off-by-one.
+    drain_spawn_queue();
+    total_remaining
 }
 
 // ── Future construction ───────────────────────────────────────────────
@@ -374,6 +473,7 @@ fn install_and_poll<T: Activity + Default>(
         let activity: Box<dyn Activity> = Box::new(T::default());
         let mut new_slot = Box::new(Slot {
             pending: None,
+            spawned: Vec::new(),
             activity,
             ctx: Context {
                 metrics: Metrics::default(),
@@ -394,6 +494,7 @@ fn install_and_poll<T: Activity + Default>(
         new_slot.pending = Some(PendingDispatch {
             future: fut,
             completed: None,
+            cmd_kind: CREATE,
         });
 
         // Install slot before polling — poll's raw pointers read from
@@ -454,6 +555,14 @@ fn install_and_poll<T: Activity + Default>(
 
             _ => return Err(1),
         }
+        // Stone 11.6.5 (#11) — stamp cmd_kind on the freshly installed
+        // pending dispatch so `drive_pending` can apply scope-cancel
+        // hooks (PAUSE/DESTROY) when the future resolves. The various
+        // install_* helpers default to 0; we patch the truth post-install
+        // here to avoid threading cmd_kind through every helper.
+        if let Some(p) = slot.pending.as_mut() {
+            p.cmd_kind = cmd_kind;
+        }
         Ok::<(), u32>(())
     })?;
 
@@ -475,14 +584,14 @@ where
         + 'static,
 {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, body);
-    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
 }
 
 fn install_destroy(slot: &mut Slot) {
     let fut = build_async_future(slot, DispatchOutcome::Destroy, |a, c| {
         Box::pin(async move { a.on_destroy(c).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
 }
 
 fn install_pointer(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
@@ -504,7 +613,7 @@ fn install_pointer(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_pointer(c, ev).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
@@ -525,7 +634,7 @@ fn install_key(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_key(c, ev).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
@@ -540,7 +649,7 @@ fn install_resize(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_resize(c, metrics).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
@@ -551,7 +660,7 @@ fn install_new_intent(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
             // Drop silently — same policy as the legacy code path.
             slot.pending = Some(PendingDispatch {
                 future: Box::pin(async move { DispatchOutcome::NoBytes }),
-                completed: None,
+                completed: None, cmd_kind: 0,
             });
             return Ok(());
         }
@@ -559,7 +668,7 @@ fn install_new_intent(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_new_intent(c, &intent).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
@@ -571,7 +680,7 @@ fn install_activity_result(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
         Err(_) => {
             slot.pending = Some(PendingDispatch {
                 future: Box::pin(async move { DispatchOutcome::NoBytes }),
-                completed: None,
+                completed: None, cmd_kind: 0,
             });
             return Ok(());
         }
@@ -579,7 +688,7 @@ fn install_activity_result(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_activity_result(c, rc, &result).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
@@ -609,7 +718,7 @@ fn run_render_sync(slot: &mut Slot) {
     // that doesn't exist.
     slot.pending = Some(PendingDispatch {
         future: Box::pin(async move { DispatchOutcome::Paint }),
-        completed: Some(DispatchOutcome::Paint),
+        completed: Some(DispatchOutcome::Paint), cmd_kind: 0,
     });
 }
 
@@ -620,7 +729,7 @@ fn run_save_state_sync(slot: &mut Slot) {
     slot.last_outcome = DispatchOutcome::SavedState;
     slot.pending = Some(PendingDispatch {
         future: Box::pin(async move { DispatchOutcome::SavedState }),
-        completed: Some(DispatchOutcome::SavedState),
+        completed: Some(DispatchOutcome::SavedState), cmd_kind: 0,
     });
 }
 
@@ -633,18 +742,26 @@ fn run_restore_state_sync(slot: &mut Slot, rest: &[u8]) {
     slot.last_outcome = DispatchOutcome::NoBytes;
     slot.pending = Some(PendingDispatch {
         future: Box::pin(async move { DispatchOutcome::NoBytes }),
-        completed: Some(DispatchOutcome::NoBytes),
+        completed: Some(DispatchOutcome::NoBytes), cmd_kind: 0,
     });
 }
 
 /// Poll the pending future for `dispatch_id` once. Updates
 /// `pending.completed` if it reaches a terminal state.
+///
+/// Stone 11.6.5 (#11) — when a `PAUSE` dispatch reaches `Ready`, every
+/// `Resumed`-scoped spawned task on the same slot is dropped. `DESTROY`
+/// is handled implicitly: the slot itself evicts in `get_result` and
+/// the entire `spawned` Vec drops with it. After driving, any spawns
+/// the body queued get flushed into their slots.
 fn drive_pending(dispatch_id: u64) -> u32 {
+    use crate::op_kinds::cmd;
+
     let handle = match with_dispatches(|d| d.get(&dispatch_id).copied()) {
         Some(h) => h,
         None => return op_kinds::status::ERROR,
     };
-    with_slots(|slots_map| {
+    let status = with_slots(|slots_map| {
         let slot = match slots_map.get_mut(&handle) {
             Some(s) => s,
             None => return op_kinds::status::ERROR,
@@ -660,11 +777,23 @@ fn drive_pending(dispatch_id: u64) -> u32 {
             Poll::Pending => op_kinds::status::PENDING,
             Poll::Ready(outcome) => {
                 pending.completed = Some(outcome);
+                let cmd_kind = pending.cmd_kind;
                 slot.last_outcome = outcome;
+                // Cancellation hook: drop scoped spawns on the right
+                // lifecycle edge. PAUSE drops Resumed-scoped only;
+                // DESTROY drops everything when the slot evicts in
+                // get_result, so we don't touch spawned here for it.
+                if cmd_kind == cmd::PAUSE {
+                    slot.spawned.retain(|t| t.kind != ScopeKind::Resumed);
+                }
                 op_kinds::status::READY
             }
         }
-    })
+    });
+    // Body may have spawned tasks during this poll. Flush them into
+    // their slots before returning so a subsequent poll sees them.
+    drain_spawn_queue();
+    status
 }
 
 /// `akiva_app_dispatch` body. Returns `0` on accept (the host should
@@ -879,6 +1008,265 @@ mod tests {
     fn pack_poll_round_trips() {
         assert_eq!(pack_poll(op_kinds::status::READY, 42), 1u64 | (42u64 << 32));
         assert_eq!(pack_poll(op_kinds::status::PENDING, 0), 0u64);
+    }
+
+    /// Activity that does nothing — placeholder for `mem::replace`
+    /// dances in `run_lifecycle_with` (a `Slot` field can't be left
+    /// uninitialised, so we swap in this dummy when consuming the
+    /// real activity).
+    #[derive(Default)]
+    struct NopActivity;
+    #[async_trait(?Send)]
+    impl Activity for NopActivity {}
+
+    /// Stone 11.6.5 (#11) — a future that records every poll on a
+    /// shared counter and always returns `Pending`. Used to assert
+    /// that drive_spawned fires it, and that cancellation stops the
+    /// firing.
+    struct PollCounterFuture(std::rc::Rc<std::cell::Cell<u32>>);
+    impl Future for PollCounterFuture {
+        type Output = ();
+        fn poll(
+            self: Pin<&mut Self>,
+            _cx: &mut core::task::Context<'_>,
+        ) -> Poll<()> {
+            self.0.set(self.0.get() + 1);
+            Poll::Pending
+        }
+    }
+
+    /// Activity that spawns a single counter-future under the given
+    /// scope on the matching lifecycle edge. Lifecycle hook is chosen
+    /// via `spawn_in_create` / `spawn_in_resume` so tests can target
+    /// either side without writing N variants.
+    struct SpawnInActivity {
+        spawn_in_create: Option<(crate::activity::ScopeKind, std::rc::Rc<std::cell::Cell<u32>>)>,
+        spawn_in_resume: Option<(crate::activity::ScopeKind, std::rc::Rc<std::cell::Cell<u32>>)>,
+    }
+    impl Default for SpawnInActivity {
+        fn default() -> Self {
+            Self { spawn_in_create: None, spawn_in_resume: None }
+        }
+    }
+    #[async_trait(?Send)]
+    impl Activity for SpawnInActivity {
+        async fn on_create(&mut self, ctx: &mut Context<'_>) {
+            if let Some((kind, counter)) = self.spawn_in_create.take() {
+                let scope = match kind {
+                    crate::activity::ScopeKind::Activity => ctx.activity_scope(),
+                    crate::activity::ScopeKind::Resumed  => ctx.resumed_scope(),
+                };
+                scope.spawn(PollCounterFuture(counter));
+            }
+        }
+        async fn on_resume(&mut self, ctx: &mut Context<'_>) {
+            if let Some((kind, counter)) = self.spawn_in_resume.take() {
+                let scope = match kind {
+                    crate::activity::ScopeKind::Activity => ctx.activity_scope(),
+                    crate::activity::ScopeKind::Resumed  => ctx.resumed_scope(),
+                };
+                scope.spawn(PollCounterFuture(counter));
+            }
+        }
+    }
+
+    /// Tests need to construct the slot directly (the dispatch path
+    /// uses `T::default()` and we want test-owned state). This helper
+    /// installs a `Slot` in `SLOTS` for `handle` carrying the supplied
+    /// activity, then fires the lifecycle dispatches in order. Returns
+    /// nothing — assertions are made via the shared counters captured
+    /// in the activity.
+    fn run_lifecycle_with(
+        handle: u32,
+        mut activity: Box<dyn Activity>,
+        cmds: &[(u64, u32)],
+    ) {
+        // Build a Slot with the user's activity. The CREATE path of
+        // `dispatch::<T>` would T::default() instead of using ours, so
+        // we install manually.
+        let class_static = intern_class("Test");
+        let mut slot = Box::new(Slot {
+            pending: None,
+            spawned: Vec::new(),
+            activity: std::mem::replace(
+                &mut activity,
+                Box::new(NopActivity::default()),
+            ),
+            ctx: Context {
+                metrics: Metrics::default(),
+                timestamp_ms: 0.0,
+                pointer: None,
+                class: class_static,
+                handle,
+            },
+            paint_buf: Vec::new(),
+            save_buf: Vec::new(),
+            last_outcome: DispatchOutcome::NoBytes,
+        });
+        // Install — pin the slot before any dispatch fires it.
+        with_slots(|s| { s.insert(handle, std::mem::replace(&mut slot, Box::new(empty_slot()))); });
+
+        // Run the cmds. CREATE/etc each get a fresh dispatch_id.
+        for &(dispatch_id, cmd_kind) in cmds {
+            // Build the lifecycle future for the cmd. We bypass
+            // install_and_poll because that path constructs a fresh
+            // T::default(); we want to drive the existing slot.
+            with_slots(|slots| {
+                let s = slots.get_mut(&handle).unwrap();
+                let body: Box<dyn FnOnce(
+                    &'static mut Box<dyn Activity>,
+                    &'static mut Context<'static>,
+                ) -> Pin<Box<dyn Future<Output = ()> + 'static>> + 'static> = match cmd_kind {
+                    cmd::CREATE  => Box::new(|a, c| Box::pin(async move { a.on_create(c).await; })),
+                    cmd::RESUME  => Box::new(|a, c| Box::pin(async move { a.on_resume(c).await; })),
+                    cmd::PAUSE   => Box::new(|a, c| Box::pin(async move { a.on_pause(c).await; })),
+                    cmd::DESTROY => Box::new(|a, c| Box::pin(async move { a.on_destroy(c).await; })),
+                    other => panic!("unexpected cmd_kind in test fixture: {other:#x}"),
+                };
+                let outcome = if cmd_kind == cmd::DESTROY {
+                    DispatchOutcome::Destroy
+                } else {
+                    DispatchOutcome::NoBytes
+                };
+                let fut = build_async_future(s, outcome, body);
+                s.pending = Some(PendingDispatch {
+                    future: fut,
+                    completed: None,
+                    cmd_kind,
+                });
+            });
+            with_dispatches(|d| { d.insert(dispatch_id, handle); });
+            let _ = drive_pending(dispatch_id);
+            let mut len: u32 = 0;
+            let _ = get_result(dispatch_id, &mut len as *mut u32);
+        }
+    }
+
+    /// Helper: an empty `Slot` placeholder. The mem::replace dance in
+    /// `run_lifecycle_with` needs *something* shaped like a Slot to
+    /// swap the real one out of, and a Slot can't be `Default` (the
+    /// activity field is `Box<dyn Activity>`).
+    fn empty_slot() -> Slot {
+        Slot {
+            pending: None,
+            spawned: Vec::new(),
+            activity: Box::new(NopActivity::default()),
+            ctx: Context {
+                metrics: Metrics::default(),
+                timestamp_ms: 0.0,
+                pointer: None,
+                class: "x",
+                handle: 0,
+            },
+            paint_buf: Vec::new(),
+            save_buf: Vec::new(),
+            last_outcome: DispatchOutcome::NoBytes,
+        }
+    }
+
+    #[test]
+    fn resumed_scope_spawn_is_polled_by_drive_spawned() {
+        // Spawn from on_resume with Resumed scope. drive_pending only
+        // *queues* the spawned task into the slot (via
+        // drain_spawn_queue); the host's akiva_app_drive_spawned is
+        // what actually polls. Verify that path.
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let activity = Box::new(SpawnInActivity {
+            spawn_in_create: None,
+            spawn_in_resume: Some((crate::activity::ScopeKind::Resumed, counter.clone())),
+        });
+        run_lifecycle_with(0xa01, activity, &[(1, cmd::CREATE), (2, cmd::RESUME)]);
+        // Pre-drive: not polled yet (drive_pending just queued).
+        assert_eq!(counter.get(), 0);
+        // Each drive_spawned call advances the counter by 1.
+        let _ = drive_spawned();
+        assert_eq!(counter.get(), 1);
+        let _ = drive_spawned();
+        assert_eq!(counter.get(), 2);
+        // Cleanup.
+        run_lifecycle_with(0xa01, Box::new(SpawnInActivity::default()),
+            &[(99, cmd::DESTROY)]);
+    }
+
+    #[test]
+    fn pause_drops_resumed_scope_spawns() {
+        // After PAUSE resolves, drive_spawned should NOT advance the
+        // counter — the Resumed-scoped task got dropped.
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let activity = Box::new(SpawnInActivity {
+            spawn_in_create: None,
+            spawn_in_resume: Some((crate::activity::ScopeKind::Resumed, counter.clone())),
+        });
+        run_lifecycle_with(0xa02, activity,
+            &[(1, cmd::CREATE), (2, cmd::RESUME), (3, cmd::PAUSE)]);
+        let frozen = counter.get();
+        let _ = drive_spawned();
+        let _ = drive_spawned();
+        assert_eq!(counter.get(), frozen,
+            "Resumed-scoped task must be dropped on PAUSE; further drive_spawned must be a no-op for it");
+        // Cleanup.
+        run_lifecycle_with(0xa02, Box::new(SpawnInActivity::default()),
+            &[(99, cmd::DESTROY)]);
+    }
+
+    #[test]
+    fn pause_keeps_activity_scope_spawns_alive() {
+        // Activity-scoped tasks survive PAUSE and keep being polled.
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let activity = Box::new(SpawnInActivity {
+            spawn_in_create: Some((crate::activity::ScopeKind::Activity, counter.clone())),
+            spawn_in_resume: None,
+        });
+        run_lifecycle_with(0xa03, activity,
+            &[(1, cmd::CREATE), (2, cmd::RESUME), (3, cmd::PAUSE)]);
+        let before = counter.get();
+        let _ = drive_spawned();
+        assert_eq!(counter.get(), before + 1,
+            "Activity-scoped task must keep ticking across PAUSE");
+        // Cleanup.
+        run_lifecycle_with(0xa03, Box::new(SpawnInActivity::default()),
+            &[(99, cmd::DESTROY)]);
+    }
+
+    #[test]
+    fn destroy_drops_every_spawn() {
+        // Activity-scoped task spawned in on_create. After DESTROY the
+        // slot is gone and drive_spawned shouldn't poll the future.
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let activity = Box::new(SpawnInActivity {
+            spawn_in_create: Some((crate::activity::ScopeKind::Activity, counter.clone())),
+            spawn_in_resume: None,
+        });
+        run_lifecycle_with(0xa04, activity,
+            &[(1, cmd::CREATE), (2, cmd::DESTROY)]);
+        let frozen = counter.get();
+        let _ = drive_spawned();
+        let _ = drive_spawned();
+        assert_eq!(counter.get(), frozen,
+            "DESTROY evicts the slot, including all spawned tasks regardless of scope");
+        // Slot should be gone.
+        assert!(with_slots(|s| !s.contains_key(&0xa04u32)));
+    }
+
+    #[test]
+    fn drive_spawned_returns_pending_count() {
+        // Sanity: drive_spawned reports the number of tasks still in
+        // flight, not the number it polled.
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let activity = Box::new(SpawnInActivity {
+            spawn_in_create: Some((crate::activity::ScopeKind::Activity, counter.clone())),
+            spawn_in_resume: None,
+        });
+        run_lifecycle_with(0xa05, activity,
+            &[(1, cmd::CREATE)]);
+        // The Pending future never resolves, so drive_spawned reports 1.
+        let n = drive_spawned();
+        assert_eq!(n, 1);
+        // Cleanup.
+        run_lifecycle_with(0xa05, Box::new(SpawnInActivity::default()),
+            &[(99, cmd::DESTROY)]);
+        assert_eq!(drive_spawned(), 0,
+            "after destroy the slot is gone — no pending tasks anywhere");
     }
 
     #[test]

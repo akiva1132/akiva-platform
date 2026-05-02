@@ -144,5 +144,15 @@ macro_rules! akiva_app {
         ) -> *const u8 {
             $crate::runtime::get_result(dispatch_id, out_len_ptr)
         }
+
+        /// Stone 11.6.5 (#11) — drive every `TaskScope`-spawned future
+        /// across every live activity slot. Returns the count still
+        /// pending after the sweep so the host can short-circuit when
+        /// idle. Called by the worker shell on every `host_op_done`
+        /// arrival; cheap when no spawns exist.
+        #[no_mangle]
+        pub extern "C" fn akiva_app_drive_spawned() -> u32 {
+            $crate::runtime::drive_spawned()
+        }
     };
 }

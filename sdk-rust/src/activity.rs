@@ -104,68 +104,68 @@ pub fn block_on_ready<F: Future>(f: F) -> F::Output {
 
 // ── Lifecycle scopes ──────────────────────────────────────────────────
 //
-// Three task scopes — `activity_scope`, `resumed_scope`, one-shot —
-// modelled on Android's `lifecycleScope` / `viewModelScope` and
-// SwiftUI's `.task(id:)`. The contract from
-// docs/isolation-design.md §4.7:
+// Two task scopes — `activity_scope` and `resumed_scope` — modelled on
+// Android's `lifecycleScope` / `viewModelScope` and SwiftUI's
+// `.task(id:)`. The contract from docs/isolation-design.md §4.7:
 //
 //   - `activity_scope`: tasks live until on_destroy.
 //   - `resumed_scope`:  tasks live until on_pause.
-//   - one-shot:         tasks die when the calling fn returns
-//                       (already the default if you `.await` directly).
 //
-// In Stone 11.2 every spawned future completes in a single poll
-// (host imports still sync), so cancellation is unobservable — there's
-// nothing pending to drop when on_pause / on_destroy fires. The API
-// surface is locked in here so apps can write the right code today;
-// Stone 11.3 puts teeth on it once a real executor holds futures
-// across .await points.
+// One-shot await (`storage::read("k").await` directly inside a
+// callback) doesn't need a scope — it dies when the calling fn
+// returns by definition.
 //
-// Until then `TaskScope::spawn` is just a renamed `block_on_ready` —
-// runs the future to completion right then. That matches what an
-// executor would do anyway when the future is Ready-on-first-poll, so
-// app behaviour will stay identical when 11.3 swaps the body.
+// Stone 11.6.5 (#11) put cancellation teeth on these. Each spawned
+// future is stored in the activity's slot until it resolves, the
+// activity hits the matching cancellation edge, or the activity
+// destroys. The runtime ([`crate::runtime`]) owns the queue and
+// drives every spawned task once per host wake-up; the SDK exports
+// `akiva_app_drive_spawned` for the worker shell to pump after each
+// `host_op_done`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScopeKind {
+pub(crate) enum ScopeKind {
     /// Outlives every callback except `on_destroy` — the activity itself.
     Activity,
     /// Active only between `on_resume` and the matching `on_pause`.
     Resumed,
 }
 
-/// Task scope used by [`Context::activity_scope`] /
-/// [`Context::resumed_scope`]. Carries the cancellation policy as
-/// data; in Stone 11.2 it's API surface only (see module comment).
+/// Task scope handed back by [`Context::activity_scope`] /
+/// [`Context::resumed_scope`]. Carries the activity handle and the
+/// cancellation policy together so [`TaskScope::spawn`] can route
+/// the future to the right per-activity queue without a thread-local
+/// lookup.
+///
+/// Cheap to copy (one `u32` + one enum tag) — apps that want to spawn
+/// from inside a closure can clone the scope value into the closure's
+/// captures.
+#[derive(Clone, Copy)]
 pub struct TaskScope {
     kind: ScopeKind,
+    handle: u32,
 }
 
 impl TaskScope {
     /// Spawn `fut` under this scope's cancellation policy.
     ///
-    /// In Stone 11.2 this drives `fut` to completion synchronously via
-    /// [`block_on_ready`] (`Pending` panics — every host call still
-    /// resolves on first poll). Stone 11.3 replaces the body with the
-    /// real executor; the signature stays the same so apps don't churn.
+    /// The future is stored in the activity's slot and polled once per
+    /// host wake-up (each `host_op_done` arrival from the kernel-worker
+    /// triggers a sweep). When the activity hits the cancellation edge
+    /// for this scope (`on_pause` for [`ScopeKind::Resumed`],
+    /// `on_destroy` for [`ScopeKind::Activity`]) the SDK runtime drops
+    /// the future without further polling — any local state the future
+    /// held drops with it, and any in-flight host op the future was
+    /// awaiting is left to land and get discarded.
     ///
-    /// The future is bound by the caller's lifetime (whatever borrows
-    /// it captures). 11.3 will tighten this to `+ 'static` to allow
-    /// cross-callback storage; until then a non-static future is fine
-    /// because we poll-to-completion before this fn returns.
-    pub fn spawn<F: Future<Output = ()>>(&self, fut: F) {
-        let _ = self.kind;
-        block_on_ready(fut);
+    /// `'static` is required because the future is retained across
+    /// callbacks. Apps that need to share state with the activity
+    /// instance pass it through `Rc<RefCell<...>>` or similar — the
+    /// SDK doesn't try to magic-borrow `&mut self`.
+    pub fn spawn<F: Future<Output = ()> + 'static>(&self, fut: F) {
+        crate::runtime::spawn_in_slot(self.handle, self.kind, Box::pin(fut));
     }
 }
-
-/// Singletons addressable as `&'static TaskScope`. Cheap, no per-handle
-/// state — fits the 11.2 model where scopes are markers. When 11.3
-/// makes scopes hold a queue of pending tasks they'll move into the
-/// per-handle [`crate::runtime::Slot`] and the accessors on [`Context`]
-/// will return non-static refs borrowing from there.
-pub(crate) static ACTIVITY_SCOPE: TaskScope = TaskScope { kind: ScopeKind::Activity };
-pub(crate) static RESUMED_SCOPE:  TaskScope = TaskScope { kind: ScopeKind::Resumed  };
 
 // ── Context impl ──────────────────────────────────────────────────────
 
@@ -175,8 +175,8 @@ impl<'a> Context<'a> {
     /// for state that should outlive a brief background trip (e.g. an
     /// unstarted-yet network request the user will see when they come
     /// back).
-    pub fn activity_scope(&self) -> &'static TaskScope {
-        &ACTIVITY_SCOPE
+    pub fn activity_scope(&self) -> TaskScope {
+        TaskScope { kind: ScopeKind::Activity, handle: self.handle }
     }
 
     /// Scope whose tasks live only while the activity is in the
@@ -184,8 +184,8 @@ impl<'a> Context<'a> {
     /// scope is opened the next time `on_resume` fires. Use this for
     /// listeners / polling loops that only make sense when the user
     /// is actively looking at the activity.
-    pub fn resumed_scope(&self) -> &'static TaskScope {
-        &RESUMED_SCOPE
+    pub fn resumed_scope(&self) -> TaskScope {
+        TaskScope { kind: ScopeKind::Resumed, handle: self.handle }
     }
 
     // ── Affordance API ────────────────────────────────────────────────
@@ -582,30 +582,24 @@ mod tests {
     }
 
     #[test]
-    fn task_scope_spawn_runs_body_before_returning() {
-        // 11.2 contract: spawn drives the future to completion right
-        // there. After this returns the side effect must already be
-        // visible. This anchors the migration story: app code that
-        // works against the 11.2 stub will keep working when 11.3
-        // swaps the executor in (Ready-on-first-poll futures complete
-        // identically either way).
-        let scope = TaskScope { kind: ScopeKind::Activity };
-        let mut fired = false;
-        scope.spawn(async {
-            fired = true;
-        });
-        assert!(fired);
-    }
-
-    #[test]
     fn context_exposes_distinct_scope_kinds() {
-        // `activity_scope` and `resumed_scope` resolve to different
-        // singletons — they're the same shape today but different
-        // identities, so when 11.3 attaches behaviour the wiring is
-        // already in place.
-        assert_eq!(ACTIVITY_SCOPE.kind, ScopeKind::Activity);
-        assert_eq!(RESUMED_SCOPE.kind,  ScopeKind::Resumed);
-        assert_ne!(ACTIVITY_SCOPE.kind, RESUMED_SCOPE.kind);
+        // `activity_scope` and `resumed_scope` carry distinct kinds so
+        // the runtime can apply the right cancellation policy. Both
+        // scopes capture the calling context's handle, which is what
+        // routes a spawned task to the correct slot.
+        let ctx = Context {
+            metrics: Metrics::default(),
+            timestamp_ms: 0.0,
+            pointer: None,
+            class: "",
+            handle: 7,
+        };
+        let a = ctx.activity_scope();
+        let r = ctx.resumed_scope();
+        assert_eq!(a.kind, ScopeKind::Activity);
+        assert_eq!(r.kind, ScopeKind::Resumed);
+        assert_eq!(a.handle, 7);
+        assert_eq!(r.handle, 7);
     }
 
     #[test]

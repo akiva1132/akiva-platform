@@ -115,6 +115,10 @@ const REQUIRED_EXPORTS = [
   "akiva_app_dispatch",
   "akiva_app_poll_dispatch",
   "akiva_app_get_result",
+  // Stone 11.6.5 (#11) — pumps `TaskScope::spawn`-queued futures.
+  // Called after every dispatch resolution and every host_op_done so
+  // tasks awaiting host ops wake when their reply lands.
+  "akiva_app_drive_spawned",
 ];
 
 /**
@@ -274,6 +278,11 @@ function handleDispatch(msg) {
   // it parks on a host_op, we'll re-poll once host_op_done arrives.
   pendingDispatches.set(dispatchId, { cmd_kind });
   driveDispatch(dispatchId);
+  // Stone 11.6.5 (#11) — the dispatch body may have spawned tasks
+  // (e.g. on_resume calling `ctx.resumed_scope().spawn(...)`). Pump
+  // them once now so first-poll-Ready spawns resolve before we
+  // return; pending ones stay armed for the next host_op_done.
+  driveSpawned();
 }
 
 /**
@@ -381,6 +390,29 @@ function handleHostOpDone(msg) {
     for (const id of ids) {
       driveDispatch(id);
     }
+  }
+  // Stone 11.6.5 (#11) — pump TaskScope-spawned tasks too. A spawned
+  // task may have parked on this exact host_op (storage::read,
+  // text_width, query_packages...), and there's no per-task wake-up
+  // signal; the host op resolution is itself the trigger.
+  driveSpawned();
+}
+
+/**
+ * Stone 11.6.5 (#11) — call the wasm export that polls every
+ * `TaskScope`-spawned future across every live activity slot.
+ * Cheap when no spawns exist (the wasm side returns 0 immediately).
+ * Traps inside the export are reported as a hard worker fault — a
+ * spawned future panicking takes down the whole worker today, same
+ * fault model as a callback panicking.
+ */
+function driveSpawned() {
+  if (!wasmInstance) return;
+  try {
+    wasmInstance.exports.akiva_app_drive_spawned();
+  } catch (err) {
+    postLog("error", `drive_spawned trapped: ${err?.message ?? err}`);
+    postTrapped(`drive_spawned: ${err?.message ?? err}`);
   }
 }
 
