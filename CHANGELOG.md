@@ -12,15 +12,22 @@ rationale live in the linked stone or risk entry.
 
 ## [0.3.0] — 2026-05 (Stone 11.6.8)
 
-**MINOR** — additive: new host imports, a new status code, and an
-SDK-only sync surface.
+**MINOR** — additive: two new host imports, a new status code, and
+an SDK-only sync surface.
 
-- **Added.** `akiva_host_random_bytes(out_ptr, len)` import — CSPRNG
-  primitive, ungated. Maps to `crypto.getRandomValues` in the worker
-  shell. Promoted from `risks.md §7.15`.
-- **Added.** `akiva_host_wall_clock_ms() -> u64` import — wall-clock
-  primitive, ungated. Maps to `Date.now()`. Distinct from the
-  monotonic `ctx.timestamp_ms`. Promoted from `risks.md §7.18`.
+- **Added.** `akiva_host_random_bytes(out_ptr, len) -> u32` import —
+  CSPRNG primitive, ungated. Maps to `crypto.getRandomValues` in the
+  worker shell with internal chunking around the 64 KiB cap. Wired
+  via `getrandom`'s `register_custom_getrandom!` so the entire Rust
+  crypto ecosystem (`rand`, `uuid`, `ring`, `rustls`, …) works in
+  Akiva apps without app-side glue. Promoted from `risks.md §7.15`.
+- **Added.** `akiva_host_clock_ms(clock_id) -> u64` import — single
+  extern that mirrors POSIX `clock_gettime(clockid_t)`. `clock_id`
+  values: `0 = Monotonic` (`performance.now()`), `1 = RealTime`
+  (`Date.now()`). Single extern with id keeps the ABI extensible —
+  future clock types can land without a new import or another bump.
+  SDK side: `clock_gettime_ms(ClockId)` in `akiva_sdk::clock`.
+  Promoted from `risks.md §7.18`.
 - **Added.** `STATUS_BUSY = 3` — io_poll status returned when a slot
   hits `MAX_PENDING_PER_SLOT = 256` concurrent in-flight dispatches.
   Apps backoff or treat as `Err(_::Busy)`. Promoted from

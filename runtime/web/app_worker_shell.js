@@ -562,30 +562,45 @@ function buildHostImports() {
 
       // ── Primitives ──────────────────────────────────────────────
       // Stone 11.6.8 #1 — CSPRNG. Fills `len` bytes at `out_ptr`
-      // with cryptographic random data. Synchronous, ungated; the
-      // host's `crypto.getRandomValues` is sub-millisecond for any
-      // reasonable buffer. The single 64 KiB Web Crypto cap is
-      // chunked here so apps don't have to care.
+      // with cryptographic random data. Returns 0 on success per
+      // the `getrandom` custom-backend contract; the SDK side wires
+      // this as the system getrandom backend so every Rust crate
+      // (rand, uuid, ring, …) inherits it without app glue. The
+      // single 64 KiB Web Crypto cap is chunked transparently.
       akiva_host_random_bytes: (outPtr, len) => {
-        if (!wasmMemory || len === 0) return;
-        // crypto.getRandomValues caps at 65 536 bytes per call;
-        // chunk to cover larger asks transparently.
-        const CHUNK = 65536;
-        for (let off = 0; off < len; off += CHUNK) {
-          const slice = new Uint8Array(
-            wasmMemory.buffer,
-            outPtr + off,
-            Math.min(CHUNK, len - off),
-          );
-          crypto.getRandomValues(slice);
+        if (!wasmMemory || len === 0) return 0;
+        try {
+          const CHUNK = 65536;
+          for (let off = 0; off < len; off += CHUNK) {
+            const slice = new Uint8Array(
+              wasmMemory.buffer,
+              outPtr + off,
+              Math.min(CHUNK, len - off),
+            );
+            crypto.getRandomValues(slice);
+          }
+          return 0;
+        } catch (err) {
+          postLog("error", `random_bytes: ${err?.message ?? err}`);
+          return 1;
         }
       },
 
-      // Stone 11.6.8 #4 — wall-clock time (ms since UNIX epoch).
-      // Returned as BigInt for u64 transport. Date.now() returns a
-      // Number (53-bit safe int) which fits comfortably until the
-      // year 285_426; cast is loss-less.
-      akiva_host_wall_clock_ms: () => BigInt(Date.now()),
+      // Stone 11.6.8 #4 — clock read for the requested clock id.
+      // Mirrors POSIX `clock_gettime(clockid_t)`: 0 = MONOTONIC
+      // (`performance.now()`), 1 = REALTIME (`Date.now()`). Returned
+      // as BigInt for u64 transport. Both source values are Numbers
+      // (53-bit safe int) — losslessly representable until the
+      // year 285_426 for REALTIME and indefinitely for MONOTONIC.
+      // Unknown clock_id falls back to MONOTONIC with a warn log
+      // (defensive — newer SDK can introduce ids without breaking
+      // older hosts).
+      akiva_host_clock_ms: (clockId) => {
+        if (clockId === 0) return BigInt(Math.round(performance.now()));
+        if (clockId === 1) return BigInt(Date.now());
+        postLog("warn", `clock_ms: unknown clock_id=${clockId}, falling back to MONOTONIC`);
+        return BigInt(Math.round(performance.now()));
+      },
 
       // ── Unified-ABI multiplexers ─────────────────────────────────
       akiva_host_fire: (opKind, argsPtr, argsLen) => {

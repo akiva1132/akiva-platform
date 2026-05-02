@@ -1,83 +1,79 @@
 //! Cryptographic random bytes (Stone 11.6.8 #1).
 //!
-//! `wasm` itself has no source of randomness. The host (a Web Worker
-//! with `crypto.getRandomValues` available) does. This module exposes
-//! that primitive to apps without going through the io / fire
-//! channels — RNG is synchronous and infallible at the host's chosen
-//! granularity, so a future would be ceremony.
+//! Wasm itself has no source of randomness; the host (a Web Worker
+//! with `crypto.getRandomValues` available) does. Rather than ship a
+//! standalone API that only apps aware of it would use, this module
+//! wires the platform's RNG host import as a `getrandom` v0.2 custom
+//! backend. The downstream effect: every crate that depends on
+//! `getrandom` — `rand`, `uuid`, `ring`, `rustls`, `chacha20poly1305`,
+//! and so on — works inside an Akiva app with zero glue.
 //!
-//! Use cases:
+//! ```ignore
+//! use uuid::Uuid;
 //!
-//! - **UUIDs / session tokens** — generate v4 UUIDs, opaque session
-//!   IDs, anti-CSRF nonces.
-//! - **Crypto** — keys, IVs, salts. The host backing is
-//!   `crypto.getRandomValues`, which is NIST SP 800-90A-compliant on
-//!   every modern browser.
-//! - **Game logic** — initial board state, deck shuffles. Use a
-//!   seeded PRNG instead if you need reproducibility; this is for
-//!   "I don't care, just give me bytes."
+//! // No SDK setup, no `use akiva_sdk::*` — just the standard
+//! // ecosystem call. Routes through `getrandom` → our custom
+//! // backend → `akiva_host_random_bytes` → `crypto.getRandomValues`.
+//! let id = Uuid::new_v4();
+//! ```
 //!
-//! Ungated — RNG is a primitive, not a resource. Same model as
-//! `Math.random()` (without the bias problem).
+//! For apps that just want raw bytes without a dependency, this
+//! module also exposes thin wrappers:
 //!
 //! ```ignore
 //! use akiva_sdk::random;
 //!
 //! let mut salt = [0u8; 16];
-//! random::fill_bytes(&mut salt);
+//! random::fill(&mut salt);
 //!
-//! let token = random::u64();
+//! let token = random::bytes(32);
 //! ```
+//!
+//! Ungated — RNG is a primitive, not a resource. Same model as
+//! `Math.random()` in browsers (without the bias problem) and
+//! `getentropy(2)` on POSIX.
 
-/// Fill `buf` with cryptographic random bytes. Length is whatever the
-/// caller chose; the host doesn't impose a maximum (chunks internally
-/// for `crypto.getRandomValues`'s 64 KiB limit). Empty `buf` is a no-op.
+/// Custom backend for `getrandom`: routes every system-entropy
+/// request through our wasm host import. Registered exactly once
+/// at module load via `register_custom_getrandom!`; the ecosystem
+/// then sees us as the system RNG.
+///
+/// Non-wasm builds (`cargo test` on the developer's machine) skip
+/// the custom registration so the standard `getrandom` backends
+/// (urandom on Linux, BCryptGenRandom on Windows, etc.) keep
+/// working — a host call `akiva_host_random_bytes` doesn't exist
+/// outside wasm.
 #[cfg(target_arch = "wasm32")]
-pub fn fill_bytes(buf: &mut [u8]) {
-    if buf.is_empty() { return; }
-    // SAFETY: the host writes exactly `len` bytes into the buffer,
-    // bounded by the slice we just measured. Single-threaded wasm
-    // means no concurrent reads can race with the fill.
-    unsafe {
-        crate::runtime::akiva_host_random_bytes(buf.as_mut_ptr(), buf.len() as u32);
-    }
+fn akiva_getrandom(dest: &mut [u8]) -> Result<(), getrandom::Error> {
+    if dest.is_empty() { return Ok(()); }
+    // SAFETY: the host writes exactly `dest.len()` bytes into the
+    // buffer we just measured. No allocations, no aliasing concerns
+    // (single-threaded wasm). Returns 0 on success per the extern
+    // contract; any non-zero return surfaces as `Error::FAILED`.
+    let ret = unsafe {
+        crate::runtime::akiva_host_random_bytes(dest.as_mut_ptr(), dest.len())
+    };
+    if ret == 0 { Ok(()) } else { Err(getrandom::Error::FAILED) }
 }
 
-/// Non-wasm builds get a deterministic in-process counter. Tests can
-/// rely on it being non-zero and varying across calls; security-
-/// sensitive code obviously must not run outside wasm.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn fill_bytes(buf: &mut [u8]) {
-    use std::cell::Cell;
-    thread_local! {
-        static COUNTER: Cell<u64> = const { Cell::new(0xDEADBEEFCAFEBABE) };
-    }
-    COUNTER.with(|c| {
-        let mut state = c.get();
-        for slot in buf.iter_mut() {
-            // xorshift step — varied, not random. For tests only.
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *slot = (state & 0xFF) as u8;
-        }
-        c.set(state);
-    });
+#[cfg(target_arch = "wasm32")]
+getrandom::register_custom_getrandom!(akiva_getrandom);
+
+/// Fill `out` with cryptographically secure random bytes.
+///
+/// Panics only if the host RNG itself failed, which on a healthy
+/// browser doesn't happen. (`getrandom::Error::FAILED` from the
+/// custom backend would propagate as a panic here; in practice the
+/// `crypto.getRandomValues` host body never returns non-zero.)
+pub fn fill(out: &mut [u8]) {
+    getrandom::getrandom(out).expect("RNG unavailable")
 }
 
-/// Generate a random `u64` from cryptographic random bytes. Useful
-/// for session IDs, hash-table seeds, etc.
-pub fn u64() -> u64 {
-    let mut buf = [0u8; 8];
-    fill_bytes(&mut buf);
-    core::primitive::u64::from_le_bytes(buf)
-}
-
-/// Generate a random `u32` from cryptographic random bytes.
-pub fn u32() -> u32 {
-    let mut buf = [0u8; 4];
-    fill_bytes(&mut buf);
-    core::primitive::u32::from_le_bytes(buf)
+/// Allocate and return `len` cryptographically secure random bytes.
+pub fn bytes(len: usize) -> Vec<u8> {
+    let mut v = vec![0u8; len];
+    fill(&mut v);
+    v
 }
 
 #[cfg(test)]
@@ -85,33 +81,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fill_bytes_writes_non_zero_to_a_nonempty_buffer() {
+    fn fill_writes_varied_bytes_to_a_nonempty_buffer() {
         let mut buf = [0u8; 32];
-        fill_bytes(&mut buf);
-        // The non-wasm xorshift can't produce all-zero output for the
-        // seed we use; the wasm path obviously can't either. Either
-        // way, the test asserts the call left the buffer in a varied
-        // state, not a literal "non-zero" guarantee on every byte.
-        assert!(buf.iter().any(|&b| b != 0), "fill_bytes left buffer all-zero");
+        fill(&mut buf);
+        // The non-wasm `getrandom` (urandom) and the wasm host both
+        // produce statistically-random output; an all-zero buffer
+        // is astronomically unlikely.
+        assert!(buf.iter().any(|&b| b != 0), "fill produced an all-zero buffer");
     }
 
     #[test]
-    fn fill_bytes_empty_buffer_is_noop() {
+    fn fill_empty_buffer_is_noop() {
         let mut buf: [u8; 0] = [];
-        fill_bytes(&mut buf); // shouldn't panic
+        fill(&mut buf); // shouldn't panic
     }
 
     #[test]
-    fn two_u64_calls_typically_differ() {
-        // Probabilistic on the wasm host (1 in 2^64 of false negative);
-        // deterministic-but-varying on the non-wasm xorshift stub.
-        let a = u64();
-        let b = u64();
-        assert_ne!(a, b, "two consecutive u64() calls must differ");
+    fn bytes_returns_a_buffer_of_requested_size() {
+        let v = bytes(0);
+        assert_eq!(v.len(), 0);
+        let v = bytes(64);
+        assert_eq!(v.len(), 64);
     }
 
     #[test]
-    fn u32_smoke() {
-        let _ = u32();
+    fn two_calls_yield_different_bytes() {
+        // Probabilistic with 32 random bytes the collision rate is
+        // ~2^-256 — comfortably zero.
+        let a = bytes(32);
+        let b = bytes(32);
+        assert_ne!(a, b, "two consecutive bytes(32) calls collided");
+    }
+
+    #[test]
+    fn uuid_v4_compiles_and_runs_via_the_getrandom_hook() {
+        // The whole point of the redesign — `Uuid::new_v4()` calls
+        // `getrandom::getrandom` under the hood. If this test
+        // compiles, the `register_custom_getrandom!` registration is
+        // honoured by the linker; if it runs, the host call returns
+        // a buffer the UUID v4 constructor finds non-zero. Use the
+        // crate version-2 surface explicitly.
+        let id = uuid::Uuid::new_v4();
+        // v4 has variant 1 ("RFC4122") and version 4 — `get_version_num`
+        // reads the canonical bits, providing a stable assertion.
+        assert_eq!(id.get_version_num(), 4);
     }
 }

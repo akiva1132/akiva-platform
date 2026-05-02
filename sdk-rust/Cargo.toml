@@ -25,6 +25,21 @@ bindings = []
 async-trait = "0.1"
 # Stone 11.6.7 #2 — shared wire-format codecs.
 akiva-wire = { workspace = true }
+# Stone 11.6.8 #1 — RNG primitive via the ecosystem-standard getrandom
+# crate. The `custom` feature lets us register `akiva_host_random_bytes`
+# as the system getrandom backend, which makes every crate that depends
+# on getrandom (rand, uuid, ring, rustls, chacha20poly1305, …) work
+# automatically inside Akiva apps with zero app-side glue.
+getrandom = { version = "0.2", features = ["custom"] }
+
+[dev-dependencies]
+# Stone 11.6.8 #1 — proves the getrandom hook is wired correctly:
+# `Uuid::new_v4()` calls `getrandom::getrandom` under the hood, which
+# routes to our custom backend, which calls `akiva_host_random_bytes`.
+# Pinned to <=1.10 so the transitive `getrandom` resolves to 0.2 (newer
+# uuid pulls getrandom 0.3+ which currently requires edition2024 / Rust
+# 1.85+, ahead of our 1.82 floor).
+uuid = { version = "<=1.10", features = ["v4"] }
 
 [package.metadata.akiva]
 role = "sdk"

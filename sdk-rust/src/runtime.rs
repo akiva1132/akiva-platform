@@ -68,18 +68,34 @@ extern "C" {
     pub fn akiva_host_fire(op_kind: u32, args_ptr: *const u8, args_len: u32) -> u32;
     pub fn akiva_host_io_start(op_kind: u32, args_ptr: *const u8, args_len: u32) -> u64;
     pub fn akiva_host_io_poll(future_id: u64, out_ptr: *mut u8, out_cap: u32) -> u64;
-    /// Stone 11.6.8 #1 — fill `len` bytes at `out_ptr` with cryptographic
-    /// random data. Maps to `crypto.getRandomValues` in the JS host.
-    /// Ungated — RNG is a primitive, not a capability. Synchronous,
-    /// fast, infallible (the JS host throws only on `len > 65536`,
-    /// which the SDK chunks around).
-    pub fn akiva_host_random_bytes(out_ptr: *mut u8, len: u32);
-    /// Stone 11.6.8 #4 — milliseconds since the UNIX epoch (1970-01-01
-    /// UTC). Wall-clock time. Subject to NTP corrections, manual
-    /// clock changes, daylight savings. For elapsed-time measurements
-    /// use `ctx.timestamp_ms` (monotonic, frame-derived) instead;
-    /// confusing the two is a frequent source of bugs.
-    pub fn akiva_host_wall_clock_ms() -> u64;
+    /// Stone 11.6.8 #1 — fill `len` bytes at `out_ptr` with
+    /// cryptographically secure random data. Maps to
+    /// `crypto.getRandomValues` in the JS host (chunked internally
+    /// around the 64 KiB Web Crypto cap). Returns `0` on success;
+    /// non-zero on failure (in practice never fails). Ungated — RNG
+    /// is a primitive, not a capability.
+    ///
+    /// This signature matches what `getrandom`'s custom-backend
+    /// contract expects of a system entropy source. `crate::random`
+    /// wires it via `register_custom_getrandom!` so every Rust crate
+    /// in the ecosystem (rand, uuid, ring, rustls, …) works in Akiva
+    /// apps without app-side glue.
+    pub fn akiva_host_random_bytes(out_ptr: *mut u8, len: usize) -> u32;
+    /// Stone 11.6.8 #4 — millisecond reading for the requested
+    /// clock. Mirrors POSIX `clock_gettime(clockid_t, ...)`.
+    ///
+    /// `clock_id`:
+    /// - `0` = `Monotonic` — `performance.now()`. Never jumps
+    ///   backward; reference epoch is unspecified (process start in
+    ///   practice). Use for elapsed-time, timeouts.
+    /// - `1` = `RealTime`  — `Date.now()`. Wall-clock time, ms since
+    ///   UNIX epoch. May jump (NTP, DST, manual clock change). Use
+    ///   for user-visible "created at" timestamps.
+    ///
+    /// Single extern with id keeps the ABI extensible — future clock
+    /// types (`ProcessCputimeId`, etc.) won't need a fresh extern
+    /// or an ABI bump for the addition.
+    pub fn akiva_host_clock_ms(clock_id: u32) -> u64;
 }
 
 // ── Side-effect raisers (Stone 9.x; unchanged across P0 #4) ────────────
