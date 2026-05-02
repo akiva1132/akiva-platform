@@ -36,10 +36,12 @@ pub mod io {
     pub const TEXT_WIDTH: u32 = 0x0101;
     /// Args: `[]` -> `pkgs_wire blob`. Gated by QUERY_PACKAGES.
     pub const QUERY_PACKAGES: u32 = 0x0102;
-    /// Args: `[key: utf8...]` -> `Option<bytes>`.
+    /// Args: `[key: utf8...]` -> `[present: u8, value_bytes...]`.
     pub const STORAGE_GET: u32 = 0x0103;
     /// Args: `[key_len: u32 LE | key: utf8... | value: bytes...]` -> `[]`.
     pub const STORAGE_SET: u32 = 0x0104;
+    /// Args: `[key: utf8...]` -> `[]`. Idempotent (missing key = no-op success).
+    pub const STORAGE_DELETE: u32 = 0x0105;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds. Mirror of
@@ -106,6 +108,7 @@ mod tests {
         assert!(fire::SET_RESULT <= 0x00FF);
         assert!(io::TEXT_WIDTH >= 0x0101 && io::TEXT_WIDTH <= 0x01FF);
         assert!(io::STORAGE_SET >= 0x0101 && io::STORAGE_SET <= 0x01FF);
+        assert!(io::STORAGE_DELETE >= 0x0101 && io::STORAGE_DELETE <= 0x01FF);
         assert_eq!(status::PENDING, 0);
         assert_eq!(status::READY,   1);
         assert_eq!(status::ERROR,   2);

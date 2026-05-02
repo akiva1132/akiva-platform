@@ -734,6 +734,84 @@ export class AppRegistry {
   }
 
   /**
+   * Stone 11.6 — namespace a user-supplied key under the package's
+   * sandbox prefix. The kernel-worker's `Storage` is a flat KV map
+   * (no path traversal possible — keys are opaque strings — but
+   * an unprefixed key would still collide across packages, and
+   * inspecting OPFS for support would lump everyone into one map).
+   *
+   * Choice of prefix: `pkgs/{package_id}/{user_key}`. Same shape
+   * as `packages/...` reserved for app wasm + manifest, but in a
+   * sibling namespace to keep the install side unambiguous.
+   *
+   * Reserved characters in `package_id` (none — it's UTF-8 from a
+   * manifest field that PackageManager validates) plus the `/`
+   * separator pin a unique prefix; any user key is appended as-is.
+   */
+  _sandboxKey(packageId, userKey) {
+    return `pkgs/${packageId}/${userKey}`;
+  }
+
+  /**
+   * Stone 11.6 — kernel-side dispatch for the three storage ops.
+   * Returns `{ status, payload }` matching the `host_op_done` reply
+   * shape. Empty user key is rejected (the storage layer would
+   * accept it but it's a footgun; SDK already trims trailing
+   * whitespace in the read API).
+   */
+  _dispatchStorage(packageId, opKind, args) {
+    switch (opKind) {
+      case IO.STORAGE_GET: {
+        const key = this._decoder.decode(args);
+        if (key.length === 0) {
+          return { status: STATUS.ERROR, payload: this._encoder.encode("storage: empty key") };
+        }
+        const val = this._storage.get(this._sandboxKey(packageId, key));
+        if (val === null || val === undefined) {
+          // Not found → present:0, no value bytes.
+          return { status: STATUS.READY, payload: new Uint8Array([0]) };
+        }
+        // Found → present:1, then value bytes. 1-byte prefix lets the
+        // SDK distinguish "key absent" from "empty value present"
+        // without paying a 4-byte length prefix.
+        const out = new Uint8Array(1 + val.length);
+        out[0] = 1;
+        out.set(val, 1);
+        return { status: STATUS.READY, payload: out };
+      }
+      case IO.STORAGE_SET: {
+        if (args.length < 4) {
+          return { status: STATUS.ERROR, payload: this._encoder.encode("storage: set args truncated") };
+        }
+        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+        const keyLen = view.getUint32(0, true);
+        if (keyLen === 0 || 4 + keyLen > args.length) {
+          return { status: STATUS.ERROR, payload: this._encoder.encode("storage: bad key length") };
+        }
+        const key = this._decoder.decode(args.subarray(4, 4 + keyLen));
+        const value = args.slice(4 + keyLen);
+        const rc = this._storage.set(this._sandboxKey(packageId, key), value);
+        if (rc !== 0) {
+          return { status: STATUS.ERROR, payload: this._encoder.encode(`storage: set rc=${rc}`) };
+        }
+        return { status: STATUS.READY, payload: new Uint8Array(0) };
+      }
+      case IO.STORAGE_DELETE: {
+        const key = this._decoder.decode(args);
+        if (key.length === 0) {
+          return { status: STATUS.ERROR, payload: this._encoder.encode("storage: empty key") };
+        }
+        // Idempotent: storage.delete on a missing key returns SR_OK
+        // already (see runtime/web/storage.js).
+        this._storage.delete(this._sandboxKey(packageId, key));
+        return { status: STATUS.READY, payload: new Uint8Array(0) };
+      }
+      default:
+        return { status: STATUS.ERROR, payload: this._encoder.encode(`storage: unknown op_kind 0x${opKind.toString(16)}`) };
+    }
+  }
+
+  /**
    * Stone 11.4c-3 — resolve a `host_op` request raised by an app
    * worker that needed a kernel-served io op (QUERY_PACKAGES,
    * STORAGE_GET, STORAGE_SET). Capability gating happens here
@@ -762,14 +840,17 @@ export class AppRegistry {
         break;
       }
       case IO.STORAGE_GET:
-      case IO.STORAGE_SET: {
+      case IO.STORAGE_SET:
+      case IO.STORAGE_DELETE: {
         if (!this._hasGrant(packageId, "akiva.permission.STORAGE_SANDBOX")) {
           this._log("warn", `[${packageId}] host_op STORAGE_*: denied — no STORAGE_SANDBOX grant`);
           status = STATUS.ERROR;
           break;
         }
-        // Stone 11.6 wires the actual handler. Until then, ERROR.
-        status = STATUS.ERROR;
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        const result = this._dispatchStorage(packageId, msg.op_kind, args);
+        status = result.status;
+        payload = result.payload;
         break;
       }
       default:

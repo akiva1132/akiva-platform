@@ -29,6 +29,7 @@ export const IO = Object.freeze({
   QUERY_PACKAGES: 0x0102,
   STORAGE_GET:    0x0103,
   STORAGE_SET:    0x0104,
+  STORAGE_DELETE: 0x0105,
 });
 
 // Stone 11.4b — host→app dispatch op kinds. Mirror of

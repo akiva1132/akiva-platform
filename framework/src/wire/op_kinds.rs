@@ -66,16 +66,42 @@ pub mod io {
     /// `akiva.permission.QUERY_PACKAGES`).
     pub const QUERY_PACKAGES: u32 = 0x0102;
 
-    /// Args: `(key: &str) -> Option<Vec<u8>>`. Read from the package's
-    /// sandboxed key/value store. Stone 11.6 lifts this onto OPFS
-    /// readonly handles in the app worker; in 11.3 it still routes
-    /// through the kernel.
+    /// Storage GET. Read from the package's sandboxed key/value
+    /// store. The host namespaces every user-supplied key under
+    /// `pkgs/{package_id}/` so apps can't see each other's data.
+    ///
+    /// Args:   `[key_bytes: utf8...]` (the whole args buffer is the
+    ///         key — no length prefix needed because the caller
+    ///         already supplies the byte length).
+    /// Result: `[present: u8, value_bytes...]` where `present` is
+    ///         `1` when the key existed (value follows, possibly
+    ///         empty) and `0` for "not found" (no value bytes).
+    ///         Error blob carries a UTF-8 reason on STATUS::ERROR
+    ///         (typically a quota/IO failure or empty-key reject).
+    ///
+    /// Stone 11.6 wires the kernel-routed handler. A future
+    /// optimization will hand readonly OPFS handles directly to
+    /// the app-worker so reads skip the round-trip; writes always
+    /// proxy through the kernel for single-writer discipline.
     pub const STORAGE_GET: u32 = 0x0103;
 
-    /// Args: `(key: &str, value: &[u8]) -> ()`. Write to the package's
-    /// sandboxed store. Always routed through the kernel (single
-    /// writer per OPFS handle).
+    /// Storage SET. Write to the package's sandboxed store.
+    ///
+    /// Args:   `[key_len: u32 LE, key_bytes..., value_bytes...]`.
+    ///         Length-prefixed key because the value can be any
+    ///         bytes (no separator is safe). Empty key is rejected.
+    /// Result: empty payload on success (STATUS::READY, len=0).
+    ///         Error blob carries a UTF-8 reason on STATUS::ERROR.
     pub const STORAGE_SET: u32 = 0x0104;
+
+    /// Storage DELETE. Remove a key from the package's sandboxed
+    /// store. Idempotent — deleting a missing key is a no-op
+    /// success (the SDK doesn't surface a "not present" failure
+    /// because the user's intent was "make sure it's gone").
+    ///
+    /// Args:   `[key_bytes: utf8...]`. Same shape as STORAGE_GET.
+    /// Result: empty (STATUS::READY).
+    pub const STORAGE_DELETE: u32 = 0x0105;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds.
@@ -184,7 +210,8 @@ mod tests {
             fire::START_ACTIVITY_FOR_RESULT, fire::SET_RESULT,
         ];
         let io = [
-            io::TEXT_WIDTH, io::QUERY_PACKAGES, io::STORAGE_GET, io::STORAGE_SET,
+            io::TEXT_WIDTH, io::QUERY_PACKAGES,
+            io::STORAGE_GET, io::STORAGE_SET, io::STORAGE_DELETE,
         ];
         for k in fire { assert!((0x0001..=0x00FF).contains(&k), "fire op {k:#x} out of range"); }
         for k in io   { assert!((0x0101..=0x01FF).contains(&k), "io op {k:#x} out of range"); }
@@ -207,7 +234,8 @@ mod tests {
             }
         }
         let io = [
-            io::TEXT_WIDTH, io::QUERY_PACKAGES, io::STORAGE_GET, io::STORAGE_SET,
+            io::TEXT_WIDTH, io::QUERY_PACKAGES,
+            io::STORAGE_GET, io::STORAGE_SET, io::STORAGE_DELETE,
         ];
         for (i, a) in io.iter().enumerate() {
             for b in &io[i + 1..] {
@@ -234,6 +262,7 @@ mod tests {
         assert_eq!(io::QUERY_PACKAGES,              sdk::io::QUERY_PACKAGES);
         assert_eq!(io::STORAGE_GET,                 sdk::io::STORAGE_GET);
         assert_eq!(io::STORAGE_SET,                 sdk::io::STORAGE_SET);
+        assert_eq!(io::STORAGE_DELETE,              sdk::io::STORAGE_DELETE);
         assert_eq!(status::PENDING,                 sdk::status::PENDING);
         assert_eq!(status::READY,                   sdk::status::READY);
         assert_eq!(status::ERROR,                   sdk::status::ERROR);

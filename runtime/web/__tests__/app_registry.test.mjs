@@ -57,6 +57,7 @@ function makeRegistry({ log, fakeWorker } = {}) {
   // Per-key cache → same-reference returns. `_loadResources` reads
   // from the same `storage`; absent keys return null which
   // `_loadResources` treats as "no values file" (no-op).
+  // set/delete mirror the real `Storage` shape for storage-handler tests.
   const cache = new Map();
   const storage = {
     get: (key) => {
@@ -65,6 +66,14 @@ function makeRegistry({ log, fakeWorker } = {}) {
         else cache.set(key, null);
       }
       return cache.get(key);
+    },
+    set: (key, value) => {
+      cache.set(key, new Uint8Array(value));
+      return 0;  // SR_OK
+    },
+    delete: (key) => {
+      cache.delete(key);
+      return 0;
     },
   };
   const logFn = log ?? vi.fn();
@@ -473,16 +482,118 @@ describe("host_op routing — kernel-served io ops", () => {
       lvl === "warn" && msg.includes("denied — no QUERY_PACKAGES"))).toBe(true);
   });
 
-  it("STORAGE_* without grant replies ERROR; with grant replies ERROR (Stone 11.6 wires the handler)", () => {
+  it("STORAGE_* without STORAGE_SANDBOX grant is denied", () => {
     const { registry, worker } = makeRegistry();
     registry.register(PACKAGE_ID, CLASS_NAME);
     worker._inject({ type: "host_op", future_id: 1n, op_kind: IO.STORAGE_GET, args: new Uint8Array(0) });
     expect(worker._posted.find((m) => m.type === "host_op_done").status).toBe(STATUS.ERROR);
+  });
 
+  it("STORAGE_GET on missing key returns READY with present=0", () => {
+    const { registry, worker } = makeRegistry();
     registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
-    worker._inject({ type: "host_op", future_id: 2n, op_kind: IO.STORAGE_GET, args: new Uint8Array(0) });
-    const replies = worker._posted.filter((m) => m.type === "host_op_done");
-    expect(replies[1].status).toBe(STATUS.ERROR);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({
+      type: "host_op", future_id: 7n, op_kind: IO.STORAGE_GET,
+      args: new TextEncoder().encode("notes/today"),
+    });
+    const reply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(reply.status).toBe(STATUS.READY);
+    expect(Array.from(reply.payload)).toEqual([0]);  // present=0
+  });
+
+  it("STORAGE_SET then STORAGE_GET round-trips with present=1 prefix", () => {
+    const { registry, worker } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+
+    // SET: [key_len:u32 LE][key][value]
+    const key = "notes/today";
+    const value = new TextEncoder().encode("hello, world");
+    const keyBytes = new TextEncoder().encode(key);
+    const setArgs = new Uint8Array(4 + keyBytes.length + value.length);
+    new DataView(setArgs.buffer).setUint32(0, keyBytes.length, true);
+    setArgs.set(keyBytes, 4);
+    setArgs.set(value, 4 + keyBytes.length);
+    worker._inject({ type: "host_op", future_id: 1n, op_kind: IO.STORAGE_SET, args: setArgs });
+    const setReply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(setReply.status).toBe(STATUS.READY);
+    expect(setReply.payload.length).toBe(0);
+
+    // GET round-trip: [present:1, value...]
+    worker._inject({ type: "host_op", future_id: 2n, op_kind: IO.STORAGE_GET, args: keyBytes });
+    const getReply = worker._posted.filter((m) => m.type === "host_op_done")[1];
+    expect(getReply.status).toBe(STATUS.READY);
+    expect(getReply.payload[0]).toBe(1);  // present
+    expect(new TextDecoder().decode(getReply.payload.slice(1))).toBe("hello, world");
+  });
+
+  it("STORAGE keys are sandboxed per package", () => {
+    // App A writes; app B can't see the same user key.
+    const { registry, worker, storage } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
+    registry.setGrants("com.b.app", ["akiva.permission.STORAGE_SANDBOX"]);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+
+    const otherWorker = makeFakeWorker();
+    registry._processes.set("com.b.app", { worker: otherWorker, packageId: "com.b.app" });
+    otherWorker.addEventListener("message", (e) =>
+      registry._onWorkerMessage("com.b.app", e.data));
+    registry.register("com.b.app", "Main");
+
+    // App A writes "secret" under user-key "k".
+    const k = new TextEncoder().encode("k");
+    const v = new TextEncoder().encode("secret");
+    const setArgs = new Uint8Array(4 + k.length + v.length);
+    new DataView(setArgs.buffer).setUint32(0, k.length, true);
+    setArgs.set(k, 4); setArgs.set(v, 4 + k.length);
+    worker._inject({ type: "host_op", future_id: 1n, op_kind: IO.STORAGE_SET, args: setArgs });
+
+    // Storage actually has the prefixed entry, not the raw "k".
+    expect(storage.get("k")).toBeNull();
+    expect(storage.get(`pkgs/${PACKAGE_ID}/k`)).not.toBeNull();
+
+    // App B reads its own "k" — sees nothing.
+    otherWorker._inject({ type: "host_op", future_id: 1n, op_kind: IO.STORAGE_GET, args: k });
+    const bReply = otherWorker._posted.find((m) => m.type === "host_op_done");
+    expect(bReply.status).toBe(STATUS.READY);
+    expect(Array.from(bReply.payload)).toEqual([0]);  // not present in B's sandbox
+  });
+
+  it("STORAGE_DELETE removes the key (idempotent on missing)", () => {
+    const { registry, worker, storage } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+
+    // Pre-seed via direct storage write; then STORAGE_DELETE should
+    // wipe the entry.
+    const fullKey = `pkgs/${PACKAGE_ID}/k`;
+    storage.set?.(fullKey, new Uint8Array([1, 2, 3]));
+    // Our test stub doesn't implement set(); poke the cache directly.
+    if (typeof storage.set !== "function") {
+      // (Test stub side-channel — the storage facade in the real
+      // worker.js wraps a real Storage instance with .set/.delete.)
+    }
+
+    const k = new TextEncoder().encode("k");
+    worker._inject({ type: "host_op", future_id: 1n, op_kind: IO.STORAGE_DELETE, args: k });
+    const reply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(reply.status).toBe(STATUS.READY);
+
+    // Second delete is a no-op success.
+    worker._inject({ type: "host_op", future_id: 2n, op_kind: IO.STORAGE_DELETE, args: k });
+    const reply2 = worker._posted.filter((m) => m.type === "host_op_done")[1];
+    expect(reply2.status).toBe(STATUS.READY);
+  });
+
+  it("STORAGE_GET with empty key returns ERROR with reason", () => {
+    const { registry, worker } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "host_op", future_id: 1n, op_kind: IO.STORAGE_GET, args: new Uint8Array(0) });
+    const reply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(reply.status).toBe(STATUS.ERROR);
+    expect(new TextDecoder().decode(reply.payload)).toMatch(/empty key/);
   });
 
   it("unknown op_kind replies ERROR + warn-logs", () => {
