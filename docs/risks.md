@@ -52,7 +52,7 @@ The `research-component-model.md` memo deferred the migration to v0.4+. Meanwhil
 
 **Fix in place.** [`docs/abi.md` §1.2](abi.md) now defines an in-scope / out-of-scope split (extern signatures, op_kind constants, status codes, wire layouts, capabilities, public `MAX_*_BYTES` are in; SDK Rust ergonomics, internal kernel logic, runtime/web JS internals, docs are out), PATCH/MINOR/MAJOR bump rules, 1.0 promotion criteria (Phase 11+12+13 exit criteria all met, three third-party apps survived a `MINOR` bump, WIT migration plan in writing, full CHANGELOG, public docs marked frozen), and a review process. New [`CHANGELOG.md`](../CHANGELOG.md) at repo root tracks every bump from `0.1.0` forward.
 
-**ABI bumped to `0.3.0`** as part of Stone 11.6.8 (additive: + `akiva_host_random_bytes`, + `akiva_host_wall_clock_ms`, + `STATUS_BUSY = 3`).
+**ABI bumped to `0.3.0`** as part of Stone 11.6.8 (additive: + `akiva_host_random_bytes`, + `akiva_host_clock_ms`, + `STATUS_BUSY = 3`).
 
 ---
 
@@ -281,7 +281,7 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Was.** `grep -nE "rand|getRandomValues" sdk-rust/` returned nothing. The SDK exposed no host import for entropy. Wasm itself has no source of randomness. Apps that needed crypto, UUIDs, session tokens, password salts, or anti-CSRF nonces had nowhere to go.
 
-**Fix in place.** New `akiva_host_random_bytes(out_ptr, len)` extern, mapped to `crypto.getRandomValues` in [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js) with internal chunking around the 64 KiB Web Crypto cap. New [`sdk-rust/src/random.rs`](../sdk-rust/src/random.rs) module — `fill_bytes(&mut [u8])`, `u64()`, `u32()`. Ungated. Non-wasm builds get a deterministic xorshift fallback for unit tests; security-sensitive code obviously must not run there.
+**Fix in place.** New `akiva_host_random_bytes(out_ptr: *mut u8, len: usize) -> u32` extern, mapped to `crypto.getRandomValues` in [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js). The key design decision: instead of a standalone `akiva_sdk::random` module that only apps aware of it would use, the extern is wired as a `getrandom` v0.2 custom backend via `register_custom_getrandom!`. This means the entire Rust ecosystem — `rand`, `uuid`, `ring`, `rustls`, `chacha20poly1305` — works in Akiva apps without any app-side change. `akiva_sdk::random::{fill, bytes}` are thin convenience wrappers over `getrandom::getrandom`. Ungated (RNG is a primitive, not a resource).
 
 ### 7.16 ✅ Backpressure cap on concurrent in-flight dispatches — fixed (Stone 11.6.8 #2, May 2026)
 
@@ -306,7 +306,7 @@ Custom (not embassy-sync) — single-threaded wasm doesn't need cross-thread ato
 
 **Was.** `ctx.timestamp_ms` is monotonic (frame-based, derived from the host's `performance.now()`). There was no wall-clock import. An app writing a note and wanting to stamp it "created at 2026-05-02 14:32" had nowhere to fetch the wall time.
 
-**Fix in place.** New extern `akiva_host_wall_clock_ms() -> u64` mapped to `Date.now()` in [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js). New [`sdk-rust/src/clock.rs`](../sdk-rust/src/clock.rs) module with `wall_clock_ms() -> u64` and a doc-comment table that contrasts wall vs. monotonic time so callers don't confuse them. Ungated (time is a primitive). Non-wasm builds use `SystemTime::now()` so unit tests pass on the developer machine.
+**Fix in place.** Single new extern `akiva_host_clock_ms(clock_id: u32) -> u64` mapped to `performance.now()` (id=0) or `Date.now()` (id=1) in [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js). New [`sdk-rust/src/clock.rs`](../sdk-rust/src/clock.rs) with a `ClockId` enum (`Monotonic = 0`, `RealTime = 1`) and `clock_gettime_ms(id: ClockId) -> u64` — a direct mirror of POSIX `clock_gettime(clockid_t, ...)`. The single-extern-with-id design keeps the ABI extensible (future clock types such as `ProcessCputimeId` can be added without a new extern). A doc-comment table explicitly contrasts `Monotonic` with `ctx.timestamp_ms` (frame-stable, not a host call). Ungated. Non-wasm builds delegate to `std::time` so unit tests run on the developer machine.
 
 ---
 

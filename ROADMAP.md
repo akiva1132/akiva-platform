@@ -824,39 +824,58 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 **למה לא קודם.** ה-5 פערים נסתרים — לא מתבטאים ב-tests של 4 ה-MVP apps (calc, hello, tic-tac-toe, infinite-loop). הם נחשפים רק כש-app אמיתי כותב code שמשתמש ב-crypto, או רוצה לדעת איזה תאריך היום, או צריך 2 spawned tasks לתאם ביניהן. May 2026 audit פוסט-11.6.7 חשף את כולם.
 
-#### פריט 1 — CSPRNG / entropy host import (~30 דק')
+#### פריט 1 — CSPRNG / entropy: getrandom custom hook (~45 דק')
 
-**הבעיה.** ב-`grep -nE "rand|getRandomValues" sdk-rust/`: אין שום thing. אין לאפליקציה דרך לקבל bytes אקראיים. wasm לבד אין לו entropy — כל crypto, UUID generation, session token, password salt, anti-CSRF — חסום. iOS, Android, Linux כולם חושפים primitive זה ungated (זה לא reflection של privacy, זה primitive נחוץ).
+**הבעיה.** ב-`grep -nE "rand|getRandomValues" sdk-rust/`: אין שום thing. אין לאפליקציה דרך לקבל bytes אקראיים. wasm לבד אין לו entropy — כל crypto, UUID generation, session token, password salt, anti-CSRF — חסום. iOS, Android, Linux כולם חושפים primitive זה ungated.
+
+**גישה: `getrandom` custom hook — לא module עצמאי.**
+הcrate `getrandom` הוא ה-primitive שעליו כל ה-Rust ecosystem מסתמך: `rand`, `uuid`, `ring`, `rustls`, `chacha20poly1305` — כולם קוראים ל-`getrandom::getrandom` תחת המכסה. במקום לבנות `akiva_sdk::random` שרק apps שמכירים אותו ישתמשו בו, מממשים את ה-`getrandom` custom backend — ואז כל ה-crates האלה עובדים אוטומטית בלי שה-app developer צריך לדעת על ה-ABI.
 
 **Implementation.**
+- `sdk-rust/Cargo.toml`: הוסף `getrandom = { version = "0.2", features = ["custom"] }`.
 - New host import ב-[`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs):
   ```rust
   extern "C" {
-      fn akiva_host_random_bytes(out_ptr: *mut u8, len: u32);
+      /// Fills [out_ptr, out_ptr+len) with cryptographically secure random bytes.
+      /// Backed by crypto.getRandomValues on the JS side.
+      /// Returns 0 on success, non-zero on failure (in practice never fails).
+      fn akiva_host_random_bytes(out_ptr: *mut u8, len: usize) -> u32;
   }
   ```
-- חדש module `sdk-rust/src/random.rs`:
+- חדש `sdk-rust/src/random.rs` — מממש את ה-custom backend ומוציא thin wrappers:
   ```rust
-  pub fn fill_random(out: &mut [u8]) {
-      unsafe { akiva_host_random_bytes(out.as_mut_ptr(), out.len() as u32); }
+  use getrandom::register_custom_getrandom;
+
+  fn akiva_getrandom(dest: &mut [u8]) -> Result<(), getrandom::Error> {
+      let ret = unsafe { crate::runtime::akiva_host_random_bytes(dest.as_mut_ptr(), dest.len()) };
+      if ret == 0 { Ok(()) } else { Err(getrandom::Error::FAILED) }
   }
-  pub fn random_bytes(len: usize) -> Vec<u8> {
-      let mut v = vec![0u8; len];
-      fill_random(&mut v);
-      v
+  register_custom_getrandom!(akiva_getrandom);
+
+  /// Fills `out` with cryptographically secure random bytes.
+  pub fn fill(out: &mut [u8]) { getrandom::getrandom(out).expect("RNG unavailable") }
+
+  /// Returns `len` cryptographically secure random bytes.
+  pub fn bytes(len: usize) -> Vec<u8> { let mut v = vec![0u8; len]; fill(&mut v); v }
+  ```
+- JS-side ב-[`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js):
+  ```js
+  akiva_host_random_bytes: (ptr, len) => {
+      crypto.getRandomValues(new Uint8Array(instance.exports.memory.buffer, ptr, len));
+      return 0;
   }
   ```
-- JS-side ב-[`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js): ה-import ממולא ע"י `crypto.getRandomValues(new Uint8Array(memory.buffer, ptr, len))`.
 - **No capability gate** — RNG הוא primitive, לא resource. תיעוד מפורש ב-`docs/abi.md` שזה ungated.
-- אין op_kind ב-fire/io_start — הוא extern נפרד כי הוא sync write לwasm memory ב-call יחיד (לא matches ל-fire pattern של "args in, status out").
+- **Side effect:** `rand::random::<u64>()`, `uuid::Uuid::new_v4()`, כל crate שמשתמש ב-`getrandom` — עובד מעכשיו ב-Akiva apps ללא שינוי נוסף.
 
 **DoD.**
-- [ ] `let mut buf = [0u8; 32]; random::fill_random(&mut buf);` ממלא 32 bytes.
-- [ ] שתי קריאות → ה-bytes שונים (test עם seed-not-fixed ב-mock JS).
+- [ ] `let mut buf = [0u8; 32]; random::fill(&mut buf);` ממלא 32 bytes.
+- [ ] שתי קריאות → ה-bytes שונים (probabilistic; test עם מספיק bytes שה-collision probability < 2⁻⁶⁴).
+- [ ] `uuid = "1"` כ-dev-dependency ב-sdk-rust: `Uuid::new_v4()` מקמפל ורץ ללא כל שינוי.
 - [ ] vitest: mock `crypto.getRandomValues` שמחזיר predictable bytes; assert ה-wasm memory מכיל את ה-bytes.
-- [ ] doc-test ב-`random.rs`: דוגמת UUID generation ב-`/// # Examples`.
+- [ ] doc-test ב-`random.rs`: דוגמת `Uuid::new_v4()` ב-`/// # Examples`.
 
-**Code surfaces.** [`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs) (extern), `sdk-rust/src/random.rs` (חדש), [`sdk-rust/src/lib.rs`](sdk-rust/src/lib.rs) (re-export `pub mod random`), [`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js) (host import body), [`docs/abi.md`](docs/abi.md) (תיעוד ב-§ ה-imports).
+**Code surfaces.** [`sdk-rust/Cargo.toml`](sdk-rust/Cargo.toml) (getrandom dep), [`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs) (extern), `sdk-rust/src/random.rs` (חדש), [`sdk-rust/src/lib.rs`](sdk-rust/src/lib.rs) (re-export `pub mod random`), [`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js) (host import body), [`docs/abi.md`](docs/abi.md) (תיעוד ב-§ ה-imports).
 
 #### פריט 2 — `MAX_PENDING_PER_SLOT` bound (~30 דק')
 
@@ -942,36 +961,60 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 **Code surfaces.** New: `sdk-rust/src/sync/{mod.rs, channel.rs, mutex.rs, signal.rs}`. Updated: [`sdk-rust/src/lib.rs`](sdk-rust/src/lib.rs) (re-export), [`sdk-rust/src/executor.rs`](sdk-rust/src/executor.rs) (waker registration helper if needed).
 
-#### פריט 4 — Wall-clock time host import (~30 דק')
+#### פריט 4 — `clock_gettime_ms(ClockId)` — שני clock types כמו POSIX (~45 דק')
 
-**הבעיה.** `ctx.timestamp_ms` הוא monotonic (frame timestamp). App שכותב note ורוצה לסמן "נוצר ב-2026-05-02 14:32" — אין מאיפה לקחת. ב-OS אמיתי שני clock-types נחשפים (CLOCK_MONOTONIC + CLOCK_REALTIME). Akiva חושף רק monotonic.
+**הבעיה.** `ctx.timestamp_ms` הוא monotonic frame-timestamp (קפוא לאורך ה-frame). אין שעה אמיתית. ב-OS אמיתי קיימים שני clock types נפרדים: `CLOCK_MONOTONIC` (לא קופץ לאחור, למדידת elapsed time) ו-`CLOCK_REALTIME` (שעון קיר, לsignposting הודעות, timestamps למשתמש). הם לא ניתנים להחלפה — ו-POSIX מאז 1993 לא מנסה לאחד אותם.
+
+**גישה: extern יחיד עם `clock_id` param — מקביל לPOSIX `clock_gettime(clockid_t, ...)`.**
+במקום שני imports נפרדים, extern אחד שמקבל clock ID מספרי. זה extensible (אפשר להוסיף `CLOCK_PROCESS_CPUTIME_ID` בעתיד בלי ABI bump) ומירור נאמן של POSIX.
 
 **Implementation.**
-- New host import:
+- New host import ב-[`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs):
   ```rust
-  extern "C" { fn akiva_host_wall_clock_ms() -> u64; }
+  extern "C" {
+      /// Returns milliseconds for the requested clock.
+      /// clock_id 0 = MONOTONIC (performance.now()), 1 = REALTIME (Date.now()).
+      fn akiva_host_clock_ms(clock_id: u32) -> u64;
+  }
   ```
 - New module `sdk-rust/src/clock.rs`:
   ```rust
-  /// Wall-clock time in milliseconds since UNIX epoch.
-  /// Subject to NTP corrections, user clock changes, daylight savings.
-  /// For elapsed-time measurements use `ctx.timestamp_ms` instead.
-  pub fn wall_clock_ms() -> u64 {
-      unsafe { akiva_host_wall_clock_ms() }
+  /// Which clock to query. Mirrors POSIX clockid_t.
+  #[repr(u32)]
+  pub enum ClockId {
+      /// Monotonic time since an unspecified epoch (process start).
+      /// Never jumps backward. Use for measuring elapsed time, timeouts.
+      /// Backed by `performance.now()`.
+      Monotonic = 0,
+      /// Wall-clock time in milliseconds since UNIX epoch.
+      /// May jump due to NTP, DST, or manual changes. Use for user-visible timestamps.
+      /// Backed by `Date.now()`.
+      RealTime  = 1,
+  }
+
+  pub fn clock_gettime_ms(id: ClockId) -> u64 {
+      unsafe { crate::runtime::akiva_host_clock_ms(id as u32) }
   }
   ```
-- JS-side: `Date.now()` mapped to BigInt for u64 transport.
-- **No capability gate** — like RNG, time is primitive.
-- תיעוד מפורש ב-doc-comment של ההבדל מ-monotonic (הבדל גדול ש-apps לפעמים מבלבלים).
+- JS-side ב-[`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js):
+  ```js
+  akiva_host_clock_ms: (clockId) => {
+      if (clockId === 0) return BigInt(Math.round(performance.now()));
+      return BigInt(Date.now()); // REALTIME
+  }
+  ```
+- **No capability gate** — time is primitive, ungated like RNG.
+- הבדל מ-`ctx.timestamp_ms`: זה frame-stable (מגיע כ-arg ב-on_render, לא host import), ואין לו ClockId. apps שמדדו elapsed עם `ctx.timestamp_ms` ממשיכים לעשות זאת; `clock_gettime_ms(Monotonic)` הוא call-site-fresh.
 
 **DoD.**
-- [ ] `random::fill_random` returns >0 value.
-- [ ] שתי קריאות סדרתיות: ה-2 ≥ ה-1 (monotonicity של Date.now ב-deltas של ms).
-- [ ] vitest mock: `Date.now` mocked לערך קבוע, app רואה אותו.
-- [ ] doc-test ב-`clock.rs` שמראה note-with-timestamp.
-- [ ] doc note שמסביר את ההבדל מ-`ctx.timestamp_ms` (monotonic, frame-based).
+- [ ] `clock_gettime_ms(ClockId::RealTime)` מחזיר ערך ≥ `2026-01-01` כ-unix ms (> 1_735_689_600_000).
+- [ ] שתי קריאות סדרתיות ל-`RealTime`: ה-2 ≥ ה-1.
+- [ ] `clock_gettime_ms(ClockId::Monotonic)` מחזיר ערך > 0 ועולה בין קריאות.
+- [ ] vitest mock: `Date.now` mocked לערך קבוע, `clockId=1` מחזיר אותו; `performance.now` mocked, `clockId=0` מחזיר אותו.
+- [ ] doc-test ב-`clock.rs` שמראה note-with-timestamp + elapsed-time pattern.
+- [ ] `docs/abi.md` import section: `akiva_host_clock_ms(clock_id: u32) -> u64` עם טבלת clock_id values.
 
-**Code surfaces.** [`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs) (extern), `sdk-rust/src/clock.rs` (חדש), [`sdk-rust/src/lib.rs`](sdk-rust/src/lib.rs) (re-export `pub mod clock`), [`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js) (host import body), [`docs/abi.md`](docs/abi.md) (תיעוד ב-§ ה-imports).
+**Code surfaces.** [`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs) (extern), `sdk-rust/src/clock.rs` (חדש), [`sdk-rust/src/lib.rs`](sdk-rust/src/lib.rs) (re-export `pub mod clock`), [`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js) (host import body), [`docs/abi.md`](docs/abi.md) (§ imports).
 
 #### פריט 5 — ABI versioning policy formalization (~30 דק', no code)
 
@@ -998,7 +1041,7 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 **DoD.**
 - [ ] `docs/abi.md` כולל את ה-policy החדש כ-§1.X (לאחר §1 הקיים, לפני §2).
 - [ ] [`docs/risks.md` §3](docs/risks.md) (JS-side ABI governance) ניתן לסמן ✅ — promoted to abi.md.
-- [ ] [`CHANGELOG.md`](CHANGELOG.md) חדש ב-root עם entry יחיד שמתעד את ה-ABI bumps של 0.1.0 → 0.2.0 (P0 #4 + Stone 11.6.5) + 0.2.0 → 0.3.0 (Stone 11.6.8: + RANDOM, + WALL_CLOCK, + STATUS_BUSY).
+- [ ] [`CHANGELOG.md`](CHANGELOG.md) חדש ב-root עם entry יחיד שמתעד את ה-ABI bumps של 0.1.0 → 0.2.0 (P0 #4 + Stone 11.6.5) + 0.2.0 → 0.3.0 (Stone 11.6.8: + `akiva_host_random_bytes`, + `akiva_host_clock_ms`, + `STATUS_BUSY`).
 - [ ] commit message convention documented: כל commit שמשנה ABI כולל `[ABI: MINOR]` או `[ABI: MAJOR]` ב-subject line.
 
 **Code surfaces.** [`docs/abi.md`](docs/abi.md) (new section), [`CHANGELOG.md`](CHANGELOG.md) (new file ב-root), [`docs/risks.md`](docs/risks.md) §3 (mark resolved).
@@ -1009,7 +1052,7 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 - [ ] ABI bumped ל-`0.3.0` (פריטים 1, 2, 4 הם MINOR additions; פריט 3 הוא pure SDK; פריט 5 הוא תיעוד policy).
 - [ ] cargo test green: 414+ Rust tests + 54+ vitest tests (תוספת של ~12-18 חדשים).
 - [ ] `docs/sdk-rust.md` §19 מעודכן: §19.X חדש לכל primitive חדש (random, clock, sync).
-- [ ] `docs/abi.md` מעודכן: imports list (random_bytes, wall_clock_ms), status codes (BUSY), versioning policy.
+- [ ] `docs/abi.md` מעודכן: imports list (`akiva_host_random_bytes`, `akiva_host_clock_ms` + clock_id table), status codes (BUSY), versioning policy.
 - [ ] `docs/risks.md` §3 (ABI governance) → ✅ resolved.
 
 **הערכת זמן Total:** 1-2 ימי עבודה.
