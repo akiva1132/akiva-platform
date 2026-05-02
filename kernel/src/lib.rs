@@ -229,6 +229,59 @@ impl KernelWasmHost {
         self.future_results.borrow_mut().insert(id, bytes);
         id
     }
+
+    /// Stone 11.4b — single-call helper. Builds nothing extra; just
+    /// hands the encoded payload + cmd_kind to the JS host. The
+    /// caller is responsible for appending its per-cmd args after the
+    /// `[handle: u32 LE]` prefix that every payload starts with.
+    fn dispatch(&self, cmd_kind: u32, payload: &[u8]) -> u64 {
+        // SAFETY: payload is a borrow of caller-owned bytes; the host
+        // copies them into app memory before returning. Ptr can be
+        // null for empty payload — but we never emit empty payloads
+        // (handle is always present), so just pass the slice as-is.
+        unsafe {
+            host::hal_app_dispatch(cmd_kind, payload.as_ptr(), payload.len() as u32)
+        }
+    }
+
+    /// Stone 11.4b — fetch the bytes for a non-zero `future_id`
+    /// returned by [`Self::dispatch`]. Same two-phase buffer
+    /// convention as the legacy `hal_app_render` (start at
+    /// `initial_cap`, retry once if the app produced more).
+    fn fetch_result(&self, future_id: u64, initial_cap: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; initial_cap];
+        let needed = unsafe {
+            host::hal_app_get_result(future_id, buf.as_mut_ptr(), buf.len() as u32)
+        } as usize;
+        if needed > buf.len() {
+            buf = vec![0u8; needed];
+            let got = unsafe {
+                host::hal_app_get_result(future_id, buf.as_mut_ptr(), buf.len() as u32)
+            } as usize;
+            buf.truncate(got.min(buf.len()));
+        } else {
+            buf.truncate(needed);
+        }
+        buf
+    }
+}
+
+/// Stone 11.4b — map [`framework::wasm_activity::LifecycleTransition`]
+/// to its `cmd::*` op kind. The two enums are deliberately off by one
+/// (transition starts at 0, cmd_kind at 0x01) so the `0` sentinel for
+/// future_ids stays unambiguous; spelling the mapping explicitly
+/// keeps it greppable.
+fn cmd_for_lifecycle(t: akiva_framework::wasm_activity::LifecycleTransition) -> u32 {
+    use akiva_framework::wasm_activity::LifecycleTransition::*;
+    use akiva_framework::wire::op_kinds::cmd;
+    match t {
+        Create  => cmd::CREATE,
+        Start   => cmd::START,
+        Resume  => cmd::RESUME,
+        Pause   => cmd::PAUSE,
+        Stop    => cmd::STOP,
+        Destroy => cmd::DESTROY,
+    }
 }
 
 impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
@@ -255,11 +308,17 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         handle: akiva_framework::wasm_activity::AppHandle,
         t: akiva_framework::wasm_activity::LifecycleTransition,
     ) -> u64 {
-        unsafe { host::hal_app_lifecycle(handle.get(), t as u32) }
-        // Stone 11.4a: single-worker — the host ran the wasm app's
-        // export inline before returning. No future to track.
-        // 11.4c flips this to a non-zero `future_id` once the app
-        // lives in a per-package Worker.
+        // Stone 11.4b — every lifecycle transition is just `[handle]`.
+        // CREATE looks identical here; the JS host augments the
+        // payload with the slot's class string (it knows the class
+        // from `register`) before forwarding to `akiva_app_dispatch`.
+        let payload = handle.get().to_le_bytes();
+        let _ = self.dispatch(cmd_for_lifecycle(t), &payload);
+        // Stone 11.4a/b: single-worker — the JS host ran the wasm
+        // export inline before `dispatch` returned. The app's
+        // future_id is always 0 for ack-only ops; we map that to
+        // the framework's `0` sync sentinel. 11.4c flips this when
+        // the app lives in a per-package Worker.
         0
     }
 
@@ -269,16 +328,17 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         ev: fw_act::PointerEvent,
         ts_ms: f64,
     ) -> u64 {
-        unsafe {
-            host::hal_app_pointer(
-                handle.get(),
-                ev.x, ev.y,
-                ev.button as u32,
-                akiva_framework::wasm_activity::pointer_phase_wire(ev.phase),
-                ts_ms,
-            )
-        }
-        // Stone 11.4a sync sentinel — see `lifecycle` doc above.
+        // [handle: u32, x:f32, y:f32, button:u32, phase:u32, ts:f64] = 28 bytes
+        let mut p = [0u8; 28];
+        p[0..4].copy_from_slice(&handle.get().to_le_bytes());
+        p[4..8].copy_from_slice(&ev.x.to_le_bytes());
+        p[8..12].copy_from_slice(&ev.y.to_le_bytes());
+        p[12..16].copy_from_slice(&(ev.button as u32).to_le_bytes());
+        p[16..20].copy_from_slice(
+            &akiva_framework::wasm_activity::pointer_phase_wire(ev.phase).to_le_bytes(),
+        );
+        p[20..28].copy_from_slice(&ts_ms.to_le_bytes());
+        let _ = self.dispatch(akiva_framework::wire::op_kinds::cmd::POINTER, &p);
         0
     }
 
@@ -288,15 +348,16 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         ev: fw_act::KeyEvent,
         ts_ms: f64,
     ) -> u64 {
-        unsafe {
-            host::hal_app_key(
-                handle.get(),
-                ev.code,
-                ev.modifiers as u32,
-                akiva_framework::wasm_activity::key_phase_wire(ev.phase),
-                ts_ms,
-            )
-        }
+        // [handle: u32, code:u32, modifiers:u32, phase:u32, ts:f64] = 24 bytes
+        let mut p = [0u8; 24];
+        p[0..4].copy_from_slice(&handle.get().to_le_bytes());
+        p[4..8].copy_from_slice(&ev.code.to_le_bytes());
+        p[8..12].copy_from_slice(&(ev.modifiers as u32).to_le_bytes());
+        p[12..16].copy_from_slice(
+            &akiva_framework::wasm_activity::key_phase_wire(ev.phase).to_le_bytes(),
+        );
+        p[16..24].copy_from_slice(&ts_ms.to_le_bytes());
+        let _ = self.dispatch(akiva_framework::wire::op_kinds::cmd::KEY, &p);
         0
     }
 
@@ -305,7 +366,13 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         handle: akiva_framework::wasm_activity::AppHandle,
         m: fw_act::SurfaceMetrics,
     ) -> u64 {
-        unsafe { host::hal_app_resize(handle.get(), m.width_px, m.height_px, m.density) }
+        // [handle: u32, width:u32, height:u32, density:f32] = 16 bytes
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&handle.get().to_le_bytes());
+        p[4..8].copy_from_slice(&m.width_px.to_le_bytes());
+        p[8..12].copy_from_slice(&m.height_px.to_le_bytes());
+        p[12..16].copy_from_slice(&m.density.to_le_bytes());
+        let _ = self.dispatch(akiva_framework::wire::op_kinds::cmd::RESIZE, &p);
         0
     }
 
@@ -314,52 +381,44 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         handle: akiva_framework::wasm_activity::AppHandle,
         ts_ms: f64,
     ) -> u64 {
-        // 16 KiB is generous for per-frame paint ops; the retry branch
-        // doubles up if an app ever needs more, at the cost of a second
-        // render. Apps producing huge frames should use layered views
-        // instead of fat single frames.
-        let mut buf = vec![0u8; 16 * 1024];
-        let needed = unsafe {
-            host::hal_app_render(handle.get(), ts_ms, buf.as_mut_ptr(), buf.len() as u32)
-        } as usize;
-        if needed > buf.len() {
-            log::warn(&format!(
-                "app {}: paint buffer too small ({} > {}); retrying",
-                handle.get(), needed, buf.len()
-            ));
-            buf = vec![0u8; needed];
-            let got = unsafe {
-                host::hal_app_render(handle.get(), ts_ms, buf.as_mut_ptr(), buf.len() as u32)
-            } as usize;
-            buf.truncate(got.min(buf.len()));
-        } else {
-            buf.truncate(needed);
+        // [handle: u32, ts:f64] = 12 bytes
+        let mut p = [0u8; 12];
+        p[0..4].copy_from_slice(&handle.get().to_le_bytes());
+        p[4..12].copy_from_slice(&ts_ms.to_le_bytes());
+        let app_future = self.dispatch(akiva_framework::wire::op_kinds::cmd::RENDER, &p);
+        // App-side `0` means "no result bytes" (idle render). Skip the
+        // fetch and tell the framework "no paint stream this frame".
+        if app_future == 0 {
+            return 0;
         }
-        // Idle frame → 0 sentinel. The framework skips the poll and
-        // leaves the caller's FrameCommands untouched.
-        if buf.is_empty() { return 0; }
-        self.alloc_future(buf)
+        // 16 KiB is generous for per-frame paint ops; the retry branch
+        // doubles up if an app ever needs more, at the cost of a
+        // second copy. Apps producing huge frames should use layered
+        // views instead of fat single frames.
+        let bytes = self.fetch_result(app_future, 16 * 1024);
+        // The app may have signalled a non-zero future_id but produced
+        // empty bytes (e.g. canvas-clear-only frame). Treat as idle.
+        if bytes.is_empty() {
+            return 0;
+        }
+        self.alloc_future(bytes)
     }
 
     fn save_state(&self, handle: akiva_framework::wasm_activity::AppHandle) -> u64 {
-        // Start at the typical UI-state size. The framework caps the wire
-        // size at `SavedState::MAX_BYTES` (64 KiB); if the app returns more
-        // we truncate on the way to storage rather than allocating more.
-        let mut buf = vec![0u8; 4 * 1024];
-        let needed = unsafe {
-            host::hal_app_save_state(handle.get(), buf.as_mut_ptr(), buf.len() as u32)
-        } as usize;
-        if needed > buf.len() {
-            buf = vec![0u8; needed];
-            let got = unsafe {
-                host::hal_app_save_state(handle.get(), buf.as_mut_ptr(), buf.len() as u32)
-            } as usize;
-            buf.truncate(got.min(buf.len()));
-        } else {
-            buf.truncate(needed);
+        // [handle: u32] = 4 bytes
+        let payload = handle.get().to_le_bytes();
+        let app_future = self.dispatch(akiva_framework::wire::op_kinds::cmd::SAVE_STATE, &payload);
+        if app_future == 0 {
+            return 0;
         }
-        if buf.is_empty() { return 0; }
-        self.alloc_future(buf)
+        // 4 KiB initial guess matches the legacy `hal_app_save_state`
+        // call; SavedState wire is capped at 64 KiB and the retry
+        // branch handles the larger end.
+        let bytes = self.fetch_result(app_future, 4 * 1024);
+        if bytes.is_empty() {
+            return 0;
+        }
+        self.alloc_future(bytes)
     }
 
     fn restore_state(
@@ -368,16 +427,14 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         bytes: &[u8],
     ) -> u64 {
         if bytes.is_empty() { return 0; }
-        let rc = unsafe {
-            host::hal_app_restore_state(handle.get(), bytes.as_ptr(), bytes.len() as u32)
-        };
-        if rc != 0 {
-            log::warn(&format!(
-                "app {}: restore_state returned {} (handle miss or host copy failed)",
-                handle.get(), rc
-            ));
-        }
-        // Sync sentinel: hal_app_restore_state runs the app inline.
+        // [handle: u32, state: bytes...]
+        let mut payload = Vec::with_capacity(4 + bytes.len());
+        payload.extend_from_slice(&handle.get().to_le_bytes());
+        payload.extend_from_slice(bytes);
+        let _ = self.dispatch(
+            akiva_framework::wire::op_kinds::cmd::RESTORE_STATE,
+            &payload,
+        );
         0
     }
 
@@ -428,15 +485,14 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         bytes: &[u8],
     ) -> u64 {
         if bytes.is_empty() { return 0; }
-        let rc = unsafe {
-            host::hal_app_new_intent(handle.get(), bytes.as_ptr(), bytes.len() as u32)
-        };
-        if rc != 0 {
-            log::warn(&format!(
-                "app {}: new_intent returned {} (handle miss or host copy failed)",
-                handle.get(), rc
-            ));
-        }
+        // [handle: u32, intent: bytes...]
+        let mut payload = Vec::with_capacity(4 + bytes.len());
+        payload.extend_from_slice(&handle.get().to_le_bytes());
+        payload.extend_from_slice(bytes);
+        let _ = self.dispatch(
+            akiva_framework::wire::op_kinds::cmd::NEW_INTENT,
+            &payload,
+        );
         0
     }
 
@@ -520,17 +576,15 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         bytes: &[u8],
     ) -> u64 {
         if bytes.is_empty() { return 0; }
-        let rc = unsafe {
-            host::hal_app_activity_result(
-                handle.get(), request_code, bytes.as_ptr(), bytes.len() as u32,
-            )
-        };
-        if rc != 0 {
-            log::warn(&format!(
-                "app {}: activity_result returned {} (handle miss or host copy failed)",
-                handle.get(), rc
-            ));
-        }
+        // [handle: u32, request_code: u32, result: bytes...]
+        let mut payload = Vec::with_capacity(8 + bytes.len());
+        payload.extend_from_slice(&handle.get().to_le_bytes());
+        payload.extend_from_slice(&request_code.to_le_bytes());
+        payload.extend_from_slice(bytes);
+        let _ = self.dispatch(
+            akiva_framework::wire::op_kinds::cmd::ACTIVITY_RESULT,
+            &payload,
+        );
         0
     }
 

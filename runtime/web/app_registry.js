@@ -15,7 +15,7 @@
 // from within kernel code — no promise juggling needed.
 
 import { fontString } from "./renderer/canvas2d.js";
-import { FIRE, IO, STATUS, packPoll, isFireKind, isIoKind } from "./op_kinds.mjs";
+import { FIRE, IO, STATUS, CMD, packPoll, isFireKind, isIoKind } from "./op_kinds.mjs";
 
 export class AppRegistry {
   /**
@@ -462,6 +462,88 @@ export class AppRegistry {
     const bytes = this._copyKernelSlice(bytesPtr, bytesLen);
     return this._callAppWithBytes(handle, "restore_state", bytes,
       (proc, appPtr, len) => proc.instance.exports.akiva_app_restore_state(handle, appPtr, len));
+  }
+
+  // ── Stone 11.4b: unified host→app dispatch ─────────────────────────────
+  //
+  // `dispatch(cmdKind, payloadPtr, payloadLen)` is the JS handler for the
+  // `hal_app_dispatch` import the kernel calls instead of the 12 legacy
+  // `hal_app_*` per-callback imports. The kernel-side payload always
+  // starts with `[handle: u32 LE, ...]`, so we read the handle to find
+  // the wasm process, copy the payload into app memory, fire
+  // `akiva_app_dispatch`, and return its u64 future_id.
+  //
+  // CREATE special case: the kernel only emits `[handle]` (it doesn't
+  // know the class string — the class lives on the JS side, set during
+  // `register`). We splice the encoded class onto the payload before
+  // forwarding, matching the legacy `_dispatchCreate` path.
+  //
+  // Stone 11.4b coexists with the legacy lifecycle/pointer/.../
+  // activity_result methods above; 11.4b-5 will remove them.
+
+  /** Dispatch a host→app command. Returns the u64 future_id (BigInt). */
+  dispatch(cmdKind, payloadPtr, payloadLen) {
+    if (payloadLen < 4) return 0n;
+    const kernelBuf = this._kernelMemory().buffer;
+    const handle = new DataView(kernelBuf).getUint32(payloadPtr, true);
+    const ctx = this._lookup(handle);
+    if (!ctx) return 0n;
+    const { slot, proc } = ctx;
+
+    // Build the app-side payload. CREATE gets the class string
+    // appended; every other cmd_kind passes through unchanged.
+    let bytes;
+    if (cmdKind === CMD.CREATE) {
+      const cls = this._encoder.encode(slot.class);
+      bytes = new Uint8Array(4 + cls.length);
+      bytes.set(new Uint8Array(kernelBuf, payloadPtr, 4), 0);  // handle
+      bytes.set(cls, 4);
+    } else {
+      bytes = this._copyKernelSlice(payloadPtr, payloadLen);
+    }
+
+    // Allocate in app memory, copy, dispatch, dealloc. Buffer life
+    // spans only the dispatch call — the app's runtime decodes
+    // synchronously, so we can free immediately on return.
+    let appPtr;
+    try {
+      appPtr = proc.instance.exports.akiva_app_alloc(bytes.length);
+      if (appPtr === 0) {
+        this._log("warn",
+          `app ${slot.packageId}: alloc(${bytes.length}) for dispatch(${cmdKind}) returned null`);
+        return 0n;
+      }
+      new Uint8Array(proc.memory.buffer, appPtr, bytes.length).set(bytes);
+      // Wasm i64 returns as BigInt on the JS side; pass through to the
+      // kernel as-is (the `hal_app_dispatch` env entry expects BigInt).
+      const futureId = proc.instance.exports.akiva_app_dispatch(cmdKind, appPtr, bytes.length);
+      this._dbg("dispatch",
+        `${slot.packageId}[handle=${handle}] cmd=${cmdKind.toString(16)} → ${futureId}`);
+      return typeof futureId === "bigint" ? futureId : BigInt(futureId);
+    } catch (err) {
+      this._log("error",
+        `app ${slot.packageId}.dispatch(${cmdKind}): ${err?.message ?? err}`);
+      return 0n;
+    } finally {
+      if (appPtr) {
+        try { proc.instance.exports.akiva_app_dealloc(appPtr, bytes.length); }
+        catch (_) { /* best effort */ }
+      }
+    }
+  }
+
+  /**
+   * Fetch result bytes for a non-zero `future_id` returned by
+   * `dispatch`. The future_id encodes the handle in its low 32 bits
+   * (single-worker mode); 11.4c's worker path uses the same shape.
+   * Same two-phase buffer contract as `render` / `saveState`: returns
+   * the *needed* length, copies up to `outCap` bytes into kernel
+   * memory at `outPtr`.
+   */
+  getResult(futureId, outPtr, outCap) {
+    const handle = Number(futureId & 0xFFFFFFFFn);
+    return this._copyAppToKernel(handle, "get_result", outPtr, outCap,
+      (proc, lenPtr) => proc.instance.exports.akiva_app_get_result(futureId, lenPtr));
   }
 
   // ── Internals ───────────────────────────────────────────────────────────
@@ -1138,6 +1220,13 @@ const LEVEL_NAMES = ["trace", "debug", "info", "warn", "error"];
 // means the wasm wasn't built against sdk-rust (or was built for a
 // different ABI) and we refuse to load it rather than discovering the
 // gap at first lifecycle call.
+//
+// Stone 11.4b — `akiva_app_dispatch` and `akiva_app_get_result` joined
+// the list. The 13 legacy per-callback exports
+// (`akiva_app_create`/`..._render`/etc.) stay required until 11.4b-5
+// removes them in lockstep with the legacy `hal_app_*` imports;
+// during the 11.4b-3..4 transition both sets must be present so a
+// host that's mid-migration doesn't silently fall through.
 const REQUIRED_EXPORTS = [
   "memory",
   "akiva_app_alloc",
@@ -1157,6 +1246,9 @@ const REQUIRED_EXPORTS = [
   "akiva_app_restore_state",
   "akiva_app_new_intent",
   "akiva_app_activity_result",
+  // Stone 11.4b — unified dispatch entry point + result fetcher.
+  "akiva_app_dispatch",
+  "akiva_app_get_result",
 ];
 
 // Loud-and-obvious placeholder when an `@color/` ref is undefined.

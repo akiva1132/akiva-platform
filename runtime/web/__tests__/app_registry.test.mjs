@@ -16,7 +16,7 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { AppRegistry, AUTO_IMPORTS, CAPABILITY_IMPORTS } from "../app_registry.js";
-import { FIRE, IO, STATUS, packPoll } from "../op_kinds.mjs";
+import { FIRE, IO, STATUS, CMD, packPoll } from "../op_kinds.mjs";
 
 // ── Test harness ──────────────────────────────────────────────────────
 
@@ -69,6 +69,9 @@ function makeFakeProc(opts = {}) {
     akiva_app_new_intent: vi.fn(),
     akiva_app_activity_result: vi.fn(),
     akiva_app_abi_version: vi.fn(() => 0),
+    // Stone 11.4b — unified dispatch + result fetcher.
+    akiva_app_dispatch: vi.fn(() => 0n),
+    akiva_app_get_result: vi.fn(() => 0),
   };
 
   return {
@@ -979,3 +982,167 @@ describe("setPackages — package-list snapshot (Stone 11.0a)", () => {
 // tests in the `Stone 11.3c — unified-ABI dispatcher > io dispatch +
 // FutureRegistry` block above (see "two-phase retry: payload too large
 // returns length, retains entry").
+
+// ── Stone 11.4b: unified host→app dispatch ─────────────────────────────
+
+describe("dispatch — host→app multiplexer", () => {
+  it("returns 0n on too-short payload (< 4 bytes for the handle)", () => {
+    const fake = makeFakeProc();
+    const { registry } = makeRegistry({ fakeProc: fake });
+    seedHandle(registry);
+    expect(registry.dispatch(CMD.RESUME, 0, 0)).toBe(0n);
+    expect(registry.dispatch(CMD.RESUME, 0, 3)).toBe(0n);
+    expect(fake.exports.akiva_app_dispatch).not.toHaveBeenCalled();
+  });
+
+  it("returns 0n on unknown handle", () => {
+    const fake = makeFakeProc();
+    const { registry, kernelMemory } = makeRegistry({ fakeProc: fake });
+    seedHandle(registry, 1);
+    // Write handle=42 (unknown) to kernel memory at offset 0.
+    new DataView(kernelMemory.buffer).setUint32(0, 42, true);
+    expect(registry.dispatch(CMD.RESUME, 0, 4)).toBe(0n);
+    expect(fake.exports.akiva_app_dispatch).not.toHaveBeenCalled();
+  });
+
+  it("forwards a non-CREATE payload unchanged to akiva_app_dispatch", () => {
+    const fake = makeFakeProc();
+    const { registry, kernelMemory } = makeRegistry({ fakeProc: fake });
+    const handle = seedHandle(registry, 7);
+    // Build a POINTER payload [handle, x, y, button, phase, ts] = 28 bytes.
+    const dv = new DataView(kernelMemory.buffer);
+    dv.setUint32(0, handle, true);
+    dv.setFloat32(4, 12.5, true);
+    dv.setFloat32(8, 34.5, true);
+    dv.setUint32(12, 0, true);   // button
+    dv.setUint32(16, 1, true);   // phase = Move
+    dv.setFloat64(20, 1234.0, true);
+    fake.exports.akiva_app_dispatch.mockReturnValueOnce(0n);
+
+    const ret = registry.dispatch(CMD.POINTER, 0, 28);
+    expect(ret).toBe(0n);
+    expect(fake.exports.akiva_app_dispatch).toHaveBeenCalledTimes(1);
+    const [cmdKind, appPtr, len] = fake.exports.akiva_app_dispatch.mock.calls[0];
+    expect(cmdKind).toBe(CMD.POINTER);
+    expect(len).toBe(28);
+    // The bytes the app saw must match what we put in kernel memory.
+    const appBytes = new Uint8Array(fake.proc.memory.buffer, appPtr, len);
+    const kernelBytes = new Uint8Array(kernelMemory.buffer, 0, 28);
+    expect(Array.from(appBytes)).toEqual(Array.from(kernelBytes));
+  });
+
+  it("CREATE augments the [handle] payload with the class string", () => {
+    const fake = makeFakeProc();
+    const { registry, kernelMemory } = makeRegistry({ fakeProc: fake });
+    const handle = seedHandle(registry, 3);
+    // Kernel emits only [handle:u32 LE] for CREATE.
+    new DataView(kernelMemory.buffer).setUint32(0, handle, true);
+
+    registry.dispatch(CMD.CREATE, 0, 4);
+    const [cmdKind, appPtr, len] = fake.exports.akiva_app_dispatch.mock.calls[0];
+    expect(cmdKind).toBe(CMD.CREATE);
+    // 4 bytes handle + class string ("Main" = 4 bytes) = 8.
+    expect(len).toBe(4 + CLASS_NAME.length);
+    const appBytes = new Uint8Array(fake.proc.memory.buffer, appPtr, len);
+    // Handle prefix preserved.
+    expect(new DataView(fake.proc.memory.buffer, appPtr, 4).getUint32(0, true))
+      .toBe(handle);
+    // Class string follows.
+    const cls = new TextDecoder().decode(appBytes.slice(4));
+    expect(cls).toBe(CLASS_NAME);
+  });
+
+  it("returns the app's BigInt future_id and frees the alloc", () => {
+    const fake = makeFakeProc();
+    const { registry, kernelMemory } = makeRegistry({ fakeProc: fake });
+    const handle = seedHandle(registry, 11);
+    new DataView(kernelMemory.buffer).setUint32(0, handle, true);
+    fake.exports.akiva_app_dispatch.mockReturnValueOnce(11n);
+
+    const ret = registry.dispatch(CMD.RENDER, 0, 12);
+    expect(ret).toBe(11n);
+    // Buffer-life lasts only the dispatch call — 11.4b dealloc-on-return.
+    expect(fake.exports.akiva_app_dealloc).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns 0n + warns when alloc fails, no dispatch invocation", () => {
+    const fake = makeFakeProc({ allocFailAfter: 0 });
+    const log = vi.fn();
+    const { registry, kernelMemory } = makeRegistry({ fakeProc: fake, log });
+    const handle = seedHandle(registry, 5);
+    new DataView(kernelMemory.buffer).setUint32(0, handle, true);
+
+    expect(registry.dispatch(CMD.RESUME, 0, 4)).toBe(0n);
+    expect(fake.exports.akiva_app_dispatch).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      "warn",
+      expect.stringContaining("alloc"),
+    );
+  });
+
+  it("returns 0n + logs and still frees on app dispatch throw", () => {
+    const fake = makeFakeProc();
+    const log = vi.fn();
+    const { registry, kernelMemory } = makeRegistry({ fakeProc: fake, log });
+    const handle = seedHandle(registry, 9);
+    new DataView(kernelMemory.buffer).setUint32(0, handle, true);
+    fake.exports.akiva_app_dispatch.mockImplementationOnce(() => {
+      throw new Error("simulated trap");
+    });
+
+    expect(registry.dispatch(CMD.PAUSE, 0, 4)).toBe(0n);
+    expect(fake.exports.akiva_app_dealloc).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(
+      "error",
+      expect.stringContaining("simulated trap"),
+    );
+  });
+});
+
+describe("getResult — fetch dispatch result bytes", () => {
+  it("decodes the handle from low 32 bits of future_id and copies app bytes", () => {
+    const fake = makeFakeProc();
+    const { registry, kernelMemory } = makeRegistry({ fakeProc: fake });
+    const handle = seedHandle(registry, 4);
+    // Pre-place result bytes in app memory at a known address. The
+    // _copyAppToKernel helper allocates a 4-byte len ptr, calls the
+    // export with that ptr, reads len from app memory, and copies
+    // src[0..len] into kernel memory. Mock: write 5 to *lenPtr and
+    // return a pointer to "hello" in app memory.
+    const HELLO_PTR = 5000;
+    const helloBytes = new TextEncoder().encode("hello");
+    new Uint8Array(fake.proc.memory.buffer, HELLO_PTR, helloBytes.length).set(helloBytes);
+
+    fake.exports.akiva_app_get_result.mockImplementationOnce((_fid, lenPtr) => {
+      new DataView(fake.proc.memory.buffer).setUint32(lenPtr, helloBytes.length, true);
+      return HELLO_PTR;
+    });
+
+    const outPtr = 100;
+    const ret = registry.getResult(BigInt(handle), outPtr, 64);
+    expect(ret).toBe(5);
+    const got = new Uint8Array(kernelMemory.buffer, outPtr, 5);
+    expect(new TextDecoder().decode(got)).toBe("hello");
+  });
+
+  it("returns the needed length without copying when len > outCap", () => {
+    const fake = makeFakeProc();
+    const { registry } = makeRegistry({ fakeProc: fake });
+    const handle = seedHandle(registry, 4);
+    fake.exports.akiva_app_get_result.mockImplementationOnce((_fid, lenPtr) => {
+      new DataView(fake.proc.memory.buffer).setUint32(lenPtr, 1024, true);
+      return 5000;
+    });
+    // outCap=64 < 1024; helper must return needed length and not copy.
+    expect(registry.getResult(BigInt(handle), 0, 64)).toBe(1024);
+  });
+
+  it("returns 0 on unknown handle (decoded from future_id)", () => {
+    const fake = makeFakeProc();
+    const { registry } = makeRegistry({ fakeProc: fake });
+    seedHandle(registry, 1);
+    // future_id encodes handle=999 — not seeded.
+    expect(registry.getResult(999n, 0, 64)).toBe(0);
+    expect(fake.exports.akiva_app_get_result).not.toHaveBeenCalled();
+  });
+});

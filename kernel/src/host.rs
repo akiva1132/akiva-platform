@@ -85,6 +85,45 @@ extern "C" {
     ) -> u32;
     pub fn hal_app_unregister(handle: u32);
 
+    // ── Stone 11.4b: unified host→app dispatch ────────────────────────────
+    //
+    // `hal_app_dispatch` replaces the 12 per-callback imports
+    // (`hal_app_lifecycle`, `hal_app_pointer`, …, `hal_app_activity_result`)
+    // with a single multiplexer keyed by `cmd_kind`. The JS host reads the
+    // `[handle: u32 LE, ...]` prefix from `payload`, looks up the wasm
+    // process that owns the handle, copies the payload into app memory,
+    // and forwards to the app's `akiva_app_dispatch` export. Returns the
+    // app's `future_id`:
+    //   - `0`        — sync, no result bytes (every ack-only cmd_kind).
+    //   - non-zero   — sync result bytes available; kernel calls
+    //                  `hal_app_get_result(future_id, ...)` next.
+    //
+    // The legacy per-callback imports below are still declared (and the
+    // JS env still maps them) so the migration can land without breaking
+    // mid-air. Stone 11.4b-5 removes them.
+    //
+    // CREATE special case: the kernel passes only `[handle]` in the
+    // payload; the JS host augments with the slot's class string before
+    // forwarding to `akiva_app_dispatch` — same split as the legacy
+    // path where `_dispatchCreate` looks up the class on the JS side.
+    pub fn hal_app_dispatch(
+        cmd_kind: u32,
+        payload_ptr: *const u8,
+        payload_len: u32,
+    ) -> u64;
+
+    /// Companion to `hal_app_dispatch`: fetch the result bytes for a
+    /// non-zero `future_id` returned by a RENDER or SAVE_STATE
+    /// dispatch. Two-phase buffer convention (matches `hal_app_render`
+    /// pre-11.4b): kernel passes `out_ptr` + `out_cap`, host copies up
+    /// to `out_cap` bytes, returns the *needed* length. If the return
+    /// exceeds `out_cap` the kernel reallocates and retries.
+    pub fn hal_app_get_result(
+        future_id: u64,
+        out_ptr: *mut u8,
+        out_cap: u32,
+    ) -> u32;
+
     /// `transition` matches `framework::wasm_activity::LifecycleTransition`.
     pub fn hal_app_lifecycle(handle: u32, transition: u32);
 

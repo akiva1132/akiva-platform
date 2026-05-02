@@ -51,14 +51,79 @@ ABI v0 קטן בכוונה — 7 exports app-side ו-7 imports kernel→host. ז
 
 כל app חייב לייצא את ה-wasm `memory` (מופעל אוטומטית ע"י rustc ל-`wasm32-unknown-unknown`) ואת הפונקציות הבאות (C ABI). `runtime/web/app_registry.js::REQUIRED_EXPORTS` בודק את הרשימה בזמן טעינה; apps שחסרים משהו נדחים לפני הקריאה הראשונה למחזור חיים.
 
+#### 2.2.1 Memory ABI (always required)
+
 ```rust
-// Memory — ה-host משתמש בכדי להזריק data ל-app (intents, saved state, ...).
+// ה-host משתמש בכדי להזריק data ל-app (intents, saved state, dispatch payloads).
 extern "C" fn akiva_app_alloc(size: u32) -> *mut u8;
 extern "C" fn akiva_app_dealloc(ptr: *mut u8, size: u32);
 
 // ABI version — null-terminated UTF-8 ("0.1.0").
 extern "C" fn akiva_app_abi_version() -> *const u8;
+```
 
+#### 2.2.2 Unified dispatch entry (Stone 11.4b — current)
+
+הExports החדשים שהוצגו ב-Stone 11.4b מכווצים את 13 ה-callback exports הנפרדים (lifecycle / input / render / state / intent) ל-export יחיד שמפענח `cmd_kind`. ה-host (kernel + JS) קורא רק לזוג הזה דרך 11.4b-3 ואילך.
+
+```rust
+// Unified dispatch — ה-host מעביר cmd_kind שמזהה את הקריאה (lifecycle
+// transition / input / render / save / restore / intent) ופ-payload שמתחיל
+// תמיד ב-`[handle: u32 LE, ...]`. מחזיר u64 future_id:
+//   0           — sync, no result bytes (כל ack-only).
+//   non-zero    — sync, bytes מוכנים; ה-host קורא ל-akiva_app_get_result
+//                 מיד עם אותו future_id.
+// (ב-11.4c עם workers, future_id non-zero יכול לסמן שהעבודה עוד לא
+// הסתיימה — אז ה-host חוזר ל-poll_future מאוחר יותר.)
+extern "C" fn akiva_app_dispatch(
+    cmd_kind: u32,
+    payload_ptr: *const u8,
+    payload_len: u32,
+) -> u64;
+
+// Companion ל-dispatch — מחזיר ptr ל-buffer app-owned שמכיל את ה-bytes
+// שה-dispatch ייצר (paint stream של RENDER, SavedState של SAVE_STATE).
+// ה-buffer תקף עד ה-dispatch הבא שמייצר bytes על אותו handle (שmatches
+// את ה-lifetime של akiva_app_render legacy).
+extern "C" fn akiva_app_get_result(
+    future_id: u64,
+    out_len_ptr: *mut u32,
+) -> *const u8;
+```
+
+`cmd_kind` הוא integer יציב מ-`framework::wire::op_kinds::cmd::*` (mirror ב-`akiva_sdk::op_kinds::cmd::*` וב-`runtime/web/op_kinds.mjs::CMD`). הטווחים מקובעים לעולם:
+
+| Range          | קטגוריה   | Ops                                                       |
+|----------------|-----------|-----------------------------------------------------------|
+| `0x01..=0x0F`  | Lifecycle | CREATE / START / RESUME / PAUSE / STOP / DESTROY          |
+| `0x10..=0x1F`  | Input     | POINTER / KEY / RESIZE                                    |
+| `0x20..=0x2F`  | Render    | RENDER                                                    |
+| `0x30..=0x3F`  | State     | SAVE_STATE / RESTORE_STATE                                |
+| `0x40..=0x4F`  | Intent    | NEW_INTENT / ACTIVITY_RESULT                              |
+| `0x50..=`      | reserved  | streams / pushed events (Stone 11.5+)                     |
+
+Payload layout פר-cmd (כל אחד מתחיל ב-`[handle: u32 LE, ...]`):
+
+| cmd_kind          | payload after handle                                                     |
+|-------------------|--------------------------------------------------------------------------|
+| CREATE            | `class: utf8` (host-augmented — kernel passes only `[handle]`)           |
+| START/RESUME/PAUSE/STOP/DESTROY | אין                                                        |
+| POINTER           | `x: f32, y: f32, button: u32, phase: u32, ts: f64` (24 bytes)            |
+| KEY               | `code: u32, modifiers: u32, phase: u32, ts: f64` (20 bytes)              |
+| RESIZE            | `width: u32, height: u32, density: f32` (12 bytes)                       |
+| RENDER            | `ts: f64` (8 bytes); result = paint-op stream                            |
+| SAVE_STATE        | אין; result = `SavedState::encode` bytes                                 |
+| RESTORE_STATE     | `state: bytes`                                                           |
+| NEW_INTENT        | `intent: encoded Intent`                                                 |
+| ACTIVITY_RESULT   | `request_code: u32, result: encoded ActivityResult`                      |
+
+`future_id` ב-11.4b-3+ encoded כ-`handle as u64` ל-RENDER ו-SAVE_STATE; `0` לכל היתר. ב-11.4c (כשה-app יחיה ב-Worker נפרד) ה-future_id יקבל namespace שונה ויהפוך לאמיתי async — ה-API stays identical.
+
+#### 2.2.3 Legacy per-callback exports (Stone 11.4b-5 will remove)
+
+עד שStone 11.4b-5 ינקה אותם, כל app עדיין חייב לייצא גם את ה-13 ה-exports הישנים. ה-host מעדיף את ה-dispatch path אבל REQUIRED_EXPORTS דורש את שני הסטים כדי ש-host באמצע migration לא יפול בשקט. ה-SDK macro `akiva_app!` מייצר את שני הסטים יחד.
+
+```rust
 // Lifecycle — handle הוא per-activity.
 extern "C" fn akiva_app_create(handle: u32, class_ptr: *const u8, class_len: u32);
 extern "C" fn akiva_app_start(handle: u32);
@@ -85,13 +150,17 @@ extern "C" fn akiva_app_render(handle: u32, ts_ms: f64, out_len_ptr: *mut u32) -
 // Saved state — סימטרי ל-render. ה-app מסדר את ה-UI state שלו לפי
 // הפורמט של `SavedState` ([sdk-rust/src/activity.rs]) ומחזיר pointer
 // ל-buffer app-owned שתקף עד הקריאה הבאה ל-save_state עם אותו handle.
-// ב-restore, ה-host מעתיק bytes שמורים פנימה (דרך akiva_app_alloc) וקורא
-// ל-restore_state; ה-app מפענח ומעדכן את ה-state שלו בפנים.
 extern "C" fn akiva_app_save_state(handle: u32, out_len_ptr: *mut u32) -> *const u8;
 extern "C" fn akiva_app_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32);
+
+// Intent redelivery + activity result.
+extern "C" fn akiva_app_new_intent(handle: u32, bytes_ptr: *const u8, bytes_len: u32);
+extern "C" fn akiva_app_activity_result(
+    handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
+);
 ```
 
-ה-buffer שמוחזר מ-`akiva_app_render` הוא app-owned: ה-app חייב להחזיק אותו בחיים לפחות עד הקריאה הבאה ל-`akiva_app_render` עם אותו handle. ה-convention הוא buffer per-handle שנמחזר כל frame — מקצה פעם אחת, מנקה עם `clear()`, ומחזיר את הכתובת שוב.
+ה-buffer שמוחזר מ-`akiva_app_render` (וגם מ-`akiva_app_get_result` לאחר RENDER) הוא app-owned: ה-app חייב להחזיק אותו בחיים לפחות עד הקריאה הבאה לdata-producing dispatch על אותו handle. ה-convention הוא buffer per-handle שנמחזר כל frame — מקצה פעם אחת, מנקה עם `clear()`, ומחזיר את הכתובת שוב.
 
 ### 2.3 Imports (host → app)
 
@@ -234,6 +303,40 @@ fn hal_app_register(
     class_ptr: *const u8,      class_len: usize,
 ) -> u32;  // 0 = unknown package/class
 fn hal_app_unregister(handle: u32);
+
+// ── Stone 11.4b: unified host→app dispatch ──────────────────────────
+//
+// `hal_app_dispatch` is what the framework's `KernelWasmHost` calls
+// for every per-callback transition (lifecycle, input, render, state,
+// intent). The JS host reads `[handle: u32 LE, ...]` from the payload,
+// looks up the wasm process that owns the handle, copies the payload
+// into app memory, and forwards to the app's `akiva_app_dispatch`.
+// CREATE special case: kernel passes only `[handle]`; JS host augments
+// with the slot's class string before forwarding.
+//
+// Returns the app's u64 future_id:
+//   0           — sync, no result bytes (every ack-only cmd_kind).
+//   non-zero    — sync, bytes available; kernel calls
+//                 `hal_app_get_result(future_id, ...)` next.
+fn hal_app_dispatch(
+    cmd_kind: u32, payload_ptr: *const u8, payload_len: u32,
+) -> u64;
+
+// Companion to `hal_app_dispatch`: fetch the bytes for a non-zero
+// future_id (RENDER paint stream, SAVE_STATE encoded state). Same
+// two-phase buffer contract as the legacy `hal_app_render`: returns
+// the *needed* length; truncated copies trigger a retry with a
+// larger buffer.
+fn hal_app_get_result(
+    future_id: u64, out_ptr: *mut u8, out_cap: u32,
+) -> u32;
+
+// ── Legacy per-callback imports (Stone 11.4b-5 will remove) ────────
+//
+// Until 11.4b-5 lands, the JS env still wires these — a host or
+// kernel mid-migration must not trap because the other side hasn't
+// switched yet. The Rust `KernelWasmHost` no longer calls them as of
+// 11.4b-3.
 fn hal_app_lifecycle(handle: u32, transition: u32);  // 0=Create .. 5=Destroy
 fn hal_app_pointer(handle: u32, x: f32, y: f32, button: u32, phase: u32, ts_ms: f64);
 fn hal_app_key(handle: u32, code: u32, modifiers: u32, phase: u32, ts_ms: f64);

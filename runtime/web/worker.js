@@ -303,6 +303,22 @@ function buildImports() {
     hal_app_register: (pidPtr, pidLen, clsPtr, clsLen) =>
       apps.register(readUtf8(pidPtr, pidLen), readUtf8(clsPtr, clsLen)),
     hal_app_unregister: (handle) => apps.unregister(handle),
+
+    // Stone 11.4b — unified host→app dispatch. The kernel-side
+    // `KernelWasmHost` builds a `[handle: u32 LE, ...]` payload and
+    // calls this with the cmd_kind that identifies the lifecycle /
+    // input / render / state / intent transition. Returns the app's
+    // u64 future_id (0 = sync, no bytes; non-zero = bytes available
+    // via `hal_app_get_result`). Coexists with the legacy per-callback
+    // imports below until 11.4b-5 removes them.
+    hal_app_dispatch:   (cmdKind, payloadPtr, payloadLen) =>
+      apps.dispatch(cmdKind, payloadPtr, payloadLen),
+    hal_app_get_result: (futureId, outPtr, outCap) =>
+      apps.getResult(futureId, outPtr, outCap),
+
+    // Legacy per-callback imports — Stone 11.4b-5 will remove these in
+    // lockstep with the corresponding SDK-macro exports. Until then
+    // they remain wired so a partial-migration host doesn't trap.
     hal_app_lifecycle:  (handle, transition) => apps.lifecycle(handle, transition),
     hal_app_pointer:    (handle, x, y, button, phase, ts) => apps.pointer(handle, x, y, button, phase, ts),
     hal_app_key:        (handle, code, mods, phase, ts) => apps.key(handle, code, mods, phase, ts),
