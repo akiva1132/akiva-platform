@@ -1375,3 +1375,54 @@ fg = "#ff000000"`,
     expect(colors.bg).toBe(0xff222222);
   });
 });
+
+describe("evictPackage — Phase 12.3 LMK eviction", () => {
+  it("terminates the worker, clears the slot, and returns 1", () => {
+    const { registry, worker } = makeRegistry();
+    let terminated = false;
+    worker.terminate = () => { terminated = true; };
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    expect(registry._processes.has(PACKAGE_ID)).toBe(true);
+
+    const result = registry.evictPackage(PACKAGE_ID);
+    expect(result).toBe(1);
+    expect(terminated).toBe(true);
+    expect(registry._processes.has(PACKAGE_ID)).toBe(false);
+  });
+
+  it("returns 0 for an unknown package without throwing", () => {
+    const { registry } = makeRegistry();
+    expect(registry.evictPackage("never.installed")).toBe(0);
+  });
+
+  it("is idempotent — second call returns 0", () => {
+    const { registry, worker } = makeRegistry();
+    worker.terminate = () => {};
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    expect(registry.evictPackage(PACKAGE_ID)).toBe(1);
+    expect(registry.evictPackage(PACKAGE_ID)).toBe(0);
+  });
+
+  it("evicts in-flight dispatch entries belonging to the dead worker", () => {
+    const { registry, worker } = makeRegistry();
+    worker.terminate = () => {};
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    // Stage two _dispatches entries directly: one for our victim,
+    // one for a peer. evictPackage must drop only the victim's.
+    registry._dispatches.set(101n, { packageId: PACKAGE_ID, status: 0 });
+    registry._dispatches.set(102n, { packageId: "com.peer.app", status: 0 });
+
+    registry.evictPackage(PACKAGE_ID);
+
+    expect(registry._dispatches.has(101n)).toBe(false);
+    expect(registry._dispatches.has(102n)).toBe(true);
+  });
+
+  it("does NOT add the package to _pendingTraps (LMK runs framework cleanup directly)", () => {
+    const { registry, worker } = makeRegistry();
+    worker.terminate = () => {};
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    registry.evictPackage(PACKAGE_ID);
+    expect(registry._pendingTraps.has(PACKAGE_ID)).toBe(false);
+  });
+});

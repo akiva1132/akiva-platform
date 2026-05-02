@@ -25,6 +25,7 @@ pub mod activity_manager;
 pub mod compositor;
 pub mod cpu_budget;
 pub mod intent;
+pub mod lmk;
 pub mod manifest;
 pub mod memory_manager;
 pub mod package_manager;
@@ -114,6 +115,12 @@ pub fn boot(
         pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
             cpu: cpu_budget::CpuBudget::new(),
+            lmk_policy: lmk::LmkPolicy::default(),
+            lmk_protected: {
+                let mut s = std::collections::HashSet::new();
+                s.insert("sys.shell".to_string());
+                s
+            },
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -390,6 +397,15 @@ pub struct Framework {
     /// `performance.now()`); read by Phase 12.3 LMK ranking. See
     /// [`cpu_budget`] for the rate-window mechanics.
     pub cpu: cpu_budget::CpuBudget,
+    /// Phase 12.3 — LMK policy thresholds. Mutable so the kernel can
+    /// retune at runtime (e.g. when the browser surfaces a memory
+    /// pressure level change). Default values target desktop; mobile
+    /// will retune in the Phase-12 mobile baseline pass.
+    pub lmk_policy: lmk::LmkPolicy,
+    /// Phase 12.3 — packages excluded from LMK eviction. Always
+    /// includes `sys.shell`; the kernel can add more (e.g. a system
+    /// IME, or a recovery app) post-boot.
+    lmk_protected: std::collections::HashSet<String>,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -675,6 +691,51 @@ impl Framework {
     /// rate, debug overlays show all four.
     pub fn cpu_usage(&self, package_id: &str) -> Option<cpu_budget::CpuReport> {
         self.cpu.usage(package_id)
+    }
+
+    /// Phase 12.3 — run the LMK policy and return packages the kernel
+    /// should evict, in the order it should evict them. **Pure read** —
+    /// neither activities nor memory accounting is mutated by this call.
+    /// The kernel takes the returned [`lmk::KillRequest`] vec and:
+    ///   1. Sends `worker.terminate()` to each victim's app worker
+    ///      (HAL signal — the framework has no direct handle).
+    ///   2. Calls [`Framework::evict_package`] to drop activity records
+    ///      and forget memory/cpu accounting.
+    ///
+    /// `reason` is preserved on every returned request for telemetry.
+    /// Most callers pass [`lmk::KillReason::SystemPressure`]; the
+    /// browser memory-pressure binding (when wired) maps to
+    /// [`lmk::KillReason::HostPressure`].
+    pub fn drive_lmk(&self, reason: lmk::KillReason) -> Vec<lmk::KillRequest> {
+        let protected: std::collections::HashSet<&str> =
+            self.lmk_protected.iter().map(String::as_str).collect();
+        lmk::pick_victims(&self.lmk_policy, &self.memory, &self.activities, &protected, reason)
+    }
+
+    /// Phase 12.3 — add `package_id` to the LMK exclusion set. Idempotent.
+    /// Used at boot for system packages (Shell already covered) and at
+    /// runtime if the kernel has additional always-on candidates (e.g.
+    /// a recovery activity).
+    pub fn lmk_protect(&mut self, package_id: &str) {
+        self.lmk_protected.insert(package_id.to_string());
+    }
+
+    /// Phase 12.3 — drop accounting + activity records for a package
+    /// the kernel just terminated. The actual `worker.terminate()`
+    /// happens host-side; this method handles the framework-side
+    /// cleanup. Activity records transition to `Trapped` (if not already)
+    /// so any in-flight transitions resolve cleanly. Memory + CPU
+    /// accounting is forgotten — a re-launch will start with fresh
+    /// counters.
+    ///
+    /// Returns the number of activity records affected. Safe to call
+    /// for a package with no activities (e.g. a worker that never
+    /// finished launching) — returns 0.
+    pub fn evict_package(&mut self, package_id: &str, now_ms: f64) -> usize {
+        let n = self.mark_package_trapped(package_id, now_ms);
+        self.memory.forget(package_id);
+        self.cpu.forget(package_id);
+        n
     }
 
     /// P0 #3 — recycle `Trapped` activity records whose age exceeds
@@ -1631,6 +1692,12 @@ mod tests {
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
             cpu: cpu_budget::CpuBudget::new(),
+            lmk_policy: lmk::LmkPolicy::default(),
+            lmk_protected: {
+                let mut s = std::collections::HashSet::new();
+                s.insert("sys.shell".to_string());
+                s
+            },
         }
     }
 
@@ -2690,6 +2757,8 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
             cpu: cpu_budget::CpuBudget::new(),
+            lmk_policy: lmk::LmkPolicy::default(),
+            lmk_protected: std::collections::HashSet::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -2789,6 +2858,8 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
             cpu: cpu_budget::CpuBudget::new(),
+            lmk_policy: lmk::LmkPolicy::default(),
+            lmk_protected: std::collections::HashSet::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -2936,6 +3007,95 @@ optional = []
             "frame_budget_fraction must exceed 1.0 for an over-budget app");
     }
 
+    /// Phase 12.3 — `drive_lmk` returns no victims when total memory
+    /// is below the policy threshold.
+    #[test]
+    fn drive_lmk_returns_empty_when_under_threshold() {
+        let mut fw = empty_framework();
+        fw.lmk_policy.threshold_bytes = 100 * 1024 * 1024;
+        fw.record_app_memory("a", 30 * 1024 * 1024);
+        fw.record_app_memory("b", 40 * 1024 * 1024);
+        assert!(fw.drive_lmk(lmk::KillReason::SystemPressure).is_empty());
+    }
+
+    /// Phase 12.3 — `drive_lmk` picks the lowest-priority victim when
+    /// pressure is real. With no activity records the priority for both
+    /// candidates is `Empty`, so tie-break by largest current bytes wins.
+    #[test]
+    fn drive_lmk_picks_largest_when_priorities_tied() {
+        let mut fw = empty_framework();
+        fw.lmk_policy.threshold_bytes = 100 * 1024 * 1024;
+        fw.lmk_policy.recovery_bytes = 60 * 1024 * 1024;
+        fw.record_app_memory("small", 50 * 1024 * 1024);
+        fw.record_app_memory("big", 200 * 1024 * 1024);
+        let victims = fw.drive_lmk(lmk::KillReason::SystemPressure);
+        assert_eq!(victims.len(), 1, "killing 'big' alone (200MB→50MB total) hits recovery");
+        assert_eq!(victims[0].package_id, "big");
+    }
+
+    /// Phase 12.3 — `evict_package` marks every activity for the
+    /// package as `Trapped` and forgets memory + cpu accounting. The
+    /// caller (kernel) is responsible for the actual `worker.terminate()`
+    /// over the HAL — this test only covers the framework-side cleanup.
+    #[test]
+    fn evict_package_marks_trapped_and_forgets_accounting() {
+        use activity_manager::{LaunchMode, LifecycleState};
+
+        struct Stub;
+        impl activity::Activity for Stub {
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+        }
+
+        let mut fw = empty_framework();
+        fw.activities.register("doomed", "Main", LaunchMode::Standard, || Box::new(Stub));
+        let outcome = fw.activities.launch("doomed", "Main").unwrap();
+        fw.activities.force_state_for_test(outcome.id, LifecycleState::Resumed);
+
+        fw.record_app_memory("doomed", 200 * 1024 * 1024);
+        fw.record_app_cpu("doomed", 0.0, 0.0);
+        fw.record_app_cpu("doomed", 30.0, 1000.0);
+        assert!(fw.memory_usage("doomed").is_some());
+        assert!(fw.cpu_usage("doomed").is_some());
+
+        let trapped = fw.evict_package("doomed", 1234.0);
+        assert_eq!(trapped, 1, "single Resumed activity → marked Trapped");
+        assert_eq!(fw.activities.state_of(outcome.id), Some(LifecycleState::Trapped));
+        assert!(fw.memory_usage("doomed").is_none(), "memory accounting forgotten");
+        assert!(fw.cpu_usage("doomed").is_none(), "cpu accounting forgotten");
+    }
+
+    /// Phase 12.3 — `evict_package` is a no-op for unknown packages.
+    /// The kernel may race a kill request against an uninstall; we
+    /// don't want to panic there.
+    #[test]
+    fn evict_package_on_unknown_is_zero_count_no_op() {
+        let mut fw = empty_framework();
+        let n = fw.evict_package("never.installed", 0.0);
+        assert_eq!(n, 0);
+    }
+
+    /// Phase 12.3 — `lmk_protect` adds packages to the exclusion set,
+    /// and `drive_lmk` honours both the boot-default (sys.shell) and
+    /// runtime-added entries.
+    #[test]
+    fn lmk_protect_excludes_package_from_eviction() {
+        let mut fw = empty_framework();
+        fw.lmk_policy.threshold_bytes = 100 * 1024 * 1024;
+        fw.lmk_policy.recovery_bytes = 50 * 1024 * 1024;
+        // Shell is protected by default; add a second protected pkg.
+        fw.lmk_protect("sys.recovery");
+
+        fw.record_app_memory("sys.shell", 80 * 1024 * 1024);
+        fw.record_app_memory("sys.recovery", 90 * 1024 * 1024);
+        fw.record_app_memory("user.app", 60 * 1024 * 1024);
+
+        let victims = fw.drive_lmk(lmk::KillReason::SystemPressure);
+        let ids: Vec<&str> = victims.iter().map(|v| v.package_id.as_str()).collect();
+        assert!(!ids.contains(&"sys.shell"));
+        assert!(!ids.contains(&"sys.recovery"));
+        assert_eq!(ids, vec!["user.app"]);
+    }
+
     #[test]
     fn drive_pending_saves_persists_when_future_resolves() {
         // P0 #1 — `destroy_with_persist` fires `save_state` at the
@@ -3018,6 +3178,8 @@ optional = []
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
             cpu: cpu_budget::CpuBudget::new(),
+            lmk_policy: lmk::LmkPolicy::default(),
+            lmk_protected: std::collections::HashSet::new(),
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -3130,6 +3292,8 @@ optional = []
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
             cpu: cpu_budget::CpuBudget::new(),
+            lmk_policy: lmk::LmkPolicy::default(),
+            lmk_protected: std::collections::HashSet::new(),
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -3267,6 +3431,8 @@ optional = []
             }],
             memory: memory_manager::MemoryManager::new(),
             cpu: cpu_budget::CpuBudget::new(),
+            lmk_policy: lmk::LmkPolicy::default(),
+            lmk_protected: std::collections::HashSet::new(),
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),

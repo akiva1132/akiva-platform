@@ -713,6 +713,15 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
         sample_app_resources_into(fw, timestamp_ms);
     }
 
+    // Phase 12.3 — Low-Memory Killer. Runs after the resource sample
+    // (so accounting is fresh) and before event dispatch (so a click
+    // doesn't land on an activity that's about to be evicted). Ordered
+    // list of victims is honoured: kill the highest-impact one first,
+    // re-run on the next frame if pressure is still real.
+    if let Some(fw) = k.framework.as_mut() {
+        drive_lmk_into(fw, timestamp_ms);
+    }
+
     // Drain all queued events and dispatch.
     while let Some(ev) = k.events.pop() {
         k.handle_event(ev);
@@ -763,6 +772,41 @@ fn sample_app_resources_into(fw: &mut akiva_framework::Framework, frame_ts: f64)
             host::hal_app_cpu_ms(id.as_ptr(), id.len())
         };
         fw.record_app_cpu(&id, cpu_ms, frame_ts);
+    }
+}
+
+/// Phase 12.3 — Low-Memory Killer driver. Asks the framework who to
+/// evict, terminates each victim's worker via `hal_evict_package`, and
+/// runs framework-side cleanup (`Framework::evict_package` — marks
+/// every activity Trapped, forgets memory + cpu accounting).
+///
+/// Pure no-op below the policy threshold — `drive_lmk` returns an
+/// empty vec and the loop never enters. `now_ms` is forwarded to the
+/// framework so the resulting `Trapped` records get stamped for the
+/// P0 #3 reap pass.
+///
+/// Each `worker.terminate()` is independent — a failed HAL call (host
+/// returned 0) does not block the framework cleanup. The intent is
+/// that the package is gone either way; if the worker was already
+/// dead (race vs the watchdog), framework-side cleanup is still useful
+/// because it recovers memory accounting.
+fn drive_lmk_into(fw: &mut akiva_framework::Framework, now_ms: f64) {
+    use akiva_framework::lmk::KillReason;
+    let victims = fw.drive_lmk(KillReason::SystemPressure);
+    if victims.is_empty() {
+        return;
+    }
+    for victim in &victims {
+        log::info(&format!(
+            "lmk: evicting {} (priority={:?}, current={}MB, reason={:?})",
+            victim.package_id,
+            victim.priority,
+            victim.current_bytes / (1024 * 1024),
+            victim.reason,
+        ));
+        let pid = victim.package_id.as_bytes();
+        let _terminated = unsafe { host::hal_evict_package(pid.as_ptr(), pid.len()) };
+        fw.evict_package(&victim.package_id, now_ms);
     }
 }
 

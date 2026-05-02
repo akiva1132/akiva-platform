@@ -194,6 +194,25 @@ extern "C" {
     // declared the field; absent packages stay on the default.
     pub fn hal_app_set_watchdog_timeout_ms(pid_ptr: *const u8, pid_len: usize, ms: u32);
 
+    // ── Phase 12.3: LMK eviction ──────────────────────────────────────────
+    //
+    // `hal_evict_package(package_id)` terminates the named app's worker
+    // and discards its in-flight dispatch entries. The kernel calls this
+    // for every victim returned by `Framework::drive_lmk` per frame —
+    // host-side it's `worker.terminate()` plus a `_dispatches` cleanup,
+    // mirroring the watchdog kill path but driven by memory pressure
+    // rather than liveness. Framework-side cleanup (mark every activity
+    // for the package as `Trapped`, forget memory + cpu accounting) is
+    // a separate `Framework::evict_package` call the kernel makes
+    // immediately after; the two halves don't depend on each other and
+    // are documented separately so a future host (Stone 13's
+    // multi-display) can swap in its own implementation.
+    //
+    // Returns `1` on a successful terminate, `0` if no worker was
+    // spawned for the package (no-op). Idempotent — calling twice is
+    // not an error; the second call returns `0`.
+    pub fn hal_evict_package(pid_ptr: *const u8, pid_len: usize) -> u32;
+
     // ── App → host signals (Stone 9.3) ────────────────────────────────────
     //
     // The app imports `akiva_host_finish()` to ask the platform to tear it

@@ -502,6 +502,42 @@ export class AppRegistry {
     return proc?.cpuMs ?? 0;
   }
 
+  /**
+   * Phase 12.3 — terminate the worker for `packageId` on demand. The
+   * Low-Memory Killer (kernel-side `drive_lmk_into`) calls this for
+   * every victim it elects: same `worker.terminate()` + dispatch
+   * cleanup as the watchdog kill path, **without** adding the package
+   * to `_pendingTraps`.
+   *
+   * Why no `_pendingTraps`: the LMK path runs framework-side cleanup
+   * (`Framework::evict_package`) directly from the kernel, so routing
+   * the trap mark through the next-frame drain would be redundant.
+   * The watchdog path keeps using `_pendingTraps` because it has no
+   * concurrent kernel-side counterpart.
+   *
+   * Returns `1` on a successful terminate, `0` if no worker was spawned
+   * (idempotent — a second call returns `0`).
+   */
+  evictPackage(packageId) {
+    const proc = this._processes.get(packageId);
+    if (!proc) return 0;
+    this._log("info", `lmk: terminating worker for ${packageId}`);
+    try { proc.worker.terminate(); } catch (_) { /* best effort */ }
+    if (proc.pingTimer) {
+      clearTimeout(proc.pingTimer);
+      proc.pingTimer = null;
+    }
+    this._processes.delete(packageId);
+    // Evict every dispatch entry that belonged to the dead worker —
+    // same surgical pruning as the watchdog kill (audit fix #2).
+    for (const [fid, entry] of this._dispatches) {
+      if (entry.packageId === packageId) {
+        this._dispatches.delete(fid);
+      }
+    }
+    return 1;
+  }
+
   // ── Internals ───────────────────────────────────────────────────────────
 
   /**

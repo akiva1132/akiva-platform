@@ -718,6 +718,26 @@ fn legal_transition(from: LifecycleState, to: LifecycleState) -> bool {
     )
 }
 
+/// Test-only escape hatches. Crate-internal so other modules' unit
+/// tests (e.g. `lmk`) can build deterministic fixtures without driving
+/// the full async lifecycle. Never compiled into release binaries.
+#[cfg(test)]
+impl ActivityManager {
+    /// Stamp `state` directly onto the record. Skips every `legal_transition`
+    /// check — that's the point. Only callable from test code.
+    pub(crate) fn force_state_for_test(&mut self, id: ActivityId, state: LifecycleState) {
+        if let Some(rec) = self.records.get_mut(&id) {
+            rec.state = state;
+        }
+    }
+
+    /// Set the foreground task without driving `bring_task_to_front`'s
+    /// pause/resume side effects.
+    pub(crate) fn set_foreground_task_for_test(&mut self, task: TaskId) {
+        self.foreground_task = Some(task);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -408,6 +408,13 @@ function buildImports() {
     hal_app_set_watchdog_timeout_ms: (pidPtr, pidLen, ms) =>
       apps.setWatchdogTimeoutMs(readUtf8(pidPtr, pidLen), ms),
 
+    // Phase 12.3 — terminate the worker for `package_id`. Returns 1 on
+    // a successful terminate, 0 if no worker was spawned. Called from
+    // the kernel's `drive_lmk_into` for every LMK victim. Framework-
+    // side cleanup runs separately via `Framework::evict_package`.
+    hal_evict_package: (pidPtr, pidLen) =>
+      apps.evictPackage(readUtf8(pidPtr, pidLen)),
+
     // Stone 9.3 — read + clear the pending-finish flag for `handle`.
     // Returns 1 if the app called `akiva_host_finish` since the last
     // drain, 0 otherwise.
