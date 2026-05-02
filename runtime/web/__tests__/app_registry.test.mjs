@@ -16,7 +16,7 @@
 
 import { describe, it, expect, vi } from "vitest";
 import { AppRegistry, AUTO_IMPORTS, CAPABILITY_IMPORTS } from "../app_registry.js";
-import { CMD, FIRE, STATUS } from "../op_kinds.mjs";
+import { CMD, FIRE, IO, STATUS } from "../op_kinds.mjs";
 
 // ── Test harness ──────────────────────────────────────────────────────
 
@@ -375,6 +375,57 @@ describe("side_effect from worker — stages into _pending* maps", () => {
       args: concat(u32le(handle), result),
     });
     expect(Array.from(registry.drainSetResult(handle))).toEqual([9, 8, 7]);
+  });
+});
+
+// ── host_op cross-worker protocol ─────────────────────────────────────
+
+describe("host_op routing — kernel-served io ops", () => {
+  it("QUERY_PACKAGES with grant replies host_op_done with the packages blob", () => {
+    const { registry, worker } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.QUERY_PACKAGES"]);
+    const blob = new Uint8Array([1, 2, 3, 4, 5]);
+    registry.setPackages(blob);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+
+    worker._inject({ type: "host_op", future_id: 7n, op_kind: IO.QUERY_PACKAGES, args: new Uint8Array(0) });
+    const reply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(reply).toBeDefined();
+    expect(reply.future_id).toBe(7n);
+    expect(reply.status).toBe(STATUS.READY);
+    expect(Array.from(reply.payload)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("QUERY_PACKAGES without grant replies ERROR + warn-logs", () => {
+    const { registry, worker, log } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "host_op", future_id: 11n, op_kind: IO.QUERY_PACKAGES, args: new Uint8Array(0) });
+    const reply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(reply.status).toBe(STATUS.ERROR);
+    expect(log.mock.calls.some(([lvl, msg]) =>
+      lvl === "warn" && msg.includes("denied — no QUERY_PACKAGES"))).toBe(true);
+  });
+
+  it("STORAGE_* without grant replies ERROR; with grant replies ERROR (Stone 11.6 wires the handler)", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "host_op", future_id: 1n, op_kind: IO.STORAGE_GET, args: new Uint8Array(0) });
+    expect(worker._posted.find((m) => m.type === "host_op_done").status).toBe(STATUS.ERROR);
+
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
+    worker._inject({ type: "host_op", future_id: 2n, op_kind: IO.STORAGE_GET, args: new Uint8Array(0) });
+    const replies = worker._posted.filter((m) => m.type === "host_op_done");
+    expect(replies[1].status).toBe(STATUS.ERROR);
+  });
+
+  it("unknown op_kind replies ERROR + warn-logs", () => {
+    const { registry, worker, log } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "host_op", future_id: 99n, op_kind: 0x01FE, args: new Uint8Array(0) });
+    const reply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(reply.status).toBe(STATUS.ERROR);
+    expect(log.mock.calls.some(([lvl, msg]) =>
+      lvl === "warn" && msg.includes("unknown op_kind"))).toBe(true);
   });
 });
 

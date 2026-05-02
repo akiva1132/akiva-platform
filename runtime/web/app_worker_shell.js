@@ -127,6 +127,9 @@ self.addEventListener("message", (e) => {
     case "set_grants":
       grants = new Set(msg.grants ?? []);
       break;
+    case "set_packages":
+      packagesBlob = msg.packagesBlob instanceof Uint8Array ? msg.packagesBlob : new Uint8Array(0);
+      break;
     default:
       postLog("warn", `unknown message type: ${msg?.type}`);
   }
@@ -402,10 +405,10 @@ function dispatchIoStart(opKind, args) {
     postLog("warn", `io_start(0x${opKind.toString(16)}): not an io op_kind`);
     return 0n;
   }
-  let payload;
-  let status = STATUS.READY;
   switch (opKind) {
     case IO.TEXT_WIDTH: {
+      // Resolved locally — every worker has its own OffscreenCanvas
+      // for `measureText`, so no kernel round-trip needed.
       if (args.length < 4) return 0n;
       const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
       const size = view.getFloat32(0, true);
@@ -415,27 +418,44 @@ function dispatchIoStart(opKind, args) {
       const width = ctx.measureText(text).width;
       const out = new Uint8Array(4);
       new DataView(out.buffer).setFloat32(0, width, true);
-      payload = out;
-      break;
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.READY, payload: out });
+      return fid;
     }
-    case IO.QUERY_PACKAGES:
+    case IO.QUERY_PACKAGES: {
+      // Resolved locally — the kernel pushes the snapshot at `init`
+      // and again on every `setPackages` (install/uninstall). The
+      // SDK's `read_blob` polls just once and gives up on PENDING,
+      // so a kernel round-trip would race the first frame; serving
+      // the cached blob here makes the call synchronously READY in
+      // the same dispatch the wasm raised it.
+      if (!grants.has("akiva.permission.QUERY_PACKAGES")) {
+        postLog("warn", `io_start(QUERY_PACKAGES): denied — no QUERY_PACKAGES grant`);
+        return 0n;
+      }
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.READY, payload: packagesBlob.slice() });
+      return fid;
+    }
     case IO.STORAGE_GET:
-    case IO.STORAGE_SET:
-      // Stone 11.4c-4 forwards these to the kernel-worker as
-      // `host_op` messages, returns a local future_id immediately,
-      // and stages the entry as PENDING. For 11.4c-1 we resolve to
-      // ERROR locally so smoke tests don't hang waiting for a wired
-      // round-trip.
-      status = STATUS.ERROR;
-      payload = new Uint8Array(0);
-      break;
+    case IO.STORAGE_SET: {
+      // Storage ops genuinely need the kernel — backed by OPFS the
+      // app-worker can't see directly (Stone 11.6 wires read-only
+      // handles into the worker, but writes still proxy here).
+      // Allocate a local future_id, stage as PENDING, post host_op,
+      // and let host_op_done flip it for the next io_poll.
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
+      postMessage(
+        { type: "host_op", future_id: fid, op_kind: opKind, args },
+        [args.buffer],
+      );
+      return fid;
+    }
     default:
       postLog("warn", `io_start(0x${opKind.toString(16)}): unknown op_kind`);
       return 0n;
   }
-  const fid = nextFutureId++;
-  futures.set(fid, { status, payload });
-  return fid;
 }
 
 function pollFuture(futureId, outPtr, outCap) {

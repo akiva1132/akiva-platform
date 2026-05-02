@@ -19,7 +19,7 @@
 // Worker stays alive — Stone 11.5 adds the cleanup).
 
 import { fontString } from "./renderer/canvas2d.js";
-import { STATUS, packPoll, FIRE } from "./op_kinds.mjs";
+import { STATUS, FIRE, IO } from "./op_kinds.mjs";
 
 export class AppRegistry {
   /**
@@ -151,6 +151,17 @@ export class AppRegistry {
    */
   setPackages(bytes) {
     this._packagesBlob = bytes instanceof Uint8Array ? bytes : new Uint8Array(0);
+    // Push the new snapshot to every running worker so its local
+    // QUERY_PACKAGES handler returns up-to-date data without a kernel
+    // round-trip. setPackages is rare (boot + install/uninstall), so
+    // a fan-out broadcast here is cheaper than the per-call host_op
+    // we'd need otherwise.
+    for (const proc of this._processes.values()) {
+      proc.worker.postMessage({
+        type: "set_packages",
+        packagesBlob: this._packagesBlob.slice(),
+      });
+    }
     this._dbg("permissions", `packages snapshot: ${this._packagesBlob.length} bytes`);
   }
 
@@ -351,6 +362,9 @@ export class AppRegistry {
     // wasmBytes ownership: storage hands us a fresh-copy Uint8Array
     // backed by its own ArrayBuffer (see `Storage.get`), so transferring
     // is safe and saves a structured-clone of the wasm bytes.
+    //
+    // packagesBlob is sliced (not transferred) because we want to
+    // keep our own copy as well — every worker gets the snapshot.
     worker.postMessage(
       {
         type: "init",
@@ -358,6 +372,7 @@ export class AppRegistry {
         wasmBytes,
         grants,
         resources,
+        packagesBlob: this._packagesBlob.slice(),
       },
       [wasmBytes.buffer],
     );
@@ -435,9 +450,7 @@ export class AppRegistry {
         this._handleSideEffect(packageId, msg);
         break;
       case "host_op":
-        // Stone 11.4c-3 routes QUERY_PACKAGES / STORAGE_* here.
-        // Until then, app-worker resolves locally to ERROR.
-        this._log("warn", `${packageId}: host_op routing not wired yet (op_kind=0x${(msg.op_kind ?? 0).toString(16)})`);
+        this._handleHostOp(packageId, msg);
         break;
       case "log":
         this._log(msg.level ?? "info", msg.text ?? "");
@@ -511,6 +524,56 @@ export class AppRegistry {
 
   _hasGrant(packageId, capability) {
     return this._grants.get(packageId)?.has(capability) ?? false;
+  }
+
+  /**
+   * Stone 11.4c-3 — resolve a `host_op` request raised by an app
+   * worker that needed a kernel-served io op (QUERY_PACKAGES,
+   * STORAGE_GET, STORAGE_SET). Capability gating happens here
+   * (mirrors the legacy single-worker dispatcher); the result is
+   * posted back via `host_op_done` so the worker's own `io_poll`
+   * resolves on the next tick.
+   */
+  _handleHostOp(packageId, msg) {
+    const futureId = typeof msg.future_id === "bigint" ? msg.future_id : BigInt(msg.future_id ?? 0);
+    const proc = this._processes.get(packageId);
+    if (!proc) return;
+
+    let status = STATUS.READY;
+    let payload = new Uint8Array(0);
+
+    switch (msg.op_kind) {
+      case IO.QUERY_PACKAGES: {
+        if (!this._hasGrant(packageId, "akiva.permission.QUERY_PACKAGES")) {
+          this._log("warn", `[${packageId}] host_op QUERY_PACKAGES: denied — no QUERY_PACKAGES grant`);
+          status = STATUS.ERROR;
+          break;
+        }
+        // Slice so a later `setPackages` reassignment can't mutate
+        // the staged payload out from under a pending poll.
+        payload = this._packagesBlob.slice();
+        break;
+      }
+      case IO.STORAGE_GET:
+      case IO.STORAGE_SET: {
+        if (!this._hasGrant(packageId, "akiva.permission.STORAGE_SANDBOX")) {
+          this._log("warn", `[${packageId}] host_op STORAGE_*: denied — no STORAGE_SANDBOX grant`);
+          status = STATUS.ERROR;
+          break;
+        }
+        // Stone 11.6 wires the actual handler. Until then, ERROR.
+        status = STATUS.ERROR;
+        break;
+      }
+      default:
+        this._log("warn", `[${packageId}] host_op unknown op_kind=0x${(msg.op_kind ?? 0).toString(16)}`);
+        status = STATUS.ERROR;
+    }
+
+    proc.worker.postMessage(
+      { type: "host_op_done", future_id: futureId, status, payload },
+      [payload.buffer],
+    );
   }
 
   /**
