@@ -1239,35 +1239,427 @@ new ResizeObserver(entries => {
 
 **תלוי ב:** לא תלוי ב-Phase 11/12 (יכול לרוץ במקביל). מוזכר אחרון כי חשיבותו כ-OS-core קטנה יותר.
 
-**רכיבים שנבנים:**
+**אופי העבודה:** כולה Rust/framework-internal — לא דורש browser APIs חדשים. Canvas2D כבר תומך בכל הנדרש (transform stack, z-ordering דרך paint order). כל stone עצמאי; אפשר לעבוד sequentially.
 
-### 13.1 WindowManager ב-framework
-- מחליף את ה-stub ב-[`framework/src/window_manager.rs`](framework/src/window_manager.rs)
-- מודל: surfaces מרובים בין compositor לפעילויות, כל אחת עם `WindowLayer` (wallpaper, app, overlay, system)
+---
 
-### 13.2 Compositor z-ordering
-- Compositor מרכיב frame מ-multiple surfaces בסדר z
-- Overlay אפליקטיבי (למשל system dialog) מצויר מעל app
+### Stone 13.0 — Window surface model (~1 שבוע)
 
-### 13.3 System dialog overlays
-- API לאפליקציה: `ctx.show_dialog(title, message, buttons)` → framework מצייר dialog ב-overlay layer
-- Focus routing: dialog מקבל input; app שמאחוריו ב-paused-but-visible
+**הבעיה.** [`framework/src/window_manager.rs`](framework/src/window_manager.rs) הוא stub — מחזיר `()` על הכל. Compositor עובד עם `FrameCommands` יחיד גלובלי. אין concept של "surface" נפרד מ-"activity" — כל הציור הולך לאותו buffer.
 
-### 13.4 Transitions
-- Task switch: fade between task stacks
-- Activity push: slide from right
-- configurable via resources (`@style/transition_app_enter`?)
+**מה נבנה.**
 
-### 13.5 Cross-display (multi-tab)
-- Task חדש → display target (tab) חדש
-- ממומש על בסיס "tabs as displays" model מ-[`ARCHITECTURE.md §9`](ARCHITECTURE.md)
+`WindowLayer` enum ב-[`framework/src/window_manager.rs`](framework/src/window_manager.rs):
+```rust
+#[repr(u32)]
+pub enum WindowLayer { Wallpaper = 0, App = 100, Overlay = 200, System = 300 }
+```
 
-**Exit criteria:**
-- [ ] system dialog מעל app פעיל; tap מחוץ לו סוגר אותו
-- [ ] activity push עם animation, לא jump cut
-- [ ] שני tabs מציגים שתי tasks שונות, משתמש מעביר activity ביניהן
+`SurfaceId(u32)` — opaque handle. `WindowManager` מחזיק `Vec<SurfaceRecord>`:
+```rust
+struct SurfaceRecord {
+    id: SurfaceId, owner: AppHandle, layer: WindowLayer,
+    bounds: Rect, visible: bool,
+}
+```
 
-**הערכת זמן:** 3-4 שבועות.
+API חדש:
+```rust
+pub fn create_surface(&mut self, owner: AppHandle, layer: WindowLayer) -> SurfaceId
+pub fn destroy_surface(&mut self, id: SurfaceId)
+pub fn set_bounds(&mut self, id: SurfaceId, rect: Rect)
+pub fn set_visible(&mut self, id: SurfaceId, visible: bool)
+pub fn focus(&mut self, id: SurfaceId) -> Option<SurfaceId>  // returns old focus
+pub fn focused(&self) -> Option<SurfaceId>
+pub fn surfaces_in_z_order(&self) -> Vec<SurfaceId>  // sorted by layer+creation_order
+```
+
+`Framework::render_frame` מקצה `FrameCommands` per-surface במקום global אחד. כל activity ציור הולך ל-surface שלה.
+
+**DoD:**
+- [ ] `WindowManager::create_surface` / `destroy_surface` + 5 unit tests (layer ordering, visibility, focus stack)
+- [ ] `surfaces_in_z_order` מחזיר לפי layer value, creation-order כ-tiebreak
+- [ ] Calculator + Shell ממשיכים לעבוד — stub replaced, same behavior
+
+---
+
+### Stone 13.1 — Compositor z-ordering (~3 ימים)
+
+**הבעיה.** [`framework/src/compositor.rs`](framework/src/compositor.rs) — `Compositor` מחזיק `FrameCommands` יחיד. הוספת surface שני היא undefined — אין הגדרה איזה z הוא מעל.
+
+**מה נבנה.**
+
+`Compositor` עובר מ-`frame: FrameCommands` ל-`surfaces: HashMap<SurfaceId, FrameCommands>`.
+
+```rust
+pub fn begin_surface(&mut self, id: SurfaceId) { self.surfaces.insert(id, FrameCommands::new()); }
+pub fn surface_target(&mut self, id: SurfaceId) -> &mut FrameCommands { ... }
+pub fn finish_frame(&self, order: &[SurfaceId]) -> FrameCommands {
+    // concatenate ops in z-order — flat stream for the HAL
+    let mut out = FrameCommands::new();
+    for id in order { if let Some(fc) = self.surfaces.get(id) { out.extend(fc); } }
+    out
+}
+```
+
+`Framework::render_frame` שואל `WindowManager::surfaces_in_z_order()` → passes to `Compositor::finish_frame`. Result: single flat `FrameCommands` → HAL (renderer unchanged).
+
+**DoD:**
+- [ ] שתי surfaces: app + overlay → overlay ops appear last in output (drawn on top)
+- [ ] `destroy_surface` → removed from `surfaces` map; no dangling entries
+- [ ] Performance: finish_frame ≤ 0.5ms for 4 active surfaces (no per-frame allocs beyond ops copy)
+
+---
+
+### Stone 13.2 — System dialog overlays (~3 ימים)
+
+**הבעיה.** אין dialog API. App שרוצה "confirm?" צריך לצייר ולנהל focus בעצמו — ואין isolation שמונע מ-app שמאחורי ה-dialog לקבל pointer events.
+
+**מה נבנה.**
+
+SDK API ב-[`sdk-rust/src/ctx.rs`](sdk-rust/src/ctx.rs):
+```rust
+pub fn show_dialog(
+    &mut self, title: &str, body: &str, buttons: &[&str],
+) -> Future<DialogResult>
+
+pub enum DialogResult { Button(usize), Dismissed }
+```
+
+Framework: `SystemDialogRenderer` — מנוהלת ב-framework, לא ב-app wasm. מצייר dialog box ישירות על `WindowLayer::Overlay` surface שלו, כולל background dim על ה-App surface שמתחתיה.
+
+Focus routing: `WindowManager::focus(dialog_surface)` → `Framework::dispatch_pointer` בודק `focused()` — אם overlay פתוח, events מגיעים רק לdialog. Tap מחוץ ל-`dialog_bounds` → `DialogResult::Dismissed`. App מאחורי עובר ל-`paused-but-visible`: ממשיך לצייר (מוצג dimmed), לא מקבל input.
+
+**DoD:**
+- [ ] Calculator: `ctx.show_dialog("Clear?", "This will reset", &["Yes", "No"])` → dialog מוצג מעל
+- [ ] Tap "Yes" → `DialogResult::Button(0)` מגיע ל-Future; calculator מטפל
+- [ ] Tap outside bounds → `DialogResult::Dismissed`
+- [ ] בזמן dialog פתוח — calculator לא מקבל pointer events
+- [ ] Background dim (alpha ~0.4) על ה-app surface בזמן dialog פתוח
+
+---
+
+### Stone 13.3 — Transitions (~1 שבוע)
+
+**הבעיה.** כל activity push/pop הוא jump-cut מיידי. על mobile, transition מגדיר את תחושת ה-"OS" יותר מכל שינוי אחר ב-UI.
+
+**מה נבנה.**
+
+`framework/src/animation.rs` — `AnimationController`:
+```rust
+pub enum Transition {
+    FadeIn { duration_ms: u32 },
+    FadeOut { duration_ms: u32 },
+    SlideFromRight { duration_ms: u32 },
+    SlideToLeft { duration_ms: u32 },
+}
+
+impl AnimationController {
+    pub fn tick(&mut self, elapsed_ms: f64) -> Option<f32>  // None = done, Some(t) = [0..1]
+}
+```
+
+`Compositor::set_surface_props(id, alpha: f32, translate_x: f32)` — לפני `finish_frame`, מחיל `OP_PUSH_TRANSFORM(translate_x, 0, 1.0)` בתחילת surface's ops + rgba alpha multiplier על כל op. אין opcode חדש — transform stack קיים.
+
+`Framework::push_activity` מפעיל `SlideFromRight(250ms)` על surface הנכנס. `pop_activity` מפעיל `SlideToLeft(200ms)` + `FadeOut(200ms)` במקביל. בכל frame: `tick(delta_ms)` → progress → compositor מחיל → כשהסתיים, outgoing surface נהרס.
+
+**DoD:**
+- [ ] Activity push → slide-in animation 250ms — 60fps ב-devtools performance trace
+- [ ] Activity pop → slide-out 200ms
+- [ ] 2 concurrent transitions (push during another push) → queued, לא crash
+- [ ] Transition frame ≤ 4ms (no per-frame heap allocs beyond existing paint ops)
+
+---
+
+### Stone 13.4 — Cross-display / multi-tab (~1 שבוע)
+
+**הבעיה.** כיום `hal_post_to_display(displayId, bytes)` קיים ב-worker.js (Stone 11.x) — אבל tab שני מקבל אותו `displayId=0` כמו הראשון ולא task נפרד. אין מנגנון שמאפשר ל-tab שני לתבוע display חדש.
+
+**מה נבנה.**
+
+`tab.js` side: `{ type: "request_display" }` → session forwards to worker → kernel assigns `displayId` חדש (via `DisplayManager::alloc_display`) → kernel renders assigned task ל-displayId → `hal_post_to_display(displayId, bytes)` → worker.js שולח `display_frame(displayId)` ב-BroadcastChannel → tab שתבע אותו displayId מציג.
+
+`leader.js` / Session: `Map<displayId, MessageChannel>` — כל tab שהצהיר `{ type: "claim_display", displayId }` מקבל frames רלוונטיים.
+
+`DisplayManager` ב-kernel: `HashMap<DisplayId, SurfaceMetrics>` (קיים ב-[`kernel/src/display_manager.rs`](kernel/src/display_manager.rs), נרחיב ל-alloc/release).
+
+**DoD:**
+- [ ] שני tabs: כל אחד מקבל task נפרד (Calculator ב-tab A, Shell ב-tab B)
+- [ ] resize ב-tab B → אינו משפיע על metrics ב-tab A
+- [ ] tab B נסגר → kernel מקבל `release_display` → task עובר לbackground; tab A לא מושפע
+
+---
+
+**Exit criteria — Phase 13:**
+- [ ] 5 stones סגורים.
+- [ ] System dialog מעל app פעיל; tap מחוץ לו סוגר אותו.
+- [ ] Activity push עם animation — לא jump-cut.
+- [ ] שני tabs מציגים שתי tasks שונות.
+
+**הערכת זמן:** 5-7 שבועות.
+
+---
+
+## שלב 14 — Capabilities (Browser ↔ Apps)
+
+**מטרה:** חשיפת platform capabilities שזמינות רק דרך הדפדפן לאפליקציות Akiva — רשת, אודיו, התראות, לוח, רטט, מיקום. כל capability עובר דרך HAL imports (kernel worker), עם proxying ל-tab.js עבור APIs שדורשות main thread.
+
+**תלוי ב:** Phase 10 (Permission model — כל capability דורשת permission grant; ללא Phase 10, כל app מקבל גישה ל-WebSocket ויכול לדלוף נתונים). Phase 11 (isolated workers — capabilities נחשפות ל-app worker בלבד, לא ל-kernel ישירות).
+
+**למה "14" ולא קודם.** Capabilities ללא permission model זה XSS-by-design: כל app מקבל גישה חופשית לרשת ויכול ל-exfiltrate נתוני app אחר. הסדר הנכון: isolation (Phase 11) → governance (Phase 12) → capabilities (Phase 14).
+
+**ארכיטקטורת HAL לcapabilities:**
+
+```
+App (wasm) ─► hal_cap_* imports ─► kernel worker ─┬─[worker-native]──────────► Web API (WebSocket, Notifications)
+                                                   └─[main-thread-proxied]──► postMessage("cap_req") ─► tab.js ─► Web API
+                                                                               postMessage("cap_resp") ◄──────────────────
+```
+
+שתי קטגוריות:
+- **Worker-native** (Stones 14.1–14.3): WebSocket, WebTransport, Notifications — ישירות ב-dedicated worker, ללא proxy
+- **Main-thread-proxied** (Stones 14.4–14.6): Clipboard, Vibration, Geolocation — API תקפה רק ב-main thread; worker שולח `cap_req` ל-tab.js ומקבל `cap_resp`
+
+---
+
+### Stone 14.1 — WebSocket (~1 שבוע)
+
+**מה הדפדפן מאפשר.**
+`WebSocket` (RFC 6455) — bidirectional, message-framed, TCP/TLS. **Baseline 2015**. **זמין ב-dedicated workers** (`self.WebSocket`) — kernel worker יכול לפתוח חיבורים ישירות ב-`self`, ללא proxy לmain thread. Binary frames (`binaryType = "arraybuffer"`), UTF-8 text frames. Browser מנהל TLS + WS handshake בשקיפות. Latency: ≤ 1ms ב-local network, ~20-100ms ל-remote.
+
+**מה אנחנו עושים.**
+
+`kernel/src/host.rs` — 4 HAL imports חדשים:
+```rust
+hal_ws_open(url_ptr: u32, url_len: u32, handle_out_ptr: u32) -> i32   // 0=ok, -1=err
+hal_ws_send(handle: u32, data_ptr: u32, data_len: u32) -> i32
+hal_ws_recv(handle: u32, out_ptr: u32, out_cap: u32, out_len_ptr: u32) -> i32  // 0=empty, -1=closed
+hal_ws_close(handle: u32)
+```
+
+`runtime/web/worker.js` — `Map<u32, { ws: WebSocket, ring: Uint8Array[] }>`. פתיחה: `new WebSocket(url); ws.binaryType = "arraybuffer"`. `onmessage` → `ring.push(new Uint8Array(e.data))`. `hal_ws_recv` מוציא frame אחד מה-ring (returns `0` אם ריק; ה-app עושה yield ומנסה שוב בframe הבא).
+
+`framework/src/net.rs` — `WsHandle(u32)`. `async fn connect(url: &str) -> Result<WsHandle, WsError>` polls `hal_ws_open` future (future system מ-11.6.8). `async fn send(&self, data: &[u8])`. `async fn recv(&self) -> Result<Vec<u8>, WsError>` polls `hal_ws_recv` — מחכה עד שring לא ריק.
+
+SDK: `akiva_sdk::net::WebSocket` wrapping `framework::net::WsHandle`.
+
+**אופי המימוש:** additive — 4 imports חדשים ל-ABI (MINOR bump). App worker שולח WebSocket requests ישירות; kernel worker אינו מעורב ב-routing.
+
+**DoD:**
+- [ ] Sample app: connect → send "hello" → recv "hello" back מ-echo server
+- [ ] `hal_ws_recv` returns `0` (not panic) כשring ריק — app loops with yield
+- [ ] Server closes → next `recv()` → `Err(WsError::Closed)`
+- [ ] Connection refused (bad URL) → `Err(WsError::Failed)` תוך ≤ 5s
+- [ ] `docs/abi.md` מעודכן עם 4 imports; ABI MINOR bump
+
+---
+
+### Stone 14.2 — WebTransport (~3 ימים)
+
+**מה הדפדפן מאפשר.**
+`WebTransport` over HTTP/3 (QUIC). **Baseline 2023** (Chrome 97+, Firefox 114+, Safari 18.2+). זמין ב-dedicated workers (Chrome 104+). מספק:
+- `datagrams.readable/writable` — unreliable, unordered, UDP-style; אידיאלי ל-game state ו-real-time telemetry (קטן יותר מWS לmessages קטנות, ללא head-of-line blocking)
+- `createBidirectionalStream()` → QUIC stream (reliable, ordered, backpressure)
+- דורש HTTPS (HTTP/3 server בלבד)
+
+**מה אנחנו עושים.**
+
+Worker-native (כמו WS). HAL imports:
+```
+hal_wt_open(url_ptr, url_len, handle_out) → i32
+hal_wt_datagram_send(handle, data_ptr, data_len)
+hal_wt_datagram_recv(handle, out_ptr, out_cap, out_len) → i32   // 0=empty, -1=closed
+hal_wt_stream_open(handle, stream_out) → i32
+hal_wt_stream_send(stream, data_ptr, data_len) → i32
+hal_wt_stream_recv(stream, out_ptr, out_cap, out_len) → i32
+hal_wt_close(handle)
+```
+
+`worker.js` — `Map<u32, WebTransport>` + datagrams ring buffer. `wt.datagrams.readable.getReader()` pumped async ל-ring.
+
+SDK: `akiva_sdk::net::WebTransport` עם `send_datagram(&[u8])`, `recv_datagram() -> Future<Vec<u8>>`, `open_stream() -> Future<WtStream>`.
+
+**DoD:**
+- [ ] Datagram roundtrip ב-test server
+- [ ] `typeof WebTransport === "undefined"` (old browser) → `hal_wt_open` returns `-1` gracefully, לא crash
+- [ ] Stream open + send + recv roundtrip
+
+---
+
+### Stone 14.3 — Notifications (~3 ימים)
+
+**מה הדפדפן מאפשר.**
+`Notification` — **Baseline 2022**. **זמין ב-dedicated workers** (`self.Notification`). `new Notification(title, { body, icon, tag, badge })` → OS-level system notification. `tag` deduplicates — אותו tag מעדכן notification קיים במקום ליצור חדש (חשוב נגד spam). `Notification.requestPermission()` → Promise<"granted"|"denied"|"default">; browser stores בין sessions.
+
+**מה אנחנו עושים.**
+
+Worker-native — אין proxy. `runtime/web/worker.js`:
+```js
+let notifyPermission = "default";
+const hal_notify_post = async (titlePtr, titleLen, bodyPtr, bodyLen) => {
+  if (notifyPermission !== "granted") {
+    notifyPermission = await Notification.requestPermission();
+  }
+  if (notifyPermission !== "granted") return 1;  // denied → app handles
+  new Notification(readUtf8(titlePtr, titleLen), {
+    body: readUtf8(bodyPtr, bodyLen),
+    tag:  "akiva-notify",
+  });
+  return 0;
+};
+```
+
+Permission integration: app manifest `permissions = ["NOTIFICATION"]` (Phase 10). Kernel checks permission table לפני שמגיע ל-HAL; אם לא granted → returns 1 מבלי לשאול.
+
+SDK: `akiva_sdk::notify::post(title: &str, body: &str) -> i32`.
+
+**DoD:**
+- [ ] OS notification מוצגת מ-Calculator app לאחר חישוב
+- [ ] Same `tag` → update existing notification, לא spam
+- [ ] `Notification` לא נתמך (HTTP context) → returns -1, לא crash
+- [ ] Permission denied → returns 1; app log ברור
+
+---
+
+### Stone 14.4 — Clipboard (~3 ימים)
+
+**מה הדפדפן מאפשר.**
+`navigator.clipboard.writeText(text)` / `.readText()` — **Baseline 2018**, secure context בלבד. **Main thread only** — `navigator` לא זמין ב-dedicated workers. `readText()` דורש `clipboard-read` permission (Permissions API). `writeText()` עובד ב-response ל-user gesture.
+
+**מה אנחנו עושים.**
+
+`cap_req` / `cap_resp` protocol חדש ב-tab.js + worker.js:
+
+`worker.js`:
+```js
+let capReqId = 0;
+const capPending = new Map();  // reqId → resolve fn
+
+// בhandler של "message":
+if (e.data?.type === "cap_resp") {
+  const r = capPending.get(e.data.reqId);
+  if (r) { r(e.data); capPending.delete(e.data.reqId); }
+}
+
+function capRequest(payload) {
+  return new Promise(resolve => {
+    const id = ++capReqId;
+    capPending.set(id, resolve);
+    self.postMessage({ type: "cap_req", reqId: id, ...payload });
+  });
+}
+
+hal_clipboard_write: async (ptr, len) => {
+  const r = await capRequest({ capability: "clipboard_write", text: readUtf8(ptr, len) });
+  return r.error ? -1 : 0;
+},
+hal_clipboard_read: async (outPtr, outCap, outLenPtr) => { ... },
+```
+
+`tab.js`:
+```js
+case "cap_req": handleCapReq(msg); break;
+
+async function handleCapReq(msg) {
+  const resp = { type: "cap_resp", reqId: msg.reqId };
+  try {
+    if (msg.capability === "clipboard_write")
+      await navigator.clipboard.writeText(msg.text);
+    else if (msg.capability === "clipboard_read")
+      resp.text = await navigator.clipboard.readText();
+  } catch (e) { resp.error = e.message; }
+  session.send(resp);
+}
+```
+
+SDK: `akiva_sdk::clipboard::write(text: &str) -> Future<()>`, `read() -> Future<String>`.
+
+**DoD:**
+- [ ] Write "hello" → paste ב-external app works
+- [ ] `read()` Future resolves עם clipboard text
+- [ ] Permission denied → `Err(ClipboardError::Denied)`, לא crash
+- [ ] Non-secure context (HTTP) → graceful `Err`, לא panic
+
+---
+
+### Stone 14.5 — Vibration (~1 יום)
+
+**מה הדפדפן מאפשר.**
+`navigator.vibrate(pattern)` — `pattern` הוא `number` (ms) או `number[]` (vibrate/pause/vibrate). Chrome 32+/Firefox 16+ ב-Android. **Safari: לא תומך — מחזיר `false` בשקט.** Main thread only. שימוש נפוץ: haptic feedback על tap, redo/undo, alert patterns.
+
+**מה אנחנו עושים.**
+
+Fire-and-forget — לא דורש Future. `hal_vibrate(pattern_ptr, pattern_len)` → worker posts `{ type: "cap_req", capability: "vibrate", pattern: [...u16] }`. tab.js:
+```js
+case "vibrate":
+  if (navigator.vibrate) navigator.vibrate(msg.pattern);
+  // no cap_resp needed — fire and forget
+  break;
+```
+
+SDK: `akiva_sdk::device::vibrate(pattern: &[u16])`.
+
+**DoD:**
+- [ ] Android Chrome — vibrate pattern רוטט (200ms)
+- [ ] Safari / desktop → silent no-op (returns immediately, no crash, no warning log)
+
+---
+
+### Stone 14.6 — Geolocation (~3 ימים)
+
+**מה הדפדפן מאפשר.**
+`navigator.geolocation.getCurrentPosition(ok, err, opts)` / `watchPosition()`. Requires secure context. **Main thread only**. User permission dialog. `opts.enableHighAccuracy: true` → GPS (battery expensive, 1-10s cold start); `false` → network/WiFi triangulation (fast, ~100m). `watchPosition` fires callback כל פעם שמיקום משתנה (מינימום ~1s).
+
+**מה אנחנו עושים.**
+
+Proxied via `cap_req` / `cap_resp` (מ-Stone 14.4). `worker.js`:
+```
+hal_geo_current() → future_id: u32  // result arrives via cap_resp
+hal_geo_watch_start() → watch_id: u32
+hal_geo_watch_stop(watch_id: u32)
+```
+
+`tab.js`:
+```js
+case "geo_current":
+  navigator.geolocation.getCurrentPosition(
+    pos => session.send({ type: "cap_resp", reqId: msg.reqId,
+      lat: pos.coords.latitude, lng: pos.coords.longitude,
+      accuracy_m: pos.coords.accuracy, ts_ms: pos.timestamp }),
+    err => session.send({ type: "cap_resp", reqId: msg.reqId, error: err.code }),
+    { enableHighAccuracy: false, timeout: 10000 }
+  );
+  break;
+case "geo_watch_start": {
+  const wid = navigator.geolocation.watchPosition(pos => { ... }, err => { ... });
+  session.send({ type: "cap_resp", reqId: msg.reqId, watchId: wid });
+  break;
+}
+```
+
+SDK: `akiva_sdk::location::get_current() -> Future<GeoPosition>`, `watch() -> GeoWatcher`.
+```rust
+pub struct GeoPosition { pub lat: f64, pub lng: f64, pub accuracy_m: f32, pub ts_ms: f64 }
+```
+
+**DoD:**
+- [ ] `get_current()` Future resolves עם position (test על mobile Chrome)
+- [ ] Permission denied → `Err(GeoError::Denied)`, app continues
+- [ ] `watch()` fires updates על movement (5+ updates ב-30s walk test)
+- [ ] Non-HTTPS → `Err(GeoError::InsecureContext)` מ-tab.js
+
+---
+
+**Exit criteria — Phase 14:**
+- [ ] 6 stones סגורים, כל אחד עם end-to-end test app.
+- [ ] Calculator: notification לאחר כל חישוב → OS notification מוצגת.
+- [ ] Sample "ping" app: WebSocket send/recv roundtrip ל-echo server.
+- [ ] Clipboard write/read roundtrip עובד.
+- [ ] כל capability מטפלת gracefully ב-permission denied + browser ללא תמיכה.
+- [ ] `docs/abi.md` מעודכן עם כל HAL imports חדשים.
+- [ ] ABI MINOR bump (additive imports — לא breaking).
+
+**הערכת זמן:** 5-7 שבועות.
 
 ---
 
@@ -1282,9 +1674,21 @@ new ResizeObserver(entries => {
 
 הסוקר החיצוני ([codex-notes/external-review.md](codex-notes/external-review.md), 2026-04-22) זיהה שלושת אלה כ-"three tests before real OS". v0.3 הוא הפעולה הממוקדת לסגור את השלישייה הזו.
 
+## סיכום v0.4
+
+**סה"כ זמן:** ~5-7 שבועות אחרי v0.3.
+
+בסיום v0.4, Akiva עוברת מ-OS מבודדת ל-**connected OS**:
+- **networking:** apps מדברות עם servers בזמן אמת (WebSocket, WebTransport)
+- **audio:** חוויית מולטימדיה native-grade (Web Audio API)
+- **platform integration:** התראות, clipboard, מיקום, רטט — כל מה שOS mobile מציע
+- **הוכחה:** Akiva apps עושות את מה שApps בכל OS אחר עושות
+
 ---
 
 ## סיכום זמנים
+
+### MVP (v0.1) — Phases 0–7
 
 | שלב | תיאור | זמן |
 |---|---|---|
@@ -1301,6 +1705,20 @@ new ResizeObserver(entries => {
 **סה"כ MVP: ~5-7 חודשים** עבודה ממוקדת של מפתח יחיד.
 
 לא מהיר. אבל ב-סוף השלב הזה יש לנו **OS אמיתית עם אפליקציה אמיתית**, לא demo. זה משהו שאפשר להראות, להסביר, ולהרחיב.
+
+### post-MVP — Phases 8–14
+
+| שלב | תיאור | זמן |
+|---|---|---|
+| 8  | Package distribution (.akv + install) | 2-3 שבועות |
+| 9  | Activity lifecycle מלא (back stack, for-result) | 3-4 שבועות |
+| 10 | Permission model (capability-via-imports) | 2-3 שבועות |
+| 11 | Process isolation (dedicated workers + ABI) | 13-19 שבועות |
+| 12 | Resource Governance (memory + CPU quota) | 3-5 שבועות |
+| 13 | WindowManager completion (overlays, transitions) | 5-7 שבועות |
+| 14 | Capabilities (WebSocket, Audio, Notify, Clipboard…) | 5-7 שבועות |
+
+**סה"כ post-MVP v0.2–v0.4: ~8-13 חודשים** נוספים.
 
 ---
 
