@@ -780,21 +780,73 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
 
 10. **worker shell unit tests** — currently tested only via integration. add `app_worker_shell.test.mjs` with mocked `postMessage` that exercises the dispatcher.
 
-### Recommended Order
+#### 🔴 Phase 12 readiness — חייבים לסגור לפני שsuspension/LMK יעלה
+
+הערכה מ-2026-05-02 (אחרי שכל P0 + 2/3 P1 נסגרו) זיהתה שלוש פערים ברמת ה-SDK שsemantically חוסמים את Phase 12 — לא ארכיטקטוניים אלא API-level. הם נשמטו במהלך Stone 11.2 (התכנון של ה-SDK הסתיים כש-`block_on_ready` עוד היה ה-executor) ולא נחשפו עד ש-P0 #4 (executor אמיתי) ב-Stone 11.6 הפך אותם ל-actionable.
+
+**ההצדקה לעצור את Phase 12:** Phase 12.4 (App suspension / CACHED state) דורש שscope-based cancellation עובד. בלי TaskScope אמיתי, "suspend" יוכל רק לעשות `worker.terminate()` — סמנטית זה crash, לא suspension. כל ה-design של 12.3 (LMK priority tiers) מניח ש-`Resumed`-scoped tasks מתבטלים ב-pause; אם זה לא קורה, ה-priority tiers איבדו משמעות. מימוש 12.x על-גבי API שבור = bedrock של טעות.
+
+הדרך הנכונה: stone חדש **11.6.5 — SDK API completeness pass**, נסגר לפני 11.7. 11.7 (akiva new + docs) חייב לכתוב על API שעובד, אחרת הdocs ינעלו את הטעות בעיני מפתחים עתידיים.
+
+11. **🔴 TaskScope אמיתי (lifecycle-aware cancellation) — cardinal**
+   - **המצב היום.** [sdk-rust/src/activity.rs:156-159](../sdk-rust/src/activity.rs#L156) — `TaskScope::spawn(fut)` הוא ממש `block_on_ready(fut)`. ה-API surface קיימת אבל ה-cancellation לא. ה-doc-comment בקוד (`activity.rs:117-127`) אומר את זה במפורש: *"In Stone 11.2 every spawned future completes in a single poll ... TaskScope::spawn is just a renamed block_on_ready."*
+   - **למה זה חוסם את Phase 12.** App suspension = "save state, cancel running work, drop instance." בלי scope-aware cancellation, אין דרך לבטל באופן selective רק את ה-Resumed-scope tasks ב-on_pause; הברירה היחידה היא להפיל את ה-worker כולו. זה הופך כל suspension להיות סמנטית של crash, וכל revival ל-cold-boot — בדיוק ההפך מ-CACHED state.
+   - **גם חוסם את Stone 11.7.** ה-docs של 11.7 יתעדו `ctx.activity_scope().spawn(...)` כ-API, אבל ה-API לא עושה את מה שמשמעו (cancellation). מפתח שיכתוב `ctx.resumed_scope().spawn(async { loop { sensor.next().await; } })` יקבל infinite loop שגומר את ה-watchdog שלו ב-1.5s, לא task שמת ב-on_pause.
+   - **תיקון.** הוסף שדה ל-`crate::runtime::Slot`: `spawned: Vec<SpawnedTask>` (או slab עם stable IDs). כל `SpawnedTask` מחזיק `Pin<Box<dyn Future + 'static>>` + `kind: ScopeKind`. `TaskScope::spawn` דוחף לרשימה במקום לpolל; ה-app worker shell drive-them ב-frame-by-frame poll (אותו mechanism כמו pending dispatches). on_pause נכנס → ה-runtime מסיר את כל ה-`ScopeKind::Resumed` בלי re-poll. on_destroy → מסיר את הכולם.
+   - **דרישה נוספת.** SDK חייב לתת cancellation token ל-app code (`ctx.is_cancelled() -> bool` או דרך `core::task::Poll::Pending` כשyielded after cancellation). אחרת tight loops לא יכולים לבדוק selber. משאיר את הdetail לטיוטת ה-stone.
+   - **DoD.**
+     - test 1: `ctx.resumed_scope().spawn(infinite_yield_future)` ב-on_resume; trigger on_pause; assert ה-future לא נpolled יותר.
+     - test 2: spawn ב-`activity_scope`; trigger on_pause + on_resume; assert ה-future נpolled ברצף ללא reset.
+     - test 3: spawn 5 tasks (mixed scopes); on_destroy → כולם dropped, drop counter == 5.
+   - **סקופ.** 1-2 ימי עבודה — Slot extension + cancellation tracking + 4-6 tests + עדכון docstring ב-`activity.rs`.
+
+12. **🔴 Concurrent host calls per activity — cardinal**
+   - **המצב היום.** [sdk-rust/src/executor.rs:38-42](../sdk-rust/src/executor.rs#L38-L42) קובע: *"only one in-flight dispatch per handle."* `Slot.pending: Option<PendingDispatch>` — slot יחיד. שני `storage::read()` באותה activity → השני panics או דורס. ה-comment ב-`executor.rs:31-45` קובע את זה כ-invariant שמוגדר על-ידי ה-framework's PendingTransition discipline; הוא נכון לcallback dispatches אבל שגוי ל-user-spawned tasks (שלא עוברים דרך הPendingTransition).
+   - **למה זה חוסם את Phase 12.** ה-`MemoryManager::record(package_id, bytes)` של 12.1 מודד baseline של "memory בשימוש כש-app אקטיבי." app שעובד עם data כבד באופן מציאותי מקצה batches מקבילים — אם ה-API מאלץ אותו לסדר אותם, ה-baseline שאתה מודד שגוי, וה-`max_memory_mb` enforcement של 12.5 לא יואכף על העומס האמיתי.
+   - **גם פוגע ב-DX vision.** ב-iOS `async let a = read("a"); async let b = read("b");` נותן מקבילות חינם. ב-Akiva זה panic. ב-Android, `coroutineScope { launch { ... }; launch { ... }; }`. כל דוגמה ב-docs של 11.7 שתשתמש ב-pattern הזה — תשבר. ושיא הבושה: futures::join! של זה משלום שיוצא בעקבות 11.7 docs **לא יקמפל** עם הinvariant הקיים.
+   - **תיקון.** `Slot.pending` הופך ל-`Slab<PendingDispatch>` או `HashMap<u64, PendingDispatch>` עם dispatch_id ייחודי בתוך ה-slot. `akiva_app_poll_dispatch(id)` polls רק את המסוים; `host_op_done` re-polls רק את ה-future ש-parked על ה-host_op הזה. invariant ה-callback מתחזק (lifecycle FIFO ניהול ע"י Framework), אבל user-spawned tasks יכולים להיות מקבילים.
+   - **תלות:** מקבילות host-calls מצריכה את TaskScope (#11) — בלי spawn אמיתי אין דרך ליצור מקבילות. אבל TaskScope לבד לא מספיק; ה-Slot צריך להיות מסוגל לפלוט dispatches מקבילים. שניהם נצרכים יחד.
+   - **DoD.**
+     - test 1: שני `storage::read` ב-`futures::join!` — שני reads ירוצו במקביל ב-runtime (תיעוד ע"י lookup ב-`pendingDispatches` ב-app worker shell, מאמת `len() == 2`).
+     - test 2: cancellation אמצע flight — spawn task ב-resumed_scope ש-await על read; on_pause → ה-pending dispatch עבור הread נקרע גם הוא (cleanup discipline).
+     - test 3: re-entry — read aware ב-on_create. on_create completes לפני שה-read resolves. ה-read אמור להישאר תקוע ב-Activity scope עד שיresolve או עד destroy. assertion: read.await; ב-on_resume תופס את הbytes.
+   - **סקופ.** 2-3 ימי עבודה — slot redesign (Slab/HashMap) + dispatch_id allocation policy + 8-10 tests + עדכון invariant doc ב-`executor.rs:31-45`.
+
+13. **🟡 Streams API — לא חוסם 12, אבל יחסום 13+**
+   - **המצב היום.** ה-ABI יודע one-shot futures בלבד (`io_start` → eventual `io_poll` → result, פעם אחת). אין primitive ל-stream of values: sensor readings, audio samples, file watch, animation tickers.
+   - **למה זה לא חוסם את Phase 12.** Phase 12.x לא מציג capability חדש שדורש stream.
+   - **למה זה כן יחסום את 13+.** WindowManager event routing, animation tickers, real-time data — הכל streams. WASI 0.3 בנוי סביב `stream<T>`. כל יום של דחייה יעלה ב-migration cost.
+   - **תיקון מתוכנן.** op_kind חדש `STREAM_OPEN` שמחזיר `stream_id`; `stream_poll(stream_id)` מחזיר `Vec<Item>` מ-batch של values (שgrouped מאז ה-poll הקודם); `stream_close(stream_id)`. wire shape דומה ל-Component Model `stream<T>` ל-future migration.
+   - **סקופ.** 3-5 ימי עבודה — חדש לחלוטין, גם בwasm side וגם בJS side, עם לפחות 2 example streams (frame_ticker, log_tail).
+   - **המלצה.** דחה ל-Phase 13 prep (ה-problem domain יהיה ברור יותר אז כשWindowManager צריך event streams). **אל תכלול ב-11.6.5.**
+
+### Recommended Order (revised post-2026-05-02 audit)
 
 ```
-P0-1 (save_state pipeline)  →  P0-2 (graceful shutdown)
-                            →  P0-3 (Trapped recycle)
-                            →  P0-4 (SDK async executor)
-                                ↓
-                            P1: storage WriteHandle, config block, drain phase
-                                ↓
-                            P2: e2e tests, worker shell tests
-                                ↓
-                            Phase 11 done — מעבר ל-Phase 12 (Resource Governance)
+P0-1 (save_state)         ✅
+P0-2 (graceful shutdown)  ✅
+P0-3 (Trapped recycle)    ✅
+P0-4 (async executor)     ✅
+P1-2 (config block)       ✅
+P1-3 (drain phase)        ✅
+                            ↓
+P1-1 (storage WriteHandle, ~30 דק') + P1-4 (pkgs_wire dedup, ~1-2h, אופציונלי)
+                            ↓
+🔴 Stone 11.6.5 — SDK API completeness (~3-5 ימים)
+   • #11 TaskScope אמיתי (cardinal)
+   • #12 concurrent host calls per activity (cardinal)
+   • #13 streams — נדחה ל-Phase 13 prep
+                            ↓
+Stone 11.7 — akiva new + docs (1-2 שבועות) — מתועד על API שעובד
+                            ↓
+Stone 11.8 — perf + benchmarks (1 שבוע)
+                            ↓
+Phase 11 done — מעבר ל-Phase 12 (Resource Governance)
 ```
 
-**אומדן זמן:** P0 כולו ~3-4 ימי עבודה, P1 ~חצי יום, P2 ~יום.
+**אומדן זמן (revised):** P0 + P1 closed; **11.6.5 = 3-5 ימים**; 11.7 + 11.8 לא השתנו.
+
+**Gate ל-Phase 12:** אסור להתחיל את 12.x לפני ש-11.6.5 #11 + #12 ירוקים. ראה [ROADMAP.md שלב 12](../ROADMAP.md) — ה-precondition מתועד שם מפורשות.
 
 ---
 

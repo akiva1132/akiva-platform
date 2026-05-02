@@ -225,6 +225,36 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Trigger to promote.** Phase 11.8 (perf + benchmarks) is a natural pairing — both want a real-browser e2e test bed (Playwright). Build the worker-shell harness as a step on the way there.
 
+### 7.9 🔴 TaskScope cancellation is a façade (Phase-12 blocker)
+
+**Concern.** `Context::activity_scope()` and `Context::resumed_scope()` return `&'static TaskScope` whose `spawn(fut)` is literally `block_on_ready(fut)` ([sdk-rust/src/activity.rs:156-159](../sdk-rust/src/activity.rs#L156)). The doc-comment in the file admits it: *"In Stone 11.2 every spawned future completes in a single poll ... TaskScope::spawn is just a renamed block_on_ready."* No cancellation, no cross-callback retention, no lifecycle awareness — only the API name promises Android `lifecycleScope`-equivalence; the body delivers nothing.
+
+**Why deferred (until now).** Stone 11.2 set the API surface knowing the body would land with the real executor. The real executor (P0 #4) shipped May 2026 but only wired up the Activity-callback futures themselves; user-spawned tasks were left for later. Surfacing this as a tracked gap rather than implementing inline kept the P0 list small.
+
+**Trigger to promote.** Phase 12.4 (App suspension / CACHED state) requires scope-aware cancellation — without it, "suspend" can only do `worker.terminate()`, which is semantically a crash, not a suspension. Also blocks Stone 11.7: documenting `ctx.activity_scope().spawn(...)` as a real API while the body is a no-op-on-cancel locks the lie into bedrock for future devs.
+
+**Code surfaces.** `sdk-rust/src/runtime.rs` (`Slot` extension to hold spawned futures by scope), `sdk-rust/src/activity.rs:140-168` (TaskScope body), `runtime/web/app_worker_shell.js` (re-poll integration with the existing `pendingDispatches` mechanism). Detailed plan in [`docs/isolation-design.md` §10.5 #11](isolation-design.md). **Stone 11.6.5 owns this.**
+
+### 7.10 🔴 Concurrent host calls per activity blocked (Phase-12 blocker)
+
+**Concern.** `Slot.pending: Option<PendingDispatch>` enforces one in-flight dispatch per activity handle ([sdk-rust/src/executor.rs:38-42](../sdk-rust/src/executor.rs#L38-L42)). Two `storage::read` calls in the same activity panic or clobber. The invariant is correct for the Framework's lifecycle FIFO (PendingTransition discipline guarantees one callback dispatch in flight) but wrong for user-spawned tasks that don't go through PendingTransition. A future `futures::join!(read("a"), read("b"))` on an activity is a static panic by design.
+
+**Why deferred (until now).** Stone 11.2 picked the simplest single-slot model that satisfies the lifecycle FIFO. The bug only became visible as a "real DX problem" once the real executor (P0 #4) made `.await` work — at which point pattern-matching to iOS's `async let` becomes the natural style for app code, and the single-slot ceiling is a hard-stop.
+
+**Trigger to promote.** Phase 12.1 (memory accounting) measures baseline of a real workload — apps allocate data in parallel batches; serial dispatch silently distorts the baseline and `manifest.runtime.max_memory_mb` enforcement (12.5) won't fire on the real load shape. Also: every Stone 11.7 example using `join!` or two-step `read; read` will be wrong code.
+
+**Code surfaces.** `Slot.pending` becomes `Slab<PendingDispatch>` or `HashMap<u64, _>` keyed by dispatch_id; `akiva_app_poll_dispatch(id)` polls the specific entry; `host_op_done` re-polls only the future parked on that op. Framework callback FIFO unchanged. Tests must cover ordering, mid-flight cancellation, and re-entry. Detailed plan in [`docs/isolation-design.md` §10.5 #12](isolation-design.md). **Stone 11.6.5 owns this.**
+
+### 7.11 🟡 No streams primitive in the ABI
+
+**Concern.** The unified ABI (`io_start` → `io_poll` → result, single-shot) has no `stream<T>` equivalent. Sensor readings, audio samples, file watch, animation tickers, real-time data feeds — every "many values over time" capability has to be faked with polling-as-future, which loses backpressure and ordering guarantees.
+
+**Why deferred.** No current capability needs a stream. Phase 12 doesn't introduce any; the gap stays cosmetic until WindowManager event routing (Phase 13) or the first real-time capability (audio playback, gestures) lands.
+
+**Trigger to promote.** First capability where the polling-as-future fake costs us correctness: audio sample streaming, drag/scroll gestures with sub-frame ordering, or WindowManager event fan-out. Also: the WASI 0.3 migration (deferred to v0.5+) is built around `stream<T>` — every day of delay raises the migration cost when we eventually adopt it.
+
+**Code surfaces.** New op_kind `STREAM_OPEN` returning `stream_id`; `stream_poll(stream_id)` returns `Vec<Item>` of values batched since the prior poll; `stream_close(stream_id)`. Wire shape should mirror Component Model `stream<T>` to keep the v0.5 migration mechanical. Detailed plan in [`docs/isolation-design.md` §10.5 #13](isolation-design.md). **Recommended for Phase 13 prep, not 11.6.5.**
+
 ---
 
 ## Retired / promoted entries

@@ -677,6 +677,29 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 - close-on-uninstall protocol.
 - benchmark: read latency direct vs kernel-routed.
 
+### 11.6.5 SDK API completeness pass (3-5 ימים) — **🔴 חוסם את Phase 12**
+
+**מטרה:** סגירת שני פערים semantically קריטיים ב-SDK שזוהו ב-2026-05-02 audit (אחרי ש-P0/P1 של 11.6 נסגרו). שני הפערים נשמטו ב-Stone 11.2 (התכנון של ה-SDK הסתיים כש-`block_on_ready` עוד היה ה-executor) ולא נחשפו עד שה-executor האמיתי (P0 #4) הפך אותם ל-actionable.
+
+**למה לא 11.7 קודם.** ה-docs של 11.7 מתעדים את ה-API; אם נכתוב docs על TaskScope שלא מבטל ועל host calls שאינם מקבילים, ה-API יקובע ב-bedrock של מפתחים עתידיים והעלות ל-fix תעלה pi-fold.
+
+**למה לפני Phase 12.** Phase 12.4 (App suspension / CACHED state) מניח שscope-based cancellation עובד — בלי זה, "suspend" יוכל רק לעשות `worker.terminate()`. Phase 12.1 (Memory accounting) מניח שapp יכולה להקצות data באופן מציאותי (מקבילי) — בלי זה ה-baseline שגוי. ראה [`docs/isolation-design.md` §10.5 → Phase 12 readiness](docs/isolation-design.md) לdetailed analysis.
+
+**רכיבים:**
+
+- **#11: TaskScope אמיתי** — `Slot.spawned: Vec<SpawnedTask>` עם cancellation ב-on_pause/on_destroy לפי `ScopeKind`. דרישה משלימה: cancellation token שאpps יכולים לקרוא (`ctx.is_cancelled() -> bool`). קוד: `sdk-rust/src/runtime.rs`, `sdk-rust/src/activity.rs:140-168` (TaskScope), `runtime/web/app_worker_shell.js` (re-poll integration).
+- **#12: Concurrent host calls per activity** — `Slot.pending` הופך מ-`Option<PendingDispatch>` ל-`Slab` או `HashMap`; dispatch_ids ייחודיים בתוך ה-slot; framework FIFO ל-callback dispatches נשמר אבל user-spawned tasks יכולים להיות מקבילים. קוד: `sdk-rust/src/{executor.rs, runtime.rs}`, `runtime/web/app_worker_shell.js::pendingDispatches`, invariant doc-comment update.
+
+**Definition of Done:**
+- [ ] test app spawns infinite-yield task ב-`resumed_scope`, on_pause → ה-task מפסיק להיpoll (counter קבוע אחרי on_pause).
+- [ ] `let (a, b) = futures::join!(storage::read("a"), storage::read("b"));` באותה activity — שני reads רצים מקבילים, completion order עצמאי.
+- [ ] cancellation אמצע flight: read.await בתוך resumed-scoped task; on_pause → ה-pending dispatch נקרע (אין resource leak).
+- [ ] re-entry: read.await ב-`activity_scope` ב-on_create; on_create returns לפני resolution; ה-await ב-on_resume תופס את הbytes (lifetime cross-callback מותר ב-activity scope).
+- [ ] ABI עדיין `0.2.0` (לא breaking) — ה-changes הם לkeep-alive contract בwasm side ובshell side, לא ל-import surface.
+- [ ] documentation update: `sdk-rust/src/activity.rs` ו-`executor.rs` — את ה-comments שאומרים *"only one in-flight dispatch per handle"* ו-*"renamed block_on_ready"* יש להחליף ב-truth החדשה.
+
+**הערכת זמן:** 3-5 ימי עבודה.
+
 ### 11.7 `akiva new` + dev tooling polish (1-2 שבועות) — **DX foundation**
 - `akiva new <name>` — scaffold app (Cargo.toml, manifest.toml, src/lib.rs hello-world async, README).
 - 3 templates: `default`, `compose-style`, `game`.
@@ -707,7 +730,9 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 **מטרה:** מערכת יודעת כמה memory וכמה CPU כל app צורך, ויכולה לעצור או להקפיא apps שעוברים את ה-quota.
 
-**תלוי ב:** Phase 11 (בלי workers נפרדים, CPU attribution בלתי אפשרית ו-memory eviction מסוכנת).
+**🔴 Precondition (mandatory):** Stone **11.6.5** סגור — TaskScope אמיתי + concurrent host calls per activity. בלי זה, 12.4 (App suspension) יורד ל-`worker.terminate()` בלבד (סמנטית = crash, לא suspension), ו-12.1 (memory accounting) מודד baseline שגוי על app שלא יכולה להקצות data באופן מציאותי. ה-design של 12.3 (LMK priority tiers) מניח ש-`Resumed`-scoped tasks מתבטלים ב-pause; אם זה לא קורה, ה-priority tiers איבדו משמעות. ראה [`docs/isolation-design.md` §10.5 Phase 12 readiness](docs/isolation-design.md) ו-[Stone 11.6.5](#1165-sdk-api-completeness-pass-3-5-ימים----חוסם-את-phase-12) לדetailed analysis.
+
+**תלוי ב:** Phase 11 (בלי workers נפרדים, CPU attribution בלתי אפשרית ו-memory eviction מסוכנת) **+ Stone 11.6.5** (semantic foundation ל-suspension).
 
 **רכיבים שנבנים:**
 

@@ -572,10 +572,92 @@ impl WriteHandle {
 
 - **Activity trait `async fn` הוא קצת שקר ארכיטקטוני** עד שיש executor אמיתי. ה-API חושב כאילו זה async, אבל בפועל הכל single-poll synchronous-with-await-fudge. עם §19.1 השקר נסגר.
 
+### 19.5 🔴 TaskScope cancellation הוא façade (Phase-12 blocker)
+
+**הבעיה.** `Context::activity_scope()` ו-`Context::resumed_scope()` מחזירים `&'static TaskScope`. ה-`spawn(fut)` שלהם הוא ממש [`block_on_ready(fut)`](../sdk-rust/src/activity.rs#L156). אין retention של ה-future בין callbacks, אין cancellation ב-on_pause/on_destroy, אין lifecycle awareness בכלל. ה-name של ה-API מבטיח Android `lifecycleScope` equivalence; ה-body הוא no-op על cancel.
+
+ה-doc-comment בקובץ אומר את זה במפורש (activity.rs:117-127):
+
+> *"In Stone 11.2 every spawned future completes in a single poll ... TaskScope::spawn is just a renamed block_on_ready — runs the future to completion right then."*
+
+**מה זה משבר בפועל.** מפתח שיכתוב:
+
+```rust
+async fn on_resume(&mut self, ctx: &mut Context<'_>) {
+    ctx.resumed_scope().spawn(async {
+        loop {
+            sensor.next().await;
+            // process
+        }
+    });
+}
+```
+
+יקבל infinite loop שגומר את ה-watchdog שלו ב-1.5s ויהרוג את ה-app. לא task שמת ב-on_pause כמו ש-`resumed_scope` מבטיח. ה-API משקר.
+
+**ה-blocker ל-Phase 12.** App suspension (12.4 / CACHED state) דורש sudah scope-aware cancellation. בלי זה, "suspend" יוכל רק לעשות `worker.terminate()` — סמנטית = crash. כל ה-design של LMK priority tiers (12.3) מניח ש-`Resumed`-scoped tasks מתבטלים ב-pause; אם לא, ה-tiers איבדו משמעות.
+
+**ה-blocker ל-Stone 11.7.** ה-docs יתעדו את ה-API. אם ה-API משקר — הdocs לוכדים את השקר.
+
+**התיקון.** הוסף שדה ל-`Slot`: `spawned: Vec<SpawnedTask>` (או slab עם stable IDs). כל `SpawnedTask` מחזיק `Pin<Box<dyn Future + 'static>>` + `kind: ScopeKind`. `TaskScope::spawn` דוחף לרשימה, לא poles. ה-app worker shell drives them frame-by-frame (אותו mechanism כמו pending dispatches). on_pause נכנס → ה-runtime מסיר את כל ה-`ScopeKind::Resumed` בלי re-poll. on_destroy → מסיר את הכולם.
+
+**דרישה משלימה.** cancellation token שאpps יכולים לקרוא — `ctx.is_cancelled() -> bool` או דרך `Poll::Pending` כשyielded after cancellation. אחרת tight loops לא יכולים לבדוק selber.
+
+**Code surfaces.** `sdk-rust/src/runtime.rs` (Slot extension), `sdk-rust/src/activity.rs:140-168` (TaskScope body, `ACTIVITY_SCOPE`/`RESUMED_SCOPE` static migration), `runtime/web/app_worker_shell.js` (re-poll integration). פורמליזציה ב-[`docs/isolation-design.md` §10.5 #11](isolation-design.md). **Stone 11.6.5 owns this.**
+
+### 19.6 🔴 Concurrent host calls per activity blocked (Phase-12 blocker)
+
+**הבעיה.** `Slot.pending: Option<PendingDispatch>` מקצה slot יחיד ל-handle שלם ([sdk-rust/src/executor.rs:38-42](../sdk-rust/src/executor.rs#L38-L42)). שני `storage::read("a")` ו-`storage::read("b")` באותה activity → השני panics או דורס. ה-invariant נכון ל-callback FIFO של ה-Framework (PendingTransition discipline) אבל שגוי ל-user-spawned tasks שלא עוברים דרך PendingTransition.
+
+**מה זה משבר בפועל.** דוגמה שכל מפתח iOS יצפה שתעבוד:
+
+```rust
+async fn on_create(&mut self, ctx: &mut Context<'_>) {
+    let (notes, settings) = futures::join!(
+        storage::read("notes"),
+        storage::read("settings"),
+    );
+    // ...
+}
+```
+
+ב-iOS זה מקבילות חינם. ב-Akiva היום זה panic — ה-second read קורא ל-`io_start` כש-`Slot.pending` כבר Some. הinvariant doc-comment ב-`executor.rs:31-45` מקובע על ה-טעות.
+
+**ה-blocker ל-Phase 12.** Memory accounting (12.1) מודד baseline של "memory בשימוש כש-app אקטיבי". App עם data כבד מקצה batches מקבילים — אם ה-API מאלץ אותו לסדר אותם, ה-baseline שמודד שגוי, וה-`max_memory_mb` enforcement (12.5) לא יואכף על העומס האמיתי. בנוסף suspension צריך לבטל מספר tasks בו-זמנית; היום אין יותר מ-task אחד ב-flight.
+
+**ה-blocker ל-Stone 11.7.** כל דוגמה ב-docs שתשתמש ב-`join!` או ב-spawn-then-await pattern — תשבר.
+
+**התלות במcient §19.5.** מקבילות host calls מצריכה את TaskScope אמיתי — בלי spawn אמיתי אין דרך ליצור concurrency. אבל TaskScope לבד לא מספיק; ה-Slot צריך להיות מסוגל לפלוט dispatches מקבילים. שניהם נצרכים יחד ב-11.6.5.
+
+**התיקון.** `Slot.pending` הופך ל-`Slab<PendingDispatch>` או `HashMap<u64, PendingDispatch>` עם dispatch_id ייחודי בתוך ה-slot. `akiva_app_poll_dispatch(id)` polls רק את הspeci האחד; `host_op_done` re-polls רק את ה-future ש-parked על ה-host_op הזה. invariant ה-callback FIFO מתחזק; user-spawned tasks יכולים להיות מקבילים.
+
+**Tests חיוניים.**
+- ordering: `join!(read("a"), read("b"))` — שני reads רצים מקבילים, completion order עצמאי, ה-tuple נכון.
+- mid-flight cancellation: read.await בתוך resumed-scoped task; on_pause → ה-pending dispatch נקרע.
+- re-entry: read.await ב-`activity_scope` ב-on_create; on_create returns לפני resolution; ה-await ב-on_resume תופס את הbytes.
+
+**Code surfaces.** `sdk-rust/src/{executor.rs, runtime.rs}`, `runtime/web/app_worker_shell.js::pendingDispatches`, invariant doc-comment update ב-`executor.rs:31-45`. פורמליזציה ב-[`docs/isolation-design.md` §10.5 #12](isolation-design.md). **Stone 11.6.5 owns this.**
+
+### 19.7 🟡 No streams primitive (Phase-13 prep, לא חוסם 12)
+
+**הבעיה.** ה-ABI יודע one-shot futures בלבד (`io_start` → eventual `io_poll` → result, פעם אחת). אין primitive ל-`stream<T>`: sensor readings, audio samples, file watch, animation tickers.
+
+**מה זה משבר.** כל capability שטבעי-stream צריך להיות wrapped כ-polling-as-future, מה שמאבד backpressure ו-ordering guarantees. למשל drag/scroll gesture עם sub-frame ordering היה מסבך את ה-app event loop במקום להיות `stream.next().await` נקי.
+
+**מה זה לא משבר עכשיו.** Phase 12 לא מציג capability חדש שדורש stream.
+
+**ה-blocker ל-Phase 13+.** WindowManager event routing, animation tickers, real-time data — הכל streams. WASI 0.3 (v0.5+ migration) בנוי סביב `stream<T>`. כל יום של דחייה יעלה ב-migration cost.
+
+**התיקון מתוכנן.** op_kind חדש `STREAM_OPEN` שמחזיר `stream_id`; `stream_poll(stream_id)` מחזיר `Vec<Item>` של values שגרהrouped מאז ה-poll הקודם; `stream_close(stream_id)`. wire shape דומה ל-Component Model `stream<T>`.
+
+**המלצה.** דחה ל-Phase 13 prep — ה-problem domain יהיה ברור יותר אז כש-WindowManager צריך event streams. **לא ב-Stone 11.6.5.** מתועד ב-[`docs/isolation-design.md` §10.5 #13](isolation-design.md).
+
 ### Status & ordering
 
 ראה [`docs/isolation-design.md` §10.5 Phase 11 Foundation Gaps](isolation-design.md) לתכנית עבודה מלאה. בקצרה:
 
-- **P0** (חייבים): §19.2 (save_state pipeline), graceful shutdown, Trapped recycle, **§19.1 (async executor) — cardinal**
-- **P1** (כדאי): §19.3 (WriteHandle), magic-numbers config, drain phase separation, §19.4 (pkgs_wire dedup)
-- **P2** (future): e2e tests, worker shell unit tests
+- **P0** (סגור): ✅ §19.1 (async executor — cardinal), ✅ §19.2 (save_state pipeline), graceful shutdown, Trapped recycle.
+- **P1** (חלקי): ✅ magic-numbers config, ✅ drain phase separation. **פתוחים:** §19.3 (WriteHandle, ~30 דק'), §19.4 (pkgs_wire dedup, ~1-2h).
+- **🔴 11.6.5 — חוסם Phase 12** (3-5 ימים): §19.5 (TaskScope אמיתי), §19.6 (concurrent host calls per activity).
+- **P2** (Phase 11.8): e2e tests, worker shell unit tests.
+- **Phase 13 prep:** §19.7 (streams).
