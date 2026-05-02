@@ -280,6 +280,23 @@ struct Slot {
     save_buf: Vec<u8>,
     metrics: Metrics,
     last_pointer: Option<PointerEvent>,
+    /// Stone 11.4b — which buffer holds the bytes the host should
+    /// fetch via `akiva_app_get_result`. Set by the dispatch paths
+    /// that produce bytes (Render → `Paint`, SaveState →
+    /// `SavedState`); cleared back to `None` by every other dispatch
+    /// so a stale render's bytes can't leak into a save_state poll
+    /// that arrived right after.
+    last_result: LastResult,
+}
+
+/// Stone 11.4b — which slot buffer the next `get_result` should hand
+/// back. The dispatch entry point sets this each time it routes to a
+/// per-callback runtime fn.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LastResult {
+    None,
+    Paint,
+    SavedState,
 }
 
 /// Registry keyed by handle. `Option` so we can lazy-init on first use
@@ -354,6 +371,7 @@ pub fn on_create<T: Activity + Default>(handle: u32, class_ptr: *const u8, class
         save_buf: Vec::new(),
         metrics: Metrics::default(),
         last_pointer: None,
+        last_result: LastResult::None,
     });
 }
 
@@ -596,4 +614,215 @@ fn read_utf8(ptr: *const u8, len: u32) -> String {
     // keeps us safe even if the host passed garbage.
     let slice = unsafe { core::slice::from_raw_parts(ptr, len as usize) };
     String::from_utf8_lossy(slice).into_owned()
+}
+
+// ── Stone 11.4b: unified host→app dispatch ────────────────────────────
+//
+// `akiva_app_dispatch(cmd_kind, payload_ptr, payload_len) -> u64`
+// replaces the 12-13 per-callback exports with a single entry point.
+// The host packs per-callback args into the payload (every payload
+// starts with a u32 LE handle); this function decodes, routes to the
+// existing `on_*` helpers above, and returns a `future_id` for the
+// data-returning ops (RENDER, SAVE_STATE) or `0` for ack-only ops.
+//
+// Today the runtime is single-worker so every dispatch resolves
+// inline before the function returns. The non-zero `future_id` for
+// RENDER/SAVE_STATE is just a routing key into the per-handle slot —
+// the host calls `akiva_app_get_result(future_id, out_len_ptr)`
+// immediately to fetch the bytes. Stone 11.4c (workers) will defer
+// the actual work; the wire shape stays identical.
+//
+// Future_id encoding (locked):
+//   - `0` for every ack-only dispatch (lifecycle, input, restore_state,
+//     new_intent, activity_result, restoration variants). Host knows
+//     "no bytes to fetch".
+//   - `handle as u64` for RENDER and SAVE_STATE. Host calls
+//     `get_result(handle as u64, ...)` to fetch the produced bytes.
+//
+//   Handles are non-zero by construction (`AppHandle::new`), so the
+//   `0` sentinel is unambiguous.
+
+/// Unified host→app dispatcher. Called from the `akiva_app_dispatch`
+/// export emitted by the [`akiva_app!`] macro. Generic over the user's
+/// `Activity` type so [`on_create`] can stamp out a fresh instance.
+///
+/// Malformed payload (length too small for the cmd_kind, unknown
+/// cmd_kind) returns `0` and drops the call silently. The wasm app
+/// can't easily report a host bug — trapping would take the whole
+/// process down on a host wire-format slip, which is worse than the
+/// dropped op manifesting as "callback didn't fire".
+pub fn dispatch<T: Activity + Default>(
+    cmd_kind: u32,
+    payload_ptr: *const u8,
+    payload_len: u32,
+) -> u64 {
+    use crate::op_kinds::cmd::*;
+
+    // Empty/null payload is only valid for cmd_kinds that don't carry
+    // a handle, of which there are none today — every cmd starts with
+    // [handle: u32 LE]. Treat as malformed.
+    if payload_len < 4 || payload_ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: the host owns the buffer for the duration of this call
+    // (it allocated via `akiva_app_alloc`, copied bytes in, and frees
+    // after we return). We only read.
+    let payload = unsafe {
+        core::slice::from_raw_parts(payload_ptr, payload_len as usize)
+    };
+    let handle = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let rest = &payload[4..];
+
+    match cmd_kind {
+        CREATE => {
+            // [handle, class: utf8...]
+            on_create::<T>(handle, rest.as_ptr(), rest.len() as u32);
+            mark_no_result(handle);
+            0
+        }
+        START   => { on_start(handle);   mark_no_result(handle); 0 }
+        RESUME  => { on_resume(handle);  mark_no_result(handle); 0 }
+        PAUSE   => { on_pause(handle);   mark_no_result(handle); 0 }
+        STOP    => { on_stop(handle);    mark_no_result(handle); 0 }
+        DESTROY => { on_destroy(handle); mark_no_result(handle); 0 }
+
+        POINTER => {
+            // [handle, x:f32, y:f32, button:u32, phase:u32, ts:f64] = 4+24
+            if rest.len() < 24 { return 0; }
+            let x = f32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+            let y = f32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+            let button = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
+            let phase = u32::from_le_bytes([rest[12], rest[13], rest[14], rest[15]]);
+            let ts_ms = read_f64(&rest[16..24]);
+            on_pointer(handle, x, y, button, phase, ts_ms);
+            mark_no_result(handle);
+            0
+        }
+        KEY => {
+            // [handle, code:u32, modifiers:u32, phase:u32, ts:f64] = 4+20
+            if rest.len() < 20 { return 0; }
+            let code = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+            let modifiers = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+            let phase = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
+            let ts_ms = read_f64(&rest[12..20]);
+            on_key(handle, code, modifiers, phase, ts_ms);
+            mark_no_result(handle);
+            0
+        }
+        RESIZE => {
+            // [handle, width:u32, height:u32, density:f32] = 4+12
+            if rest.len() < 12 { return 0; }
+            let w = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+            let h = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+            let d = f32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
+            on_resize(handle, w, h, d);
+            mark_no_result(handle);
+            0
+        }
+
+        RENDER => {
+            // [handle, ts:f64] = 4+8
+            if rest.len() < 8 { return 0; }
+            let ts_ms = read_f64(&rest[0..8]);
+            // Reuse on_render but discard its (ptr,len) return — the
+            // bytes live in slot.paint_buf and will be retrieved via
+            // get_result. A stack-local u32 satisfies its out_len_ptr
+            // contract; the value goes nowhere.
+            let mut throwaway: u32 = 0;
+            let _ = on_render(handle, ts_ms, &mut throwaway as *mut u32);
+            mark_paint_result(handle);
+            handle as u64
+        }
+
+        SAVE_STATE => {
+            // [handle] only.
+            let mut throwaway: u32 = 0;
+            let _ = on_save_state(handle, &mut throwaway as *mut u32);
+            mark_save_result(handle);
+            handle as u64
+        }
+
+        RESTORE_STATE => {
+            // [handle, state: bytes...]
+            on_restore_state(handle, rest.as_ptr(), rest.len() as u32);
+            mark_no_result(handle);
+            0
+        }
+
+        NEW_INTENT => {
+            // [handle, intent: bytes...]
+            on_new_intent(handle, rest.as_ptr(), rest.len() as u32);
+            mark_no_result(handle);
+            0
+        }
+
+        ACTIVITY_RESULT => {
+            // [handle, request_code:u32, result: bytes...] = 4+(4+...)
+            if rest.len() < 4 { return 0; }
+            let rc = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+            let bytes = &rest[4..];
+            on_activity_result(handle, rc, bytes.as_ptr(), bytes.len() as u32);
+            mark_no_result(handle);
+            0
+        }
+
+        _ => {
+            // Unknown cmd_kind. Wire bug or version skew — drop.
+            0
+        }
+    }
+}
+
+/// Companion to [`dispatch`]. Returns a pointer + length into the
+/// app's per-handle scratch buffer that holds bytes produced by the
+/// most recent RENDER or SAVE_STATE on `future_id == handle`.
+///
+/// Returns `(null, 0)` when the slot is unknown OR when no
+/// data-producing op ran for that handle. The buffer stays valid
+/// until the next data-producing op for the same handle (matches the
+/// existing `akiva_app_render` / `akiva_app_save_state` lifetime
+/// contract — the dispatcher hasn't relaxed it).
+pub fn get_result(future_id: u64, out_len_ptr: *mut u32) -> *const u8 {
+    // Future_ids in 11.4b are just the handle (since every dispatch
+    // is sync, a "future_id" is really a slot key). 11.5+ may move
+    // to a counter when deferred host calls land.
+    let handle = future_id as u32;
+    let Some(slot) = slots().get(&handle) else {
+        unsafe { *out_len_ptr = 0; }
+        return core::ptr::null();
+    };
+    let buf: &[u8] = match slot.last_result {
+        LastResult::Paint => &slot.paint_buf,
+        LastResult::SavedState => &slot.save_buf,
+        LastResult::None => {
+            unsafe { *out_len_ptr = 0; }
+            return core::ptr::null();
+        }
+    };
+    unsafe { *out_len_ptr = buf.len() as u32; }
+    buf.as_ptr()
+}
+
+fn mark_no_result(handle: u32) {
+    if let Some(slot) = slots().get_mut(&handle) {
+        slot.last_result = LastResult::None;
+    }
+}
+fn mark_paint_result(handle: u32) {
+    if let Some(slot) = slots().get_mut(&handle) {
+        slot.last_result = LastResult::Paint;
+    }
+}
+fn mark_save_result(handle: u32) {
+    if let Some(slot) = slots().get_mut(&handle) {
+        slot.last_result = LastResult::SavedState;
+    }
+}
+
+fn read_f64(bytes: &[u8]) -> f64 {
+    debug_assert!(bytes.len() >= 8);
+    f64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5], bytes[6], bytes[7],
+    ])
 }

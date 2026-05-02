@@ -179,5 +179,40 @@ macro_rules! akiva_app {
         ) {
             $crate::runtime::on_activity_result(handle, request_code, bytes_ptr, bytes_len)
         }
+
+        // ── Stone 11.4b: unified host→app dispatch ──────────────────────
+        // The host packs per-callback args into the payload (every
+        // payload starts with `[handle: u32 LE, ...]`) and the app
+        // demuxes by `cmd_kind`. The two new exports coexist with the
+        // legacy per-callback exports above; 11.4b-5 removes the
+        // legacy ones once every host (Rust kernel + JS app_registry)
+        // has switched.
+        //
+        // Return value:
+        //   `0`           — sync, no bytes to fetch.
+        //   `handle as u64` — sync, RENDER/SAVE_STATE bytes available;
+        //                     host calls `akiva_app_get_result(this, ...)`.
+        //
+        // 11.4c will introduce non-handle future_ids when the dispatch
+        // genuinely defers (worker round-trip).
+        #[no_mangle]
+        pub extern "C" fn akiva_app_dispatch(
+            cmd_kind: u32, payload_ptr: *const u8, payload_len: u32,
+        ) -> u64 {
+            $crate::runtime::dispatch::<$ty>(cmd_kind, payload_ptr, payload_len)
+        }
+
+        /// Companion to `akiva_app_dispatch` — fetches the bytes
+        /// produced by the most recent RENDER or SAVE_STATE on the
+        /// activity identified by `future_id`. Same buffer-lifetime
+        /// contract as the legacy `akiva_app_render` / `akiva_app_save_state`
+        /// exports: pointer stays valid until the next data-producing
+        /// dispatch for the same handle.
+        #[no_mangle]
+        pub extern "C" fn akiva_app_get_result(
+            future_id: u64, out_len_ptr: *mut u32,
+        ) -> *const u8 {
+            $crate::runtime::get_result(future_id, out_len_ptr)
+        }
     };
 }
