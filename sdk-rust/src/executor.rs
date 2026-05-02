@@ -24,7 +24,7 @@
 //! Each `PendingDispatch` holds a `Pin<Box<dyn Future<Output = ...> +
 //! 'static>>` whose body internally borrows `&mut Box<dyn Activity>`
 //! and `&mut Context` from the same `Slot`. The borrows are encoded
-//! through raw pointers ([`build_async_future`] in `runtime.rs`)
+//! through raw pointers (`build_async_future` in `runtime.rs`)
 //! because Rust can't express "two mutable borrows of disjoint
 //! fields, captured into a 'static future."
 //!

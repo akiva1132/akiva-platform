@@ -47,6 +47,8 @@ pub struct Signal<T: Clone> {
 }
 
 impl<T: Clone> Signal<T> {
+    /// Construct an empty signal. [`Signal::current`] returns `None`
+    /// until the first [`Signal::set`].
     pub fn new() -> Self {
         Self {
             value: RefCell::new(None),

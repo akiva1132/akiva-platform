@@ -90,10 +90,15 @@ use node::{Node, NodeId};
 /// this extra space stacks on top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MainAxis {
+    /// Pack children at the start, no slot expansion. The default.
     #[default]
     Start,
+    /// Centre children along the main axis. Stack fills slot.
     Center,
+    /// Pack children at the end. Stack fills slot.
     End,
+    /// Distribute leftover space evenly between adjacent children.
+    /// `.gap()` is treated as the minimum gap; this adds on top.
     SpaceBetween,
 }
 
@@ -108,10 +113,16 @@ impl MainAxis {
 /// stack's inner cross dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CrossAxis {
+    /// Pack children at the cross-axis start (top for HStack, left for
+    /// VStack). The default.
     #[default]
     Start,
+    /// Centre children on the cross axis. Stack fills its cross slot.
     Center,
+    /// Pack children at the cross-axis end. Stack fills its cross slot.
     End,
+    /// Force every child's cross-axis size to match the stack's inner
+    /// cross dimension — useful for full-width buttons in a VStack.
     Stretch,
 }
 
@@ -138,13 +149,20 @@ pub struct NodeAttr {
 /// exclusive (a point exactly on the right/bottom edge is *outside*).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Rect {
+    /// Top-left x coordinate in physical pixels.
     pub x: f32,
+    /// Top-left y coordinate in physical pixels.
     pub y: f32,
+    /// Width in physical pixels.
     pub w: f32,
+    /// Height in physical pixels.
     pub h: f32,
 }
 
 impl Rect {
+    /// True iff the point `(x, y)` lies inside this rect, with the
+    /// right/bottom edges treated as exclusive (matching how hit-test
+    /// rects are used during pointer dispatch).
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && x < self.x + self.w
             && y >= self.y && y < self.y + self.h
@@ -181,6 +199,9 @@ pub struct UiState {
 }
 
 impl UiState {
+    /// Empty UI state. Equivalent to `UiState::default()`; the explicit
+    /// constructor exists so call-sites can read as
+    /// `UiState::new()` rather than reaching for `Default`.
     pub fn new() -> Self { Self::default() }
 
     /// Feed pointer events so `Ui::was_clicked` can correlate presses to
@@ -210,6 +231,10 @@ pub struct Ui<'s, 'c, 'b> {
 }
 
 impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
+    /// Borrow the per-activity [`UiState`], the per-frame [`Context`],
+    /// and the SDK [`Canvas`] together for one frame's worth of UI
+    /// construction. Resets per-frame derived state (hit rects, current
+    /// clicks/actions) so a previous frame's leftovers don't bleed in.
     pub fn new(
         state: &'s mut UiState,
         ctx: &Context<'_>,
@@ -279,18 +304,29 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
     // `.build() -> NodeId`. That keeps the call-site fluent without
     // committing to a pile of overloaded positional constructors.
 
+    /// Begin a [`Text`][node::Node::Text] node. Chain `.size`, `.color`,
+    /// `.grow` and friends, then `.build()` for the [`NodeId`].
     pub fn text(&mut self, text: impl Into<String>) -> node::TextBuilder<'_, 's, 'c, 'b> {
         node::TextBuilder::new(self, text.into())
     }
 
+    /// Begin a [`Rect`][node::Node::Rect] node — a flat colour fill with
+    /// optional rounding. Chain `.size`, `.radius`, `.grow`.
     pub fn rect(&mut self, color: u32) -> node::RectBuilder<'_, 's, 'c, 'b> {
         node::RectBuilder::new(self, color)
     }
 
+    /// Begin a [`Spacer`][node::Node::Spacer] node — empty intrinsic-zero
+    /// node useful as a flexible gap inside stacks (chain `.grow(1.0)`).
     pub fn spacer(&mut self) -> node::SpacerBuilder<'_, 's, 'c, 'b> {
         node::SpacerBuilder::new(self)
     }
 
+    /// Push a [`Button`][node::Node::Button] node. Returns the
+    /// [`NodeId`] directly — buttons skip the builder pattern because
+    /// the defaults look right and the hot path is "id + label".
+    /// `id` is the lookup key for [`Self::was_clicked`]; pass it back
+    /// after `present()` to query whether a click landed.
     pub fn button(&mut self, id: impl Into<String>, label: impl Into<String>) -> NodeId {
         // Buttons keep simpler (non-builder) defaults because they're
         // the common case and the defaults look right in both the
@@ -333,10 +369,15 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         }
     }
 
+    /// Vertical stack — children laid out top-to-bottom. Chain `.gap`,
+    /// `.padding`, `.main`, `.cross`, `.grow`. Children come from this
+    /// `Ui` (you build them first, then pass the `NodeId`s here).
     pub fn v_stack(&mut self, children: &[NodeId]) -> node::StackBuilder<'_, 's, 'c, 'b> {
         node::StackBuilder::new_v(self, children.to_vec())
     }
 
+    /// Horizontal stack — children laid out left-to-right. Same builder
+    /// surface as [`Self::v_stack`].
     pub fn h_stack(&mut self, children: &[NodeId]) -> node::StackBuilder<'_, 's, 'c, 'b> {
         node::StackBuilder::new_h(self, children.to_vec())
     }

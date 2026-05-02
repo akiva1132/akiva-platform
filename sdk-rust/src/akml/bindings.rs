@@ -50,6 +50,18 @@ pub struct Bindings {
 }
 
 impl Bindings {
+    /// Empty bindings. Build up with chained
+    /// [`text`](Self::text) / [`color`](Self::color) /
+    /// [`number`](Self::number) calls.
+    ///
+    /// ```
+    /// use akiva_sdk::akml::Bindings;
+    /// let b = Bindings::new()
+    ///     .text("greeting", "hello")
+    ///     .color("accent", 0xffff8800)
+    ///     .number("size", 24.0);
+    /// # let _ = b;
+    /// ```
     pub fn new() -> Self { Self::default() }
 
     /// Bind a string, used by `<Text text>` / `<Button label>` /

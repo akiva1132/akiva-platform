@@ -47,6 +47,9 @@ pub struct MutexGuard<'a, T> {
 }
 
 impl<T> Mutex<T> {
+    /// Construct a new mutex around `value`. The lock starts in the
+    /// unlocked state. Wrap in `Rc<Mutex<T>>` to share between
+    /// cooperating tasks.
     pub fn new(value: T) -> Self {
         Self {
             locked: Cell::new(false),

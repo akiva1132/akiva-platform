@@ -29,9 +29,18 @@ use super::parser::{self, Element, Loc};
 use crate::ui::node::NodeId;
 use crate::ui::{CrossAxis, MainAxis, Ui};
 
+/// Failure encountered while turning an AKML element tree into a live
+/// widget tree. Wraps a short human-readable message plus the source
+/// [`Loc`] of the element or attribute that triggered the failure, so
+/// editors can underline the offending span. Common causes: unknown
+/// widget tag, malformed colour / number literal, missing required
+/// attribute, unknown attribute *value* on a typed enum (e.g.
+/// `cross="middle"`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct InflateError {
+    /// One-line description of what went wrong.
     pub message: String,
+    /// 1-based source location of the offending element or attribute.
     pub loc: Loc,
 }
 

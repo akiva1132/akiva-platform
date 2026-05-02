@@ -152,8 +152,8 @@ impl TaskScope {
     /// The future is stored in the activity's slot and polled once per
     /// host wake-up (each `host_op_done` arrival from the kernel-worker
     /// triggers a sweep). When the activity hits the cancellation edge
-    /// for this scope (`on_pause` for [`ScopeKind::Resumed`],
-    /// `on_destroy` for [`ScopeKind::Activity`]) the SDK runtime drops
+    /// for this scope (`on_pause` for `Resumed` scopes, `on_destroy`
+    /// for `Activity` scopes) the SDK runtime drops
     /// the future without further polling — any local state the future
     /// held drops with it, and any in-flight host op the future was
     /// awaiting is left to land and get discarded.
@@ -465,7 +465,7 @@ impl SavedState {
         out
     }
 
-    /// Decode from the wire format. The inverse of [`encode`].
+    /// Decode from the wire format. The inverse of [`Self::encode`].
     pub fn decode(bytes: &[u8]) -> Result<Self, SavedStateDecodeError> {
         if bytes.len() > Self::MAX_BYTES {
             return Err(SavedStateDecodeError::TooLarge);

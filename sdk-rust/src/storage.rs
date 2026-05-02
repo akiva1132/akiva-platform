@@ -39,7 +39,7 @@
 //!
 //! ## Why writes are fire-and-forget
 //!
-//! [`write`] and [`remove`] return `()`: there's no observable
+//! [`write()`](write()) and [`remove()`](remove()) return `()`: there's no observable
 //! "did the write succeed" path within the same frame for the same
 //! reason as reads. The kernel logs failures (quota, IO error),
 //! and we accept the standard sandbox-storage discipline that
@@ -122,13 +122,13 @@ pub fn read(key: &str) -> Option<ReadFuture> {
     Some(ReadFuture { future_id: fid, cached: None })
 }
 
-/// Future returned by [`write`]. Resolves to `Ok(())` on a
+/// Future returned by [`write()`](write()). Resolves to `Ok(())` on a
 /// successful storage write or `Err(StorageError)` on quota / IO /
 /// denial. Stone 11.6.7 (#1) replaced the prior fire-and-forget
 /// `pub fn write(...)` with this handle so durability-critical apps
 /// can `await` confirmation; `let _ = storage::write(k, v);` (drop
 /// without await) preserves the old fire-and-forget behaviour
-/// because [`write`] still dispatches `STORAGE_SET` to the host
+/// because [`write()`](write()) still dispatches `STORAGE_SET` to the host
 /// inside its body — only the *result* is what the future delivers.
 ///
 /// Polls `host_io_poll` on each call. When the kernel-worker hasn't
