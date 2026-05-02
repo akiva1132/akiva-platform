@@ -575,6 +575,38 @@ impl Framework {
         }
     }
 
+    /// P0 #3 — recycle `Trapped` activity records whose age exceeds
+    /// `max_age_ms`. The instance and record both drop without firing
+    /// `on_destroy` (the worker that owned the activity is dead, and a
+    /// destroy dispatch would either time out or land in a recycled
+    /// handle slot). Returns the number of records recycled.
+    ///
+    /// `now_ms` is the kernel's frame timestamp — same clock the trap
+    /// was stamped against in `mark_trapped`. Activities older than
+    /// `now_ms - max_age_ms` get reaped; younger ones are left so a
+    /// debugger / tap-to-restart UI has a window to attach.
+    ///
+    /// Idempotent and cheap when no trapped records exist (the common
+    /// case): the iteration stops at the filter, no allocation if the
+    /// id list comes back empty.
+    pub fn reap_trapped(&mut self, now_ms: f64, max_age_ms: f64) -> usize {
+        let ids = self.activities.reap_trapped_ids(now_ms, max_age_ms);
+        if ids.is_empty() {
+            return 0;
+        }
+        let mut n = 0;
+        for id in ids {
+            // The record may have been recycled out from under us by
+            // a concurrent tap-to-restart flip — `reap` returns None
+            // in that case, which we count as "someone else handled
+            // it" and skip silently.
+            if self.activities.reap(id).is_some() {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// P0 #2 — graceful-shutdown checkpoint. Triggers a `save_state`
     /// dispatch on the foreground activity without changing its
     /// lifecycle state, and queues the resulting bytes through the
@@ -657,11 +689,15 @@ impl Framework {
     /// Returns the number of activities transitioned (only those in a
     /// live state count; already-Destroyed/Trapped are skipped). The
     /// kernel uses this to decide whether to log a notification.
-    pub fn mark_package_trapped(&mut self, package_id: &str) -> usize {
+    ///
+    /// `now_ms` stamps `ActivityRecord::trapped_at_ms` on each
+    /// transition so [`Self::reap_trapped`] can age the entries out
+    /// after the configured grace window (P0 #3).
+    pub fn mark_package_trapped(&mut self, package_id: &str, now_ms: f64) -> usize {
         let ids = self.activities.ids_for_package(package_id);
         let mut n = 0;
         for id in ids {
-            if self.activities.mark_trapped(id).is_some() {
+            if self.activities.mark_trapped(id, now_ms).is_some() {
                 n += 1;
             }
         }
@@ -2828,6 +2864,40 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
         let n3 = fw.checkpoint(125.0);
         assert_eq!(n3, 1, "post-drain checkpoint must dispatch a fresh save");
         assert_eq!(*host.save_calls.borrow(), 2);
+    }
+
+    #[test]
+    fn reap_trapped_recycles_records_older_than_grace_window() {
+        // P0 #3 — Framework wrapper drops Trapped records once
+        // `now_ms - trapped_at_ms` exceeds `max_age_ms`. Younger
+        // entries stay (debugger / tap-to-restart window). The
+        // record + instance both vanish; no on_destroy fires.
+        use crate::activity::Activity;
+        struct Stub;
+        impl Activity for Stub {
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+        }
+        let mut fw = empty_framework();
+        fw.activities.register(
+            "test.pkg",
+            "Stub",
+            activity_manager::LaunchMode::Standard,
+            || Box::new(Stub),
+        );
+        let young = fw.activities.launch("test.pkg", "Stub").unwrap().id;
+        let old = fw.activities.launch("test.pkg", "Stub").unwrap().id;
+        fw.activities.mark_trapped(young, 9_000.0).unwrap();
+        fw.activities.mark_trapped(old, 0.0).unwrap();
+
+        // now_ms=10_000, max_age=5_000 → only `old` is ripe.
+        let n = fw.reap_trapped(10_000.0, 5_000.0);
+        assert_eq!(n, 1);
+        assert!(fw.activities.record(old).is_none(), "old reaped");
+        assert!(fw.activities.record(young).is_some(), "young survived");
+
+        // Empty queue → no work, no count.
+        let n2 = fw.reap_trapped(10_000.0, 5_000.0);
+        assert_eq!(n2, 0);
     }
 
     #[test]

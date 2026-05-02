@@ -742,14 +742,13 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
    - **מגבלה שנשארת.** ה-save bytes טסים async דרך גבול ה-worker. ב-`visibilitychange` הדף נשאר חי (browsers שומרים pages ברקע לעשרות שניות) → round-trip מסתיים. ב-`pagehide` hard close ה-tab עלול למות לפני שה-bytes נחתים → best effort. ה"save אחרון" הוא ה-`visibilitychange` checkpoint האחרון; data שנוצר אחריו ולפני הסגירה — אבד.
    - **Code:** `framework/src/lib.rs::checkpoint`, `kernel/src/lib.rs::akiva_checkpoint`, `runtime/web/{worker.js, tab.js}`. Tests: `checkpoint_dispatches_save_state_for_foreground_activity`, `checkpoint_skips_when_no_foreground`.
 
-3. **Trapped activity recycle (Stone 11.6+3)**
-   - **בעיה:** Trapped instances מחזיקים `ActivityRecord` + instance לעד. bounded by session length, אבל חסר GC.
-   - **תיקון:**
-     - `Framework::reap_trapped(now_ms, max_age_ms)` שעובר על כל records ב-`Trapped` state, מסיר אם age > threshold.
-     - Kernel קורא ל-reap ב-`akiva_frame` (every N frames or every X seconds) דומה ל-`drive_pending_transitions`.
-     - Threshold קונפיגורבילי (default ~30s — מספיק זמן לdebugger לתפוס; קצר מספיק שהזיכרון לא דולף יותר מדי).
-   - **DoD:** test שמסמן activity Trapped, מקדם זמן, מאמת שה-record נמחק.
-   - **סקופ:** ~30 דק'.
+3. **✅ Trapped activity recycle — תוקן (P0 #3, May 2026)**
+   - **תיקון בפועל:**
+     - שדה חדש `ActivityRecord::trapped_at_ms: Option<f64>` רושם את רגע ה-trap. `mark_trapped(id, now_ms)` מטביע; `mark_package_trapped(pkg, now_ms)` מעביר את ה-timestamp של ה-frame.
+     - helpers חדשים `ActivityManager::reap_trapped_ids(now_ms, max_age_ms)` ו-`reap(id)` — האחרון מסיר record + instance בלי לירות `on_destroy` (ה-worker מת, dispatch היה או timing out או נוחת ב-handle slot שכבר ממוחזר).
+     - `Framework::reap_trapped(now_ms, max_age_ms) -> usize` wraps אותם.
+     - Kernel קורא `fw.reap_trapped(timestamp_ms, TRAPPED_GRACE_MS)` כל frame מ-`akiva_frame`. `TRAPPED_GRACE_MS = 30_000.0` (30s) — מספיק זמן ל-debugger pause / tap-to-restart UI עתידי לקחת את ה-record explicitly לפני ה-recycle.
+   - **Code.** `framework/src/{activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::{akiva_frame, drain_trapped_packages_into}`. Tests: 5 חדשים (mark_trapped stamps timestamp; reap_trapped_ids filters; reap drops record+instance; reap refuses non-Trapped; reap survives missing timestamp; framework wrapper end-to-end).
 
 4. **🔴 SDK async executor — embassy או ידני (Stone 11.6+4)**
    - **בעיה הקרדינלית:** ה-`Activity` trait הוא `async fn`, אבל ה-executor (`block_on_ready` ב-`sdk-rust/src/activity.rs`) panics על `Pending`. כל future שלא נפתר ב-poll הראשון (storage::read, network call עתידי, cross-worker host_op) חייב להיות wrapped ב-deferred-handle pattern מסורבל. ה-API מ"async fn מודרני" → "callback-soup with manual handles".

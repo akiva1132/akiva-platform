@@ -155,15 +155,17 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Code.** `framework/src/lib.rs::checkpoint`, `kernel/src/lib.rs::akiva_checkpoint`, `runtime/web/{worker.js, tab.js}`. Tests: `checkpoint_dispatches_save_state_for_foreground_activity` (de-dup + persist), `checkpoint_skips_when_no_foreground` (boot-time edge).
 
-### 7.4 🟡 Trapped activities leak ActivityRecord
+### 7.4 ✅ Trapped activity recycle — fixed (P0 #3, May 2026)
 
-**Concern.** When the watchdog terminates a worker (or a wasm trap is reported), `ActivityRecord` flips to `Trapped` but never advances to `Destroyed`. Bounded by session length (each crash adds one zombie); unrecycled.
+**Was.** When the watchdog terminated a worker (or a wasm trap was reported), `ActivityRecord` flipped to `Trapped` but never advanced to `Destroyed`. Bounded by session length, but the leak grew with every crash.
 
-**Why deferred.** Bounded leak — survives a session, doesn't persist. UX recovery (Shell tap-to-restart) was deferred to post-foundation work, so there was no user trigger to recycle the record.
+**Fix.**
+- New field `ActivityRecord::trapped_at_ms: Option<f64>` records the moment of trap. `mark_trapped(id, now_ms)` stamps it; `mark_package_trapped(pkg, now_ms)` threads the kernel's frame timestamp through.
+- New `ActivityManager` helpers `reap_trapped_ids(now_ms, max_age_ms)` and `reap(id)` — the latter drops the record + instance without firing `on_destroy` (the worker is dead, dispatch would either time out or land in a recycled handle slot).
+- New `Framework::reap_trapped(now_ms, max_age_ms) -> usize` wraps both.
+- Kernel calls `fw.reap_trapped(timestamp_ms, TRAPPED_GRACE_MS)` once per frame from `akiva_frame`. `TRAPPED_GRACE_MS = 30_000.0` (30s) — long enough for a debugger pause / future tap-to-restart confirm UI to claim the record explicitly before recycle.
 
-**Trigger to promote.** Foundation closeout work. Add a `Framework::reap_trapped(now_ms, max_age_ms)` walker the kernel calls each frame.
-
-**Code surfaces.** `framework/src/activity_manager.rs` (new method), `framework/src/lib.rs` (call site), `kernel/src/lib.rs` (akiva_frame integration). ~30 min.
+**Code.** `framework/src/{activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::{akiva_frame, drain_trapped_packages_into}`. Tests: `reap_trapped_ids_returns_only_aged_records`, `reap_drops_record_and_instance_for_trapped`, `reap_refuses_non_trapped_records`, `reap_trapped_ids_skips_records_without_timestamp`, `reap_trapped_recycles_records_older_than_grace_window`. The 30s constant lands in the runtime config block planned for P1 (`runtime/web/config.js`).
 
 ### 7.5 🟡 `drain_post` on every render is concept-muddy
 

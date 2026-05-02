@@ -115,6 +115,13 @@ fn map_key_phase(p: KeyPhase) -> fw_act::KeyPhase {
 static BOOTED: AtomicBool = AtomicBool::new(false);
 static mut KERNEL: Kernel = Kernel::new();
 
+/// P0 #3 — grace window between marking an activity `Trapped` and
+/// recycling its `ActivityRecord` slot. 30s is long enough for a
+/// debugger pause / a tap-to-restart confirm dialog to claim the
+/// record explicitly before the GC takes it. Should land in the
+/// runtime config block planned in P1 (`runtime/web/config.js`).
+const TRAPPED_GRACE_MS: f64 = 30_000.0;
+
 /// Grab a mutable reference to the kernel singleton.
 ///
 /// Safety: wasm in a worker is single-threaded; entry points are mutually
@@ -635,7 +642,7 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
     // bad package as Trapped. Done before event dispatch so a click
     // on a trapped activity doesn't try to forward into a dead worker.
     if let Some(fw) = k.framework.as_mut() {
-        drain_trapped_packages_into(fw);
+        drain_trapped_packages_into(fw, timestamp_ms);
     }
 
     // P0 #1 — drain any save_state futures the worker has answered
@@ -644,6 +651,18 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
     // effectively free outside of finish-bursts.
     if let Some(fw) = k.framework.as_mut() {
         fw.drive_pending_saves();
+    }
+
+    // P0 #3 — recycle Trapped records older than the grace window.
+    // The instance + record drop without firing destroy callbacks
+    // (the worker is dead). 30s gives a debugger time to attach and
+    // a future tap-to-restart UI a chance to flip Trapped → Destroyed
+    // explicitly before reap; bounded leak in the meantime.
+    if let Some(fw) = k.framework.as_mut() {
+        let n = fw.reap_trapped(timestamp_ms, TRAPPED_GRACE_MS);
+        if n > 0 {
+            log::info(&format!("reaped {n} trapped activity record(s)"));
+        }
     }
 
     // Drain all queued events and dispatch.
@@ -666,7 +685,11 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
 /// queue. Two-phase buffer: peek at the size first, then realloc if
 /// needed. The host evicts the entries on a fitting copy, so this is
 /// always single-shot per frame.
-fn drain_trapped_packages_into(fw: &mut akiva_framework::Framework) {
+///
+/// `now_ms` is the frame timestamp; passed through to
+/// `mark_package_trapped` so each `Trapped` record gets stamped with
+/// the time it died for P0 #3's reap pass.
+fn drain_trapped_packages_into(fw: &mut akiva_framework::Framework, now_ms: f64) {
     // Most frames the queue is empty (`needed == 0`); the bigger
     // buffer only kicks in when many apps trap simultaneously. 256
     // covers ~10 package_ids before the retry branch ever fires.
@@ -697,7 +720,7 @@ fn drain_trapped_packages_into(fw: &mut akiva_framework::Framework) {
     for pkg in blob.split('\n') {
         let pkg = pkg.trim();
         if pkg.is_empty() { continue; }
-        let n = fw.mark_package_trapped(pkg);
+        let n = fw.mark_package_trapped(pkg, now_ms);
         if n > 0 {
             log::warn(&format!("package '{pkg}' trapped — {n} activity(s) marked Trapped"));
         }

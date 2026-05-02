@@ -128,6 +128,14 @@ pub struct ActivityRecord {
     /// declines to fire fresh dispatches at this activity until it
     /// clears.
     pub pending: Option<PendingTransition>,
+    /// P0 #3 — frame timestamp at which the activity was marked
+    /// `Trapped`. `None` for activities that haven't trapped (the
+    /// common case). [`Framework::reap_trapped`] compares this against
+    /// `now_ms` and drops records whose age exceeds the configured
+    /// grace window — a real Android-equivalent of "the OS gives a
+    /// crashed process some time to be re-launched manually before
+    /// recycling its slot".
+    pub trapped_at_ms: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -280,6 +288,7 @@ impl ActivityManager {
             state: LifecycleState::Initial,
             launch_mode,
             pending: None,
+            trapped_at_ms: None,
         });
         self.instances.insert(id, instance);
         Ok(LaunchOutcome { id, reused: false, popped: Vec::new() })
@@ -579,7 +588,11 @@ impl ActivityManager {
     /// `None` if the id is unknown, the instance is gone, or the activity
     /// was already Trapped/Destroyed (idempotent — re-trap is a no-op).
     /// Any open pending slot clears: the future will never resolve.
-    pub fn mark_trapped(&mut self, id: ActivityId) -> Option<LifecycleState> {
+    ///
+    /// `now_ms` is the frame timestamp at which the trap was observed —
+    /// stored on the record so [`Framework::reap_trapped`] can age the
+    /// entry out after the configured grace window.
+    pub fn mark_trapped(&mut self, id: ActivityId, now_ms: f64) -> Option<LifecycleState> {
         let rec = self.records.get_mut(&id)?;
         if !legal_transition(rec.state, LifecycleState::Trapped) {
             return None;
@@ -590,6 +603,7 @@ impl ActivityManager {
         let prev = rec.state;
         rec.state = LifecycleState::Trapped;
         rec.pending = None;
+        rec.trapped_at_ms = Some(now_ms);
         Some(prev)
     }
 
@@ -625,6 +639,47 @@ impl ActivityManager {
         for task in self.tasks.values_mut() {
             task.stack.retain(|id| !set.contains(id));
         }
+    }
+
+    // ── P0 #3: Trapped recycle ────────────────────────────────────────────
+
+    /// Trapped activity ids whose `trapped_at_ms` is older than
+    /// `now_ms - max_age_ms`. Records that landed in `Trapped` without
+    /// a timestamp (legacy callers from before P0 #3 wired the
+    /// parameter through) are considered ageless and won't be reaped —
+    /// the safe choice when in doubt.
+    pub fn reap_trapped_ids(&self, now_ms: f64, max_age_ms: f64) -> Vec<ActivityId> {
+        self.records.iter()
+            .filter(|(_, r)| {
+                matches!(r.state, LifecycleState::Trapped)
+                    && r.trapped_at_ms.map_or(false, |t| now_ms - t > max_age_ms)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Recycle a Trapped record: drop the instance and remove the
+    /// record entirely. No lifecycle callbacks fire — the worker that
+    /// owned the activity is dead, and dispatching `on_destroy` would
+    /// either time out or land in a recycled handle slot.
+    ///
+    /// Returns `Some(())` on success, `None` if the id is unknown or
+    /// the record isn't actually `Trapped` (e.g. concurrent recovery
+    /// flipped it to `Destroyed` first via tap-to-restart). Idempotent
+    /// against the second call: the second `reap` returns `None`.
+    ///
+    /// The caller is responsible for purging any task-stack references
+    /// to `id` first via [`Self::evict_from_task_stacks`] —
+    /// `Framework::mark_package_trapped` already does this at trap
+    /// time so reap normally finds the stack already clean.
+    pub fn reap(&mut self, id: ActivityId) -> Option<()> {
+        let rec = self.records.get(&id)?;
+        if !matches!(rec.state, LifecycleState::Trapped) {
+            return None;
+        }
+        self.records.remove(&id);
+        self.instances.remove(&id);
+        Some(())
     }
 }
 
@@ -1418,9 +1473,11 @@ mod tests {
         // would also work but the closure inference around the `cb`
         // generic is fussy; the driver wraps the `fire` helper for us.)
         am.resume(id, fire);
-        let prev = am.mark_trapped(id);
+        let prev = am.mark_trapped(id, 1000.0);
         assert_eq!(prev, Some(LifecycleState::Resumed));
         assert_eq!(am.state_of(id), Some(LifecycleState::Trapped));
+        assert_eq!(am.record(id).unwrap().trapped_at_ms, Some(1000.0),
+            "P0 #3 — mark_trapped stamps the timestamp for reap aging");
     }
 
     #[test]
@@ -1428,7 +1485,7 @@ mod tests {
         let (mut am, _log) = harness();
         let id = am.launch("test.pkg", "RecMain").unwrap().id;
         assert!(am.open_pending(id, LifecycleState::Created, 99, 0.0));
-        am.mark_trapped(id).unwrap();
+        am.mark_trapped(id, 0.0).unwrap();
         // The future is gone — the worker won't ever resolve it.
         assert!(am.pending_of(id).is_none());
         assert!(am.pending_ids().is_empty());
@@ -1438,10 +1495,71 @@ mod tests {
     fn mark_trapped_is_idempotent() {
         let (mut am, _log) = harness();
         let id = am.launch("test.pkg", "RecMain").unwrap().id;
-        assert!(am.mark_trapped(id).is_some());
+        assert!(am.mark_trapped(id, 0.0).is_some());
         // Second call: state is already Trapped, no legal edge.
-        assert!(am.mark_trapped(id).is_none());
+        assert!(am.mark_trapped(id, 5000.0).is_none());
         assert_eq!(am.state_of(id), Some(LifecycleState::Trapped));
+    }
+
+    // ── P0 #3: Trapped recycle ─────────────────────────────────────────────
+
+    #[test]
+    fn reap_trapped_ids_returns_only_aged_records() {
+        let (mut am, _log) = harness();
+        let young = am.launch("test.pkg", "RecMain").unwrap().id;
+        let old = am.launch("test.pkg", "RecMain").unwrap().id;
+        am.mark_trapped(young, 9_000.0).unwrap();
+        am.mark_trapped(old, 0.0).unwrap();
+
+        // now_ms=10_000, max_age=5_000 → age threshold is anything older
+        // than ts=5_000. `young` (9_000 → age 1_000) stays; `old`
+        // (0 → age 10_000) is ripe.
+        let ids = am.reap_trapped_ids(10_000.0, 5_000.0);
+        assert_eq!(ids, vec![old]);
+    }
+
+    #[test]
+    fn reap_drops_record_and_instance_for_trapped() {
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        am.mark_trapped(id, 0.0).unwrap();
+        assert!(am.reap(id).is_some(), "first reap succeeds");
+        assert!(am.record(id).is_none(), "record gone");
+        assert!(!am.with_instance(id, |_| {}), "instance gone");
+
+        // Second reap is a no-op (idempotent — record is gone).
+        assert!(am.reap(id).is_none());
+    }
+
+    #[test]
+    fn reap_refuses_non_trapped_records() {
+        // Reaping a Resumed/Initial activity would be a state-machine
+        // violation — only Trapped records are recyclable without
+        // firing on_destroy. Defensive check so a buggy caller can't
+        // silently drop a live activity.
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        am.resume(id, fire);
+        assert!(am.reap(id).is_none(),
+            "live (Resumed) activity must not be reapable");
+        assert!(am.record(id).is_some(), "record stayed");
+    }
+
+    #[test]
+    fn reap_trapped_ids_skips_records_without_timestamp() {
+        // Defensive: a hypothetical legacy record that landed in
+        // Trapped without a timestamp (e.g. constructed by hand in a
+        // test fixture) is treated as ageless and must not be reaped
+        // — the safe default when we don't know how old the entry is.
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        am.mark_trapped(id, 0.0).unwrap();
+        // Manually clear the stamp to simulate the legacy shape.
+        am.records.get_mut(&id).unwrap().trapped_at_ms = None;
+
+        let ids = am.reap_trapped_ids(10_000_000.0, 0.0);
+        assert!(ids.is_empty(),
+            "missing trapped_at_ms must be treated as ageless, not stale");
     }
 
     #[test]
