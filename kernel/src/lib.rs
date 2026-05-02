@@ -115,12 +115,39 @@ fn map_key_phase(p: KeyPhase) -> fw_act::KeyPhase {
 static BOOTED: AtomicBool = AtomicBool::new(false);
 static mut KERNEL: Kernel = Kernel::new();
 
+// ── Kernel-side tuning knobs ───────────────────────────────────────────
+//
+// JS-side tunables (watchdog timeouts, heartbeat tick) live in
+// `runtime/web/config.js`; this block is the Rust-side counterpart for
+// values the kernel wasm reaches for. Each constant carries a `Why:`
+// comment so the *reasoning* survives even if the value is later
+// retuned.
+
 /// P0 #3 — grace window between marking an activity `Trapped` and
-/// recycling its `ActivityRecord` slot. 30s is long enough for a
-/// debugger pause / a tap-to-restart confirm dialog to claim the
-/// record explicitly before the GC takes it. Should land in the
-/// runtime config block planned in P1 (`runtime/web/config.js`).
+/// recycling its `ActivityRecord` slot.
+///
+/// Why: 30s is long enough for a debugger pause or a tap-to-restart
+/// confirm dialog to claim the record explicitly before GC takes it,
+/// short enough that a crashed app doesn't sit in the table forever.
 const TRAPPED_GRACE_MS: f64 = 30_000.0;
+
+/// Initial buffer size for `WasmHost::poll_future` when fetching a
+/// READY dispatch's bytes. The two-phase buffer protocol grows past
+/// this on demand, so the value only matters for the common case.
+///
+/// Why: a typical app's per-frame paint stream sits a few KiB; 16 KiB
+/// covers the common case in one host call. Anything that exceeds
+/// (a `SavedState` blob, a complex render) takes a single retry. Too
+/// small (e.g. 1 KiB) would force a retry every frame.
+const POLL_RESULT_INITIAL_CAP: usize = 16 * 1024;
+
+/// Initial buffer size for `hal_drain_trapped_packages`. Same two-
+/// phase grow-on-overflow contract as `POLL_RESULT_INITIAL_CAP`.
+///
+/// Why: most frames the trap queue is empty (`needed == 0`) and the
+/// buffer is unused; the bigger fallback only kicks in when many apps
+/// trap at once. 256 covers ~10 typical package_ids before retry.
+const TRAP_DRAIN_INITIAL_CAP: usize = 256;
 
 /// Grab a mutable reference to the kernel singleton.
 ///
@@ -585,12 +612,12 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
             0 => None,
             // STATUS::READY — fetch + return.
             1 => {
-                // 16 KiB initial cap covers the common per-frame paint
-                // stream; SavedState wire is capped at 64 KiB and the
-                // retry branch handles anything larger. Lifecycle/input
-                // cmds resolve to 0 bytes which `fetch_result` returns
-                // as an empty Vec.
-                let bytes = self.fetch_result(future_id, 16 * 1024);
+                // Common per-frame paint stream sits within the
+                // POLL_RESULT_INITIAL_CAP window; the retry branch in
+                // fetch_result handles SavedState and oversized paint.
+                // Lifecycle/input cmds resolve to 0 bytes which
+                // `fetch_result` returns as an empty Vec.
+                let bytes = self.fetch_result(future_id, POLL_RESULT_INITIAL_CAP);
                 Some(Ok(bytes))
             }
             // STATUS::ERROR — worker reported a trap or rejected the
@@ -691,9 +718,9 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
 /// the time it died for P0 #3's reap pass.
 fn drain_trapped_packages_into(fw: &mut akiva_framework::Framework, now_ms: f64) {
     // Most frames the queue is empty (`needed == 0`); the bigger
-    // buffer only kicks in when many apps trap simultaneously. 256
-    // covers ~10 package_ids before the retry branch ever fires.
-    let mut buf = [0u8; 256];
+    // buffer only kicks in when many apps trap simultaneously. See
+    // TRAP_DRAIN_INITIAL_CAP at the top of this file for the rationale.
+    let mut buf = [0u8; TRAP_DRAIN_INITIAL_CAP];
     let needed = unsafe {
         host::hal_drain_trapped_packages(buf.as_mut_ptr(), buf.len() as u32)
     } as usize;

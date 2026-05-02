@@ -20,6 +20,7 @@
 
 import { fontString } from "./renderer/canvas2d.js";
 import { STATUS, FIRE, IO } from "./op_kinds.mjs";
+import { WATCHDOG } from "./config.js";
 
 export class AppRegistry {
   /**
@@ -518,7 +519,7 @@ export class AppRegistry {
       // ticks — bail cleanly.
       if (this._processes.get(proc.packageId) !== proc) return;
       const now = performance.now();
-      if (now - proc.lastPongAt > 1500) {
+      if (now - proc.lastPongAt > WATCHDOG.TIMEOUT_MS) {
         this._log("error",
           `app ${proc.packageId}: no pong in ${(now - proc.lastPongAt).toFixed(0)}ms — terminating worker`);
         try { proc.worker.terminate(); } catch (_) { /* best effort */ }
@@ -538,9 +539,9 @@ export class AppRegistry {
         return;
       }
       proc.worker.postMessage({ type: "ping", t: now });
-      proc.pingTimer = setTimeout(tick, 500);
+      proc.pingTimer = setTimeout(tick, WATCHDOG.HEARTBEAT_MS);
     };
-    proc.pingTimer = setTimeout(tick, 500);
+    proc.pingTimer = setTimeout(tick, WATCHDOG.HEARTBEAT_MS);
   }
 
   /**

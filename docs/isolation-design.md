@@ -762,7 +762,10 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
 
 5. **`WriteHandle` ל-storage** — היום `storage::write` הוא fire-and-forget. לcritical data app רוצה לדעת אם נכשל. ~30 דק'.
 
-6. **Magic numbers → config block** — 1500ms (watchdog), 16KB (render initial buf), 4KB (save_state initial buf), 256B (trap drain buf). מקובצים ב-`runtime/web/config.js` כdefault const block, dev mode יכול להחליף. ~15 דק'.
+6. **✅ Magic numbers → config block — תוקן (P1 #2, May 2026)**
+   - **JS-side:** קובץ חדש `runtime/web/config.js` מייצא `WATCHDOG.{TIMEOUT_MS, HEARTBEAT_MS}` ו-`FRAME_FALLBACK_MS`. `app_registry.js` ו-`worker.js` מייבאים משם במקום inline literals. Override hook (`globalThis.__akivaConfig`) מתועד אבל עוד לא חיווט — single source עד שיש צורך אמיתי.
+   - **Rust-side:** הconst block בראש `kernel/src/lib.rs` מאחד `TRAPPED_GRACE_MS` (קיים) עם שני חדשים: `POLL_RESULT_INITIAL_CAP = 16 KiB`, `TRAP_DRAIN_INITIAL_CAP = 256`. כל קבוע נושא הערת `Why:` כך שהשיקול שורד retune.
+   - **תוצאה:** קריאה אחת לכל magic number, כל שינוי tuning עובר דרך פיגום אחד. 54 vitest + 172 framework + 0 kernel(no test crate yet) green.
 
 7. **`drain_post` separation** — להוציא מ-`render` לframework phase נפרד `drive_pending_signals(ts)` שrun-it כל frame בkernel. clarity in concept. ~30 דק'.
 

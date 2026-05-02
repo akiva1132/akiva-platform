@@ -15,6 +15,7 @@
 import { Canvas2DBackend } from "./renderer/canvas2d.js";
 import { Storage, SR_BAD_KEY } from "./storage.js";
 import { AppRegistry } from "./app_registry.js";
+import { FRAME_FALLBACK_MS } from "./config.js";
 
 /** @type {WebAssembly.Instance | null} */
 let instance = null;
@@ -267,7 +268,7 @@ function startFrameLoop() {
       self.postMessage({ type: "panic", text: String(err?.message ?? err) });
       return;
     }
-    rafId = self.requestAnimationFrame ? self.requestAnimationFrame(tick) : setTimeout(() => tick(performance.now()), 16);
+    rafId = self.requestAnimationFrame ? self.requestAnimationFrame(tick) : setTimeout(() => tick(performance.now()), FRAME_FALLBACK_MS);
   };
   rafId = self.requestAnimationFrame ? self.requestAnimationFrame(tick) : setTimeout(() => tick(performance.now()), 16);
 }
