@@ -816,6 +816,206 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 **Gate ל-11.7:** אסור לפתוח את 11.7 (akiva new + docs מקיפים) לפני ש-11.6.7 ירוק. ה-docs יבעירו את ה-API לbedrock; כל rough edge שלא נסגר עכשיו יחיה לעולם בעיני מפתחים עתידיים.
 
+### 11.6.8 Foundation primitives gap (1-2 ימים) — **חוסם 11.7**
+
+**מטרה:** סגירת חמישה primitives בסיסיים ב-API שחסרים ב-foundation למרות ש-11.6.5 + 11.6.7 ירוקים. כולם **additive ל-ABI** (לא breaking, לא bumping ABI_VERSION ל-0.3.0 — תוספות הן MINOR ב-policy). כולם foundational במובן שmappים בסיסיים יזדקקו להם, ובלעדיהם אפליקציה שתוכל להיכתב על Akiva היא subset של מה שאפליקציה דומה ל-Android יכולה לעשות.
+
+**אופי הקלאסטר:** כמו 11.6.7 — 5 פריטים עצמאיים, אין dependencies בין הפריטים, אפשר sequential או parallel.
+
+**למה לא קודם.** ה-5 פערים נסתרים — לא מתבטאים ב-tests של 4 ה-MVP apps (calc, hello, tic-tac-toe, infinite-loop). הם נחשפים רק כש-app אמיתי כותב code שמשתמש ב-crypto, או רוצה לדעת איזה תאריך היום, או צריך 2 spawned tasks לתאם ביניהן. May 2026 audit פוסט-11.6.7 חשף את כולם.
+
+#### פריט 1 — CSPRNG / entropy host import (~30 דק')
+
+**הבעיה.** ב-`grep -nE "rand|getRandomValues" sdk-rust/`: אין שום thing. אין לאפליקציה דרך לקבל bytes אקראיים. wasm לבד אין לו entropy — כל crypto, UUID generation, session token, password salt, anti-CSRF — חסום. iOS, Android, Linux כולם חושפים primitive זה ungated (זה לא reflection של privacy, זה primitive נחוץ).
+
+**Implementation.**
+- New host import ב-[`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs):
+  ```rust
+  extern "C" {
+      fn akiva_host_random_bytes(out_ptr: *mut u8, len: u32);
+  }
+  ```
+- חדש module `sdk-rust/src/random.rs`:
+  ```rust
+  pub fn fill_random(out: &mut [u8]) {
+      unsafe { akiva_host_random_bytes(out.as_mut_ptr(), out.len() as u32); }
+  }
+  pub fn random_bytes(len: usize) -> Vec<u8> {
+      let mut v = vec![0u8; len];
+      fill_random(&mut v);
+      v
+  }
+  ```
+- JS-side ב-[`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js): ה-import ממולא ע"י `crypto.getRandomValues(new Uint8Array(memory.buffer, ptr, len))`.
+- **No capability gate** — RNG הוא primitive, לא resource. תיעוד מפורש ב-`docs/abi.md` שזה ungated.
+- אין op_kind ב-fire/io_start — הוא extern נפרד כי הוא sync write לwasm memory ב-call יחיד (לא matches ל-fire pattern של "args in, status out").
+
+**DoD.**
+- [ ] `let mut buf = [0u8; 32]; random::fill_random(&mut buf);` ממלא 32 bytes.
+- [ ] שתי קריאות → ה-bytes שונים (test עם seed-not-fixed ב-mock JS).
+- [ ] vitest: mock `crypto.getRandomValues` שמחזיר predictable bytes; assert ה-wasm memory מכיל את ה-bytes.
+- [ ] doc-test ב-`random.rs`: דוגמת UUID generation ב-`/// # Examples`.
+
+**Code surfaces.** [`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs) (extern), `sdk-rust/src/random.rs` (חדש), [`sdk-rust/src/lib.rs`](sdk-rust/src/lib.rs) (re-export `pub mod random`), [`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js) (host import body), [`docs/abi.md`](docs/abi.md) (תיעוד ב-§ ה-imports).
+
+#### פריט 2 — `MAX_PENDING_PER_SLOT` bound (~30 דק')
+
+**הבעיה.** ב-Stone 11.6.5 #12 השנינו `Slot.pending` ל-`HashMap<u64, PendingDispatch>` — concurrent dispatches per activity. אבל ה-HashMap **unbounded**. App עוין שיעשה `for _ in 0..1_000_000 { ctx.activity_scope().spawn(slow_io()); }` יקצה מיליון future_ids ב-burst אחד, ויצרוך זיכרון unbounded לפני שה-watchdog יתפוס. גם app legitimate שעושה `join_all` של 10K reads — מוצא את עצמו unbounded.
+
+**Implementation.**
+- const חדש ב-[`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs):
+  ```rust
+  /// Maximum concurrent in-flight dispatches per activity slot.
+  /// Why: bounds DoS-via-allocation; an app spinning up unbounded
+  /// futures should fail loudly, not OOM the worker.
+  const MAX_PENDING_PER_SLOT: usize = 256;
+  ```
+- ב-`install_*` / `run_*_sync` helpers — לפני insertion: `if slot.pending.len() >= MAX_PENDING_PER_SLOT { return STATUS_BUSY; }`.
+- ABI status חדש (additive — extends existing status enum ב-op_kinds): `STATUS_BUSY = 3` (after the existing PENDING/READY/CANCELLED).
+- [`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js): כשה-status הוא BUSY, log warning + reply ל-host_op_done עם `Err(BUSY)`.
+- App-side: `storage::read("k").await` במצב busy מחזיר `Err(StorageError::Busy)` — אפליקציה יכולה להחליט לחזור (backoff) או להחליט ש-task הזה מיותר.
+- 256 הוא רחב dummy — מאפשר 100+ legitimate concurrent operations, מספיק נמוך כדי לתפוס spam-loop ב-< 50ms.
+
+**DoD.**
+- [ ] vitest test: spam 257 concurrent dispatches → ה-257 חוזר עם BUSY status.
+- [ ] vitest test: complete 100 dispatches → 100 חדשים מקובלים (בנייה לא מצטברת).
+- [ ] vitest test: 256 dispatches בכל אחד מ-2 slots שונים — שניהם עובדים (per-slot, לא global).
+- [ ] sdk test: `Future` שמקבל BUSY מ-`io_poll` resolves ל-`Err(_::Busy)` proper.
+- [ ] doc update ב-`executor.rs` invariant comment: "bounded by MAX_PENDING_PER_SLOT."
+
+**Code surfaces.** [`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs), [`sdk-rust/src/op_kinds.rs`](sdk-rust/src/op_kinds.rs) (status enum), [`framework/src/op_kinds.rs`](framework/src/op_kinds.rs), [`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js), [`runtime/web/op_kinds.mjs`](runtime/web/op_kinds.mjs), [`sdk-rust/src/storage.rs`](sdk-rust/src/storage.rs) (StorageError::Busy variant).
+
+#### פריט 3 — SDK concurrency primitives (Channel, Mutex, Signal) (~1-2 ימים)
+
+**הבעיה.** Stone 11.6.5 #11 הביא `TaskScope::spawn`. אבל אין primitives לתאם בין spawned tasks. App ש-spawn 2 tasks — אין `Channel<T>` להעביר נתונים, אין `Mutex<T>` להגן על shared state, אין `Signal<T>` שיודיע על שינוי. Coroutines של Kotlin שולחים `Channel`, `Mutex`, `Flow`, `StateFlow` out of the box. SwiftUI שולח `AsyncStream`, `actor`, `@MainActor`. אצלנו — אין כלום. ה-vision של "DX כמו Compose/SwiftUI" פוגע פה.
+
+**Implementation.**
+- New module tree `sdk-rust/src/sync/` עם `mod.rs` שmוצא:
+  ```rust
+  pub mod channel;
+  pub mod mutex;
+  pub mod signal;
+  pub use channel::Channel;
+  pub use mutex::{Mutex, MutexGuard};
+  pub use signal::Signal;
+  ```
+- **Channel** — bounded MPSC (single-producer-single-consumer מספיק לחלק גדול מה-cases ב-single-threaded wasm; אפשר להרחיב למרובה מאוחר):
+  ```rust
+  pub struct Channel<T, const N: usize> { /* ring buffer + waker slots */ }
+  impl<T, const N: usize> Channel<T, N> {
+      pub fn new() -> Self;
+      pub async fn send(&self, value: T);                 // backpressure when full
+      pub async fn recv(&self) -> T;                       // wait when empty
+      pub fn try_send(&self, value: T) -> Result<(), Full<T>>;
+      pub fn try_recv(&self) -> Option<T>;
+  }
+  ```
+- **Mutex** — futurized (גם בwasm single-threaded זה שימושי כי spawned tasks חולקים ה-event loop):
+  ```rust
+  pub struct Mutex<T> { /* RefCell + Vec<Waker> */ }
+  impl<T> Mutex<T> {
+      pub fn new(value: T) -> Self;
+      pub async fn lock(&self) -> MutexGuard<'_, T>;
+      pub fn try_lock(&self) -> Option<MutexGuard<'_, T>>;
+  }
+  ```
+- **Signal** — single-slot, multiple-waiter (מקביל ל-`mutableStateOf` של Compose):
+  ```rust
+  pub struct Signal<T> { /* RefCell<Option<T>> + Vec<Waker> */ }
+  impl<T: Clone> Signal<T> {
+      pub fn new() -> Self;
+      pub fn set(&self, value: T);                         // wakes all waiters
+      pub async fn wait(&self) -> T;                       // returns latest on change
+      pub fn current(&self) -> Option<T>;
+  }
+  ```
+- **Implementation strategy.** Custom (לא embassy-sync) — מסיבות זהות כמו ה-executor: wasm single-threaded לא דורש cross-thread atomics, ה-API tightly-fitted לcase שלנו, ~200-300 שורות סך הכל. חיבור ל-waker mechanism הקיים ב-`crate::executor`. embassy-sync יישאר כ-fallback אם פעם נצטרך wide-scope concurrency.
+- **Re-export ב-`lib.rs`:** `pub mod sync;` כך ש-apps כותבים `use akiva_sdk::sync::Channel;`.
+
+**DoD.**
+- [ ] **Channel:** producer task `send` 10 items, consumer task `recv` 10 — סדר נכון, ערכים נכונים. test ב-`sdk-rust/src/sync/channel.rs::tests`.
+- [ ] **Channel backpressure:** Channel<i32, 4>, send 5 items, ה-5 ממתין; recv אחד, send חוזר ומשלים.
+- [ ] **Mutex contention:** 2 spawned tasks `lock().await`, רק אחד מחזיק בכל זמן; test ע"י assertion שה-counter אחרי שניהם == 2 ולא ערך אחר.
+- [ ] **Signal multi-waiter:** 3 tasks `wait().await` במקביל, set אחד → כולם wake-up עם הvalue.
+- [ ] **Cancellation interaction:** spawn task ב-resumed_scope שעושה `channel.recv().await`; on_pause נקרא; ה-task נקרע. ה-channel לא נשאר ב-state corrupt — recv חדש מ-activity_scope עובד.
+- [ ] vitest doc-tests ב-3 ה-modules — דוגמאות מציאותיות (producer-consumer pattern, lock-the-counter, observe-state-change).
+
+**Code surfaces.** New: `sdk-rust/src/sync/{mod.rs, channel.rs, mutex.rs, signal.rs}`. Updated: [`sdk-rust/src/lib.rs`](sdk-rust/src/lib.rs) (re-export), [`sdk-rust/src/executor.rs`](sdk-rust/src/executor.rs) (waker registration helper if needed).
+
+#### פריט 4 — Wall-clock time host import (~30 דק')
+
+**הבעיה.** `ctx.timestamp_ms` הוא monotonic (frame timestamp). App שכותב note ורוצה לסמן "נוצר ב-2026-05-02 14:32" — אין מאיפה לקחת. ב-OS אמיתי שני clock-types נחשפים (CLOCK_MONOTONIC + CLOCK_REALTIME). Akiva חושף רק monotonic.
+
+**Implementation.**
+- New host import:
+  ```rust
+  extern "C" { fn akiva_host_wall_clock_ms() -> u64; }
+  ```
+- New module `sdk-rust/src/clock.rs`:
+  ```rust
+  /// Wall-clock time in milliseconds since UNIX epoch.
+  /// Subject to NTP corrections, user clock changes, daylight savings.
+  /// For elapsed-time measurements use `ctx.timestamp_ms` instead.
+  pub fn wall_clock_ms() -> u64 {
+      unsafe { akiva_host_wall_clock_ms() }
+  }
+  ```
+- JS-side: `Date.now()` mapped to BigInt for u64 transport.
+- **No capability gate** — like RNG, time is primitive.
+- תיעוד מפורש ב-doc-comment של ההבדל מ-monotonic (הבדל גדול ש-apps לפעמים מבלבלים).
+
+**DoD.**
+- [ ] `random::fill_random` returns >0 value.
+- [ ] שתי קריאות סדרתיות: ה-2 ≥ ה-1 (monotonicity של Date.now ב-deltas של ms).
+- [ ] vitest mock: `Date.now` mocked לערך קבוע, app רואה אותו.
+- [ ] doc-test ב-`clock.rs` שמראה note-with-timestamp.
+- [ ] doc note שמסביר את ההבדל מ-`ctx.timestamp_ms` (monotonic, frame-based).
+
+**Code surfaces.** [`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs) (extern), `sdk-rust/src/clock.rs` (חדש), [`sdk-rust/src/lib.rs`](sdk-rust/src/lib.rs) (re-export `pub mod clock`), [`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js) (host import body), [`docs/abi.md`](docs/abi.md) (תיעוד ב-§ ה-imports).
+
+#### פריט 5 — ABI versioning policy formalization (~30 דק', no code)
+
+**הבעיה.** `ABI_VERSION = "0.2.0"` קיים ב-`sdk-rust/src/lib.rs` ו-`framework/src/lib.rs`. mismatch loudly fails-on-load. אבל **אין כתוב מתי `0.X` → `1.0` קורה, מה נחשב breaking, מי gate-r, מה הקריטריון לpromotion.** מתועד ב-[`docs/risks.md` §3](docs/risks.md) כ"premature to formalize" — אבל לפני ש-Stone 11.7 פותח את ה-public docs, ה-policy חייב להיכתב, אחרת ה-public docs ייקבעו implicit policy שאי אפשר לסגת ממנה.
+
+**Implementation.** New section `## 1.X ABI versioning policy` ב-[`docs/abi.md`](docs/abi.md). תוכן:
+
+- **In scope של ABI_VERSION:** extern function signatures (גם ב-app side וגם ב-host side), op_kind constants, status code constants, wire format byte-layouts (intent, paint, save_state, pkgs, result), capability constants, all `MAX_*_BYTES` constants ב-public types.
+- **NOT in scope:** SDK Rust API ergonomics (function names, error types names, doc comments), internal kernel implementation, framework internal logic, `runtime/web` JS internals, test harness.
+- **Bump rules:**
+  - **PATCH** (`0.X.Y` → `0.X.(Y+1)`): bug fix in implementation, contract unchanged. כדאי לשמור unused עד 1.0 — בעידן 0.X לא נשתמש.
+  - **MINOR** (`0.X.Y` → `0.(X+1).0`): additive change — new op_kind, new import, new capability, new field appended to a wire format that's documented as "may be extended." Old code remains compatible.
+  - **MAJOR** (`0.X` → `(X+1).0` ב-pre-1.0; `X.Y` → `(X+1).0` post-1.0): breaking change. Apps must rebuild against the new ABI. Includes: removing or renaming a primitive, changing type of an arg, reordering wire format fields, changing semantics of an existing op_kind.
+- **Promotion ל-1.0:**
+  - Phase 11 + 12 + 13 exit criteria all green.
+  - 6+ months without a MAJOR bump.
+  - First third-party app (signed by external party) installed end-to-end without manual ABI patches.
+  - Streams primitive is stable (or explicitly deferred to 1.X).
+  - Stone 11.7's docs at maturity (no "WIP" markers).
+- **Review process (current — single author):** any ABI bump documented in (a) commit message body, (b) the relevant design doc (`isolation-design.md` for Phase 11, `windowing-design.md` for Phase 13, etc.), (c) `CHANGELOG.md` entry under "ABI changes."
+- **Review process (future — ≥2 contributors):** RFC-style proposal in `docs/abi-proposals/<NNN>-<slug>.md` describing change + impact + migration path. 1-week review window. Approval = at least 2 maintainers signed-off ב-comment.
+- **CHANGELOG.md ב-root** — חדש (אופציונלי, אבל המומלץ עכשיו). מפלס entries לפי semver, ABI changes מסומנים `[ABI]`.
+
+**DoD.**
+- [ ] `docs/abi.md` כולל את ה-policy החדש כ-§1.X (לאחר §1 הקיים, לפני §2).
+- [ ] [`docs/risks.md` §3](docs/risks.md) (JS-side ABI governance) ניתן לסמן ✅ — promoted to abi.md.
+- [ ] [`CHANGELOG.md`](CHANGELOG.md) חדש ב-root עם entry יחיד שמתעד את ה-ABI bumps של 0.1.0 → 0.2.0 (P0 #4 + Stone 11.6.5) + 0.2.0 → 0.3.0 (Stone 11.6.8: + RANDOM, + WALL_CLOCK, + STATUS_BUSY).
+- [ ] commit message convention documented: כל commit שמשנה ABI כולל `[ABI: MINOR]` או `[ABI: MAJOR]` ב-subject line.
+
+**Code surfaces.** [`docs/abi.md`](docs/abi.md) (new section), [`CHANGELOG.md`](CHANGELOG.md) (new file ב-root), [`docs/risks.md`](docs/risks.md) §3 (mark resolved).
+
+#### Definition of Done — Stone 11.6.8 כולה
+
+- [ ] 5 פריטים סגורים, כל אחד עם tests משלו.
+- [ ] ABI bumped ל-`0.3.0` (פריטים 1, 2, 4 הם MINOR additions; פריט 3 הוא pure SDK; פריט 5 הוא תיעוד policy).
+- [ ] cargo test green: 414+ Rust tests + 54+ vitest tests (תוספת של ~12-18 חדשים).
+- [ ] `docs/sdk-rust.md` §19 מעודכן: §19.X חדש לכל primitive חדש (random, clock, sync).
+- [ ] `docs/abi.md` מעודכן: imports list (random_bytes, wall_clock_ms), status codes (BUSY), versioning policy.
+- [ ] `docs/risks.md` §3 (ABI governance) → ✅ resolved.
+
+**הערכת זמן Total:** 1-2 ימי עבודה.
+
+**Gate ל-11.7:** אסור לפתוח את 11.7 לפני ש-11.6.8 ירוק. הסיבה זהה ל-11.6.7 — public docs יבעירו את ה-API לbedrock; primitives שחסרים יחיו לעולם בעיני מפתחים שיתעדו "Akiva = Android אבל בלי RNG / wall clock / channels."
+
 ### 11.7 `akiva new` + dev tooling polish (1-2 שבועות) — **DX foundation**
 - `akiva new <name>` — scaffold app (Cargo.toml, manifest.toml, src/lib.rs hello-world async, README).
 - 3 templates: `default`, `compose-style`, `game`.

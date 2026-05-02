@@ -818,6 +818,20 @@ architectural audit פוסט-11.6.5 (May 2026) זיהה חמישה rough edges �
 
 **Gate ל-11.7:** אסור לפתוח את 11.7 לפני ש-11.6.7 ירוק. כל פריט שלא נסגר ייכבל ב-public docs ויחיה לעולם בעיני מפתחים עתידיים.
 
+### Stone 11.6.8 — Foundation primitives gap (1-2 ימים) — **חוסם 11.7**
+
+architectural audit שלישי (post-11.6.7 design) זיהה חמישה primitives **בשכבה הבסיסית** שחסרים — לא scope-deferral, לא lazy-corner שניתן לסגור ב-Phase מאוחר. הם foundational במובן ש-API contract של "OS-grade app framework" צריך לכלול אותם, וה-4 MVP apps לא נתקלים בהם רק כי הם simple-by-design. הdetail המלא של כל פריט (DoD, code surfaces, scope) ב-[ROADMAP.md Stone 11.6.8](../ROADMAP.md):
+
+1. **CSPRNG / entropy host import** (~30 דק') — אין primitive ב-SDK להשגת bytes אקראיים. wasm לבד אין לו entropy, אין host import. Apps שצריכים crypto/UUID/session token חסומים. Implementation: extern `akiva_host_random_bytes` + `akiva_sdk::random` module + ungated capability (RNG = primitive, לא resource).
+2. **`MAX_PENDING_PER_SLOT` bound** (~30 דק') — `Slot.pending: HashMap` של 11.6.5 #12 הוא unbounded. App עוין שעושה `for _ in 0..1_000_000 { spawn(io); }` יקצה מיליון future_ids ב-burst. Implementation: const cap (256), חדש `STATUS_BUSY` code, future מחזיר `Err(Busy)`.
+3. **SDK concurrency primitives — Channel, Mutex, Signal** (~1-2 ימים) — ה-vision של "DX כמו Compose/SwiftUI" לא ממומש: 2 spawned tasks אין דרך לתאם ביניהם. Coroutines שולחים Channel/Mutex/Flow out-of-the-box; אצלנו אין כלום. Implementation: custom `sdk-rust/src/sync/` module ~200-300 שורות (לא embassy-sync — אותה שיקול pragma כמו ה-executor המותאם).
+4. **Wall-clock time** (~30 דק') — `ctx.timestamp_ms` הוא monotonic; אין wall clock. App שכותב note ורוצה לסמן "נוצר ב-2026-05-02 14:32" — אין מאיפה לקחת. Implementation: extern `akiva_host_wall_clock_ms` + `akiva_sdk::clock::wall_clock_ms()`.
+5. **ABI versioning policy formalization** (~30 דק', no code) — `ABI_VERSION` קיים ו-loud-on-mismatch, אבל **אין כתוב** מתי 0.X→1.0, מה נחשב breaking, מי gate-r. ה-policy חייב להיכתב לפני 11.7 — אחרת ה-public docs יקבעו implicit policy. Implementation: §1.X חדש ב-`docs/abi.md` עם bump rules (PATCH/MINOR/MAJOR), 1.0 promotion criteria, review process. CHANGELOG.md חדש ב-root.
+
+**מה זה לא?** רוב הפריטים נראים קטנים, אבל הם foundational. בלי RNG אין לאף app שיוצר session ID. בלי wall_clock אין ל-notes app אפשרות לסמן זמן יצירה. בלי Channel ה-`spawn` של 11.6.5 #11 הוא חסר primitive בסיסי לתיאום. בלי MAX_PENDING יש vector להקצאה non-bounded. בלי ABI policy ה-public docs יקבעו את הכללים בלי כוונה.
+
+**Gate ל-11.7:** אסור לפתוח את 11.7 לפני ש-11.6.8 ירוק. כל primitive חסר ייכבל ב-public docs ויחיה לעולם בעיני מפתחים עתידיים שיכתבו "Akiva = Android אבל בלי RNG / wall clock / channels."
+
 ### Recommended Order (revised post-2026-05-02 audit)
 
 ```
@@ -832,7 +846,11 @@ Stone 11.6.5 — SDK API completeness    ✅
    • WriteHandle / pkgs_wire / direct readonly /
      lazy-spawn / watchdog tunability
                                           ↓
-Stone 11.7 — akiva new + docs (1-2 שבועות) — מתועד על API שעובד וpolished
+🔴 Stone 11.6.8 — Foundation primitives (~1-2 ימים)
+   • CSPRNG / MAX_PENDING bound / sync primitives /
+     wall_clock / ABI versioning policy
+                                          ↓
+Stone 11.7 — akiva new + docs (1-2 שבועות) — מתועד על API מלא וpolished
                                           ↓
 Stone 11.8 — perf + benchmarks (1 שבוע)
                                           ↓
@@ -841,11 +859,11 @@ Phase 11 done
 
 **Phase 12 (Resource Governance)** רץ במקביל — 12.1 (memory accounting) + 12.2 (CPU attribution) כבר נחתו (May 2026). 12.3-12.5 (LMK, suspension, enforcement) ממשיכים — 12.4 (suspension) מסתמך על TaskScope cancellation שכבר ירוק מ-11.6.5.
 
-**אומדן זמן (revised):** Foundation work closed except 11.6.7; **11.6.7 = 3-5 ימים**; 11.7 + 11.8 לא השתנו.
+**אומדן זמן (revised):** Foundation work closed except 11.6.7 + 11.6.8; **11.6.7 = 3-5 ימים, 11.6.8 = 1-2 ימים** (ניתן לעבוד עליהם בכל סדר או במקביל); 11.7 + 11.8 לא השתנו.
 
 **Gates:**
 - ✅ Phase 12 פתוח (11.6.5 ירוק).
-- 🔴 Stone 11.7 חסום עד 11.6.7 ירוק. ראה [ROADMAP.md Stone 11.6.7](../ROADMAP.md) ל-DoD מלא.
+- 🔴 Stone 11.7 חסום עד 11.6.7 + 11.6.8 ירוקים. ראה [ROADMAP.md Stone 11.6.7](../ROADMAP.md) ו-[Stone 11.6.8](../ROADMAP.md) ל-DoD מלא.
 
 ---
 
