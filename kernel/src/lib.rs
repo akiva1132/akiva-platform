@@ -145,7 +145,7 @@ pub extern "C" fn akiva_boot() {
     bump_boot_counter();
     let kstore: Box<dyn akiva_framework::storage::Storage> = Box::new(KernelStorage);
     let host: std::rc::Rc<dyn akiva_framework::wasm_activity::WasmHost> =
-        std::rc::Rc::new(KernelWasmHost);
+        std::rc::Rc::new(KernelWasmHost::new());
     let (mut fw, report) = framework::boot(kstore, host);
     log::info(&format!("packages: {} loaded", report.packages_loaded));
     for (id, err) in &report.package_errors {
@@ -195,10 +195,41 @@ fn map_storage_err(e: storage::StorageError) -> akiva_framework::storage::Storag
 }
 
 /// Adapter that routes framework `WasmHost` calls to the matching
-/// `hal_app_*` imports. Zero-sized: the host side (worker.js) owns all
-/// per-instance state — wasm module, linear memory, paint scratch —
-/// keyed by the returned handle.
-struct KernelWasmHost;
+/// `hal_app_*` imports. The host side (worker.js) owns all per-app
+/// state — wasm module, linear memory, paint scratch — keyed by the
+/// returned handle. The two fields here are the framework-side end of
+/// the Stone 11.4a `poll_future` plumbing: `render` and `save_state`
+/// produce paint/state bytes synchronously today (single-worker), but
+/// the trait now hands them back through a `future_id`. We allocate an
+/// id, stash the buffer, and `poll_future` looks it up. 11.4c flips
+/// the producer side to a real Worker without changing this scaffold.
+struct KernelWasmHost {
+    /// `future_id` → resolved bytes. Populated by `render`/`save_state`,
+    /// drained by `poll_future` (the framework calls each id exactly
+    /// once). Empty payloads short-circuit to the `0` sentinel and
+    /// never touch this map.
+    future_results: std::cell::RefCell<std::collections::HashMap<u64, Vec<u8>>>,
+    /// Monotonic counter for `future_id`. Starts at 1; wraps skip 0
+    /// (the reserved "resolved synchronously" sentinel).
+    next_future_id: std::cell::Cell<u64>,
+}
+
+impl KernelWasmHost {
+    fn new() -> Self {
+        Self {
+            future_results: std::cell::RefCell::new(std::collections::HashMap::new()),
+            next_future_id: std::cell::Cell::new(1),
+        }
+    }
+
+    fn alloc_future(&self, bytes: Vec<u8>) -> u64 {
+        let id = self.next_future_id.get();
+        let next = id.wrapping_add(1).max(1); // skip 0 on wrap
+        self.next_future_id.set(next);
+        self.future_results.borrow_mut().insert(id, bytes);
+        id
+    }
+}
 
 impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
     fn register(
@@ -282,8 +313,7 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         &self,
         handle: akiva_framework::wasm_activity::AppHandle,
         ts_ms: f64,
-        out: &mut akiva_framework::compositor::FrameCommands,
-    ) {
+    ) -> u64 {
         // 16 KiB is generous for per-frame paint ops; the retry branch
         // doubles up if an app ever needs more, at the cost of a second
         // render. Apps producing huge frames should use layered views
@@ -305,12 +335,13 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         } else {
             buf.truncate(needed);
         }
-        if let Err(e) = akiva_framework::wasm_activity::decode_frame(&buf, out) {
-            log::warn(&format!("app {}: paint decode failed: {:?}", handle.get(), e));
-        }
+        // Idle frame → 0 sentinel. The framework skips the poll and
+        // leaves the caller's FrameCommands untouched.
+        if buf.is_empty() { return 0; }
+        self.alloc_future(buf)
     }
 
-    fn save_state(&self, handle: akiva_framework::wasm_activity::AppHandle) -> Vec<u8> {
+    fn save_state(&self, handle: akiva_framework::wasm_activity::AppHandle) -> u64 {
         // Start at the typical UI-state size. The framework caps the wire
         // size at `SavedState::MAX_BYTES` (64 KiB); if the app returns more
         // we truncate on the way to storage rather than allocating more.
@@ -327,7 +358,8 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         } else {
             buf.truncate(needed);
         }
-        buf
+        if buf.is_empty() { return 0; }
+        self.alloc_future(buf)
     }
 
     fn restore_state(
@@ -528,6 +560,21 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         // any app that calls `akiva_host_query_packages`.
         unsafe {
             host::hal_host_set_packages(bytes.as_ptr(), bytes.len());
+        }
+    }
+
+    fn poll_future(&self, future_id: u64) -> Option<Result<Vec<u8>, String>> {
+        // Stone 11.4a-4: only `render` and `save_state` allocate ids
+        // here; every other dispatch returns the `0` sentinel and the
+        // framework never polls them. A miss therefore means the
+        // framework polled an id we never minted (or polled twice) —
+        // surface as Err rather than silently resolving empty so a
+        // wiring bug doesn't hide as a black frame.
+        match self.future_results.borrow_mut().remove(&future_id) {
+            Some(bytes) => Some(Ok(bytes)),
+            None => Some(Err(format!(
+                "KernelWasmHost: unknown future_id {future_id:#x}"
+            ))),
         }
     }
 }

@@ -85,21 +85,31 @@ pub trait WasmHost {
     fn key(&self, handle: AppHandle, ev: KeyEvent, ts_ms: f64) -> u64;
     fn resize(&self, handle: AppHandle, metrics: SurfaceMetrics) -> u64;
 
-    /// Ask the app to paint one frame. The host is responsible for
-    /// fetching the app's encoded paint-op bytes and appending the
-    /// decoded ops to `out`.
-    fn render(&self, handle: AppHandle, ts_ms: f64, out: &mut FrameCommands);
+    /// Ask the app to paint one frame. Returns a `future_id` that, once
+    /// polled via [`Self::poll_future`], yields the encoded paint-op
+    /// stream the framework decodes via [`decode_frame`].
+    ///
+    /// Stone 11.4a contract:
+    /// - **`0`** — empty frame (idle app, or no display) — the framework
+    ///   skips the poll and leaves the [`FrameCommands`] untouched.
+    /// - **non-zero** — paint bytes available; framework polls and
+    ///   decodes. In 11.4c with worker-per-app, the `0` short-circuit
+    ///   stays valid (idle apps still skip the round-trip), and
+    ///   non-zero futures may genuinely defer until the app-worker
+    ///   posts back.
+    fn render(&self, handle: AppHandle, ts_ms: f64) -> u64;
 
     /// Ask the app to serialise its per-activity UI state for a possible
-    /// process kill. Returned bytes are in the SDK's `SavedState` wire
-    /// format — the framework treats them as opaque. An empty vec means
-    /// "nothing to save" and the framework will skip the storage write.
+    /// process kill. Returns a `future_id`; `poll_future` yields the
+    /// encoded `SavedState` blob (the framework treats them as opaque).
     ///
-    /// Default returns empty so in-process activities (e.g. Shell) can
-    /// keep ignoring the hook.
-    fn save_state(&self, handle: AppHandle) -> Vec<u8> {
+    /// Same `0` = empty, non-zero = poll-for-bytes contract as
+    /// [`Self::render`]. Default returns `0` so in-process activities
+    /// (Shell pre-11.0c, mocks) can keep ignoring the hook with no
+    /// allocation.
+    fn save_state(&self, handle: AppHandle) -> u64 {
         let _ = handle;
-        Vec::new()
+        0
     }
 
     /// Hand previously-saved bytes back to the app. Called after
@@ -400,11 +410,45 @@ impl Activity for WasmActivity {
     }
 
     fn render(&mut self, ctx: &mut ActivityContext<'_>, out: &mut FrameCommands) {
-        self.host.render(self.handle, ctx.timestamp_ms, out);
+        let future_id = self.host.render(self.handle, ctx.timestamp_ms);
+        // 0 sentinel = empty paint stream. Skip the poll and leave `out`
+        // untouched — same as a no-op render.
+        if future_id == 0 { return; }
+        let bytes = match self.host.poll_future(future_id) {
+            Some(Ok(b)) => b,
+            // Stone 11.4a path: the host always resolves render synchronously
+            // (single worker). Pending or Err here is a wiring bug — the
+            // framework can't decode nothing. Drop and warn-via-debug-assert
+            // so production silently drops the frame instead of trapping the
+            // whole worker on what's almost certainly a host bug.
+            other => {
+                debug_assert!(false,
+                    "Stone 11.4a: render expected Some(Ok(bytes)) sync, got {other:?}");
+                return;
+            }
+        };
+        // Bytes empty (host saw zero-byte paint stream after handshake) is
+        // the same as future_id == 0 — nothing to decode.
+        if bytes.is_empty() { return; }
+        if let Err(e) = decode_frame(&bytes, out) {
+            // Framework has no log binding here; the caller (kernel) will
+            // notice the FrameCommands is empty if it cared. Same drop-on-
+            // decode-error policy KernelWasmHost::render had inline.
+            let _ = e;
+        }
     }
 
     fn save_state_bytes(&self) -> Vec<u8> {
-        self.host.save_state(self.handle)
+        let future_id = self.host.save_state(self.handle);
+        if future_id == 0 { return Vec::new(); }
+        match self.host.poll_future(future_id) {
+            Some(Ok(bytes)) => bytes,
+            other => {
+                debug_assert!(false,
+                    "Stone 11.4a: save_state expected Some(Ok(bytes)) sync, got {other:?}");
+                Vec::new()
+            }
+        }
     }
     fn restore_state_bytes(&mut self, bytes: &[u8]) {
         self.assert_sync("restore_state", self.host.restore_state(self.handle, bytes));
@@ -645,6 +689,14 @@ mod tests {
         pending_start_for_result: RefCell<Option<(Vec<u8>, u32)>>,
         /// Stone 9.5 — pending set_result blob. Read-and-clear.
         pending_set_result: RefCell<Option<Vec<u8>>>,
+        /// Stone 11.4a-4 — future_id → result-bytes cache for the two
+        /// data-returning dispatch methods (`render`, `save_state`).
+        /// Each call allocates a fresh id, stores its bytes here, and
+        /// returns the id; `poll_future` looks them up and removes the
+        /// entry. Empty paint/save bytes shortcut to the `0` sentinel
+        /// without ever touching this map.
+        future_results: RefCell<std::collections::HashMap<u64, Vec<u8>>>,
+        next_future_id: RefCell<u64>,
     }
 
     impl MockHost {
@@ -658,7 +710,16 @@ mod tests {
                 pending_intent: RefCell::new(None),
                 pending_start_for_result: RefCell::new(None),
                 pending_set_result: RefCell::new(None),
+                future_results: RefCell::new(std::collections::HashMap::new()),
+                next_future_id: RefCell::new(1),
             }
+        }
+        fn alloc_future(&self, bytes: Vec<u8>) -> u64 {
+            let mut next = self.next_future_id.borrow_mut();
+            let id = *next;
+            *next = next.wrapping_add(1).max(1);  // skip the 0 sentinel on wrap
+            self.future_results.borrow_mut().insert(id, bytes);
+            id
         }
         fn take_calls(&self) -> Vec<Call> { core::mem::take(&mut *self.calls.borrow_mut()) }
         fn set_paint_bytes(&self, bytes: Vec<u8>) { *self.paint_bytes.borrow_mut() = bytes; }
@@ -700,14 +761,20 @@ mod tests {
             self.calls.borrow_mut().push(Call::Resize(handle.get(), m.width_px, m.height_px));
             0
         }
-        fn render(&self, handle: AppHandle, ts: f64, out: &mut FrameCommands) {
+        fn render(&self, handle: AppHandle, ts: f64) -> u64 {
             self.calls.borrow_mut().push(Call::Render(handle.get(), ts));
-            let bytes = self.paint_bytes.borrow();
-            decode_frame(&bytes, out).expect("mock paint bytes decoded");
+            let bytes = self.paint_bytes.borrow().clone();
+            // Empty paint stream → 0 sentinel. Same shortcut KernelWasmHost
+            // takes when `hal_app_render` reports zero bytes — saves the
+            // framework a poll round-trip for an idle frame.
+            if bytes.is_empty() { return 0; }
+            self.alloc_future(bytes)
         }
-        fn save_state(&self, handle: AppHandle) -> Vec<u8> {
+        fn save_state(&self, handle: AppHandle) -> u64 {
             self.calls.borrow_mut().push(Call::SaveState(handle.get()));
-            self.save_bytes.borrow().clone()
+            let bytes = self.save_bytes.borrow().clone();
+            if bytes.is_empty() { return 0; }
+            self.alloc_future(bytes)
         }
         fn restore_state(&self, handle: AppHandle, bytes: &[u8]) -> u64 {
             self.calls.borrow_mut().push(Call::RestoreState(handle.get(), bytes.to_vec()));
@@ -747,6 +814,19 @@ mod tests {
         }
         fn set_packages(&self, bytes: &[u8]) {
             self.calls.borrow_mut().push(Call::SetPackages(bytes.to_vec()));
+        }
+        fn poll_future(&self, future_id: u64) -> Option<Result<Vec<u8>, String>> {
+            // Stone 11.4a-4: render and save_state route their bytes
+            // through this map. Other dispatches return the `0` sentinel
+            // and the framework never polls them — a stale future_id
+            // here would mean a bug in the caller, so we report the
+            // miss as an error rather than silently resolving empty
+            // (the trait-default behaviour). Tests exercising the deferred
+            // path opt in by using `alloc_future` directly.
+            match self.future_results.borrow_mut().remove(&future_id) {
+                Some(bytes) => Some(Ok(bytes)),
+                None => Some(Err(format!("MockHost: unknown future_id {future_id:#x}"))),
+            }
         }
     }
 
@@ -1193,7 +1273,26 @@ mod tests {
     /// that opt into the deferred path with a custom mock.
     #[test]
     fn default_poll_future_resolves_immediately_to_empty_payload() {
-        let host = MockHost::new();
+        // Stub that takes the trait-default `poll_future`. `MockHost`
+        // overrides it (it routes render/save_state bytes through a
+        // future-id map), so this test would no longer exercise the
+        // default if it used `MockHost`. The minimal stub here only
+        // implements the required methods; everything else (lifecycle,
+        // pointer, key, resize, render, poll_future, …) takes the trait
+        // default we're pinning.
+        struct DefaultHost;
+        impl WasmHost for DefaultHost {
+            fn register(&self, _: &str, _: &str) -> Option<AppHandle> {
+                AppHandle::new(1)
+            }
+            fn unregister(&self, _: AppHandle) {}
+            fn lifecycle(&self, _: AppHandle, _: LifecycleTransition) -> u64 { 0 }
+            fn pointer(&self, _: AppHandle, _: PointerEvent, _: f64) -> u64 { 0 }
+            fn key(&self, _: AppHandle, _: KeyEvent, _: f64) -> u64 { 0 }
+            fn resize(&self, _: AppHandle, _: SurfaceMetrics) -> u64 { 0 }
+            fn render(&self, _: AppHandle, _: f64) -> u64 { 0 }
+        }
+        let host = DefaultHost;
         let resolved = WasmHost::poll_future(&host, 1234);
         assert!(matches!(resolved, Some(Ok(ref bytes)) if bytes.is_empty()),
             "default poll_future is the immediate-resolve shim until 11.4c WorkerHost overrides it");

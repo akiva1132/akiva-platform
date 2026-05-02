@@ -2043,9 +2043,8 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             _m: SurfaceMetrics,
         ) -> u64 { 0 }
         fn render(
-            &self, _h: wasm_activity::AppHandle,
-            _ts: f64, _out: &mut compositor::FrameCommands,
-        ) {}
+            &self, _h: wasm_activity::AppHandle, _ts: f64,
+        ) -> u64 { 0 }
         fn set_grants(&self, package_id: &str, grants: &[&str]) {
             self.grants.borrow_mut().push((
                 package_id.to_string(),
