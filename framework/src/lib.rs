@@ -3279,6 +3279,58 @@ optional = []
         assert_eq!(fw.activities.state_of(outcome.id), Some(LifecycleState::Suspended));
     }
 
+    /// Phase 12.4b — re-launching a (pkg, class) that has a Suspended
+    /// record reaps the old record + spawns a fresh one. The
+    /// saved-state blob in storage stays put; the fresh activity will
+    /// pick it up via the standard on_restore_state path.
+    #[test]
+    fn relaunch_after_suspend_reaps_old_record_and_creates_fresh() {
+        use activity_manager::{LaunchMode, LifecycleState};
+
+        struct Stub;
+        impl activity::Activity for Stub {
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+        }
+
+        let mut fw = empty_framework();
+        fw.activities.register("dozy", "Main", LaunchMode::Standard, || Box::new(Stub));
+        let first = fw.activities.launch("dozy", "Main").unwrap();
+        fw.activities.force_state_for_test(first.id, LifecycleState::Resumed);
+
+        // Suspend the package.
+        fw.suspend_package("dozy", 0.0);
+        assert_eq!(fw.activities.state_of(first.id), Some(LifecycleState::Suspended));
+
+        // Re-launch — the Suspended record should be reaped, a fresh
+        // ActivityId allocated.
+        let second = fw.activities.launch("dozy", "Main").unwrap();
+        assert_ne!(second.id, first.id, "fresh launch must allocate a new id");
+        assert!(!second.reused, "Suspended record must not be re-used in place");
+        assert_eq!(fw.activities.state_of(first.id), None,
+            "old Suspended record reaped from records map");
+        assert_eq!(fw.activities.suspended_ids_for_package("dozy"), Vec::<_>::new(),
+            "no Suspended records remain after re-launch");
+    }
+
+    /// Phase 12.4b — `reap_suspended_for_launch` is a no-op when no
+    /// Suspended record matches. The cold-start path is unchanged.
+    #[test]
+    fn cold_launch_with_no_suspended_record_is_unchanged() {
+        use activity_manager::LaunchMode;
+
+        struct Stub;
+        impl activity::Activity for Stub {
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+        }
+
+        let mut fw = empty_framework();
+        fw.activities.register("freshapp", "Main", LaunchMode::Standard, || Box::new(Stub));
+        let outcome = fw.activities.launch("freshapp", "Main").unwrap();
+        // No Suspended record existed → cold-start invariants hold.
+        assert!(!outcome.reused);
+        assert!(outcome.popped.is_empty());
+    }
+
     /// Phase 12.4 — Suspended → Created → Resumed is the re-launch path
     /// (state machine only; full re-instantiation is Stone 12.4b).
     /// Verify the legal_transition coverage so 12.4b can rely on it.

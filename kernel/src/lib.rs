@@ -791,22 +791,37 @@ fn sample_app_resources_into(fw: &mut akiva_framework::Framework, frame_ts: f64)
 /// dead (race vs the watchdog), framework-side cleanup is still useful
 /// because it recovers memory accounting.
 fn drive_lmk_into(fw: &mut akiva_framework::Framework, now_ms: f64) {
-    use akiva_framework::lmk::KillReason;
+    use akiva_framework::lmk::{Action, KillReason};
     let victims = fw.drive_lmk(KillReason::SystemPressure);
     if victims.is_empty() {
         return;
     }
     for victim in &victims {
         log::info(&format!(
-            "lmk: evicting {} (priority={:?}, current={}MB, reason={:?})",
+            "lmk: {} {} (priority={:?}, current={}MB, reason={:?})",
+            match victim.action { Action::Suspend => "suspending", Action::Kill => "killing" },
             victim.package_id,
             victim.priority,
             victim.current_bytes / (1024 * 1024),
             victim.reason,
         ));
         let pid = victim.package_id.as_bytes();
-        let _terminated = unsafe { host::hal_evict_package(pid.as_ptr(), pid.len()) };
-        fw.evict_package(&victim.package_id, now_ms);
+        match victim.action {
+            Action::Suspend => {
+                // Stone 12.4b — soft eviction. Drive save_state +
+                // pause/stop callbacks while the worker is still alive
+                // so the bytes can land, mark Suspended, drop the
+                // activity instance, then terminate the worker.
+                fw.suspend_package(&victim.package_id, now_ms);
+                let _terminated = unsafe { host::hal_evict_package(pid.as_ptr(), pid.len()) };
+            }
+            Action::Kill => {
+                // Hard eviction — worker.terminate first, then mark the
+                // framework records Trapped + forget accounting.
+                let _terminated = unsafe { host::hal_evict_package(pid.as_ptr(), pid.len()) };
+                fw.evict_package(&victim.package_id, now_ms);
+            }
+        }
     }
 }
 

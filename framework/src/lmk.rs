@@ -104,6 +104,10 @@ pub struct KillRequest {
     pub priority: Priority,
     pub current_bytes: u64,
     pub reason: KillReason,
+    /// Stone 12.4b — granularity of the eviction. The kernel branches
+    /// on this when running [`Framework::evict_package`] vs
+    /// [`Framework::suspend_package`].
+    pub action: Action,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,6 +119,31 @@ pub enum KillReason {
     /// when to use this; the policy treats it identically to
     /// `SystemPressure` but the reason is preserved for logging.
     HostPressure,
+}
+
+/// Stone 12.4b — what to do with a victim. `Suspend` preserves saved
+/// state and lets the activity record stay in `Suspended`, ready to
+/// resurrect on a re-launch (Android CACHED equivalent). `Kill` is the
+/// hard path — worker dies and activity records get marked `Trapped`,
+/// no recovery without a fresh launch + new ActivityId.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Action {
+    Suspend,
+    Kill,
+}
+
+/// Maps a [`Priority`] tier to the preferred [`Action`]. Background
+/// and Paused packages have potentially-recoverable state so we
+/// suspend them; Empty has no state worth preserving so we kill.
+/// Visible and Foreground would only reach the victim list under
+/// extreme pressure — kill them outright (suspending a Resumed
+/// activity through every lifecycle edge is more disruptive than
+/// just terminating the worker).
+pub fn action_for(priority: Priority) -> Action {
+    match priority {
+        Priority::Background | Priority::Paused => Action::Suspend,
+        Priority::Empty | Priority::Visible | Priority::Foreground => Action::Kill,
+    }
 }
 
 /// Compute the priority of `package_id` from its activities' lifecycle
@@ -204,6 +233,7 @@ pub fn pick_victims(
             priority: prio,
             current_bytes: bytes,
             reason,
+            action: action_for(prio),
         });
         running = running.saturating_sub(bytes);
     }
@@ -414,6 +444,45 @@ mod tests {
         };
         let v = pick_victims(&policy, &mm, &am, &HashSet::new(), KillReason::SystemPressure);
         assert_eq!(v[0].package_id, "ghost", "ghost is Empty priority — killed first");
+    }
+
+    /// Stone 12.4b — Background and Paused tiers map to Suspend (state
+    /// is recoverable); Empty / Visible / Foreground map to Kill.
+    #[test]
+    fn action_for_priority_tier() {
+        assert_eq!(action_for(Priority::Empty),      Action::Kill);
+        assert_eq!(action_for(Priority::Background), Action::Suspend);
+        assert_eq!(action_for(Priority::Paused),     Action::Suspend);
+        assert_eq!(action_for(Priority::Visible),    Action::Kill);
+        assert_eq!(action_for(Priority::Foreground), Action::Kill);
+    }
+
+    /// Stone 12.4b — `pick_victims` populates the `action` field per
+    /// priority tier so the kernel can branch on it.
+    #[test]
+    fn pick_victims_tags_paused_as_suspend_and_empty_as_kill() {
+        // One Paused (Suspend), one ghost / Initial (Kill — Empty tier).
+        let mut am = ActivityManager::new();
+        am.register("paused.app", "M", LaunchMode::Standard, || Box::new(StubActivity));
+        let p = am.launch("paused.app", "M").unwrap();
+        am.force_state_for_test(p.id, LifecycleState::Paused);
+
+        let mut mm = MemoryManager::new();
+        mm.record("paused.app", 200 * 1024 * 1024);
+        mm.record("ghost",      150 * 1024 * 1024);
+        let policy = LmkPolicy {
+            threshold_bytes: 100 * 1024 * 1024,
+            recovery_bytes:   10 * 1024 * 1024,
+            max_kills_per_check: 4,
+        };
+
+        let v = pick_victims(&policy, &mm, &am, &HashSet::new(), KillReason::SystemPressure);
+        let by_id: std::collections::HashMap<&str, &KillRequest> =
+            v.iter().map(|r| (r.package_id.as_str(), r)).collect();
+        assert_eq!(by_id["ghost"].action, Action::Kill,
+            "Empty priority → Kill (no recoverable state)");
+        assert_eq!(by_id["paused.app"].action, Action::Suspend,
+            "Paused priority → Suspend (state worth preserving)");
     }
 
     #[test]

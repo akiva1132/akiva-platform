@@ -216,6 +216,15 @@ impl ActivityManager {
     /// ignoring the popped list should be a conscious decision, not a
     /// silent one.
     pub fn launch(&mut self, package_id: &str, class: &str) -> Result<LaunchOutcome, LaunchError> {
+        // Stone 12.4b — reap any Suspended records matching this
+        // (pkg, class) before any further work. The saved-state blob is
+        // in storage, so the fresh activity will pick it up via
+        // on_restore_state on the cold-start path. No callbacks fire —
+        // Suspended records have no live instance. Done first so the
+        // immutable registry borrow taken below doesn't conflict with
+        // the mutable borrow this needs.
+        self.reap_suspended_for_launch(package_id, class);
+
         let key = (package_id.to_string(), class.to_string());
         let (launch_mode, factory) = self.registry.get(&key).ok_or_else(|| {
             LaunchError::UnknownActivity { package_id: package_id.into(), class: class.into() }
@@ -672,6 +681,41 @@ impl ActivityManager {
                 && matches!(r.state, LifecycleState::Suspended))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Stone 12.4b — drop every Suspended record for `(package_id, class)`
+    /// from `records` and from any task stack it sits on. No callbacks
+    /// fire (the activity instance is already gone — was dropped at
+    /// suspension time). The saved-state blob in storage is *not*
+    /// touched: it persists for the re-launched activity to pick up via
+    /// `on_restore_state`.
+    ///
+    /// Called from [`ActivityManager::launch`] before the launch-mode
+    /// reuse logic so a re-launch from Suspended cleanly creates a
+    /// fresh activity record. Returns the count reaped (0 in the cold-
+    /// start case where no Suspended record matches).
+    pub fn reap_suspended_for_launch(&mut self, package_id: &str, class: &str) -> usize {
+        let to_reap: Vec<ActivityId> = self.records.iter()
+            .filter(|(_, r)|
+                r.package_id == package_id
+                && r.class == class
+                && matches!(r.state, LifecycleState::Suspended))
+            .map(|(id, _)| *id)
+            .collect();
+        let n = to_reap.len();
+        for id in to_reap {
+            // Pop from any task stack the record sat on. Suspended
+            // records may or may not still be in their task stack —
+            // depends on whether suspension happened from a fresh-stop
+            // (still on stack) or after the user navigated away (popped
+            // by destroy_with_persist already). retain handles both.
+            for task in self.tasks.values_mut() {
+                task.stack.retain(|x| *x != id);
+            }
+            self.records.remove(&id);
+            // `instances` was already cleared at suspension; no work here.
+        }
+        n
     }
 
     /// All activity ids in `package_id` whose state is currently `Trapped`.
