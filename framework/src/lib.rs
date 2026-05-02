@@ -23,6 +23,7 @@
 pub mod activity;
 pub mod activity_manager;
 pub mod compositor;
+pub mod cpu_budget;
 pub mod intent;
 pub mod manifest;
 pub mod memory_manager;
@@ -112,6 +113,7 @@ pub fn boot(
         host: host.clone(),
         pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
+            cpu: cpu_budget::CpuBudget::new(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -382,6 +384,12 @@ pub struct Framework {
     /// for each app worker; read by Phase 12.3 (Low-Memory Killer)
     /// and Phase 12.5 (manifest enforcement).
     pub memory: memory_manager::MemoryManager,
+    /// Phase 12.2 — per-package CPU attribution. Updated by the
+    /// host's per-frame sample of cumulative CPU ms (each app
+    /// worker brackets dispatch / poll / drive_spawned with
+    /// `performance.now()`); read by Phase 12.3 LMK ranking. See
+    /// [`cpu_budget`] for the rate-window mechanics.
+    pub cpu: cpu_budget::CpuBudget,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -647,6 +655,26 @@ impl Framework {
             peak_bytes: peak,
             limit_bytes,
         })
+    }
+
+    /// Phase 12.2 — record a fresh `(cumulative_ms, frame_ts_ms)`
+    /// pair for an app worker. The app worker brackets every
+    /// dispatch / poll / drive call with `performance.now()` and
+    /// reports the cumulative through the heartbeat pong; the
+    /// kernel pulls the value once per frame and forwards through
+    /// here. See [`cpu_budget::CpuBudget::record`] for the
+    /// rate-window mechanics.
+    pub fn record_app_cpu(&mut self, package_id: &str, cumulative_ms: f64, frame_ts_ms: f64) {
+        self.cpu.record(package_id, cumulative_ms, frame_ts_ms);
+    }
+
+    /// Phase 12.2 — public read API. Returns `None` for packages the
+    /// host has never sampled. The returned [`cpu_budget::CpuReport`]
+    /// carries `cumulative_ms`, `recent_ms_per_sec`, `peak_ms_per_sec`
+    /// and `frame_budget_fraction` — Phase 12.3 LMK ranking reads the
+    /// rate, debug overlays show all four.
+    pub fn cpu_usage(&self, package_id: &str) -> Option<cpu_budget::CpuReport> {
+        self.cpu.usage(package_id)
     }
 
     /// P0 #3 — recycle `Trapped` activity records whose age exceeds
@@ -1602,6 +1630,7 @@ mod tests {
             host: BootMockHost::new(),
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
+            cpu: cpu_budget::CpuBudget::new(),
         }
     }
 
@@ -2660,6 +2689,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             host: host.clone(),
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
+            cpu: cpu_budget::CpuBudget::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -2758,6 +2788,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             host: host.clone(),
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
+            cpu: cpu_budget::CpuBudget::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -2866,6 +2897,45 @@ optional = []
             "current 17 MiB exceeds manifest 16 MiB → over_budget()");
     }
 
+    /// Phase 12.2 — `record_app_cpu` + `cpu_usage` end-to-end on the
+    /// Framework surface. Window math is covered in detail in the
+    /// `cpu_budget` unit tests; this test verifies the public
+    /// surface routes correctly.
+    #[test]
+    fn cpu_usage_returns_none_before_first_record() {
+        let fw = empty_framework();
+        assert!(fw.cpu_usage("com.akiva.never").is_none());
+    }
+
+    #[test]
+    fn record_app_cpu_then_cpu_usage_returns_a_rate_within_window() {
+        let mut fw = empty_framework();
+        // Two snapshots 1 second apart, 4 ms of CPU consumed → 4 ms/sec.
+        // 4 ms/sec / 16.67 ms = 0.24 of a 60Hz frame — under the 0.5
+        // LMK threshold, so a healthy idle app.
+        fw.record_app_cpu("com.akiva.app", 0.0, 0.0);
+        fw.record_app_cpu("com.akiva.app", 4.0, 1000.0);
+        let r = fw.cpu_usage("com.akiva.app").expect("just recorded");
+        assert_eq!(r.cumulative_ms, 4.0);
+        assert!((r.recent_ms_per_sec - 4.0).abs() < 0.001,
+            "expected ~4 ms/sec, got {}", r.recent_ms_per_sec);
+        assert!(!r.over_frame_budget(),
+            "4 ms/sec is well under half the frame budget");
+    }
+
+    #[test]
+    fn cpu_usage_reports_over_frame_budget_when_app_is_hot() {
+        let mut fw = empty_framework();
+        // 20 ms CPU in 100 ms wall = 200 ms/sec → 12x of a 16.67 ms budget.
+        fw.record_app_cpu("com.akiva.hot", 0.0, 0.0);
+        fw.record_app_cpu("com.akiva.hot", 20.0, 100.0);
+        let r = fw.cpu_usage("com.akiva.hot").unwrap();
+        assert!(r.over_frame_budget(),
+            "200 ms/sec dwarfs the 60Hz frame budget");
+        assert!(r.frame_budget_fraction > 1.0,
+            "frame_budget_fraction must exceed 1.0 for an over-budget app");
+    }
+
     #[test]
     fn drive_pending_saves_persists_when_future_resolves() {
         // P0 #1 — `destroy_with_persist` fires `save_state` at the
@@ -2947,6 +3017,7 @@ optional = []
             host: host.clone(),
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
+            cpu: cpu_budget::CpuBudget::new(),
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -3058,6 +3129,7 @@ optional = []
             host: host.clone(),
             pending_saves: Vec::new(),
             memory: memory_manager::MemoryManager::new(),
+            cpu: cpu_budget::CpuBudget::new(),
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -3194,6 +3266,7 @@ optional = []
                 started_at_ms: 0.0,
             }],
             memory: memory_manager::MemoryManager::new(),
+            cpu: cpu_budget::CpuBudget::new(),
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),

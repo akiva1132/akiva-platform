@@ -692,14 +692,14 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
         }
     }
 
-    // Phase 12.1 — sample each installed package's
-    // WebAssembly.Memory.buffer.byteLength via the host and forward
-    // to MemoryManager. The host caches the last pong-reported value
-    // per process so this loop is one HAL call per package per frame
-    // (cheap; 5–10 packages typical). Phase 12.3 (LMK) and Phase 12.5
-    // (manifest enforcement) read what we record here.
+    // Phase 12.1 + 12.2 — sample each installed package's memory
+    // (byteLength) and cumulative CPU time, forward both to the
+    // framework. The host caches the last pong-reported values per
+    // process so this loop is two HAL calls per package per frame
+    // (cheap; 5–10 packages typical). Phase 12.3 (LMK) ranks on
+    // these; Phase 12.5 enforces manifest budgets on memory.
     if let Some(fw) = k.framework.as_mut() {
-        sample_app_memory_into(fw);
+        sample_app_resources_into(fw, timestamp_ms);
     }
 
     // Drain all queued events and dispatch.
@@ -728,23 +728,30 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
     }
 }
 
-/// Phase 12.1 — host → framework memory sampler. Walks every
-/// installed package, asks the host for its current
-/// `WebAssembly.Memory.buffer.byteLength` (zero for never-spawned or
-/// pre-pong workers), and forwards each reading into
-/// [`Framework::record_app_memory`].
+/// Phase 12.1 + 12.2 — host → framework resource sampler. Walks
+/// every installed package, asks the host for its current memory
+/// (`WebAssembly.Memory.buffer.byteLength`) and cumulative CPU time
+/// (ms spent in wasm-export brackets), forwards both readings into
+/// [`Framework::record_app_memory`] and [`Framework::record_app_cpu`]
+/// respectively.
 ///
-/// Cheap: one HAL call per package per frame (5–10 packages typical).
-/// The host's reading is updated lazily via the heartbeat pong, so
-/// this loop is essentially a copy from the host's per-process
-/// snapshot into the framework's accumulator.
-fn sample_app_memory_into(fw: &mut akiva_framework::Framework) {
+/// Cheap: two HAL calls per package per frame (5–10 packages typical).
+/// The host's readings are updated lazily via the heartbeat pong, so
+/// this loop is essentially a pair of copies from the host's
+/// per-process snapshot into the framework's accumulators. `frame_ts`
+/// is passed into the CPU side so `CpuBudget` can derive the
+/// recent-window rate; the memory side ignores it.
+fn sample_app_resources_into(fw: &mut akiva_framework::Framework, frame_ts: f64) {
     let ids: Vec<String> = fw.packages.list().map(|rec| rec.id.clone()).collect();
     for id in ids {
         let bytes = unsafe {
             host::hal_app_memory_current(id.as_ptr(), id.len())
         };
         fw.record_app_memory(&id, bytes);
+        let cpu_ms = unsafe {
+            host::hal_app_cpu_ms(id.as_ptr(), id.len())
+        };
+        fw.record_app_cpu(&id, cpu_ms, frame_ts);
     }
 }
 

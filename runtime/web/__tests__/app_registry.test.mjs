@@ -816,6 +816,43 @@ describe("memoryCurrent — kernel reads last pong-reported byteLength", () => {
   });
 });
 
+describe("cpuMs — Phase 12.2 cumulative CPU time", () => {
+  it("returns 0 for unknown packages", () => {
+    const { registry } = makeRegistry();
+    expect(registry.cpuMs("never.installed")).toBe(0);
+  });
+
+  it("returns 0 before the first pong arrives", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+    expect(registry.cpuMs(PACKAGE_ID)).toBe(0);
+  });
+
+  it("returns the latest cpu_ms carried on a pong", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+    worker._inject({ type: "pong", t: 100, cpu_ms: 12.5 });
+    expect(registry.cpuMs(PACKAGE_ID)).toBe(12.5);
+    worker._inject({ type: "pong", t: 200, cpu_ms: 28.7 });
+    expect(registry.cpuMs(PACKAGE_ID)).toBe(28.7);
+  });
+
+  it("ignores pongs with malformed cpu_ms (negative, non-numeric, NaN, Infinity)", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+    worker._inject({ type: "pong", t: 100, cpu_ms: 5.0 });
+    worker._inject({ type: "pong", t: 200, cpu_ms: "lots" });
+    worker._inject({ type: "pong", t: 300, cpu_ms: -1 });
+    worker._inject({ type: "pong", t: 400, cpu_ms: NaN });
+    worker._inject({ type: "pong", t: 500, cpu_ms: Infinity });
+    // The 5.0 reading sticks across every malformed follow-up.
+    expect(registry.cpuMs(PACKAGE_ID)).toBe(5.0);
+  });
+});
+
 // ── Stone 11.5: trap drain ────────────────────────────────────────────
 
 describe("drainTrappedPackages — kernel pulls trap notifications", () => {

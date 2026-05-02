@@ -162,6 +162,24 @@ extern "C" {
     // yet (cold boot before the first heartbeat lands).
     pub fn hal_app_memory_current(pid_ptr: *const u8, pid_len: usize) -> u64;
 
+    // ── Phase 12.2: per-package CPU attribution ───────────────────────────
+    //
+    // `hal_app_cpu_ms(package_id)` returns the cumulative CPU time
+    // (ms, f64) the named app's worker has spent inside wasm exports
+    // — `akiva_app_dispatch`, `akiva_app_poll_dispatch`,
+    // `akiva_app_get_result`, `akiva_app_drive_spawned`. Each app
+    // worker brackets these with `performance.now()` and reports the
+    // running total on every heartbeat pong; the kernel pulls the
+    // value once per frame and forwards through
+    // `Framework::record_app_cpu`, which derives the recent-window
+    // rate.
+    //
+    // Returns `0.0` for packages with no spawned worker yet or no
+    // pong reply landed. A worker restart resets the cumulative to
+    // `0.0`; `CpuBudget` clamps the resulting negative delta at zero
+    // so the rate doesn't get poisoned.
+    pub fn hal_app_cpu_ms(pid_ptr: *const u8, pid_len: usize) -> f64;
+
     // ── App → host signals (Stone 9.3) ────────────────────────────────────
     //
     // The app imports `akiva_host_finish()` to ask the platform to tear it

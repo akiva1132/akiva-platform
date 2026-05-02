@@ -736,13 +736,17 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 **רכיבים שנבנים:**
 
-### 12.1 Per-app memory accounting
+### 12.1 Per-app memory accounting ✅ (May 2026)
 - `WebAssembly.Memory.buffer.byteLength` per instance → `MemoryManager::record(package_id, bytes)` בכל grow
-- API: `fw.memory.budget(package_id) -> UsageReport { current, peak, limit }`
+- API: `fw.memory_usage(package_id) -> UsageReport { current_bytes, peak_bytes, limit_bytes }` עם `over_budget()`
+- Sampling: app workers שולחים byteLength על pong; AppRegistry stashes; kernel HAL `hal_app_memory_current` per frame; `Framework::record_app_memory` כל frame דרך `sample_app_resources_into`.
+- Code: `framework/src/memory_manager.rs`, `framework/src/lib.rs::{record_app_memory, memory_usage}`, `kernel/src/{lib.rs::sample_app_resources_into, host.rs}`, `runtime/web/{app_worker_shell.js, app_registry.js, worker.js}`.
 
-### 12.2 Per-app CPU attribution
-- per-worker performance.measure בין start-of-frame ל-end-of-frame
-- נצבר ל-`CpuBudget`; policy יודעת אם app "מכביד" על ה-frame budget
+### 12.2 Per-app CPU attribution ✅ (May 2026)
+- App workers brackets every wasm-export call (dispatch/poll/get_result/drive_spawned) עם `performance.now()`, מצטבר ל-`cumulativeCpuMs` ומדווח על pong.
+- Kernel-side: HAL `hal_app_cpu_ms`, framework `CpuBudget` עם 1-sec rolling window, `CpuReport { cumulative_ms, recent_ms_per_sec, peak_ms_per_sec, frame_budget_fraction }` ו-`over_frame_budget()` (שמתפרץ מעל 0.5 של תקציב 60Hz).
+- API: `fw.cpu_usage(package_id) -> CpuReport`. `iter()` ל-LMK ranking ב-12.3.
+- Code: `framework/src/cpu_budget.rs`, `framework/src/lib.rs::{record_app_cpu, cpu_usage}`, `kernel/src/{lib.rs::sample_app_resources_into, host.rs::hal_app_cpu_ms}`, `runtime/web/{app_worker_shell.js::chargeCpu, app_registry.js::cpuMs, worker.js}`.
 
 ### 12.3 Low-Memory Killer policy
 - Priority tiers בסגנון Android: FOREGROUND > VISIBLE > PAUSED > BACKGROUND > EMPTY

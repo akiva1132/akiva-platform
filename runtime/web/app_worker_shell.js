@@ -76,6 +76,39 @@ const decoder = new TextDecoder("utf-8");
 const encoder = new TextEncoder();
 
 /**
+ * Phase 12.2 — cumulative CPU time (ms) the worker has spent inside
+ * the wasm-export brackets (`handleDispatch`, `driveDispatch`,
+ * `handleHostOpDone`, `driveSpawned`). Reported on every pong;
+ * kernel-side `CpuBudget` derives the recent-rate from successive
+ * snapshots.
+ *
+ * Monotonic — only ever increases. A worker restart resets it to 0;
+ * the kernel's `CpuBudget::record` clamps negative deltas at zero so
+ * a reset doesn't poison the rate.
+ */
+let cumulativeCpuMs = 0;
+
+/**
+ * Bracket `fn(...args)` with `performance.now()` and add the
+ * delta to `cumulativeCpuMs`. Returns whatever `fn` returned. Used
+ * around every wasm export call so dispatch + poll + drive +
+ * get_result all roll up to one cumulative figure.
+ *
+ * `performance.now()` is guaranteed monotonic and has sub-ms
+ * resolution in dedicated workers; the bracketing overhead is
+ * comparable to the CPU we're trying to measure but stays in the
+ * noise once dispatches do non-trivial work.
+ */
+function chargeCpu(fn) {
+  const start = performance.now();
+  try {
+    return fn();
+  } finally {
+    cumulativeCpuMs += performance.now() - start;
+  }
+}
+
+/**
  * Dedicated 1×1 OffscreenCanvas for `measureText`. Constructed lazily
  * on the first IO::TEXT_WIDTH (mirrors AppRegistry's pattern — keeps
  * `OffscreenCanvas` out of the constructor so the same source can run
@@ -176,10 +209,17 @@ self.addEventListener("message", (e) => {
       // kernel-side `MemoryManager` gets a fresh sample without an
       // extra round-trip. Pre-init `wasmMemory` is null; reporting 0
       // matches "no instance yet, nothing to charge".
+      //
+      // Phase 12.2 — also report `cumulativeCpuMs`, the running
+      // total of time the worker has spent inside wasm exports.
+      // Kernel-side `CpuBudget` derives the recent rate from
+      // successive snapshots; reporting cumulative (vs. delta) lets
+      // a missed pong recover automatically on the next one.
       postMessage({
         type: "pong",
         t: msg.t,
         memory_bytes: wasmMemory ? wasmMemory.buffer.byteLength : 0,
+        cpu_ms: cumulativeCpuMs,
       });
       break;
     default:
@@ -264,7 +304,8 @@ function handleDispatch(msg) {
       }
       new Uint8Array(wasmMemory.buffer, appPtr, bytes.length).set(bytes);
     }
-    acceptStatus = exports.akiva_app_dispatch(dispatchId, cmd_kind, appPtr, bytes.length);
+    acceptStatus = chargeCpu(() =>
+      exports.akiva_app_dispatch(dispatchId, cmd_kind, appPtr, bytes.length));
   } catch (err) {
     postLog("error", `dispatch(${cmd_kind}) trapped: ${err?.message ?? err}`);
     postTrapped(`dispatch(${cmd_kind}): ${err?.message ?? err}`);
@@ -309,7 +350,7 @@ function driveDispatch(dispatchId) {
   const exports = wasmInstance.exports;
   let packed;
   try {
-    packed = exports.akiva_app_poll_dispatch(dispatchId);
+    packed = chargeCpu(() => exports.akiva_app_poll_dispatch(dispatchId));
   } catch (err) {
     postLog("error", `poll_dispatch(${dispatchId}) trapped: ${err?.message ?? err}`);
     postTrapped(`poll_dispatch: ${err?.message ?? err}`);
@@ -366,7 +407,7 @@ function fetchResult(dispatchId) {
   }
   let len, srcPtr;
   try {
-    srcPtr = exports.akiva_app_get_result(dispatchId, lenPtr);
+    srcPtr = chargeCpu(() => exports.akiva_app_get_result(dispatchId, lenPtr));
     len = new DataView(wasmMemory.buffer).getUint32(lenPtr, true);
   } finally {
     try { exports.akiva_app_dealloc(lenPtr, 4); }
@@ -419,7 +460,7 @@ function handleHostOpDone(msg) {
 function driveSpawned() {
   if (!wasmInstance) return;
   try {
-    wasmInstance.exports.akiva_app_drive_spawned();
+    chargeCpu(() => wasmInstance.exports.akiva_app_drive_spawned());
   } catch (err) {
     postLog("error", `drive_spawned trapped: ${err?.message ?? err}`);
     postTrapped(`drive_spawned: ${err?.message ?? err}`);

@@ -350,6 +350,14 @@ function buildImports() {
     hal_app_memory_current: (pidPtr, pidLen) =>
       BigInt(apps.memoryCurrent(readUtf8(pidPtr, pidLen))),
 
+    // Phase 12.2 — return the cumulative wasm-export CPU time (ms,
+    // f64) the package's worker has reported on its last pong. Same
+    // pull-from-cache shape as `hal_app_memory_current`. Returns 0
+    // for packages with no spawned process or no pong reply yet; a
+    // worker restart resets the cumulative, and the kernel-side
+    // `CpuBudget` clamps the resulting negative delta at zero.
+    hal_app_cpu_ms: (pidPtr, pidLen) => apps.cpuMs(readUtf8(pidPtr, pidLen)),
+
     // Stone 9.3 — read + clear the pending-finish flag for `handle`.
     // Returns 1 if the app called `akiva_host_finish` since the last
     // drain, 0 otherwise.

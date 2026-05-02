@@ -438,6 +438,22 @@ export class AppRegistry {
     return proc?.memoryBytes ?? 0;
   }
 
+  /**
+   * Phase 12.2 — last-known cumulative CPU time (ms) for `packageId`.
+   * Returns `0` when the package has no spawned process or the
+   * worker has not yet replied to a pong. Read by the kernel-side
+   * `hal_app_cpu_ms` import once per frame; the kernel computes the
+   * delta and forwards through `Framework::record_app_cpu`.
+   *
+   * The reading is monotonic per worker lifetime — a worker restart
+   * resets it to 0, which the kernel-side `CpuBudget` clamps as a
+   * negative delta and ignores (no rate poison).
+   */
+  cpuMs(packageId) {
+    const proc = this._processes.get(packageId);
+    return proc?.cpuMs ?? 0;
+  }
+
   // ── Internals ───────────────────────────────────────────────────────────
 
   /**
@@ -499,7 +515,7 @@ export class AppRegistry {
       [wasmCopy.buffer],
     );
 
-    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingTimer: null, memoryBytes: 0 };
+    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingTimer: null, memoryBytes: 0, cpuMs: 0 };
     this._processes.set(packageId, proc);
     // Heartbeat doesn't start until `init_ok` lands — kicking the
     // watchdog while the worker is mid-wasm-compile would mean every
@@ -651,11 +667,18 @@ export class AppRegistry {
         // process record so `memoryCurrent()` (called from the
         // kernel-side HAL) can return a fresh value without
         // round-tripping into the worker each frame.
+        //
+        // Phase 12.2 — same for `cpu_ms` (cumulative time the worker
+        // has spent inside wasm exports). Kernel-side `CpuBudget`
+        // derives the recent rate from successive snapshots.
         const proc = this._processes.get(packageId);
         if (proc) {
           proc.lastPongAt = performance.now();
           if (typeof msg.memory_bytes === "number" && msg.memory_bytes >= 0) {
             proc.memoryBytes = msg.memory_bytes;
+          }
+          if (typeof msg.cpu_ms === "number" && msg.cpu_ms >= 0 && Number.isFinite(msg.cpu_ms)) {
+            proc.cpuMs = msg.cpu_ms;
           }
         }
         break;
