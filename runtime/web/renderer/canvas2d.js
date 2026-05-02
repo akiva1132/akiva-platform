@@ -57,6 +57,18 @@ export class Canvas2DBackend {
     this.ctx.fillRect(x, y, w, h);
   }
 
+  fillRoundRect(x, y, w, h, radius, rgba) {
+    if (!this.ctx) return;
+    this.ctx.fillStyle = rgbaToCss(rgba);
+    if (radius <= 0) {
+      this.ctx.fillRect(x, y, w, h);
+      return;
+    }
+    this.ctx.beginPath();
+    this.ctx.roundRect(x, y, w, h, radius);
+    this.ctx.fill();
+  }
+
   drawText(x, y, size_px, rgba, text) {
     if (!this.ctx) return;
     this.ctx.fillStyle = rgbaToCss(rgba);

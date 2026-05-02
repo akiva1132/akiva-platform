@@ -43,6 +43,7 @@ extern "C" {
 
     pub fn hal_draw_clear(rgba: u32);
     pub fn hal_draw_rect(x: f32, y: f32, w: f32, h: f32, rgba: u32);
+    pub fn hal_draw_round_rect(x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32);
     pub fn hal_draw_text(x: f32, y: f32, size_px: f32, rgba: u32, ptr: *const u8, len: usize);
     pub fn hal_draw_present();
 

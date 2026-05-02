@@ -41,14 +41,22 @@ fn paint_node(
             // the box layout placed at `rect.y`.
             canvas.draw_text(rect.x, rect.y + size * 0.8, *size, *color, text);
         }
-        Node::Rect { color, .. } => {
-            canvas.fill_rect(rect.x, rect.y, rect.w, rect.h, *color);
+        Node::Rect { color, radius, .. } => {
+            if *radius > 0.0 {
+                canvas.fill_round_rect(rect.x, rect.y, rect.w, rect.h, *radius, *color);
+            } else {
+                canvas.fill_rect(rect.x, rect.y, rect.w, rect.h, *color);
+            }
         }
         Node::Spacer { .. } => {}
-        Node::Button { id: btn_id, label, label_size, bg, bg_pressed, fg, pad, .. } => {
+        Node::Button { id: btn_id, label, label_size, bg, bg_pressed, fg, pad, radius, .. } => {
             let is_pressed = clicked_ids.iter().any(|s| s == btn_id);
             let bg_color = if is_pressed { *bg_pressed } else { *bg };
-            canvas.fill_rect(rect.x, rect.y, rect.w, rect.h, bg_color);
+            if *radius > 0.0 {
+                canvas.fill_round_rect(rect.x, rect.y, rect.w, rect.h, *radius, bg_color);
+            } else {
+                canvas.fill_rect(rect.x, rect.y, rect.w, rect.h, bg_color);
+            }
             // Centre the label inside the button box. We estimated the
             // intrinsic size as label + 2*pad; if the parent gave us a
             // wider slot the label still sits left-ish at the pad

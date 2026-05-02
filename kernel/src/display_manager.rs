@@ -83,6 +83,9 @@ impl DisplayManager {
                     PaintOp::FillRect { x, y, w, h, rgba } => {
                         host::hal_draw_rect(*x, *y, *w, *h, *rgba);
                     }
+                    PaintOp::FillRoundRect { x, y, w, h, radius, rgba } => {
+                        host::hal_draw_round_rect(*x, *y, *w, *h, *radius, *rgba);
+                    }
                     PaintOp::DrawText { x, y, size, rgba, text } => {
                         let bytes = text.as_bytes();
                         host::hal_draw_text(*x, *y, *size, *rgba, bytes.as_ptr(), bytes.len());

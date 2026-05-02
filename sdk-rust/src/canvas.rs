@@ -19,6 +19,7 @@ const OP_PUSH_CLIP:       u8 = 3;
 const OP_POP_CLIP:        u8 = 4;
 const OP_PUSH_TRANSFORM:  u8 = 5;
 const OP_POP_TRANSFORM:   u8 = 6;
+const OP_FILL_ROUND_RECT: u8 = 7;
 
 /// Paint surface handed to `Activity::on_render`. All coordinates are in
 /// dp (density-independent pixels); colors are **`0xAARRGGBB`** — alpha
@@ -57,6 +58,20 @@ impl<'a> Canvas<'a> {
         self.buf.extend_from_slice(&y.to_le_bytes());
         self.buf.extend_from_slice(&w.to_le_bytes());
         self.buf.extend_from_slice(&h.to_le_bytes());
+        self.buf.extend_from_slice(&rgba.to_le_bytes());
+    }
+
+    /// Filled rectangle with a uniform corner radius. `radius == 0.0`
+    /// behaves identically to [`Self::fill_rect`] but goes through the
+    /// roundRect host path; for a hot path that paints thousands of
+    /// sharp-cornered rects per frame, prefer `fill_rect`.
+    pub fn fill_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32) {
+        self.buf.push(OP_FILL_ROUND_RECT);
+        self.buf.extend_from_slice(&x.to_le_bytes());
+        self.buf.extend_from_slice(&y.to_le_bytes());
+        self.buf.extend_from_slice(&w.to_le_bytes());
+        self.buf.extend_from_slice(&h.to_le_bytes());
+        self.buf.extend_from_slice(&radius.to_le_bytes());
         self.buf.extend_from_slice(&rgba.to_le_bytes());
     }
 

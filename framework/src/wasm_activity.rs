@@ -553,6 +553,7 @@ pub mod opcode {
     pub const POP_CLIP:        u8 = 4;
     pub const PUSH_TRANSFORM:  u8 = 5;
     pub const POP_TRANSFORM:   u8 = 6;
+    pub const FILL_ROUND_RECT: u8 = 7;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -609,6 +610,15 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             out.extend_from_slice(&scale.to_le_bytes());
         }
         PaintOp::PopTransform => out.push(opcode::POP_TRANSFORM),
+        PaintOp::FillRoundRect { x, y, w, h, radius, rgba } => {
+            out.push(opcode::FILL_ROUND_RECT);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&radius.to_le_bytes());
+            out.extend_from_slice(&rgba.to_le_bytes());
+        }
     }
 }
 
@@ -660,6 +670,15 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                 out.push(PaintOp::PushTransform { dx, dy, scale });
             }
             opcode::POP_TRANSFORM => out.push(PaintOp::PopTransform),
+            opcode::FILL_ROUND_RECT => {
+                let x = read_f32(&mut bytes)?;
+                let y = read_f32(&mut bytes)?;
+                let w = read_f32(&mut bytes)?;
+                let h = read_f32(&mut bytes)?;
+                let radius = read_f32(&mut bytes)?;
+                let rgba = read_u32(&mut bytes)?;
+                out.push(PaintOp::FillRoundRect { x, y, w, h, radius, rgba });
+            }
             other => return Err(DecodeError::UnknownOp(other)),
         }
     }
@@ -1001,6 +1020,7 @@ mod tests {
         let inputs = vec![
             PaintOp::Clear { rgba: 0x11223344 },
             PaintOp::FillRect { x: 1.5, y: 2.5, w: 3.5, h: 4.5, rgba: 0xdeadbeef },
+            PaintOp::FillRoundRect { x: 4.0, y: 8.0, w: 100.0, h: 36.0, radius: 8.0, rgba: 0xff2a3a50 },
             PaintOp::DrawText { x: 0.0, y: 1.0, size: 14.0, rgba: 0xabcdef01, text: "Hello, שלום".into() },
             PaintOp::PushClip { x: 0.0, y: 0.0, w: 100.0, h: 100.0 },
             PaintOp::PopClip,
@@ -1013,6 +1033,27 @@ mod tests {
         let mut frame = FrameCommands::new();
         decode_frame(&wire, &mut frame).unwrap();
         assert_eq!(frame.ops().len(), inputs.len());
+    }
+
+    #[test]
+    fn fill_round_rect_encodes_byte_for_byte_symmetric() {
+        // Stone 11.6.9 #1 — opcode 7 with x/y/w/h/radius f32 + rgba u32
+        // payload (24 bytes after the opcode). Single-op smoke: encode
+        // → decode → re-encode is byte-identical.
+        let op = PaintOp::FillRoundRect {
+            x: 12.5, y: 32.0, w: 200.0, h: 56.0, radius: 8.0, rgba: 0xff2a3a50,
+        };
+        let mut wire1 = Vec::new();
+        encode_op(&mut wire1, &op);
+        assert_eq!(wire1.len(), 1 + 4 * 5 + 4, "FillRoundRect should encode to 25 bytes");
+        assert_eq!(wire1[0], opcode::FILL_ROUND_RECT);
+
+        let mut frame = FrameCommands::new();
+        decode_frame(&wire1, &mut frame).unwrap();
+        let decoded = &frame.ops()[0];
+        let mut wire2 = Vec::new();
+        encode_op(&mut wire2, decoded);
+        assert_eq!(wire1, wire2, "encode → decode → encode must be bit-identical");
     }
 
     #[test]

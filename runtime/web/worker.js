@@ -304,6 +304,8 @@ function buildImports() {
 
     hal_draw_clear:   (rgba) => backend?.clear(rgba >>> 0),
     hal_draw_rect:    (x, y, w, h, rgba) => backend?.fillRect(x, y, w, h, rgba >>> 0),
+    hal_draw_round_rect: (x, y, w, h, radius, rgba) =>
+      backend?.fillRoundRect(x, y, w, h, radius, rgba >>> 0),
     hal_draw_text:    (x, y, size, rgba, ptr, len) => {
       const text = readUtf8(ptr, len);
       backend?.drawText(x, y, size, rgba >>> 0, text);

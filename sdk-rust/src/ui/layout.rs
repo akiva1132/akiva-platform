@@ -413,7 +413,7 @@ mod tests {
         Node::Text { text: s.into(), size, color: 0 }
     }
     fn rect(w: f32, h: f32) -> Node {
-        Node::Rect { color: 0, min: (w, h) }
+        Node::Rect { color: 0, min: (w, h), radius: 0.0 }
     }
     /// Default-aligned VStack — alignment defaults match pre-C1 behaviour
     /// (Start/Start) so tests written against the original intrinsic
@@ -476,7 +476,7 @@ mod tests {
     fn button_includes_padding_around_label() {
         let nodes = vec![Node::Button {
             id: "b".into(), action: None, label: "ok".into(), label_size: 10.0,
-            bg: 0, bg_pressed: 0, fg: 0, pad: (8.0, 4.0),
+            bg: 0, bg_pressed: 0, fg: 0, pad: (8.0, 4.0), radius: 0.0,
         }];
         let sizes = measure(&nodes, 0, (1000.0, 1000.0), 1.0, &estimate_text_width);
         // label: 2 × 10.0 × 0.55 = 11.0 + 2×8 = 27; 13.0 + 2×4 = 21

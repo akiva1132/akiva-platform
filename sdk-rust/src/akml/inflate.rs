@@ -204,6 +204,9 @@ fn inflate_button(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) ->
     let node = ui.button(id, label);
     if flex > 0.0 { ui.grow(node, flex); }
     if let Some(a) = action { ui.action(node, a); }
+    if let Some(r) = attr_f32(el, bindings, "cornerRadius", "corner_radius")? {
+        ui.corner_radius(node, r);
+    }
     Ok(node)
 }
 
@@ -218,7 +221,9 @@ fn inflate_rect(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> R
     let w = attr_f32(el, bindings, "minWidth",  "min_width")?.unwrap_or(0.0);
     let h = attr_f32(el, bindings, "minHeight", "min_height")?.unwrap_or(0.0);
     let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
+    let radius = attr_f32(el, bindings, "cornerRadius", "corner_radius")?.unwrap_or(0.0);
     let mut b = ui.rect(color).size(w, h);
+    if radius > 0.0 { b = b.radius(radius); }
     if flex > 0.0 { b = b.grow(flex); }
     Ok(b.build())
 }

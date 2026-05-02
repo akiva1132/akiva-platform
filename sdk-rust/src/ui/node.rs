@@ -31,6 +31,10 @@ pub enum Node {
     Rect {
         color: u32,
         min: (f32, f32),
+        /// Corner radius in dp. `0.0` paints sharp corners (the
+        /// classic AKML default); positive values paint rounded
+        /// corners via the `OP_FILL_ROUND_RECT` paint op.
+        radius: f32,
     },
     Spacer {
         min: (f32, f32),
@@ -91,6 +95,12 @@ pub enum Node {
         bg_pressed: u32,
         fg: u32,
         pad: (f32, f32), // x, y
+        /// Corner radius in dp. The `Ui::button` factory sets `8.0` —
+        /// the de-facto OS-native pill-button radius across Android,
+        /// iOS, macOS Big Sur+. AKML can override per-button via the
+        /// `cornerRadius` attribute. `0.0` produces the pre-11.6.9
+        /// sharp-corner look.
+        radius: f32,
     },
 }
 
@@ -129,17 +139,24 @@ pub struct RectBuilder<'u, 's, 'c, 'b> {
     ui: &'u mut Ui<'s, 'c, 'b>,
     color: u32,
     min: (f32, f32),
+    radius: f32,
     grow: f32,
 }
 
 impl<'u, 's, 'c, 'b> RectBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, color: u32) -> Self {
-        Self { ui, color, min: (0.0, 0.0), grow: 0.0 }
+        Self { ui, color, min: (0.0, 0.0), radius: 0.0, grow: 0.0 }
     }
     pub fn size(mut self, w: f32, h: f32) -> Self { self.min = (w, h); self }
+    /// Corner radius in dp. Default is `0.0` (sharp corners) so plain
+    /// background fills behave as before; UI surfaces that want a
+    /// native rounded look opt in with `.radius(8.0)`.
+    pub fn radius(mut self, radius: f32) -> Self { self.radius = radius; self }
     pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
     pub fn build(self) -> NodeId {
-        let id = self.ui.push(Node::Rect { color: self.color, min: self.min });
+        let id = self.ui.push(Node::Rect {
+            color: self.color, min: self.min, radius: self.radius,
+        });
         self.ui.set_grow(id, self.grow);
         id
     }

@@ -304,7 +304,20 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             bg_pressed: 0xff3a5070,
             fg: 0xfff0f4fa,
             pad: (16.0, 10.0),
+            radius: 8.0,
         })
+    }
+
+    /// Override the corner radius on a button after construction.
+    /// Mirrors [`Ui::action`] in taking the node id post-hoc. Silent
+    /// no-op on a non-button or stale id so a stray AKML attribute
+    /// can't panic the frame.
+    pub fn corner_radius(&mut self, id: NodeId, radius: f32) {
+        match self.nodes.get_mut(id) {
+            Some(Node::Button { radius: slot, .. }) => *slot = radius,
+            Some(Node::Rect    { radius: slot, .. }) => *slot = radius,
+            _ => {}
+        }
     }
 
     /// Attach a semantic action name to an already-pushed button. After

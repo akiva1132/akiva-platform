@@ -9,6 +9,7 @@
 /// pushing `PaintOp`s directly take `&mut dyn PaintTarget`.
 pub trait PaintTarget {
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: u32);
+    fn fill_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32);
     fn draw_text(&mut self, x: f32, y: f32, size: f32, rgba: u32, text: &str);
     fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32);
     fn pop_clip(&mut self);
@@ -23,6 +24,7 @@ pub struct FrameCommands {
 pub enum PaintOp {
     Clear { rgba: u32 },
     FillRect { x: f32, y: f32, w: f32, h: f32, rgba: u32 },
+    FillRoundRect { x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32 },
     DrawText { x: f32, y: f32, size: f32, rgba: u32, text: String },
     PushClip { x: f32, y: f32, w: f32, h: f32 },
     PopClip,
@@ -42,6 +44,9 @@ impl FrameCommands {
 impl PaintTarget for FrameCommands {
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: u32) {
         self.ops.push(PaintOp::FillRect { x, y, w, h, rgba });
+    }
+    fn fill_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32) {
+        self.ops.push(PaintOp::FillRoundRect { x, y, w, h, radius, rgba });
     }
     fn draw_text(&mut self, x: f32, y: f32, size: f32, rgba: u32, text: &str) {
         self.ops.push(PaintOp::DrawText { x, y, size, rgba, text: text.to_string() });
