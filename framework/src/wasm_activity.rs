@@ -282,11 +282,20 @@ pub trait WasmHost {
 pub struct WasmActivity {
     handle: AppHandle,
     host: Rc<dyn WasmHost>,
+    /// Stone 11.4c — render is pipelined across frames. After we
+    /// dispatch [`WasmHost::render`] we stash the returned future_id
+    /// here; the next frame polls it, decodes the bytes, and queues
+    /// the next render. Steady state is one-frame paint latency —
+    /// the worker can't synchronously hand bytes back to the kernel
+    /// thread, so the alternative would be a blank screen forever
+    /// (the prior 11.4a path's `assert_sync` becomes a no-op in
+    /// release and silently drops every paint).
+    pending_render: Option<u64>,
 }
 
 impl WasmActivity {
     pub fn new(handle: AppHandle, host: Rc<dyn WasmHost>) -> Self {
-        Self { handle, host }
+        Self { handle, host, pending_render: None }
     }
 
     pub fn handle(&self) -> AppHandle { self.handle }
@@ -410,31 +419,52 @@ impl Activity for WasmActivity {
     }
 
     fn render(&mut self, ctx: &mut ActivityContext<'_>, out: &mut FrameCommands) {
-        let future_id = self.host.render(self.handle, ctx.timestamp_ms);
-        // 0 sentinel = empty paint stream. Skip the poll and leave `out`
-        // untouched — same as a no-op render.
-        if future_id == 0 { return; }
-        let bytes = match self.host.poll_future(future_id) {
-            Some(Ok(b)) => b,
-            // Stone 11.4a path: the host always resolves render synchronously
-            // (single worker). Pending or Err here is a wiring bug — the
-            // framework can't decode nothing. Drop and warn-via-debug-assert
-            // so production silently drops the frame instead of trapping the
-            // whole worker on what's almost certainly a host bug.
-            other => {
-                debug_assert!(false,
-                    "Stone 11.4a: render expected Some(Ok(bytes)) sync, got {other:?}");
-                return;
+        // Stone 11.4c — render pipeline. Each frame:
+        //   1. If a prior render is still in-flight, poll it. READY
+        //      bytes get decoded into `out` and the slot clears.
+        //      PENDING leaves the slot armed and skips the new
+        //      dispatch — the worker is still chewing on the prior
+        //      one, queueing a second would waste cycles.
+        //   2. Otherwise (or after a successful drain) kick off a
+        //      fresh render so the next frame has bytes to paint.
+        //
+        // First frame paints nothing because there's no prior to
+        // drain; from then on the screen lags one frame behind the
+        // app's logical state. Acceptable — the worker boundary is
+        // genuinely async and there's no way to synchronously wait
+        // on a peer worker without SharedArrayBuffer.
+        let mut may_dispatch = true;
+        if let Some(fid) = self.pending_render {
+            match self.host.poll_future(fid) {
+                Some(Ok(bytes)) => {
+                    self.pending_render = None;
+                    if !bytes.is_empty() {
+                        // Drop on decode error: same policy as the
+                        // pre-11.4c inline path. The framework has no
+                        // log binding here; the kernel will notice an
+                        // empty FrameCommands if it cared.
+                        let _ = decode_frame(&bytes, out);
+                    }
+                }
+                None => {
+                    // Worker still busy. Don't queue another dispatch —
+                    // we'd just pile up futures in the registry. Try
+                    // again next frame.
+                    may_dispatch = false;
+                }
+                Some(Err(_)) => {
+                    // Stone 11.5 will fold this into a `Trapped` mark.
+                    // For now: clear the slot, leave `out` empty, and
+                    // queue a fresh dispatch below.
+                    self.pending_render = None;
+                }
             }
-        };
-        // Bytes empty (host saw zero-byte paint stream after handshake) is
-        // the same as future_id == 0 — nothing to decode.
-        if bytes.is_empty() { return; }
-        if let Err(e) = decode_frame(&bytes, out) {
-            // Framework has no log binding here; the caller (kernel) will
-            // notice the FrameCommands is empty if it cared. Same drop-on-
-            // decode-error policy KernelWasmHost::render had inline.
-            let _ = e;
+        }
+        if may_dispatch {
+            let fid = self.host.render(self.handle, ctx.timestamp_ms);
+            if fid != 0 {
+                self.pending_render = Some(fid);
+            }
         }
     }
 
@@ -900,7 +930,11 @@ mod tests {
     }
 
     #[test]
-    fn render_decodes_host_bytes_into_frame() {
+    fn render_decodes_host_bytes_into_frame_pipelined() {
+        // Stone 11.4c — render is one-frame-pipelined: first call
+        // queues a dispatch (no paint), second call drains its bytes
+        // and queues the next dispatch. Tests the full two-frame
+        // round-trip.
         let host = Rc::new(MockHost::new());
         let handle = host.register("p", "c").unwrap();
         host.take_calls();
@@ -915,9 +949,19 @@ mod tests {
         let mut act = WasmActivity::new(handle, host.clone());
         let mut vars = CtxVars::default();
         let mut ctx = vars.ctx();
+
+        // Frame 1 — dispatches render, no paint yet.
         let mut frame = FrameCommands::new();
         act.render(&mut ctx, &mut frame);
+        assert_eq!(host.take_calls(), vec![Call::Render(handle.get(), ctx.timestamp_ms)]);
+        assert_eq!(frame.ops().len(), 0,
+            "first frame in the pipeline only dispatches; bytes drain on the next call");
 
+        // Frame 2 — drains the prior render's bytes, queues the next
+        // dispatch. `MockHost` resolves futures synchronously so the
+        // first poll sees READY immediately.
+        act.render(&mut ctx, &mut frame);
+        // The MockHost's render call landed once again (the new dispatch).
         assert_eq!(host.take_calls(), vec![Call::Render(handle.get(), ctx.timestamp_ms)]);
         assert_eq!(frame.ops().len(), 3);
         assert!(matches!(frame.ops()[0], PaintOp::Clear { rgba: 0x000000ff }));
