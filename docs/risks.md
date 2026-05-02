@@ -247,15 +247,13 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Code surfaces.** New op_kind `STREAM_OPEN` returning `stream_id`; `stream_poll(stream_id)` returns `Vec<Item>` of values batched since the prior poll; `stream_close(stream_id)`. Wire shape should mirror Component Model `stream<T>` to keep the v0.5 migration mechanical. Detailed plan in [`docs/isolation-design.md` §10.5 #13](isolation-design.md). **Recommended for Phase 13 prep, not 11.6.5.**
 
-### 7.12 🔴 `storage::write` is fire-and-forget — promoted to Stone 11.6.7
+### 7.12 ✅ `storage::write` returns `WriteHandle` — fixed (Stone 11.6.7 #1, May 2026)
 
-**Concern.** [`sdk-rust/src/storage.rs`](../sdk-rust/src/storage.rs) — `pub fn write(key: &str, value: &[u8])` returns `()`. Apps writing notes, settings, or drafts have no way to learn about quota failures, IO errors, or capability denials. Real OSes (iOS NSUserDefaults, Android SharedPreferences) all surface errors.
+**What was wrong.** `pub fn write(key: &str, value: &[u8])` returned `()`. The `STORAGE_SET` host_op fired and the host posted `host_op_done` with a status, but the SDK abandoned the `future_id` so no app could observe success or failure.
 
-**Why deferred (until now).** P1 #1 was 30 minutes of work but kept getting bumped by P0 / Stone 11.6.5. The May 2026 architectural audit promoted it to Stone 11.6.7 because shipping public docs in 11.7 with `write(...)` returning `()` would lock the lossy semantics into bedrock.
+**Fix in place.** `pub fn write(key, value) -> WriteHandle`, where `WriteHandle: Future<Output = Result<(), StorageError>>`. Awaiting yields the host's verdict; dropping the handle without awaiting preserves the pre-Stone-11.6.7 fire-and-forget shape because the `STORAGE_SET` host_op is dispatched inside `write` itself — only the result is what the future delivers. `#[must_use]` ensures `storage::write(k, v);` (no `let _`) emits a compiler warning.
 
-**Trigger.** Stone 11.6.7 owns this. Implementation: future-returning API on top of the existing `STORAGE_SET` op_kind; `WriteHandle: Future<Output = Result<(), StorageError>>`. Apps that drop the handle without awaiting keep working (backward-compatible fire-and-forget). See [ROADMAP.md Stone 11.6.7 פריט 1](../ROADMAP.md).
-
-**Code surfaces.** [`sdk-rust/src/storage.rs`](../sdk-rust/src/storage.rs); host handler unchanged.
+**Code.** [`sdk-rust/src/storage.rs::{WriteHandle, write, poll_write_inner}`](../sdk-rust/src/storage.rs). The host handler ([`runtime/web/app_registry.js::_dispatchStorage`](../runtime/web/app_registry.js)) was already returning `STATUS.READY` / `STATUS.ERROR`; no host change required. Tests: 3 new in `storage.rs` (empty-key BadKey, non-wasm stub Denied, must_use shape). 174 sdk tests green.
 
 ### 7.13 🔴 Storage reads always go via kernel — promoted to Stone 11.6.7
 

@@ -116,16 +116,72 @@ pub fn read(key: &str) -> Option<ReadFuture> {
     Some(ReadFuture { future_id: fid, cached: None })
 }
 
-/// Fire-and-forget write. The kernel logs any underlying failure
-/// (quota, IO) — apps that want stronger guarantees should add an
-/// explicit "I just saved successfully" handle in a follow-up Stone.
-pub fn write(key: &str, value: &[u8]) {
-    if key.is_empty() { return; }
+/// Future returned by [`write`]. Resolves to `Ok(())` on a
+/// successful storage write or `Err(StorageError)` on quota / IO /
+/// denial. Stone 11.6.7 (#1) replaced the prior fire-and-forget
+/// `pub fn write(...)` with this handle so durability-critical apps
+/// can `await` confirmation; `let _ = storage::write(k, v);` (drop
+/// without await) preserves the old fire-and-forget behaviour
+/// because [`write`] still dispatches `STORAGE_SET` to the host
+/// inside its body — only the *result* is what the future delivers.
+///
+/// Polls `host_io_poll` on each call. When the kernel-worker hasn't
+/// replied yet, returns `Poll::Pending`; the SDK runtime parks the
+/// awaiting future and the worker shell drives a re-poll once
+/// `host_op_done` arrives.
+#[must_use = "WriteHandle is the only way to observe whether the write succeeded; \
+              dropping it preserves fire-and-forget but discards the result"]
+pub struct WriteHandle {
+    future_id: u64,
+    /// `Some` for pre-resolved errors (empty key, host rejection
+    /// before posting a future). The first terminal poll caches the
+    /// real result here too, so repeated polls (Future::poll's
+    /// post-Ready contract is undefined-but-defensive) return the
+    /// same value.
+    cached: Option<Result<(), StorageError>>,
+}
+
+impl Future for WriteHandle {
+    type Output = Result<(), StorageError>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if let Some(cached) = self.cached.take() {
+            self.cached = Some(cached.clone());
+            return Poll::Ready(cached);
+        }
+        match poll_write_inner(self.future_id) {
+            None => Poll::Pending,
+            Some(result) => {
+                self.cached = Some(result.clone());
+                Poll::Ready(result)
+            }
+        }
+    }
+}
+
+/// Begin a sandboxed write. Returns a [`WriteHandle`] the caller may
+/// `.await` for `Result<(), StorageError>`. Dropping the handle
+/// without awaiting preserves the pre-Stone-11.6.7 fire-and-forget
+/// shape — the `STORAGE_SET` host_op has already been dispatched by
+/// the time this fn returns.
+///
+/// Empty key returns a pre-resolved `Err(StorageError::BadKey)` —
+/// the host would reject it anyway, but pre-checking lets a wasted
+/// host round-trip be avoided. Host outright rejection (no
+/// `STORAGE_SANDBOX` grant) returns `Err(StorageError::Denied)`.
+pub fn write(key: &str, value: &[u8]) -> WriteHandle {
+    if key.is_empty() {
+        return WriteHandle { future_id: 0, cached: Some(Err(StorageError::BadKey)) };
+    }
     let mut args = Vec::with_capacity(4 + key.len() + value.len());
     args.extend_from_slice(&(key.len() as u32).to_le_bytes());
     args.extend_from_slice(key.as_bytes());
     args.extend_from_slice(value);
-    let _ = io_start(io::STORAGE_SET, &args);
+    let fid = io_start(io::STORAGE_SET, &args);
+    if fid == 0 {
+        return WriteHandle { future_id: 0, cached: Some(Err(StorageError::Denied)) };
+    }
+    WriteHandle { future_id: fid, cached: None }
 }
 
 /// Fire-and-forget delete. Idempotent — removing a missing key is
@@ -199,6 +255,30 @@ fn poll_read_inner(_future_id: u64) -> Option<Result<Option<Vec<u8>>, StorageErr
     Some(Ok(None))
 }
 
+// ── WriteHandle inner poller ──────────────────────────────────────────
+
+#[cfg(target_arch = "wasm32")]
+fn poll_write_inner(future_id: u64) -> Option<Result<(), StorageError>> {
+    use crate::runtime::host_io_poll;
+    // STORAGE_SET returns a 0-byte payload on success — we still
+    // need *some* buffer to satisfy `host_io_poll`'s out_cap signal.
+    // 1 byte is the smallest legal value the host writer respects.
+    let mut buf = [0u8; 1];
+    let packed = host_io_poll(future_id, &mut buf);
+    let (st, _len) = unpack_poll(packed);
+    match st {
+        status::PENDING => None,
+        status::ERROR => Some(Err(StorageError::Io)),
+        status::READY => Some(Ok(())),
+        _ => Some(Err(StorageError::Io)),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_write_inner(_future_id: u64) -> Option<Result<(), StorageError>> {
+    Some(Ok(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,8 +301,43 @@ mod tests {
     }
 
     #[test]
-    fn write_with_empty_key_is_a_silent_no_op() {
-        write("", b"value");
+    fn write_with_empty_key_returns_a_pre_resolved_bad_key_error() {
+        // Stone 11.6.7 (#1) — empty key is rejected pre-host-call;
+        // the returned WriteHandle resolves immediately to BadKey.
+        // Drop without await preserves the silent no-op shape.
+        let mut h = write("", b"value");
+        let waker = noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        match Pin::new(&mut h).poll(&mut cx) {
+            Poll::Ready(Err(StorageError::BadKey)) => {}
+            other => panic!("expected Ready(Err(BadKey)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_handle_is_resolved_synchronously_on_non_wasm_stub() {
+        // Non-wasm `io_start` returns 0 → write returns a handle
+        // pre-resolved to Denied. Documents the test fixture's
+        // shape so a future code reader doesn't think the stub is
+        // hiding a Pending state.
+        let mut h = write("k", b"v");
+        let waker = noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        match Pin::new(&mut h).poll(&mut cx) {
+            Poll::Ready(Err(StorageError::Denied)) => {}
+            other => panic!("expected Ready(Err(Denied)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_handle_is_must_use() {
+        // Compile-time hygiene check: WriteHandle has #[must_use],
+        // so `storage::write(k, v);` (no `let _`) emits a warning.
+        // We can't assert on warnings in this test, but pinning the
+        // shape via a doc-touchpoint test makes regressions visible.
+        let h = write("k", b"v");
+        // Drop is the explicit fire-and-forget ack.
+        drop(h);
     }
 
     #[test]

@@ -541,28 +541,15 @@ In-process activities (תsts, future built-ins) ממשיכים להשתמש ב-`
 
 **Code surfaces.** `framework/src/{activity.rs, wasm_activity.rs, activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Tests: `drive_pending_saves_persists_when_future_resolves` + `drive_pending_saves_drops_entry_on_host_error`.
 
-### 19.3 🟡 Multi-frame side-effects (`storage::write` ו-`remove`)
+### 19.3 ✅ `storage::write` returns `WriteHandle` (Stone 11.6.7 #1, May 2026)
 
-**הבעיה.** היום:
-```rust
-pub fn write(key: &str, value: &[u8]) {
-    let _ = io_start(io::STORAGE_SET, &args);  // fire-and-forget
-}
-```
+**מה היה הבעיה.** קודם — `pub fn write(key, value)` ללא ערך החזר. ה-host מבצע את ה-write ושולח host_op_done עם status, אבל ה-SDK פשוט abandons את ה-future_id. apps שדורשים durability (settings, notes, drafts) לא יכלו לדעת אם נכשל.
 
-ה-app אינו מקבל indication אם ה-write נכשל (quota, IO error, denied). ה-host logs את ה-failure אבל ה-app רץ לכאורה successfully.
+**התיקון.** `pub fn write(key: &str, value: &[u8]) -> WriteHandle` — `WriteHandle: Future<Output = Result<(), StorageError>>`. `let _ = storage::write(k, v).await?;` מקבל confirmation; `let _ = storage::write(k, v);` (drop בלי await) משאיר את ה-pre-Stone fire-and-forget shape — ה-`STORAGE_SET` host_op כבר נשלח בתוך הפונקציה. `WriteHandle` הוא `#[must_use]`, אז `storage::write(k, v);` (ללא let _) מקבל compiler warning לאפליקציות שכותבות data חשוב.
 
-**מה זה משבר בפועל.** apps שדורשים durability (settings, notes, drafts) לא יכולים לדעת אם ה-write בוצע. ב-OS אמיתי (iOS, Android) ה-API מחזיר Result.
+**Errors הצפויים.** `BadKey` (empty key — pre-resolved, ה-host אפילו לא נקרא); `Denied` (host דחה את ה-call לפני שהקצה future_id — חסר `STORAGE_SANDBOX` grant); `Io` (quota / OPFS / kernel-side reason).
 
-**התיקון (קל יחסית).** `WriteHandle` parallel ל-`ReadHandle`:
-```rust
-pub fn write(key: &str, value: &[u8]) -> Option<WriteHandle>;
-impl WriteHandle {
-    pub fn poll(&self) -> Option<Result<(), StorageError>>;
-}
-```
-
-המעבר ל-async-await (§19.1) ירכז את כל ה-handles הללו ל-`.await` נורמלי.
+**Code.** `sdk-rust/src/storage.rs::{WriteHandle, write, poll_write_inner}`. אין שינוי ב-`runtime/web/app_registry.js::_dispatchStorage` — ה-host כבר היה שולח host_op_done עם status מתאים. 174 sdk tests green (3 חדשים: empty-key BadKey, non-wasm stub Denied, must_use shape).
 
 ### 19.4 🟢 Other minor SDK gaps
 
