@@ -205,13 +205,18 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Code.** New `wire/Cargo.toml` + `wire/src/{lib.rs, pkgs.rs}`; thin wrappers in `framework/src/wire/pkgs.rs` and `sdk-rust/src/pkgs.rs`. SDK-side `PackageEntry.entry_class` was renamed to `class` for consistency with the wire type (apps only used `id` and `name`, no migration needed). 8 wire-crate tests cover roundtrip, unicode, truncation, oversize-truncation, bad UTF-8.
 
-### 7.7 ✅ Magic numbers — fixed (P1 #2, May 2026), tuning gap promoted to 11.6.7
+### 7.7 ✅ Watchdog tunability + warn threshold — fixed (Stone 11.6.7 #5, May 2026)
 
-**Original concern.** Watchdog timeout (1500ms), heartbeat interval (500ms), render initial buf (16KiB), save_state initial buf (4KiB), trap drain buf (256B). All hardcoded at point of use, no central tuning surface.
+**Original concern.** Watchdog had a single 1500ms terminate threshold with no warning, no per-package override, and no test-time override. Android has WARN+TIMEOUT (ANR warning before kill); we had only kill.
 
-**Status.** Centralised into `runtime/web/config.js` (JS) + const block at the top of `kernel/src/lib.rs` (Rust). Each constant carries a `Why:` comment explaining the rationale.
+**Fix in place.**
+- `WATCHDOG.WARN_MS = 1000` added in `runtime/web/config.js`. Crossing it logs a warn-level breadcrumb (`"no pong in Nms (warn threshold; will terminate at Mms)"`) but doesn't kill. The warn latches per process so a worker stuck around the warn band doesn't spam the log every heartbeat.
+- `effectiveWatchdog(perPackageMs?)` helper resolves per-tick: per-package override → `globalThis.__akivaConfig.watchdog` → defaults. Comparisons use `>=` so the boundaries are deterministic on tick.
+- `manifest.runtime.watchdog_timeout_ms: Option<u32>` parsed by `framework::manifest`. The kernel's `akiva_boot` walks `fw.packages.list()` and pushes each override through new HAL `hal_app_set_watchdog_timeout_ms(pid_ptr, len, ms)` to `AppRegistry.setWatchdogTimeoutMs(pkg, ms)`. Absent = default; `0` clears.
 
-**Remaining gap promoted to Stone 11.6.7.** No warning threshold (single 1500ms terminate; Android has WARN+TIMEOUT split), no per-package override (`manifest.runtime.watchdog_timeout_ms`), no `globalThis.__akivaConfig` runtime override hook. See [ROADMAP.md Stone 11.6.7 פריט 5](../ROADMAP.md).
+**Code.** `runtime/web/{config.js, app_registry.js, worker.js}`, `framework/src/manifest.rs`, `kernel/src/{host.rs, lib.rs::akiva_boot}`. Tests: 6 new vitest cases (warn at threshold without terminate, healthy pong clears latch, global override, per-package override survives default + trips at its own threshold, clear-via-zero, malformed-input rejection). 68 vitest green.
+
+**Original "magic numbers" concern is fully closed.** P1 #2 centralised the constants; this stone added the warn split + override hooks.
 
 ### 7.8 🟢 Worker shell has no unit tests
 

@@ -20,7 +20,7 @@
 
 import { fontString } from "./renderer/canvas2d.js";
 import { STATUS, FIRE, IO } from "./op_kinds.mjs";
-import { WATCHDOG } from "./config.js";
+import { WATCHDOG, effectiveWatchdog } from "./config.js";
 
 export class AppRegistry {
   /**
@@ -94,6 +94,19 @@ export class AppRegistry {
      * @type {Set<string>}
      */
     this._pendingTraps = new Set();
+
+    /**
+     * Stone 11.6.7 #5 — per-package watchdog timeout overrides
+     * threaded from `manifest.runtime.watchdog_timeout_ms`. The
+     * kernel pushes one entry per package that declares the field
+     * via `setWatchdogTimeoutMs(packageId, ms)`; absent entries fall
+     * back to the global `WATCHDOG.TIMEOUT_MS` (or its
+     * `globalThis.__akivaConfig.watchdog.TIMEOUT_MS` override).
+     *
+     * @type {Map<string, number>}
+     */
+    this._watchdogTimeoutMs = new Map();
+
     this._decoder = new TextDecoder("utf-8");
     this._encoder = new TextEncoder();
 
@@ -523,7 +536,7 @@ export class AppRegistry {
       [wasmCopy.buffer],
     );
 
-    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingTimer: null, memoryBytes: 0, cpuMs: 0 };
+    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingTimer: null, memoryBytes: 0, cpuMs: 0, warned: false };
     this._processes.set(packageId, proc);
     // Heartbeat doesn't start until `init_ok` lands — kicking the
     // watchdog while the worker is mid-wasm-compile would mean every
@@ -560,9 +573,17 @@ export class AppRegistry {
       // ticks — bail cleanly.
       if (this._processes.get(proc.packageId) !== proc) return;
       const now = performance.now();
-      if (now - proc.lastPongAt > WATCHDOG.TIMEOUT_MS) {
+      // Stone 11.6.7 #5 — resolve TIMEOUT_MS / WARN_MS / HEARTBEAT_MS
+      // each tick so a runtime override
+      // (`globalThis.__akivaConfig.watchdog`) or a per-package
+      // manifest.runtime.watchdog_timeout_ms takes effect without
+      // restarting the worker. Per-package wins over global which
+      // wins over defaults; see `effectiveWatchdog` in config.js.
+      const cfg = effectiveWatchdog(this._watchdogTimeoutMs.get(proc.packageId));
+      const elapsed = now - proc.lastPongAt;
+      if (elapsed >= cfg.TIMEOUT_MS) {
         this._log("error",
-          `app ${proc.packageId}: no pong in ${(now - proc.lastPongAt).toFixed(0)}ms — terminating worker`);
+          `app ${proc.packageId}: no pong in ${elapsed.toFixed(0)}ms — terminating worker`);
         try { proc.worker.terminate(); } catch (_) { /* best effort */ }
         this._pendingTraps.add(proc.packageId);
         this._processes.delete(proc.packageId);
@@ -579,10 +600,45 @@ export class AppRegistry {
         }
         return;
       }
+      // WARN — log once per crossing (proc.warned latches until a
+      // pong resets it, so a worker stuck around the warn band
+      // doesn't spam the log every heartbeat).
+      if (elapsed >= cfg.WARN_MS) {
+        if (!proc.warned) {
+          this._log("warn",
+            `app ${proc.packageId}: no pong in ${elapsed.toFixed(0)}ms (warn threshold ${cfg.WARN_MS}ms; will terminate at ${cfg.TIMEOUT_MS}ms)`);
+          proc.warned = true;
+        }
+      } else if (proc.warned) {
+        // Pong arrived since the warning — clear the latch so a
+        // future stall logs again. lastPongAt is updated in the
+        // pong handler; a recent enough pong drops elapsed below
+        // WARN_MS.
+        proc.warned = false;
+      }
       proc.worker.postMessage({ type: "ping", t: now });
-      proc.pingTimer = setTimeout(tick, WATCHDOG.HEARTBEAT_MS);
+      proc.pingTimer = setTimeout(tick, cfg.HEARTBEAT_MS);
     };
-    proc.pingTimer = setTimeout(tick, WATCHDOG.HEARTBEAT_MS);
+    // Initial schedule uses the global heartbeat — per-package
+    // overrides only adjust TIMEOUT_MS / WARN_MS, not HEARTBEAT_MS.
+    proc.pingTimer = setTimeout(tick, effectiveWatchdog().HEARTBEAT_MS);
+  }
+
+  /**
+   * Stone 11.6.7 #5 — register a per-package watchdog timeout
+   * override (from `manifest.runtime.watchdog_timeout_ms`). Called
+   * by the kernel via the `hal_app_set_watchdog_timeout_ms` HAL
+   * during boot for each package that declared the field. Absent
+   * entries fall back to the global default.
+   *
+   * Pass `0` (or a non-finite value) to clear an override.
+   */
+  setWatchdogTimeoutMs(packageId, ms) {
+    if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
+      this._watchdogTimeoutMs.delete(packageId);
+      return;
+    }
+    this._watchdogTimeoutMs.set(packageId, ms);
   }
 
   /**

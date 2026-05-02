@@ -180,6 +180,19 @@ extern "C" {
     // so the rate doesn't get poisoned.
     pub fn hal_app_cpu_ms(pid_ptr: *const u8, pid_len: usize) -> f64;
 
+    // ── Stone 11.6.7 #5: per-package watchdog timeout override ────────────
+    //
+    // `hal_app_set_watchdog_timeout_ms(package_id, ms)` registers a
+    // per-package override sourced from
+    // `manifest.runtime.watchdog_timeout_ms`. The host's heartbeat
+    // tick consults the per-package map first, then the global
+    // `WATCHDOG.TIMEOUT_MS` (or its `globalThis.__akivaConfig`
+    // override). Pass `0` to clear an override.
+    //
+    // Called during `framework::boot` once per package that
+    // declared the field; absent packages stay on the default.
+    pub fn hal_app_set_watchdog_timeout_ms(pid_ptr: *const u8, pid_len: usize, ms: u32);
+
     // ── App → host signals (Stone 9.3) ────────────────────────────────────
     //
     // The app imports `akiva_host_finish()` to ask the platform to tear it

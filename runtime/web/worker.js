@@ -358,6 +358,14 @@ function buildImports() {
     // `CpuBudget` clamps the resulting negative delta at zero.
     hal_app_cpu_ms: (pidPtr, pidLen) => apps.cpuMs(readUtf8(pidPtr, pidLen)),
 
+    // Stone 11.6.7 #5 — register a per-package watchdog timeout
+    // override (ms). Called by `framework::boot` once per package
+    // that declared `manifest.runtime.watchdog_timeout_ms`. Pass 0
+    // to clear; AppRegistry rejects non-finite / non-positive
+    // values silently.
+    hal_app_set_watchdog_timeout_ms: (pidPtr, pidLen, ms) =>
+      apps.setWatchdogTimeoutMs(readUtf8(pidPtr, pidLen), ms),
+
     // Stone 9.3 — read + clear the pending-finish flag for `handle`.
     // Returns 1 if the app called `akiva_host_finish` since the last
     // drain, 0 otherwise.

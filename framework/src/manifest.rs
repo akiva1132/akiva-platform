@@ -50,6 +50,15 @@ pub struct RuntimeInfo {
     pub wasm: String,
     pub min_memory_mb: u32,
     pub max_memory_mb: u32,
+    /// Stone 11.6.7 #5 — per-package watchdog timeout override
+    /// (ms). `None` falls back to the global `WATCHDOG.TIMEOUT_MS`
+    /// in `runtime/web/config.js` (or its
+    /// `globalThis.__akivaConfig.watchdog.TIMEOUT_MS` override).
+    /// Apps with long-running synchronous compute (cold starts,
+    /// large state restores) can lift the limit; nothing should
+    /// lower it below 200ms or the warn threshold (`WARN_MS`)
+    /// can't fire reliably.
+    pub watchdog_timeout_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +184,8 @@ struct WireRuntime {
     min_memory_mb: u32,
     #[serde(default = "default_max_mem")]
     max_memory_mb: u32,
+    #[serde(default)]
+    watchdog_timeout_ms: Option<u32>,
 }
 
 fn default_min_mem() -> u32 { 1 }
@@ -293,6 +304,7 @@ fn normalize(w: WireManifest) -> Result<Manifest, ManifestError> {
             wasm: w.runtime.wasm,
             min_memory_mb: w.runtime.min_memory_mb,
             max_memory_mb: w.runtime.max_memory_mb,
+            watchdog_timeout_ms: w.runtime.watchdog_timeout_ms,
         },
         activities,
         permissions: PermissionDecl {

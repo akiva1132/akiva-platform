@@ -14,7 +14,7 @@
 // contract without spinning up real Web Workers (which vitest's jsdom
 // env doesn't expose anyway).
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { AppRegistry, AUTO_IMPORTS, CAPABILITY_IMPORTS } from "../app_registry.js";
 import { CMD, FIRE, IO, STATUS } from "../op_kinds.mjs";
 
@@ -775,6 +775,123 @@ describe("watchdog — ping/pong with init_ok gating", () => {
       // And com.b.app is gone.
       expect(registry._processes.has("com.b.app")).toBe(false);
     }));
+});
+
+// ── Stone 11.6.7 #5: watchdog tunability ──────────────────────────────
+
+describe("watchdog tunability — Stone 11.6.7 #5", () => {
+  // Save / restore the global config so each test starts clean.
+  const originalConfig = globalThis.__akivaConfig;
+  beforeEach(() => { globalThis.__akivaConfig = undefined; });
+  afterEach(() => { globalThis.__akivaConfig = originalConfig; });
+
+  // Local copy of the watchdog `withFakeTimers` helper so this
+  // describe block doesn't depend on lexical proximity to the
+  // earlier suite. Pinning `performance.now()` to fake time is
+  // load-bearing because the heartbeat tick reads it directly.
+  function withFakeTimers(fn) {
+    return () => {
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "performance"] });
+      try { fn(); }
+      finally { vi.useRealTimers(); }
+    };
+  }
+
+  it("logs a warning at WARN_MS without terminating", withFakeTimers(() => {
+    const { registry, worker, log } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+    let terminated = false;
+    worker.terminate = () => { terminated = true; };
+
+    // Cross WARN_MS (1000ms) but stay below TIMEOUT_MS (1500ms) —
+    // we expect a warn-level log but no termination.
+    vi.advanceTimersByTime(1100);
+    expect(terminated).toBe(false);
+    expect(log.mock.calls.some(([lvl, msg]) =>
+      lvl === "warn" && msg.includes("warn threshold"))).toBe(true);
+
+    // Cross TIMEOUT_MS — termination fires.
+    vi.advanceTimersByTime(500);
+    expect(terminated).toBe(true);
+  }));
+
+  it("a healthy pong before WARN_MS clears the warn latch", withFakeTimers(() => {
+    const { registry, worker, log } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+
+    // Auto-pong on every ping so the worker stays well below WARN_MS.
+    const originalPost = worker.postMessage.bind(worker);
+    worker.postMessage = (msg, transfer) => {
+      originalPost(msg, transfer);
+      if (msg?.type === "ping") {
+        worker._inject({ type: "pong", t: msg.t });
+      }
+    };
+
+    vi.advanceTimersByTime(10_000);
+    // No warn lines should have been logged across 10 seconds of
+    // healthy pongs.
+    const warned = log.mock.calls.some(([lvl, msg]) =>
+      lvl === "warn" && msg.includes("warn threshold"));
+    expect(warned).toBe(false);
+  }));
+
+  it("globalThis.__akivaConfig.watchdog.TIMEOUT_MS overrides the default", withFakeTimers(() => {
+    globalThis.__akivaConfig = { watchdog: { TIMEOUT_MS: 200, WARN_MS: 100 } };
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+    let terminated = false;
+    worker.terminate = () => { terminated = true; };
+
+    // First heartbeat tick is at HEARTBEAT_MS=500; at that tick
+    // elapsed=500 ≥ TIMEOUT_MS=200 → terminate. Without the
+    // override this would still be alive (default TIMEOUT_MS=1500).
+    vi.advanceTimersByTime(600);
+    expect(terminated).toBe(true);
+  }));
+
+  it("setWatchdogTimeoutMs overrides for one package only", withFakeTimers(() => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+    // Push a per-package override of 5000ms — the app should
+    // survive the default 1500ms terminate threshold.
+    registry.setWatchdogTimeoutMs(PACKAGE_ID, 5000);
+    let terminated = false;
+    worker.terminate = () => { terminated = true; };
+
+    vi.advanceTimersByTime(2200);
+    expect(terminated).toBe(false);
+    expect(registry._processes.has(PACKAGE_ID)).toBe(true);
+
+    // Crossing 5000ms — the override now trips.
+    vi.advanceTimersByTime(3500);
+    expect(terminated).toBe(true);
+  }));
+
+  it("setWatchdogTimeoutMs(0) clears an override and reverts to default", () => {
+    const { registry } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    registry.setWatchdogTimeoutMs(PACKAGE_ID, 5000);
+    expect(registry._watchdogTimeoutMs.get(PACKAGE_ID)).toBe(5000);
+    registry.setWatchdogTimeoutMs(PACKAGE_ID, 0);
+    expect(registry._watchdogTimeoutMs.has(PACKAGE_ID)).toBe(false);
+  });
+
+  it("setWatchdogTimeoutMs ignores malformed values (NaN, negative, non-numeric)", () => {
+    const { registry } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    registry.setWatchdogTimeoutMs(PACKAGE_ID, 5000);
+    registry.setWatchdogTimeoutMs(PACKAGE_ID, NaN);
+    expect(registry._watchdogTimeoutMs.has(PACKAGE_ID)).toBe(false);
+    registry.setWatchdogTimeoutMs(PACKAGE_ID, -1);
+    expect(registry._watchdogTimeoutMs.has(PACKAGE_ID)).toBe(false);
+    registry.setWatchdogTimeoutMs(PACKAGE_ID, "lots");
+    expect(registry._watchdogTimeoutMs.has(PACKAGE_ID)).toBe(false);
+  });
 });
 
 // ── Phase 12.1: per-package memory accounting ─────────────────────────

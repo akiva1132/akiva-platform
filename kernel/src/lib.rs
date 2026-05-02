@@ -188,6 +188,17 @@ pub extern "C" fn akiva_boot() {
     for (id, err) in &report.resource_errors {
         log::warn(&format!("package '{id}' resource file: {err}"));
     }
+    // Stone 11.6.7 #5 — push per-package watchdog overrides from
+    // each package's `manifest.runtime.watchdog_timeout_ms`. Absent
+    // = host default; this is one HAL call per package per boot,
+    // not per frame, so the cost is bounded by install count.
+    for rec in fw.packages.list() {
+        if let Some(ms) = rec.manifest.runtime.watchdog_timeout_ms {
+            unsafe {
+                host::hal_app_set_watchdog_timeout_ms(rec.id.as_ptr(), rec.id.len(), ms);
+            }
+        }
+    }
     let m = k.display.metrics();
     fw.set_metrics(fw_act::SurfaceMetrics {
         width_px: m.width_px,
