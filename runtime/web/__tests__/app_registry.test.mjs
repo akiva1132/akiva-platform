@@ -410,6 +410,39 @@ describe("side_effect from worker — stages into _pending* maps", () => {
     });
     expect(Array.from(registry.drainSetResult(handle))).toEqual([9, 8, 7]);
   });
+
+  // Stone 11.5e provenance check — the routing-context packageId
+  // (which worker actually sent the message) is the truth, not the
+  // handle the worker put in `args`. Without this, app A's worker
+  // could forge a finish/start_activity/set_result against app B.
+  it("rejects side_effect for a handle that doesn't belong to the sender", () => {
+    const { registry, worker, log } = makeRegistry();
+    // Register PACKAGE_ID first so `worker` gets a com.test.app
+    // routed message listener — that's the seam the inject below
+    // exercises.
+    registry.register(PACKAGE_ID, CLASS_NAME);
+
+    // Set up a second package's worker + a handle that belongs to it.
+    const otherWorker = makeFakeWorker();
+    registry._processes.set("com.b.app", { worker: otherWorker, packageId: "com.b.app" });
+    otherWorker.addEventListener("message", (e) =>
+      registry._onWorkerMessage("com.b.app", e.data));
+    // Allocate a handle for com.b.app via the public register() path
+    // — its storage entry is the same default placeholder.
+    const otherHandle = registry.register("com.b.app", "Main");
+
+    // App A's worker (the one we test from `worker`) tries to finish
+    // app B's activity by forging the handle in args.
+    worker._inject({
+      type: "side_effect",
+      op_kind: FIRE.FINISH,
+      args: u32le(otherHandle),
+    });
+
+    expect(registry.drainFinish(otherHandle)).toBe(false);
+    expect(log.mock.calls.some(([lvl, msg]) =>
+      lvl === "warn" && msg.includes("doesn't belong"))).toBe(true);
+  });
 });
 
 // ── host_op cross-worker protocol ─────────────────────────────────────
@@ -567,35 +600,69 @@ describe("watchdog — ping/pong with init_ok gating", () => {
     expect(registry._pendingTraps.has(PACKAGE_ID)).toBe(false);
   }));
 
-  it("watchdog termination doesn't clobber other workers' in-flight dispatches",
+  it("watchdog termination GCs the dead worker's own _dispatches entries",
     withFakeTimers(() => {
-      // Stone 11.5e regression: previously the watchdog iterated _dispatches
-      // and marked every PENDING entry ERROR, which torched the Shell's
-      // healthy render dispatch every time a peer worker timed out.
+      // Audit fix #2: the orphaned dispatch entries on the dead
+      // worker's account must be evicted so they don't accumulate
+      // for the lifetime of the session.
       const { registry, kernelMemory, worker } = makeRegistry();
       const handle = registry.register(PACKAGE_ID, CLASS_NAME);
       worker._inject({ type: "init_ok" });
+
+      new DataView(kernelMemory.buffer).setUint32(0, handle, true);
+      const orphan = registry.dispatch(CMD.RENDER, 0, 12);
+      expect(registry._dispatches.has(orphan)).toBe(true);
+
+      vi.advanceTimersByTime(2200);  // worker hangs (no auto-pong) → terminate
+
+      expect(registry._dispatches.has(orphan)).toBe(false);
+    }));
+
+  it("watchdog termination doesn't clobber other workers' in-flight dispatches",
+    withFakeTimers(() => {
+      // Regression: pre-Stone-11.5e the watchdog iterated _dispatches
+      // and marked every PENDING entry ERROR; post-fix it also deletes
+      // entries belonging to the terminated worker. Either way, the
+      // contract is "killing worker B must NOT affect worker A's
+      // in-flight futures."
+      const { registry, kernelMemory, worker } = makeRegistry();
+      const handle = registry.register(PACKAGE_ID, CLASS_NAME);
+      worker._inject({ type: "init_ok" });
+
+      // Auto-pong on this worker so its own watchdog stays quiet.
+      // Without this, advancing 2.2s of fake time would also kill
+      // PACKAGE_ID's worker — and its dispatch would be GC'd along
+      // with it (correctly, but masking what we're trying to test).
+      const origPost = worker.postMessage.bind(worker);
+      worker.postMessage = (msg, transfer) => {
+        origPost(msg, transfer);
+        if (msg?.type === "ping") {
+          worker._inject({ type: "pong", t: msg.t });
+        }
+      };
 
       // Stage a healthy in-flight dispatch from this worker.
       new DataView(kernelMemory.buffer).setUint32(0, handle, true);
       const inFlightId = registry.dispatch(CMD.RENDER, 0, 12);
       expect(registry._dispatches.get(inFlightId).status).toBe(STATUS.PENDING);
+      expect(registry._dispatches.get(inFlightId).packageId).toBe(PACKAGE_ID);
 
-      // Spawn a SECOND worker and let it time out without ever ponging.
+      // Spawn a SECOND worker and let it time out without ponging.
       const otherWorker = makeFakeWorker();
       registry._processes.set("com.b.app", {
         worker: otherWorker, packageId: "com.b.app",
-        lastPongAt: 0, ready: true, pingInterval: null,
+        lastPongAt: 0, ready: true, pingTimer: null,
       });
       registry._startHeartbeat(registry._processes.get("com.b.app"));
 
       vi.advanceTimersByTime(2200);
 
-      // The OTHER worker's termination must not have flipped the first
-      // worker's in-flight render to ERROR.
+      // The peer's termination must not have touched our dispatch.
       const stillThere = registry._dispatches.get(inFlightId);
       expect(stillThere).toBeDefined();
       expect(stillThere.status).toBe(STATUS.PENDING);
+      // And com.b.app is gone.
+      expect(registry._processes.has("com.b.app")).toBe(false);
     }));
 });
 

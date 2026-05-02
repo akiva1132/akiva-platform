@@ -367,7 +367,14 @@ export class AppRegistry {
     }
 
     const dispatchId = this._nextDispatchId++;
-    this._dispatches.set(dispatchId, { status: STATUS.PENDING, bytes: null });
+    // Track packageId per dispatch so the watchdog/trap GC can evict
+    // entries belonging to a terminated worker without touching
+    // healthy peers' in-flight futures.
+    this._dispatches.set(dispatchId, {
+      status: STATUS.PENDING,
+      bytes: null,
+      packageId: slot.packageId,
+    });
     proc.worker.postMessage(
       { type: "dispatch", dispatch_id: dispatchId, cmd_kind: cmdKind, payload },
       [payload.buffer],
@@ -474,7 +481,7 @@ export class AppRegistry {
       [wasmCopy.buffer],
     );
 
-    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingInterval: null };
+    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingTimer: null };
     this._processes.set(packageId, proc);
     // Heartbeat doesn't start until `init_ok` lands — kicking the
     // watchdog while the worker is mid-wasm-compile would mean every
@@ -493,34 +500,47 @@ export class AppRegistry {
    * queue for the next frame's drain, and let `Framework::
    * mark_package_trapped` do the rest.
    *
-   * Why JS-level pong, not wasm: a wasm app's job is to process
-   * dispatches, not to acknowledge heartbeats. Routing the pong
-   * through wasm would put the heartbeat's liveness on the same
-   * thread that we're trying to detect as wedged — pointless.
+   * **Why JS-level pong, not wasm:** the wasm app's job is to
+   * process dispatches, not heartbeats. Routing the pong through
+   * wasm would put the heartbeat's liveness on the same thread
+   * we're trying to detect as wedged — pointless.
+   *
+   * **Why self-scheduling setTimeout, not setInterval:** setInterval
+   * fires on a fixed schedule even if the previous callback hasn't
+   * finished, which can stack overlapping ticks when the kernel-
+   * worker is busy. setTimeout chained to itself only re-arms after
+   * the current tick returns — no overlap, accepts whatever
+   * scheduling slack the runtime imposes.
    */
   _startHeartbeat(proc) {
-    proc.pingInterval = setInterval(() => {
+    const tick = () => {
+      // Worker may have been terminated by another path between
+      // ticks — bail cleanly.
+      if (this._processes.get(proc.packageId) !== proc) return;
       const now = performance.now();
       if (now - proc.lastPongAt > 1500) {
         this._log("error",
           `app ${proc.packageId}: no pong in ${(now - proc.lastPongAt).toFixed(0)}ms — terminating worker`);
-        clearInterval(proc.pingInterval);
         try { proc.worker.terminate(); } catch (_) { /* best effort */ }
         this._pendingTraps.add(proc.packageId);
         this._processes.delete(proc.packageId);
-        // _dispatches entries for the dead worker stay PENDING. They
-        // can never resolve (no worker to reply), but they also can't
-        // be polled — `dispatch()` returns 0n for unknown packages and
-        // any in-flight pending_render slot in WasmActivity points at
-        // a future_id that nobody else will create. The framework
-        // marks the activity Trapped on the next frame's drain and
-        // pops it off the stack; the orphaned _dispatches entry is
-        // bounded by the activity count of the terminated worker.
-        // Stone 11.5+1 GC pass will recycle them.
+        // Audit fix #2 — evict every _dispatches entry that belonged
+        // to the dead worker. Tracking `packageId` per entry (added
+        // in `dispatch()`) lets us prune surgically without touching
+        // healthy peers' pending futures. Without this, an
+        // unbounded number of in-flight render/save_state futures
+        // accumulate when an app crashes.
+        for (const [fid, entry] of this._dispatches) {
+          if (entry.packageId === proc.packageId) {
+            this._dispatches.delete(fid);
+          }
+        }
         return;
       }
       proc.worker.postMessage({ type: "ping", t: now });
-    }, 500);
+      proc.pingTimer = setTimeout(tick, 500);
+    };
+    proc.pingTimer = setTimeout(tick, 500);
   }
 
   /**
@@ -632,14 +652,31 @@ export class AppRegistry {
    * imports read these maps unchanged from pre-11.4c — only the
    * source moved (from in-process import callbacks to peer-worker
    * messages).
+   *
+   * **Provenance check.** The handle in `args` is supplied by the
+   * worker; without verification, app A's worker could send a
+   * `side_effect` claiming app B's handle and forge a `finish` /
+   * `start_activity` / `set_result` call against B. This mirrors
+   * Android's Binder UID check at the IPC boundary: the kernel
+   * doesn't trust the message's "I'm acting on behalf of N" claim
+   * unless the routing context confirms it. Here the routing context
+   * is `packageId` (which worker actually posted the message), and
+   * the slot's owner is the truth — handle that doesn't belong to
+   * `packageId` is dropped with a warn-level log.
    */
   _handleSideEffect(packageId, msg) {
     const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(msg.args ?? 0);
+    if (args.length < 4) return;
     const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const handle = view.getUint32(0, true);
+    if (!this._handleBelongsTo(handle, packageId)) {
+      this._log("warn",
+        `[${packageId}] side_effect op_kind=0x${(msg.op_kind ?? 0).toString(16)} ` +
+        `claimed handle=${handle} which doesn't belong to this package — dropped`);
+      return;
+    }
     switch (msg.op_kind) {
       case FIRE.FINISH: {
-        if (args.length < 4) return;
-        const handle = view.getUint32(0, true);
         this._pendingFinish.add(handle);
         this._dbg("intent", `${packageId}: side_effect FINISH handle=${handle}`);
         return;
@@ -649,8 +686,6 @@ export class AppRegistry {
           this._log("warn", `[${packageId}] side_effect START_ACTIVITY: denied — no LAUNCH_ANY_APP grant`);
           return;
         }
-        if (args.length < 4) return;
-        const handle = view.getUint32(0, true);
         const intentBytes = args.slice(4);
         if (intentBytes.length === 0) return;
         this._pendingIntent.set(handle, intentBytes);
@@ -663,7 +698,6 @@ export class AppRegistry {
           return;
         }
         if (args.length < 8) return;
-        const handle = view.getUint32(0, true);
         const requestCode = view.getUint32(4, true);
         const intentBytes = args.slice(8);
         if (intentBytes.length === 0) return;
@@ -672,8 +706,6 @@ export class AppRegistry {
         return;
       }
       case FIRE.SET_RESULT: {
-        if (args.length < 4) return;
-        const handle = view.getUint32(0, true);
         const resultBytes = args.slice(4);
         if (resultBytes.length === 0) return;
         this._pendingSetResult.set(handle, resultBytes);
@@ -683,6 +715,18 @@ export class AppRegistry {
       default:
         this._log("warn", `[${packageId}] unknown side_effect op_kind=0x${(msg.op_kind ?? 0).toString(16)}`);
     }
+  }
+
+  /**
+   * Provenance check: `handle` was assigned by `register(packageId,…)`
+   * to a specific package, and the binding never moves. Returns true
+   * only when the routing-context `packageId` matches the slot's
+   * recorded owner. Used by every cross-worker hook that takes a
+   * handle from app-supplied bytes (side_effect, host_op).
+   */
+  _handleBelongsTo(handle, packageId) {
+    const slot = this._slots.get(handle);
+    return slot != null && slot.packageId === packageId;
   }
 
   _hasGrant(packageId, capability) {

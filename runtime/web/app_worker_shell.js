@@ -157,6 +157,14 @@ function handleInit(msg) {
     };
   }
 
+  // Sync compile is intentional: the worker's incoming message queue
+  // is FIFO, so a dispatch arriving during init can't be processed
+  // before this handler returns. An async (await-based) version
+  // would yield the event loop mid-compile and let `handleDispatch`
+  // run with `wasmInstance` still null — the app would silently
+  // miss CREATE/RESIZE/START/RESUME. The cold-start cost (~50-200ms
+  // per app) is paid once per package and dominated by the network
+  // fetch of `app.wasm`, not the compile itself.
   let module, instance;
   try {
     module = new WebAssembly.Module(msg.wasmBytes);
