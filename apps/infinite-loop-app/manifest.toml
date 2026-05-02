@@ -1,0 +1,34 @@
+[app]
+id = "com.akiva.test.infinite_loop"
+name = "Loop Test"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+authors = ["Akiva Team"]
+description = "Stone 11.5e test app — press the button to hang the worker. Watchdog should kill it within ~1.5s and pop back to Shell."
+category = "utilities"
+
+[runtime]
+wasm = "infinite_loop.wasm"
+min_memory_mb = 1
+max_memory_mb = 2
+
+[[activities]]
+id = "main"
+class = "InfiniteLoopMain"
+entry = true
+launch_mode = "singleTop"
+exported = true
+
+[[activities.intent_filters]]
+actions = ["akiva.intent.action.MAIN"]
+categories = ["akiva.intent.category.LAUNCHER"]
+
+[permissions]
+required = []
+optional = []
+
+[display]
+default_width_dp = 400
+default_height_dp = 300
+resizable = true

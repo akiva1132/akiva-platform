@@ -1,0 +1,21 @@
+[package]
+name = "akiva-app-infinite-loop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Akiva Team"]
+license = "MIT OR Apache-2.0"
+description = "Stone 11.5e test app: button that hangs the activity in a busy loop. Verifies the kernel watchdog terminates the worker and the framework auto-pops back to Shell."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+akiva-sdk = { path = "../../sdk-rust" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
