@@ -738,6 +738,116 @@ impl Framework {
         n
     }
 
+    /// Phase 12.4 — soft-evict a package: drive each live activity
+    /// through `pause → save_state → stop → Suspended`, drop the
+    /// `Activity` instances, forget memory + CPU accounting. Distinct
+    /// from [`Framework::evict_package`] (which is the failure-path
+    /// twin and marks `Trapped`) — suspended records are recoverable
+    /// on re-launch (saved-state blob restores into a fresh instance).
+    ///
+    /// The save-state dispatch follows the same pattern as
+    /// `destroy_with_persist`: a non-zero `future_id` returned by
+    /// `dispatch_save_state_async` enrolls a `PendingSave` that
+    /// [`Framework::drive_pending_saves`] persists when the worker
+    /// answers. The pause/stop callbacks fire in order; for in-process
+    /// activities the synchronous `save_state_bytes` path persists
+    /// inline via `persist_saved_state`.
+    ///
+    /// Caller (kernel-side, for LMK soft eviction) must follow up with
+    /// `hal_evict_package` to terminate the wasm worker. The framework
+    /// has already dropped the `Activity` instance and cleared pending
+    /// slots by the time this returns, so it's safe to terminate at any
+    /// later point — Stone 12.4b will wire the kernel call.
+    ///
+    /// Returns the number of activities transitioned to Suspended.
+    /// Safe on packages with no activities (returns 0).
+    pub fn suspend_package(&mut self, package_id: &str, ts: f64) -> usize {
+        let ids = self.activities.ids_for_package(package_id);
+        if ids.is_empty() {
+            return 0;
+        }
+        let metrics = self.metrics;
+        let pointer = self.pointer;
+        let mut to_persist: Vec<(String, String, Vec<u8>)> = Vec::new();
+
+        for id in ids {
+            let meta = self.activities.record(id)
+                .map(|r| (r.package_id.clone(), r.class.clone()));
+
+            // Same async-save dispatch as `destroy_with_persist`. Worker
+            // FIFO guarantees pause/save/stop run in order; the bytes
+            // arrive 1+ frames later via `drive_pending_saves`.
+            let async_save_id = self.activities
+                .with_instance_ret(id, |a| a.dispatch_save_state_async())
+                .unwrap_or(0);
+            if async_save_id != 0 {
+                if let Some((pkg, class)) = &meta {
+                    self.pending_saves.push(PendingSave {
+                        future_id: async_save_id,
+                        package_id: pkg.clone(),
+                        class: class.clone(),
+                        started_at_ms: ts,
+                    });
+                }
+            }
+
+            // Drive `pause → stop` only — Suspended replaces Destroyed.
+            // Captures the synchronous save_state_bytes from in-process
+            // activities (wasm activities return empty here; the async
+            // path is the source of truth).
+            let async_in_flight = async_save_id != 0;
+            let mut sync_save_bytes: Option<Vec<u8>> = None;
+            for target in [LifecycleState::Paused, LifecycleState::Stopped] {
+                self.activities.advance(id, target, |a, new_state| {
+                    let mut finish = false;
+                    let mut launch: Option<Intent> = None;
+                    let mut launch_for_result: Option<(Intent, u32)> = None;
+                    let mut set_result: Option<result::ActivityResult> = None;
+                    let mut ctx = ActivityContext {
+                        metrics, timestamp_ms: ts, pointer,
+                        finish_requested: &mut finish,
+                        launch_requested: &mut launch,
+                        start_for_result_requested: &mut launch_for_result,
+                        set_result_requested: &mut set_result,
+                    };
+                    match new_state {
+                        LifecycleState::Paused  => a.on_pause(&mut ctx),
+                        LifecycleState::Stopped => {
+                            if !async_in_flight {
+                                sync_save_bytes = Some(a.save_state_bytes());
+                            }
+                            a.on_stop(&mut ctx);
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            if let (Some((pkg, class)), Some(bytes)) = (meta, sync_save_bytes) {
+                to_persist.push((pkg, class, bytes));
+            }
+        }
+
+        // Persist any synchronous saves outside the per-activity loop
+        // so the borrow on `self.activities` is fully released first.
+        for (pkg, class, bytes) in to_persist {
+            self.persist_saved_state(&pkg, &class, &bytes);
+        }
+
+        // Final transition: Stopped → Suspended (drops the instance,
+        // clears any open pending slot). Activities not at Stopped are
+        // skipped — typically because they were already Suspended /
+        // Destroyed / Trapped, which is fine.
+        let n = self.activities.suspend_stopped_for_package(package_id);
+
+        // Forget memory + CPU accounting — a suspended app is out of
+        // budget. On re-launch (Stone 12.4b) the kernel re-spawns the
+        // worker and accounting starts fresh.
+        self.memory.forget(package_id);
+        self.cpu.forget(package_id);
+
+        n
+    }
+
     /// P0 #3 — recycle `Trapped` activity records whose age exceeds
     /// `max_age_ms`. The instance and record both drop without firing
     /// `on_destroy` (the worker that owned the activity is dead, and a
@@ -3094,6 +3204,107 @@ optional = []
         assert!(!ids.contains(&"sys.shell"));
         assert!(!ids.contains(&"sys.recovery"));
         assert_eq!(ids, vec!["user.app"]);
+    }
+
+    /// Phase 12.4 — `suspend_package` drives Resumed → Paused → Stopped
+    /// → Suspended, drops the activity instance, forgets memory + cpu
+    /// accounting. Distinct from `evict_package` (failure path → Trapped).
+    #[test]
+    fn suspend_package_transitions_resumed_to_suspended() {
+        use activity_manager::{LaunchMode, LifecycleState};
+
+        struct CounterStub(Rc<RefCell<usize>>);
+        impl activity::Activity for CounterStub {
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+            fn on_pause(&mut self, _: &mut ActivityContext<'_>) {
+                *self.0.borrow_mut() += 1;
+            }
+            fn on_stop(&mut self, _: &mut ActivityContext<'_>) {
+                *self.0.borrow_mut() += 10;
+            }
+        }
+
+        let calls = Rc::new(RefCell::new(0usize));
+        let calls_for_factory = calls.clone();
+        let mut fw = empty_framework();
+        fw.activities.register("dozy", "Main", LaunchMode::Standard,
+            move || Box::new(CounterStub(calls_for_factory.clone())));
+        let outcome = fw.activities.launch("dozy", "Main").unwrap();
+        fw.activities.force_state_for_test(outcome.id, LifecycleState::Resumed);
+
+        fw.record_app_memory("dozy", 50 * 1024 * 1024);
+        fw.record_app_cpu("dozy", 0.0, 0.0);
+        fw.record_app_cpu("dozy", 5.0, 1000.0);
+
+        let n = fw.suspend_package("dozy", 100.0);
+        assert_eq!(n, 1, "single Resumed activity → 1 transition to Suspended");
+        assert_eq!(*calls.borrow(), 11, "on_pause (1) + on_stop (10) both fired");
+        assert_eq!(fw.activities.state_of(outcome.id), Some(LifecycleState::Suspended));
+        // Memory + cpu accounting forgotten.
+        assert!(fw.memory_usage("dozy").is_none());
+        assert!(fw.cpu_usage("dozy").is_none());
+        // Suspended activities show up via the helper for the re-launch path.
+        assert_eq!(fw.activities.suspended_ids_for_package("dozy"), vec![outcome.id]);
+    }
+
+    /// Phase 12.4 — `suspend_package` is a no-op for unknown packages
+    /// (returns 0). The kernel may race a suspension request against an
+    /// uninstall; we don't want to panic there.
+    #[test]
+    fn suspend_package_on_unknown_is_zero() {
+        let mut fw = empty_framework();
+        assert_eq!(fw.suspend_package("never.installed", 0.0), 0);
+    }
+
+    /// Phase 12.4 — calling `suspend_package` on an already-suspended
+    /// package returns 0 (the activities are already Suspended; the
+    /// Stopped → Suspended scan finds nothing). Idempotent.
+    #[test]
+    fn suspend_package_is_idempotent() {
+        use activity_manager::{LaunchMode, LifecycleState};
+
+        struct Stub;
+        impl activity::Activity for Stub {
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+        }
+
+        let mut fw = empty_framework();
+        fw.activities.register("dozy", "Main", LaunchMode::Standard, || Box::new(Stub));
+        let outcome = fw.activities.launch("dozy", "Main").unwrap();
+        fw.activities.force_state_for_test(outcome.id, LifecycleState::Resumed);
+
+        assert_eq!(fw.suspend_package("dozy", 0.0), 1);
+        // Second call: nothing left at Resumed/Stopped to transition.
+        assert_eq!(fw.suspend_package("dozy", 1.0), 0);
+        assert_eq!(fw.activities.state_of(outcome.id), Some(LifecycleState::Suspended));
+    }
+
+    /// Phase 12.4 — Suspended → Created → Resumed is the re-launch path
+    /// (state machine only; full re-instantiation is Stone 12.4b).
+    /// Verify the legal_transition coverage so 12.4b can rely on it.
+    #[test]
+    fn suspended_activity_can_re_enter_lifecycle_via_created() {
+        use activity_manager::LifecycleState;
+
+        let mut fw = empty_framework();
+        fw.activities.register("dozy", "Main",
+            activity_manager::LaunchMode::Standard,
+            || {
+                struct S;
+                impl activity::Activity for S {
+                    fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+                }
+                Box::new(S)
+            });
+        let outcome = fw.activities.launch("dozy", "Main").unwrap();
+        fw.activities.force_state_for_test(outcome.id, LifecycleState::Suspended);
+
+        // The legal_transition function (private but exercised through
+        // mark_trapped's gate) allows Suspended → Created and Suspended
+        // → Destroyed. Verify by trying the Trapped edge — which must
+        // be refused since Suspended has no live worker to misbehave.
+        assert!(fw.activities.mark_trapped(outcome.id, 0.0).is_none(),
+            "Suspended → Trapped must not be a legal edge");
     }
 
     #[test]

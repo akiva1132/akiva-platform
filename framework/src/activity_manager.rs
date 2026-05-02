@@ -47,6 +47,15 @@ pub enum LifecycleState {
     /// every dispatch into it; only edge out is `Destroyed` (driven by
     /// the user's tap-to-restart or by package uninstall).
     Trapped,
+    /// Stone 12.4 — soft eviction. Saved state has been persisted, the
+    /// `Activity` instance has been dropped, and the wasm worker has
+    /// been terminated (or will be, by the caller). The record stays so
+    /// re-launching the package can resurrect it: `Suspended → Created`
+    /// instantiates a fresh activity and feeds it the saved state via
+    /// `on_restore_state`, parallel to the cold-start path. Distinct
+    /// from `Trapped` (which is a terminal failure state) and
+    /// `Destroyed` (which discards saved state too).
+    Suspended,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,6 +626,54 @@ impl ActivityManager {
             .collect()
     }
 
+    /// Stone 12.4 — transition every `Stopped` activity in `package_id`
+    /// to `Suspended`, drop its `Activity` instance from `instances`,
+    /// and clear any open pending slot. Caller is responsible for:
+    ///   1. Driving `pause → save_state → stop` on the activities
+    ///      *before* calling this (the saved bytes need to land first;
+    ///      use the existing `pending_saves` pipeline).
+    ///   2. Terminating the wasm worker after this returns
+    ///      (`hal_evict_package` from kernel-side `drive_lmk_into`-
+    ///      style code, or a dedicated suspension call).
+    ///
+    /// Returns the count of activities transitioned. Activities not in
+    /// `Stopped` are skipped — a Resumed activity must first be paused
+    /// and stopped through the regular lifecycle path.
+    pub fn suspend_stopped_for_package(&mut self, package_id: &str) -> usize {
+        let ids: Vec<ActivityId> = self.records.iter()
+            .filter(|(_, r)|
+                r.package_id == package_id
+                && matches!(r.state, LifecycleState::Stopped))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut n = 0;
+        for id in ids {
+            if let Some(rec) = self.records.get_mut(&id) {
+                if !legal_transition(rec.state, LifecycleState::Suspended) {
+                    continue;
+                }
+                rec.state = LifecycleState::Suspended;
+                rec.pending = None;
+                self.instances.remove(&id);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Stone 12.4 — all activity ids in `package_id` whose state is
+    /// `Suspended`. The re-launch path consults this to decide whether
+    /// to instantiate fresh from the registry factory (cold start) or
+    /// resurrect an existing record (warm re-launch from suspension).
+    pub fn suspended_ids_for_package(&self, package_id: &str) -> Vec<ActivityId> {
+        self.records.iter()
+            .filter(|(_, r)|
+                r.package_id == package_id
+                && matches!(r.state, LifecycleState::Suspended))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// All activity ids in `package_id` whose state is currently `Trapped`.
     /// Used by `Framework::mark_package_trapped` to auto-pop dead
     /// activities from their task stacks.
@@ -695,13 +752,22 @@ fn legal_transition(from: LifecycleState, to: LifecycleState) -> bool {
     if matches!(to, Trapped) {
         // Any live state can trap — `loop {}` in `on_pointer`, panic in
         // `on_resume`, OOM mid-render. Only Destroyed/Trapped can't
-        // re-trap (already terminal).
-        return !matches!(from, Destroyed | Trapped);
+        // re-trap (already terminal). Suspended cannot trap (no live
+        // worker to misbehave); a re-launch from Suspended that traps
+        // marks the freshly-instantiated activity as Trapped.
+        return !matches!(from, Destroyed | Trapped | Suspended);
     }
     if matches!(from, Trapped) {
         // The single recovery edge: tear the activity down so the user
         // can restart with a fresh instance. Stone 11.5d wires the UX.
         return matches!(to, Destroyed);
+    }
+    if matches!(from, Suspended) {
+        // Stone 12.4 recovery edges. `Suspended → Created` is the
+        // re-launch path (saved state restored on the fresh instance).
+        // `Suspended → Destroyed` is uninstall / explicit `finish()`
+        // while suspended.
+        return matches!(to, Created | Destroyed);
     }
     matches!(
         (from, to),
@@ -713,6 +779,7 @@ fn legal_transition(from: LifecycleState, to: LifecycleState) -> bool {
         | (Paused, Stopped)
         | (Stopped, Started)    // onRestart → onStart
         | (Stopped, Destroyed)
+        | (Stopped, Suspended)  // Stone 12.4 — soft eviction from idle
         | (Paused, Destroyed)   // allowed when activity finishes from Paused
         | (Created, Destroyed)  // finish() called from on_create — skip Start/Resume entirely, Android parity
     )
@@ -776,6 +843,47 @@ mod tests {
         // behaviour. Lock this edge in so a future matrix cleanup
         // doesn't quietly drop it.
         assert!(legal_transition(LifecycleState::Created, LifecycleState::Destroyed));
+    }
+
+    // ── Stone 12.4: Suspended transition matrix ──────────────────────────
+
+    #[test]
+    fn stopped_to_suspended_is_legal() {
+        assert!(legal_transition(LifecycleState::Stopped, LifecycleState::Suspended));
+    }
+
+    #[test]
+    fn live_states_other_than_stopped_cannot_directly_suspend() {
+        // The orchestration in `Framework::suspend_package` drives Resumed →
+        // Paused → Stopped first; only Stopped → Suspended is legal directly.
+        use LifecycleState::*;
+        assert!(!legal_transition(Resumed, Suspended));
+        assert!(!legal_transition(Paused, Suspended));
+        assert!(!legal_transition(Created, Suspended));
+        assert!(!legal_transition(Started, Suspended));
+        assert!(!legal_transition(Initial, Suspended));
+    }
+
+    #[test]
+    fn suspended_can_recover_to_created_or_destroyed() {
+        // Re-launch path (bring back into the lifecycle) and uninstall path.
+        assert!(legal_transition(LifecycleState::Suspended, LifecycleState::Created));
+        assert!(legal_transition(LifecycleState::Suspended, LifecycleState::Destroyed));
+    }
+
+    #[test]
+    fn suspended_cannot_trap_or_re_suspend() {
+        use LifecycleState::*;
+        // No live worker → can't crash. The re-launched activity (which
+        // is a fresh instance, post-Suspended → Created) can trap.
+        assert!(!legal_transition(Suspended, Trapped));
+        assert!(!legal_transition(Suspended, Suspended));
+        // Skip over Created — Suspended → Started/Resumed must go through
+        // on_create on the fresh instance first.
+        assert!(!legal_transition(Suspended, Started));
+        assert!(!legal_transition(Suspended, Resumed));
+        assert!(!legal_transition(Suspended, Paused));
+        assert!(!legal_transition(Suspended, Stopped));
     }
 
     // ── Stone 11.5: Trapped transition matrix ────────────────────────────
@@ -874,7 +982,11 @@ mod tests {
             // here (which routes via the on_destroy arm above before
             // mark_trapped flips the state). Initial is the launch-
             // window state with no callback to run.
-            LifecycleState::Initial | LifecycleState::Trapped => {}
+            // Stone 12.4 — Suspended has no Activity instance to
+            // dispatch into. The re-launch path (Suspended → Created)
+            // creates a fresh instance from the registry factory and
+            // routes through on_create above.
+            LifecycleState::Initial | LifecycleState::Trapped | LifecycleState::Suspended => {}
         }
     }
 

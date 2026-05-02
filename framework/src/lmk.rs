@@ -137,7 +137,14 @@ pub fn priority_of(package_id: &str, activities: &ActivityManager) -> Priority {
             (LifecycleState::Created, _) => Priority::Background,
             (LifecycleState::Initial, _)
             | (LifecycleState::Destroyed, _)
-            | (LifecycleState::Trapped, _) => Priority::Empty,
+            | (LifecycleState::Trapped, _)
+            // Stone 12.4 — Suspended packages have already been evicted
+            // by definition; the LMK should never re-pick them. They
+            // also have memory.forget()-ed accounting, so they almost
+            // never reach this match in practice. Mapped to Empty for
+            // correctness in the rare case a Suspended record outlives
+            // its memory_manager entry.
+            | (LifecycleState::Suspended, _) => Priority::Empty,
         };
         if p > best {
             best = p;
