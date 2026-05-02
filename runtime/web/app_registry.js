@@ -163,6 +163,56 @@ export class AppRegistry {
       });
     }
     this._dbg("permissions", `packages snapshot: ${this._packagesBlob.length} bytes`);
+
+    // Stone 11.4c — defer-warmup. Pre-spawn a Worker for every
+    // installed package so the first user-initiated launch pays
+    // only the dispatch round-trip, not the cold worker + wasm
+    // compile cost (saved ~2s per app on the live demo).
+    //
+    // setTimeout(0) puts the loop after the current task — the
+    // boot screen / first paint go through unimpeded; warmup
+    // bills against idle time afterward. Each worker compiles
+    // its wasm in parallel on its own thread, so total wall-clock
+    // is dominated by the slowest single compile (~150KB).
+    setTimeout(() => this._warmupWorkers(), 0);
+  }
+
+  /**
+   * Stone 11.4c — proactively spawn workers for every installed
+   * package so the first launch is hot. Driven from the package
+   * snapshot the framework hands us via `setPackages`; missing
+   * wasm in storage is a benign skip (`_spawnProcess` logs and
+   * returns null). Idempotent: re-running is a no-op for already-
+   * spawned packages.
+   */
+  _warmupWorkers() {
+    const decoder = this._decoder;
+    const blob = this._packagesBlob;
+    if (blob.length < 4) return;
+    const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+    const count = view.getUint32(0, true);
+    let off = 4;
+    for (let i = 0; i < count; i++) {
+      // Wire format mirrors framework/src/pkgs_wire.rs::encode:
+      //   [u16 LE id_len][id][u16 LE class_len][class]
+      //   [u16 LE name_len][name]
+      // We only need the id; skip the rest.
+      if (off + 2 > blob.length) return;
+      const idLen = view.getUint16(off, true); off += 2;
+      if (off + idLen > blob.length) return;
+      const id = decoder.decode(blob.subarray(off, off + idLen));
+      off += idLen;
+      // Skip class + name to advance to the next record.
+      if (off + 2 > blob.length) return;
+      const classLen = view.getUint16(off, true); off += 2 + classLen;
+      if (off + 2 > blob.length) return;
+      const nameLen = view.getUint16(off, true); off += 2 + nameLen;
+
+      if (!this._processes.has(id)) {
+        // Fire-and-forget; failures log inside _spawnProcess.
+        this._spawnProcess(id);
+      }
+    }
   }
 
   _dbg(category, text) {
