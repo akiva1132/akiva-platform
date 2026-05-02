@@ -25,6 +25,7 @@ pub mod activity_manager;
 pub mod compositor;
 pub mod intent;
 pub mod manifest;
+pub mod memory_manager;
 pub mod package_manager;
 pub mod permissions;
 pub mod wire;
@@ -110,6 +111,7 @@ pub fn boot(
         task_history: Vec::new(),
         host: host.clone(),
         pending_saves: Vec::new(),
+            memory: memory_manager::MemoryManager::new(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -375,6 +377,11 @@ pub struct Framework {
     /// Storage key + activity meta is captured at dispatch time so the
     /// activity record can vanish under us before the bytes resolve.
     pending_saves: Vec<PendingSave>,
+    /// Phase 12.1 — per-package memory accounting. Updated by the
+    /// host's per-frame sample of `WebAssembly.Memory.buffer.byteLength`
+    /// for each app worker; read by Phase 12.3 (Low-Memory Killer)
+    /// and Phase 12.5 (manifest enforcement).
+    pub memory: memory_manager::MemoryManager,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -601,6 +608,45 @@ impl Framework {
         for (pkg, class, bytes) in to_persist {
             self.persist_saved_state(&pkg, &class, &bytes);
         }
+    }
+
+    /// Phase 12.1 — record a fresh `byteLength` reading for an app
+    /// worker. The host samples each app's `WebAssembly.Memory.buffer
+    /// .byteLength` once per frame and forwards each value through this
+    /// hook. `current` is replaced; `peak` advances monotonically.
+    ///
+    /// No validation against the manifest budget happens here — that's
+    /// Phase 12.5's job. This call is the cheap accumulation hook that
+    /// every later policy decision (LMK ranking, suspension picking,
+    /// enforcement traps) reads from.
+    pub fn record_app_memory(&mut self, package_id: &str, bytes: u64) {
+        self.memory.record(package_id, bytes);
+    }
+
+    /// Phase 12.1 — public read API. Returns `None` for packages the
+    /// host has never sampled (an app may exist in `PackageManager`
+    /// before its worker has spawned, and a fresh-install package will
+    /// have no readings until the first frame). Folds the manifest's
+    /// `runtime.max_memory_mb` into the report so the caller doesn't
+    /// have to chase two indices.
+    ///
+    /// If the package is tracked but has no manifest entry (test
+    /// fixtures, mid-uninstall window), the limit is reported as
+    /// `u64::MAX` — an explicit "no constraint on file" rather than
+    /// the unsafer alternative of returning the call as `None`.
+    pub fn memory_usage(&self, package_id: &str) -> Option<memory_manager::UsageReport> {
+        let current = self.memory.current(package_id)?;
+        let peak = self.memory.peak(package_id).unwrap_or(current);
+        let limit_bytes = self
+            .packages
+            .get(package_id)
+            .map(|rec| (rec.manifest.runtime.max_memory_mb as u64) * 1024 * 1024)
+            .unwrap_or(u64::MAX);
+        Some(memory_manager::UsageReport {
+            current_bytes: current,
+            peak_bytes: peak,
+            limit_bytes,
+        })
     }
 
     /// P0 #3 — recycle `Trapped` activity records whose age exceeds
@@ -1555,6 +1601,7 @@ mod tests {
             task_history: Vec::new(),
             host: BootMockHost::new(),
             pending_saves: Vec::new(),
+            memory: memory_manager::MemoryManager::new(),
         }
     }
 
@@ -2612,6 +2659,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             task_history: Vec::new(),
             host: host.clone(),
             pending_saves: Vec::new(),
+            memory: memory_manager::MemoryManager::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -2709,6 +2757,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             task_history: Vec::new(),
             host: host.clone(),
             pending_saves: Vec::new(),
+            memory: memory_manager::MemoryManager::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -2741,6 +2790,80 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
         // No panic, no observable state change. The smoke test is the
         // absence of a panic from `self.stack.last().copied()` being
         // None.
+    }
+
+    /// Phase 12.1 — Framework's `record_app_memory` + `memory_usage`
+    /// pair. Exercises the public surface, including the manifest-
+    /// limit fold-in (untracked package → u64::MAX).
+    #[test]
+    fn memory_usage_returns_none_before_first_record() {
+        let fw = empty_framework();
+        assert!(fw.memory_usage("com.akiva.never").is_none());
+    }
+
+    #[test]
+    fn record_app_memory_then_memory_usage_returns_current_and_peak() {
+        let mut fw = empty_framework();
+        // No manifest registered → limit defaults to u64::MAX.
+        fw.record_app_memory("com.akiva.app", 1024 * 1024);
+        fw.record_app_memory("com.akiva.app", 2 * 1024 * 1024);
+        fw.record_app_memory("com.akiva.app", 1_500_000);
+        let report = fw.memory_usage("com.akiva.app").expect("just recorded");
+        assert_eq!(report.current_bytes, 1_500_000);
+        assert_eq!(report.peak_bytes, 2 * 1024 * 1024,
+            "peak must persist across a shrink");
+        assert_eq!(report.limit_bytes, u64::MAX,
+            "untracked package falls back to no-limit");
+        assert!(!report.over_budget());
+    }
+
+    #[test]
+    fn memory_usage_folds_manifest_limit_when_package_is_installed() {
+        // Build a Framework with a real package whose manifest declares
+        // max_memory_mb, then verify the report carries that limit.
+        let manifest_toml = r#"
+[app]
+id = "com.akiva.budgeted"
+name = "Budgeted"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+authors = ["test"]
+description = ""
+category = "utilities"
+
+[runtime]
+wasm = "app.wasm"
+min_memory_mb = 1
+max_memory_mb = 16
+
+[[activities]]
+id = "main"
+class = "Main"
+entry = true
+launch_mode = "standard"
+
+[permissions]
+required = []
+optional = []
+"#;
+        let mut fw = empty_framework();
+        let mut store = storage::MemoryStorage::new();
+        let mut pc = permissions::PermissionController::new();
+        permissions::declare_mvp_permissions(&mut pc);
+        fw.packages.install(&mut store, &mut pc, manifest_toml, b"\0asm\x01\x00\x00\x00")
+            .expect("install");
+
+        fw.record_app_memory("com.akiva.budgeted", 8 * 1024 * 1024);
+        let report = fw.memory_usage("com.akiva.budgeted").expect("just recorded");
+        assert_eq!(report.limit_bytes, 16 * 1024 * 1024);
+        assert!(!report.over_budget());
+
+        // Push past the manifest budget — the report should now flag.
+        fw.record_app_memory("com.akiva.budgeted", 17 * 1024 * 1024);
+        let report = fw.memory_usage("com.akiva.budgeted").unwrap();
+        assert!(report.over_budget(),
+            "current 17 MiB exceeds manifest 16 MiB → over_budget()");
     }
 
     #[test]
@@ -2823,6 +2946,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             task_history: Vec::new(),
             host: host.clone(),
             pending_saves: Vec::new(),
+            memory: memory_manager::MemoryManager::new(),
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -2933,6 +3057,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             task_history: Vec::new(),
             host: host.clone(),
             pending_saves: Vec::new(),
+            memory: memory_manager::MemoryManager::new(),
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -3068,6 +3193,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
                 class: "Crash".into(),
                 started_at_ms: 0.0,
             }],
+            memory: memory_manager::MemoryManager::new(),
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),
