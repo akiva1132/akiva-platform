@@ -419,6 +419,17 @@ impl Activity for WasmActivity {
     }
 
     fn render(&mut self, ctx: &mut ActivityContext<'_>, out: &mut FrameCommands) {
+        // Stone 11.4c — drain any host-side signals (`finish`,
+        // `start_activity`, `set_result`, …) that the worker emitted
+        // since the last input/lifecycle callback. With cross-worker
+        // dispatch the side-effect for a click arrives one or more
+        // frames AFTER the pointer dispatch returned, and there's
+        // nothing else that drains them before the next user input —
+        // without this hook, "first click does nothing, second click
+        // launches the app from the FIRST click's queued intent" is
+        // the user-visible symptom.
+        self.drain_post(ctx);
+
         // Stone 11.4c — render pipeline. Each frame:
         //   1. If a prior render is still in-flight, poll it. READY
         //      bytes get decoded into `out` and the slot clears.
