@@ -1057,7 +1057,109 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 **הערכת זמן Total:** 1-2 ימי עבודה.
 
-**Gate ל-11.7:** אסור לפתוח את 11.7 לפני ש-11.6.8 ירוק. הסיבה זהה ל-11.6.7 — public docs יבעירו את ה-API לbedrock; primitives שחסרים יחיו לעולם בעיני מפתחים שיתעדו "Akiva = Android אבל בלי RNG / wall clock / channels."
+**Gate ל-11.7:** אסור לפתוח את 11.7 לפני ש-11.6.8 + 11.6.9 ירוקים. הסיבה זהה ל-11.6.7 — public docs יבעירו את ה-API לbedrock; primitives שחסרים יחיו לעולם בעיני מפתחים שיתעדו "Akiva = Android אבל בלי RNG / wall clock / channels."
+
+### 11.6.9 Rendering + platform polish (חצי יום) — **חוסם 11.7**
+
+**מטרה:** שלושה פערים שהתגלו ב-audit מאי 2026 — אחד ויזואלי (פינות מעוגלות), אחד correctness ב-resize, ואחד dark mode אוטומטי. שלושתם additive ולא breaking. `OP_FILL_ROUND_RECT` הוא MINOR ABI bump (opcode חדש). ResizeObserver ו-matchMedia הם JS-only.
+
+**למה לא אחרי 11.7.** כשה-docs של 11.7 ייכתבו עם screenshots ו-scaffold templates, הם יצלמו את ה-look הנוכחי — כפתורים עם פינות חדות, dark mode ידני. תיקון אחרי כן דורש עדכון docs + templates + screenshots. לפני 11.7 — עלות חצי יום. אחרי — פי כמה.
+
+**אופי הקלאסטר:** 3 פריטים עצמאיים, אין dependencies בין הפריטים.
+
+#### פריט 1 — `OP_FILL_ROUND_RECT` (~1h)
+
+**הבעיה.** כל ה-UI elements (כפתורים, כרטיסים, פנלים) מרובעי פינות לחלוטין. `roundRect()` הוא Baseline 2023 (Chrome 99, Firefox 112, Safari 15.4) — קיים בכל דפדפן שתומך ב-OffscreenCanvas. כל OS עכשווי (Android, iOS, macOS, Windows) משתמש בפינות מעוגלות כשפת עיצוב ברירת מחדל. בלי זה, apps ב-Akiva נראות כמו web-app משנות ה-90, לא כמו native OS.
+
+**Implementation.**
+- New variant ב-[`sdk-rust/src/canvas.rs`](sdk-rust/src/canvas.rs):
+  ```rust
+  OP_FILL_ROUND_RECT: u8 = 7;
+  PaintOp::FillRoundRect { x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32 }
+  ```
+- `encode_op` + `decode_op` ב-[`framework/src/wasm_activity.rs`](framework/src/wasm_activity.rs): x/y/w/h/radius כ-f32 LE, rgba כ-u32 LE.
+- [`runtime/web/renderer/canvas2d.js`](runtime/web/renderer/canvas2d.js):
+  ```js
+  fillRoundRect(x, y, w, h, radius, rgba) {
+      this.ctx.fillStyle = rgbaToCss(rgba);
+      this.ctx.beginPath();
+      this.ctx.roundRect(x, y, w, h, radius);
+      this.ctx.fill();
+  }
+  ```
+- [`runtime/web/worker.js`](runtime/web/worker.js): `hal_draw_round_rect: (x, y, w, h, r, rgba) => backend?.fillRoundRect(x, y, w, h, r, rgba >>> 0)`.
+- SDK widget toolkit ([`sdk-rust/src/ui/paint.rs`](sdk-rust/src/ui/paint.rs)): כפתורים מקבלים ברירת מחדל `radius: 8.0`. ניתן לoverride ב-AKML attribute `cornerRadius`.
+
+**DoD.**
+- [ ] `Canvas::fill_round_rect(x, y, w, h, radius, rgba)` מקמפל ב-wasm32.
+- [ ] encode/decode roundtrip test ב-`framework/src/wasm_activity.rs::tests` — byte-for-byte symmetric.
+- [ ] calculator buttons ו-shell buttons נראים עם פינות מעוגלות בדפדפן.
+- [ ] `radius=0.0` → שטח זהה ל-`fill_rect` (regression test).
+- [ ] AKML `cornerRadius="12"` attribute מפורש ב-`inflate.rs`, עובד על `<Button>` ו-`<Rect>`.
+
+**Code surfaces.** [`sdk-rust/src/canvas.rs`](sdk-rust/src/canvas.rs), [`framework/src/wasm_activity.rs`](framework/src/wasm_activity.rs), [`runtime/web/renderer/canvas2d.js`](runtime/web/renderer/canvas2d.js), [`runtime/web/worker.js`](runtime/web/worker.js), [`sdk-rust/src/ui/paint.rs`](sdk-rust/src/ui/paint.rs), [`sdk-rust/src/akml/inflate.rs`](sdk-rust/src/akml/inflate.rs).
+
+#### פריט 2 — `ResizeObserver` עם `devicePixelContentBoxSize` (~30 דק')
+
+**הבעיה.** [`runtime/web/tab.js:228`](runtime/web/tab.js#L228) — `window.addEventListener("resize", ...)`. זה מחמיץ:
+- שינוי zoom level (Ctrl+/-) — DPR משתנה בלי resize event, ה-canvas נשאר ברזולוציה שגויה.
+- `devicePixelContentBoxSize` נותן pixels פיזיים מדויקים ישירות, ללא צורך בכפל DPR ידני (Baseline 2022: Chrome 84+, Firefox 93+, Safari 15.4+).
+
+**Implementation.**
+```js
+// מחליף את installResizeHandler ב-tab.js
+new ResizeObserver(entries => {
+    const s = entries[0].devicePixelContentBoxSize?.[0];
+    const width_px  = s ? s.inlineSize  : Math.round(canvas.clientWidth  * dpr());
+    const height_px = s ? s.blockSize   : Math.round(canvas.clientHeight * dpr());
+    const m = { width_px, height_px, density: dpr() };
+    state.metrics = m;
+    if (state.ownsCanvas) applyCanvasSize(canvas, m);
+    session.send({ type: "resize", tabId, metrics: m });
+}).observe(canvas);
+```
+ה-`window.addEventListener("resize")` נמחק.
+
+**DoD.**
+- [ ] שינוי zoom level (Ctrl+/-) → canvas נרנדר ברזולוציה הנכונה ללא reload.
+- [ ] `window.addEventListener("resize")` מוסר מ-`installResizeHandler`.
+- [ ] בדיקה ידנית: פתיחה ב-125% zoom → UI חד, לא מטושטש.
+
+**Code surfaces.** [`runtime/web/tab.js`](runtime/web/tab.js) בלבד.
+
+#### פריט 3 — `matchMedia('prefers-color-scheme')` → auto dark mode (~1h)
+
+**הבעיה.** ResourceManager תומך ב-`values-night/` qualifier אבל **אף פעם** לא מופעל אוטומטית מהגדרת ה-OS. אפליקציות ב-Akiva לא עוברות ל-dark mode גם אם המשתמש הגדיר night mode ב-OS.
+
+**Implementation.**
+- [`runtime/web/tab.js`](runtime/web/tab.js):
+  ```js
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const sendColorScheme = () => session.send({ type: "config-change", night: mq.matches });
+  mq.addEventListener('change', sendColorScheme);
+  sendColorScheme(); // ערך נוכחי ב-boot
+  ```
+- [`runtime/web/worker.js`](runtime/web/worker.js): `case "config-change"` → `instance.exports.akiva_config_change(event.night ? 1 : 0)`.
+- Framework: `kernel/src/lib.rs` — `akiva_config_change(night: i32)` export → `DisplayManager::set_night_mode(night != 0)` → event ל-`ResourceManager::reload_qualifiers()` בframe הבא.
+
+**DoD.**
+- [ ] OS ב-dark mode + `akiva run` → calculator + shell מציגים `values-night/colors.toml`.
+- [ ] שינוי dark/light mode בזמן ריצה (system settings) → apps מתעדכנות בframe הבא, ללא reload.
+- [ ] OS ב-light mode → `values/colors.toml` ברירת מחדל (regression test).
+
+**Code surfaces.** [`runtime/web/tab.js`](runtime/web/tab.js), [`runtime/web/worker.js`](runtime/web/worker.js), [`kernel/src/lib.rs`](kernel/src/lib.rs) (export), framework device config.
+
+#### Definition of Done — Stone 11.6.9 כולה
+
+- [ ] 3 פריטים סגורים עם tests.
+- [ ] ABI bumped ל-`0.4.0` (פריט 1 הוא MINOR: opcode 7 חדש; פריטים 2+3 הם JS-only, לא ABI).
+- [ ] `docs/abi.md` imports: `hal_draw_round_rect` + opcode 7 מתועד.
+- [ ] `CHANGELOG.md` entry: 0.3.0 → 0.4.0, `[ABI: MINOR]`.
+- [ ] calculator + shell buttons נראים native בדפדפן.
+
+**הערכת זמן Total:** חצי יום.
+
+**Gate ל-11.7:** 11.6.8 + 11.6.9 ירוקים לפני פתיחת 11.7. ה-docs + scaffold templates של 11.7 יצלמו את ה-look — פינות מעוגלות + dark mode אוטומטי חייבים להיות שם ברגע שה-docs נכתבים.
 
 ### 11.7 `akiva new` + dev tooling polish (1-2 שבועות) — **DX foundation**
 - `akiva new <name>` — scaffold app (Cargo.toml, manifest.toml, src/lib.rs hello-world async, README).
