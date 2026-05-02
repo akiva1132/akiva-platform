@@ -352,6 +352,15 @@ impl ActivityManager {
         self.records.get(&id)
     }
 
+    /// Iterator over every live `ActivityRecord` regardless of state.
+    /// Order is HashMap-iteration (i.e. unspecified). Used by Phase
+    /// 12.3 (LMK) to derive per-package priority — "does this
+    /// package have any non-Trapped activity?" — without exposing
+    /// the records HashMap directly.
+    pub fn records(&self) -> impl Iterator<Item = &ActivityRecord> + '_ {
+        self.records.values()
+    }
+
     // ── Lifecycle drivers ────────────────────────────────────────────────
     //
     // Each driver takes `&mut self` *and* an `activity_access` closure that
