@@ -638,6 +638,14 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
         drain_trapped_packages_into(fw);
     }
 
+    // P0 #1 — drain any save_state futures the worker has answered
+    // since last frame. Persists the bytes (or deletes the slot on
+    // empty save). Empty queue is the common case so the call is
+    // effectively free outside of finish-bursts.
+    if let Some(fw) = k.framework.as_mut() {
+        fw.drive_pending_saves();
+    }
+
     // Drain all queued events and dispatch.
     while let Some(ev) = k.events.pop() {
         k.handle_event(ev);

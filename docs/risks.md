@@ -131,15 +131,15 @@ A self-audit after Stone 11.5 closed (process isolation + fault containment work
 
 **Code surfaces.** `sdk-rust/src/activity.rs` (replace `block_on_ready`), `sdk-rust/src/runtime.rs` (dispatch glue), `runtime/web/app_worker_shell.js` (resumption protocol), `framework/src/wasm_activity.rs` (lifecycle pipelining). Detailed plan in [`docs/sdk-rust.md` §19.1](sdk-rust.md).
 
-### 7.2 🟡 `on_save_state` degraded under cross-worker
+### 7.2 ✅ `on_save_state` degraded under cross-worker — fixed (P0 #1, May 2026)
 
-**Concern.** `WasmActivity::save_state_bytes` calls `host.save_state()` + `poll_future()` inline. Post-11.4c the first poll always returns `Pending`; release builds silently fall through to `Vec::new()`. **Phase 6 saved-state is broken in production.**
+**Was.** `WasmActivity::save_state_bytes` called `host.save_state()` + `poll_future()` inline. Post-11.4c the first poll always returned `Pending`; release builds silently fell through to `Vec::new()`. Phase 6 saved-state was broken in production.
 
-**Why deferred.** The save_state fix needs the same pipelining trick we used for render but applied to the pause→stop transition (multi-frame). Coupled with the framework state machine. Roughly 30-45 min of focused work but waited on the audit pass.
+**Fix.** Added `Activity::dispatch_save_state_async(&self) -> u64` to the trait. `WasmActivity` overrides it to dispatch `save_state` and return the `future_id`; the legacy sync `save_state_bytes` returns empty for wasm activities. `Framework::destroy_with_persist` records a `PendingSave { future_id, package_id, class }` before walking pause→stop→destroy (worker FIFO handles all four in order). New `Framework::drive_pending_saves`, called once per frame from `akiva_frame`, polls each entry and persists the bytes when the worker replies. Empty bytes delete the entry; `Err` drops the entry without persisting.
 
-**Trigger to promote.** ALWAYS — as soon as the first foundation-hardening pass starts. This is P0.
+In-process activities are unchanged — they still go through the sync `save_state_bytes` path, which `destroy_with_persist` consults only when `dispatch_save_state_async` returned `0`.
 
-**Code surfaces.** `framework/src/wasm_activity.rs` (`save_state_bytes` signature change), `framework/src/lib.rs` (`drive_to_state(Stopped)` becomes async-aware). Detailed plan in [`docs/sdk-rust.md` §19.2](sdk-rust.md).
+**Code.** `framework/src/{activity.rs, wasm_activity.rs, activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Two new tests: `drive_pending_saves_persists_when_future_resolves`, `drive_pending_saves_drops_entry_on_host_error`. 391 Rust tests + 54 vitest tests green.
 
 ### 7.3 🟡 No graceful shutdown signal
 

@@ -109,6 +109,7 @@ pub fn boot(
         pending_result: HashMap::new(),
         task_history: Vec::new(),
         host: host.clone(),
+        pending_saves: Vec::new(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -365,6 +366,36 @@ pub struct Framework {
     /// dispatch resolves inline so no slot ever opens — the field is
     /// dormant. 11.4c populates it when WorkerHost defers.
     host: Rc<dyn WasmHost>,
+    /// P0 #1 — in-flight `save_state` dispatches the destroy-path fired
+    /// at the worker. The dispatch returns a future_id but the bytes
+    /// arrive 1+ frames later (worker FIFO processes pause→save→stop→
+    /// destroy in order, but the kernel can't synchronously block on
+    /// the reply). [`Framework::drive_pending_saves`] polls each entry
+    /// once per frame and persists the bytes when the worker answers.
+    /// Storage key + activity meta is captured at dispatch time so the
+    /// activity record can vanish under us before the bytes resolve.
+    pending_saves: Vec<PendingSave>,
+}
+
+/// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
+/// [`Framework::pending_saves`] from dispatch (inside
+/// `destroy_with_persist`) until [`Framework::drive_pending_saves`]
+/// observes the future as resolved and persists / deletes the storage
+/// entry. The activity instance itself may already be Destroyed and
+/// gone from `ActivityManager` by then — the pending entry holds its
+/// own copy of `(package_id, class)` so persistence doesn't depend on
+/// record lookup.
+#[derive(Debug)]
+struct PendingSave {
+    future_id: u64,
+    package_id: String,
+    class: String,
+    /// Frame timestamp at dispatch. Future deadline / watchdog hookup
+    /// land with the next foundation pass — for now we trust the
+    /// underlying worker watchdog to eventually trap and `Err` the
+    /// future, which `drive_pending_saves` drops without persisting.
+    #[allow(dead_code)]
+    started_at_ms: f64,
 }
 
 impl Framework {
@@ -495,6 +526,52 @@ impl Framework {
                     self.activities.cancel_pending(id);
                 }
             }
+        }
+    }
+
+    /// P0 #1 — drain the in-flight `save_state` futures opened by
+    /// `destroy_with_persist`. Each frame the kernel calls this once;
+    /// every entry whose future has resolved gets its bytes written to
+    /// storage (or the existing entry deleted, on empty bytes), and is
+    /// dropped from the queue. Pending entries stay; errored entries
+    /// are dropped without persisting (the bytes the worker would have
+    /// produced are lost — the activity trapped or the dispatch was
+    /// rejected).
+    ///
+    /// Empty queue is the common case. Worst-case work per frame is
+    /// O(activities-being-destroyed-this-tick), which is bounded by
+    /// the user's tap rate on Back / launcher.
+    pub fn drive_pending_saves(&mut self) {
+        if self.pending_saves.is_empty() {
+            return;
+        }
+        // Two-pass to satisfy the borrow checker: poll all futures
+        // (immutable host borrow) and collect the resolutions, then
+        // mutate `pending_saves` and `storage` separately. Using
+        // `Vec::retain_mut` plus a closure that touches both fields
+        // doesn't compose because `self.host.poll_future` and
+        // `self.storage` come from the same `&mut self`.
+        let host: &dyn WasmHost = &*self.host;
+        let mut to_persist: Vec<(String, String, Vec<u8>)> = Vec::new();
+        self.pending_saves.retain(|ps| {
+            match host.poll_future(ps.future_id) {
+                None => true,  // still in flight, keep
+                Some(Ok(bytes)) => {
+                    to_persist.push((ps.package_id.clone(), ps.class.clone(), bytes));
+                    false
+                }
+                Some(Err(_e)) => {
+                    // Worker trapped or rejected the dispatch. Drop the
+                    // entry without persisting — best we can do is leave
+                    // the prior storage entry (if any) untouched. A
+                    // future watchdog hookup may want to log this; for
+                    // now silent-drop matches drive_pending_transitions.
+                    false
+                }
+            }
+        });
+        for (pkg, class, bytes) in to_persist {
+            self.persist_saved_state(&pkg, &class, &bytes);
         }
     }
 
@@ -1101,15 +1178,40 @@ impl Framework {
     /// activity with the same save-state discipline. Does NOT touch
     /// `self.stack` — the caller is responsible for mirror bookkeeping.
     fn destroy_with_persist(&mut self, id: ActivityId, ts: f64) {
-        // Collect (package_id, class) first so the later storage.write
-        // call doesn't need to reach through the (still-borrowed)
-        // activity manager.
+        // Collect (package_id, class) first so later storage / pending-
+        // save bookkeeping doesn't need to reach through the (still-
+        // borrowed) activity manager.
         let meta = self.activities.record(id)
             .map(|r| (r.package_id.clone(), r.class.clone()));
 
+        // P0 #1 — fire the cross-worker `save_state` dispatch BEFORE
+        // walking pause→stop→destroy. The worker queue handles all four
+        // FIFO, so save runs ahead of stop/destroy on the worker side
+        // even though every dispatch returns to us immediately. A
+        // non-zero future_id means real bytes are in flight; we record
+        // a `PendingSave` and let `drive_pending_saves` persist them
+        // when the worker replies. A `0` future_id means either an
+        // in-process activity (no async save) or a wasm activity with
+        // nothing to save — in the in-process case we fall back to the
+        // sync `save_state_bytes` path inside the destroy walk below.
+        let async_save_id = self.activities
+            .with_instance_ret(id, |a| a.dispatch_save_state_async())
+            .unwrap_or(0);
+        if async_save_id != 0 {
+            if let Some((pkg, class)) = &meta {
+                self.pending_saves.push(PendingSave {
+                    future_id: async_save_id,
+                    package_id: pkg.clone(),
+                    class: class.clone(),
+                    started_at_ms: ts,
+                });
+            }
+        }
+
         let metrics = self.metrics;
         let pointer = self.pointer;
-        let mut save_bytes: Option<Vec<u8>> = None;
+        let mut sync_save_bytes: Option<Vec<u8>> = None;
+        let async_in_flight = async_save_id != 0;
         self.activities.destroy(id, |a, new_state| {
             let mut finish = false;
             let mut launch: Option<Intent> = None;
@@ -1125,14 +1227,22 @@ impl Framework {
             match new_state {
                 LifecycleState::Paused => a.on_pause(&mut ctx),
                 LifecycleState::Stopped => {
-                    save_bytes = Some(a.save_state_bytes());
+                    // Only consult the sync path when no async save is
+                    // in flight — for wasm activities the async result
+                    // is the source of truth. Calling save_state_bytes
+                    // here would be a wasted host round-trip (the
+                    // WasmActivity impl deliberately returns empty so
+                    // the legacy path doesn't double-fire).
+                    if !async_in_flight {
+                        sync_save_bytes = Some(a.save_state_bytes());
+                    }
                     a.on_stop(&mut ctx);
                 }
                 LifecycleState::Destroyed => a.on_destroy(&mut ctx),
                 _ => {}
             }
         });
-        if let (Some((pkg, class)), Some(bytes)) = (meta, save_bytes) {
+        if let (Some((pkg, class)), Some(bytes)) = (meta, sync_save_bytes) {
             self.persist_saved_state(&pkg, &class, &bytes);
         }
     }
@@ -1309,6 +1419,7 @@ mod tests {
             pending_result: HashMap::new(),
             task_history: Vec::new(),
             host: BootMockHost::new(),
+            pending_saves: Vec::new(),
         }
     }
 
@@ -2365,6 +2476,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             pending_result: HashMap::new(),
             task_history: Vec::new(),
             host: host.clone(),
+            pending_saves: Vec::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -2409,6 +2521,168 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
         assert_eq!(fw.activities.state_of(id), Some(activity_manager::LifecycleState::Created));
         assert!(fw.activities.pending_of(id).is_none(),
             "slot must clear once the future resolves");
+    }
+
+    #[test]
+    fn drive_pending_saves_persists_when_future_resolves() {
+        // P0 #1 — `destroy_with_persist` fires `save_state` at the
+        // worker, returns immediately, and stashes a `PendingSave`. On
+        // a later frame `drive_pending_saves` polls the future, picks
+        // up the bytes, and writes them to storage. The activity
+        // record may be gone by then (destroy ran inline) so the
+        // pending entry holds its own copy of (pkg, class).
+        //
+        // Test shape: build a Framework with a SaveHost that holds the
+        // future open until the test arms it. Push a PendingSave by
+        // hand (private field — same pattern as deferred_fw). Verify:
+        //   1. drive before arm → entry stays, storage untouched
+        //   2. drive after arm → entry drops, storage write happens
+        struct SaveHost {
+            armed: RefCell<std::collections::HashMap<u64, Vec<u8>>>,
+            pending: RefCell<std::collections::HashSet<u64>>,
+            next_handle: RefCell<u32>,
+        }
+        impl SaveHost {
+            fn new() -> Rc<Self> {
+                Rc::new(Self {
+                    armed: RefCell::new(std::collections::HashMap::new()),
+                    pending: RefCell::new(std::collections::HashSet::new()),
+                    next_handle: RefCell::new(1),
+                })
+            }
+            fn arm(&self, future_id: u64, bytes: Vec<u8>) {
+                self.pending.borrow_mut().remove(&future_id);
+                self.armed.borrow_mut().insert(future_id, bytes);
+            }
+            fn open_pending(&self, future_id: u64) {
+                self.pending.borrow_mut().insert(future_id);
+            }
+        }
+        impl WasmHost for SaveHost {
+            fn register(&self, _: &str, _: &str) -> Option<wasm_activity::AppHandle> {
+                let mut n = self.next_handle.borrow_mut();
+                let h = *n; *n += 1;
+                wasm_activity::AppHandle::new(h)
+            }
+            fn unregister(&self, _: wasm_activity::AppHandle) {}
+            fn lifecycle(&self, _: wasm_activity::AppHandle, _: wasm_activity::LifecycleTransition) -> u64 { 0 }
+            fn pointer(&self, _: wasm_activity::AppHandle, _: activity::PointerEvent, _: f64) -> u64 { 0 }
+            fn key(&self, _: wasm_activity::AppHandle, _: activity::KeyEvent, _: f64) -> u64 { 0 }
+            fn resize(&self, _: wasm_activity::AppHandle, _: SurfaceMetrics) -> u64 { 0 }
+            fn render(&self, _: wasm_activity::AppHandle, _: f64) -> u64 { 0 }
+            fn poll_future(&self, future_id: u64) -> Option<Result<Vec<u8>, String>> {
+                if let Some(b) = self.armed.borrow_mut().remove(&future_id) {
+                    Some(Ok(b))
+                } else if self.pending.borrow().contains(&future_id) {
+                    None
+                } else {
+                    Some(Err(format!("unknown future_id {future_id:#x}")))
+                }
+            }
+        }
+
+        let host = SaveHost::new();
+        host.open_pending(7);
+
+        // Build a Framework with a MemoryStorage so we can inspect
+        // what got written.
+        let mut fw = Framework {
+            activities: ActivityManager::new(),
+            packages: package_manager::PackageManager::new(),
+            windows: window_manager::WindowManager::new(),
+            resources: resources::ResourceManager::new(),
+            intents: intent::IntentRouter::new(),
+            permissions: permissions::PermissionController::new(),
+            compositor: Compositor::new(),
+            metrics: SurfaceMetrics::default(),
+            pointer: None,
+            stack: Vec::new(),
+            storage: Some(Box::new(storage::MemoryStorage::new())),
+            pending_result_for: HashMap::new(),
+            pending_result: HashMap::new(),
+            task_history: Vec::new(),
+            host: host.clone(),
+            pending_saves: Vec::new(),
+        };
+        // Push the entry by hand — the integration path lives in
+        // `destroy_with_persist`; here we exercise `drive_pending_saves`
+        // in isolation so a regression in either side fails its own
+        // test.
+        fw.pending_saves.push(PendingSave {
+            future_id: 7,
+            package_id: "com.example".into(),
+            class: "MainActivity".into(),
+            started_at_ms: 0.0,
+        });
+
+        // Frame 1 — host hasn't replied yet. Entry stays, storage is
+        // empty.
+        fw.drive_pending_saves();
+        assert_eq!(fw.pending_saves.len(), 1,
+            "unresolved future must stay queued");
+        let key = package_manager::key_saved_state("com.example", "MainActivity");
+        assert!(matches!(
+            fw.storage.as_ref().unwrap().read(&key),
+            Err(storage::StorageError::NotFound),
+        ));
+
+        // Frame 2 — worker replied with the bytes. Entry drops, write
+        // hits storage.
+        host.arm(7, b"snapshot-bytes".to_vec());
+        fw.drive_pending_saves();
+        assert!(fw.pending_saves.is_empty(),
+            "resolved future must drop from the queue");
+        let read = fw.storage.as_ref().unwrap().read(&key).unwrap();
+        assert_eq!(read, b"snapshot-bytes");
+    }
+
+    #[test]
+    fn drive_pending_saves_drops_entry_on_host_error() {
+        // Trap / dispatch-rejected: pending entry drops without
+        // persisting. The prior storage value (if any) stays — the
+        // bytes the worker would have produced are simply lost. Same
+        // policy as `drive_pending_transitions` on Err.
+        struct ErrHost;
+        impl WasmHost for ErrHost {
+            fn register(&self, _: &str, _: &str) -> Option<wasm_activity::AppHandle> {
+                wasm_activity::AppHandle::new(1)
+            }
+            fn unregister(&self, _: wasm_activity::AppHandle) {}
+            fn lifecycle(&self, _: wasm_activity::AppHandle, _: wasm_activity::LifecycleTransition) -> u64 { 0 }
+            fn pointer(&self, _: wasm_activity::AppHandle, _: activity::PointerEvent, _: f64) -> u64 { 0 }
+            fn key(&self, _: wasm_activity::AppHandle, _: activity::KeyEvent, _: f64) -> u64 { 0 }
+            fn resize(&self, _: wasm_activity::AppHandle, _: SurfaceMetrics) -> u64 { 0 }
+            fn render(&self, _: wasm_activity::AppHandle, _: f64) -> u64 { 0 }
+            fn poll_future(&self, _: u64) -> Option<Result<Vec<u8>, String>> {
+                Some(Err("simulated trap".into()))
+            }
+        }
+        let mut fw = Framework {
+            activities: ActivityManager::new(),
+            packages: package_manager::PackageManager::new(),
+            windows: window_manager::WindowManager::new(),
+            resources: resources::ResourceManager::new(),
+            intents: intent::IntentRouter::new(),
+            permissions: permissions::PermissionController::new(),
+            compositor: Compositor::new(),
+            metrics: SurfaceMetrics::default(),
+            pointer: None,
+            stack: Vec::new(),
+            storage: Some(Box::new(storage::MemoryStorage::new())),
+            pending_result_for: HashMap::new(),
+            pending_result: HashMap::new(),
+            task_history: Vec::new(),
+            host: Rc::new(ErrHost),
+            pending_saves: vec![PendingSave {
+                future_id: 99,
+                package_id: "com.bad".into(),
+                class: "Crash".into(),
+                started_at_ms: 0.0,
+            }],
+        };
+        fw.drive_pending_saves();
+        assert!(fw.pending_saves.is_empty(),
+            "Err must drop the entry even though we don't persist anything");
     }
 
     #[test]

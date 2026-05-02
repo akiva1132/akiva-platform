@@ -481,6 +481,19 @@ impl ActivityManager {
         }
     }
 
+    /// Like [`Self::with_instance`] but returns the closure's value (or
+    /// `None` if the instance isn't live). Used by Framework helpers
+    /// that need to read a method's return value out of the borrow —
+    /// e.g. `dispatch_save_state_async` returning a future_id the
+    /// framework records for later polling.
+    pub fn with_instance_ret<R>(
+        &mut self,
+        id: ActivityId,
+        f: impl FnOnce(&mut dyn Activity) -> R,
+    ) -> Option<R> {
+        self.instances.get_mut(&id).map(|inst| f(inst.as_mut()))
+    }
+
     // ── Stone 11.4a-5: deferred lifecycle plumbing ───────────────────────
     //
     // `pending` slots are populated by the deferred dispatch path (Stone

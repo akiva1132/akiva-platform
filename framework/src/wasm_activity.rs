@@ -480,16 +480,23 @@ impl Activity for WasmActivity {
     }
 
     fn save_state_bytes(&self) -> Vec<u8> {
-        let future_id = self.host.save_state(self.handle);
-        if future_id == 0 { return Vec::new(); }
-        match self.host.poll_future(future_id) {
-            Some(Ok(bytes)) => bytes,
-            other => {
-                debug_assert!(false,
-                    "Stone 11.4a: save_state expected Some(Ok(bytes)) sync, got {other:?}");
-                Vec::new()
-            }
-        }
+        // P0 #1 — cross-worker save can't return bytes synchronously
+        // (the worker hasn't even processed the dispatch by the time
+        // this returns). The framework calls
+        // [`Activity::dispatch_save_state_async`] instead and tracks
+        // the pending save through [`Framework::drive_pending_saves`].
+        // Returning empty here is the contract for "use the async path"
+        // — the framework only consults this when async returned 0.
+        Vec::new()
+    }
+
+    fn dispatch_save_state_async(&self) -> u64 {
+        // Fire-and-record. The framework records the future_id in its
+        // `pending_saves` list and polls once per frame; bytes are
+        // persisted whenever the worker replies. Empty save (host
+        // returns `0`) means the activity has nothing to save, and the
+        // framework treats the absent entry as a no-op.
+        self.host.save_state(self.handle)
     }
     fn restore_state_bytes(&mut self, bytes: &[u8]) {
         self.assert_sync("restore_state", self.host.restore_state(self.handle, bytes));
@@ -1086,14 +1093,48 @@ mod tests {
     }
 
     #[test]
-    fn save_state_bytes_delegates_to_host() {
+    fn dispatch_save_state_async_returns_future_id_and_polls_to_bytes() {
+        // P0 #1 — wasm activities serve save_state via the async
+        // pipeline: dispatch returns a future_id (non-zero when there
+        // are bytes), the framework polls and persists. The legacy sync
+        // `save_state_bytes` path now returns empty for wasm activities
+        // and the framework's destroy_with_persist routes through the
+        // async path instead.
         let host = Rc::new(MockHost::new());
         let handle = host.register("p", "c").unwrap();
         host.take_calls();
         host.set_save_bytes(vec![1, 2, 3, 4]);
         let act = WasmActivity::new(handle, host.clone());
-        let bytes = act.save_state_bytes();
-        assert_eq!(bytes, vec![1, 2, 3, 4]);
+
+        let future_id = act.dispatch_save_state_async();
+        assert_ne!(future_id, 0, "non-empty save bytes ⇒ non-zero future_id");
+        assert_eq!(host.take_calls(), vec![Call::SaveState(handle.get())]);
+
+        let resolved = host.poll_future(future_id);
+        match resolved {
+            Some(Ok(bytes)) => assert_eq!(bytes, vec![1, 2, 3, 4]),
+            other => panic!("expected Some(Ok(bytes)), got {other:?}"),
+        }
+
+        // Sync save_state_bytes no longer reaches the host — it short-
+        // circuits to empty.
+        assert!(act.save_state_bytes().is_empty());
+        assert!(host.take_calls().is_empty(),
+            "save_state_bytes must not re-dispatch when async path is used");
+    }
+
+    #[test]
+    fn dispatch_save_state_async_returns_zero_when_no_bytes() {
+        // The MockHost shortcuts to the `0` sentinel when the seeded
+        // save bytes are empty. The framework reads `0` as "nothing to
+        // save" and skips the pending_saves entry entirely.
+        let host = Rc::new(MockHost::new());
+        let handle = host.register("p", "c").unwrap();
+        host.take_calls();
+        let act = WasmActivity::new(handle, host.clone());
+
+        let future_id = act.dispatch_save_state_async();
+        assert_eq!(future_id, 0);
         assert_eq!(host.take_calls(), vec![Call::SaveState(handle.get())]);
     }
 

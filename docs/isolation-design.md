@@ -728,11 +728,10 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
 
 #### P0 — חייבים לסגור
 
-1. **`save_state` עובר דרך ה-pipeline (Stone 11.6+1)**
-   - **בעיה:** היום `WasmActivity::save_state_bytes` קורא `host.save_state` + `poll_future` באותה פריים. עם cross-worker dispatch ה-poll הראשון תמיד `Pending` → `block_on_ready` panics בdebug, או release מחזיר `Vec::new()` (degraded). ה-Phase 6 saved-state feature לא עובד בפועל אחרי 11.4c.
-   - **תיקון:** לאמץ את אותו דפוס שב-`render` — `pending_save_state: Option<u64>` ב-`WasmActivity`, drained בpause path בthe next frame לפני destroy. מורכבות בינונית: pause/destroy נוזל פעמיים על פני frames.
-   - **DoD:** test שמדמה pause→resume → activity רואה את ה-state שלה.
-   - **סקופ:** ~30-45 דק'.
+1. **✅ `save_state` עובר דרך ה-pipeline — תוקן (P0 #1, May 2026)**
+   - **תיקון בפועל:** `Activity::dispatch_save_state_async` חדש בtrait — `WasmActivity` override שלו מחזיר future_id מ-`host.save_state()`; הסנכרוני `save_state_bytes` מחזיר Vec::new() ל-wasm activities. Framework שדה חדש `pending_saves: Vec<PendingSave>`; `destroy_with_persist` רושם entry שם לפני walk pause→stop→destroy (worker FIFO מטפל בכולם). `Framework::drive_pending_saves` נקרא פעם בפריים מ-`akiva_frame`, polls each entry ו-persists ה-bytes כשה-worker עונה. Empty bytes → delete; `Err` → drop ללא persist.
+   - **In-process activities** ממשיכים סנכרוני (legacy `save_state_bytes` path) — Framework consults אותו רק כש-`dispatch_save_state_async` החזיר 0.
+   - **Code:** `framework/src/{activity.rs, wasm_activity.rs, activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Tests: `drive_pending_saves_persists_when_future_resolves`, `drive_pending_saves_drops_entry_on_host_error` (391 Rust tests + 54 vitest tests green).
 
 2. **Graceful shutdown (Stone 11.6+2)**
    - **בעיה:** סגירת tab או fin שלage הורגת apps בלי הודעה. אין הזדמנות ל-save_state. ה-OS אמיתי יודע "אני נסגר, היכון".

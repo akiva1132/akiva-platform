@@ -153,10 +153,27 @@ pub trait Activity: 'static {
     /// framework treats the bytes as opaque and never inspects them.
     ///
     /// Default returns empty, which the framework reads as "nothing to
-    /// save" and skips the storage write. That keeps in-kernel activities
-    /// (Shell, system settings) ignorant of the mechanism while
-    /// `WasmActivity` opts in by delegating to its wasm host.
+    /// save" and skips the storage write. In-kernel activities that need
+    /// synchronous save (test fixtures, future built-ins) override this.
+    /// Cross-worker `WasmActivity` overrides
+    /// [`Activity::dispatch_save_state_async`] instead — the worker
+    /// boundary makes a sync return impossible, so the bytes arrive on a
+    /// later frame via [`crate::Framework::drive_pending_saves`].
     fn save_state_bytes(&self) -> Vec<u8> { Vec::new() }
+
+    /// Cross-worker save: fire `save_state` at the host and return the
+    /// `future_id` the framework should poll. Default `0` means "no async
+    /// save" — the framework falls back to [`Activity::save_state_bytes`]
+    /// (the in-process sync path) inside the destroy walk. WasmActivity
+    /// returns the host's future_id so the framework records a
+    /// `PendingSave` and persists the bytes whenever the worker replies.
+    ///
+    /// Called once on the destroy edge (before pause→stop→destroy walks
+    /// the worker queue). The returned future_id outlives the activity's
+    /// handle on the host side — the JS AppRegistry keys dispatches by
+    /// id, not by handle, so unregister doesn't drop the in-flight
+    /// reply.
+    fn dispatch_save_state_async(&self) -> u64 { 0 }
 
     /// Restore previously-persisted bytes. Called after `on_create` and
     /// before `on_start` if the framework found bytes in storage keyed to

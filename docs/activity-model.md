@@ -128,13 +128,9 @@ impl App for MyApp {
 - Serializable types בלבד
 - **לא** למטרות persistence ארוכת-טווח — זה לצורך recovery בלבד
 
-> **⚠️ Stone 11.4c regression — `on_save_state` degraded** (May 2026)
+> **✅ Stone 11.4c regression — `on_save_state` degraded — תוקן (P0 #1, May 2026)**
 >
-> אחרי המעבר ל-worker-per-app, ה-Phase 6 saved-state feature **לא עובד בפועל**. ה-`WasmActivity::save_state_bytes` בframework קורא ל-`host.save_state()` ואז `host.poll_future()` באותה פריים — אבל עם cross-worker dispatch ה-poll הראשון תמיד `Pending` (ה-worker לא הספיק לרוץ). ב-debug build זה panic; ב-release build זה fall-through שקט עם `Vec::new()`.
->
-> **תוצאה:** apps שמסתמכים על on_save_state/on_restore_state יראו ש-state נמחק בכל pause→stop→resume cycle.
->
-> **תיקון מתוכנן (Stone 11.6+1):** pipeline בstate משתנה — `pending_save: Option<u64>` ב-WasmActivity, dispatch ב-pause path, drain בframe הבא לפני stop. ראה [`docs/isolation-design.md` §10.5 P0 #1](isolation-design.md) ו-[`docs/sdk-rust.md` §19.2](sdk-rust.md). הסקופ של הtransition הופך multi-frame (Paused → wait for save_state ready → Stopped).
+> ה-fix: method חדש `Activity::dispatch_save_state_async(&self) -> u64`. `WasmActivity` override שלו מחזיר future_id מ-`host.save_state()`; ה-Framework מחזיק `pending_saves: Vec<PendingSave>` ו-`destroy_with_persist` רושם entry שם לפני pause→stop→destroy. method חדש `drive_pending_saves` נקרא פעם בפריים מ-`akiva_frame` ו-persists bytes כשה-worker עונה. In-process activities ממשיכים להשתמש ב-`save_state_bytes` הסנכרוני (legacy path). ראה [`docs/sdk-rust.md` §19.2](sdk-rust.md) ו-[`docs/risks.md` §7.2](risks.md).
 
 ### Persistent state
 

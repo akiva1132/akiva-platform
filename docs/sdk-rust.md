@@ -574,33 +574,15 @@ impl Activity for Notes {
 
 **תיקון ביניים (אופציונלי).** mini-executor שmamper רק את ה-`host_io_poll` case — הרבה פחות גנרי אבל יעיל יותר ל-MVP. נבחר רק אם ה-embassy bundle bloat (~10KB per app) הופך לבעיה אמיתית.
 
-### 19.2 🟡 `save_state` degraded under cross-worker
+### 19.2 ✅ `save_state` degraded under cross-worker — תוקן (P0 #1, May 2026)
 
-**הבעיה.** ה-`Activity::on_save_state` callback הוא חלק מchain pause→stop. ב-Stone 6 design, ה-bytes נכתבים ל-storage לpersistence.
+**הבעיה הייתה.** ב-Stone 11.4c, `WasmActivity::save_state_bytes` עשה `host.save_state()` + `poll_future()` באותו frame; cross-worker → poll הראשון תמיד `Pending` → release fall-through ל-`Vec::new()` → Phase 6 saved-state broken.
 
-ב-Stone 11.4c (worker-per-app), `WasmActivity::save_state_bytes` עושה:
-```rust
-let future_id = self.host.save_state(self.handle);
-match self.host.poll_future(future_id) {
-    Some(Ok(bytes)) => bytes,
-    other => { debug_assert!(false, ...); Vec::new() }  // ← release: silent
-}
-```
+**התיקון בפועל.** הוסיפו method חדש ל-`Activity` trait — `dispatch_save_state_async(&self) -> u64`. `WasmActivity` override שלו מחזיר את ה-`future_id` מ-`host.save_state()`; ה-`save_state_bytes` הסנכרוני מחזיר `Vec::new()` ל-wasm activities. ה-Framework מחזיק `pending_saves: Vec<PendingSave>`; ב-`destroy_with_persist` הוא קורא ל-`dispatch_save_state_async` לפני `pause→stop→destroy` (ה-worker FIFO מטפל בכולם בסדר), משאיר entry ב-pending_saves. method חדש `Framework::drive_pending_saves` נקרא פעם בכל frame מ-`akiva_frame`, polls כל future, ו-persists bytes כשה-worker עונה. ריק → delete; `Err` → drop ללא persist.
 
-עם cross-worker, ה-poll הראשון תמיד `None` (Pending) → release fall-through → empty Vec → app loses state.
+In-process activities (תsts, future built-ins) ממשיכים להשתמש ב-`save_state_bytes` הסנכרוני — ה-framework consults אותו רק כש-`dispatch_save_state_async` החזיר `0`.
 
-**מה זה משבר בפועל:**
-- App יוצא מ-foreground (Pause) — saved state ריק
-- App חוזר ל-foreground — `on_restore_state` מקבל empty bytes → app starts from default state
-- **Phase 6 saved-state is broken in production** under 11.4c.
-
-**התיקון.** pipeline בstate משתנה — ראה הדפוס שכבר הוצאנו ל-render:
-- `WasmActivity` שדה חדש `pending_save: Option<u64>`
-- בpause — dispatch save_state, store fid כ-pending
-- בdestroy — drain prior pending_save (poll). אם READY → use bytes. אם PENDING → wait one frame OR timeout.
-- ה-actual write לstorage קורה אחרי ה-drain.
-
-**הexpected complications:** ה-pause→stop chain עובר על הרבה frames מאחר ש-save_state חייב לresolve לפני stop יכול לרוץ. זה יוצר deferred lifecycle path עבור pause-only — דומה ל-render אבל לכל ה-pause/stop edge.
+**Code surfaces.** `framework/src/{activity.rs, wasm_activity.rs, activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Tests: `drive_pending_saves_persists_when_future_resolves` + `drive_pending_saves_drops_entry_on_host_error`.
 
 ### 19.3 🟡 Multi-frame side-effects (`storage::write` ו-`remove`)
 
