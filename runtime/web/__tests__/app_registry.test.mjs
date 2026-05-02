@@ -894,6 +894,106 @@ describe("watchdog tunability — Stone 11.6.7 #5", () => {
   });
 });
 
+// ── Stone 11.6.7 #4: lazy-spawn workers ───────────────────────────────
+
+/**
+ * Wire-format encoder mirroring `wire/src/pkgs.rs::encode`. Used by
+ * the lazy-spawn tests below to feed a multi-package snapshot into
+ * `setPackages` and verify only `sys.shell` gets pre-warmed.
+ */
+function encodePkgsBlob(pkgs) {
+  const enc = new TextEncoder();
+  const records = pkgs.map(([id, cls, name]) => [enc.encode(id), enc.encode(cls), enc.encode(name)]);
+  const total = 4 + records.reduce((sum, [a, b, c]) => sum + 2 + a.length + 2 + b.length + 2 + c.length, 0);
+  const blob = new Uint8Array(total);
+  const view = new DataView(blob.buffer);
+  view.setUint32(0, records.length, true);
+  let off = 4;
+  for (const [id, cls, name] of records) {
+    view.setUint16(off, id.length, true);  off += 2; blob.set(id, off);  off += id.length;
+    view.setUint16(off, cls.length, true); off += 2; blob.set(cls, off); off += cls.length;
+    view.setUint16(off, name.length, true); off += 2; blob.set(name, off); off += name.length;
+  }
+  return blob;
+}
+
+describe("lazy-spawn workers — Stone 11.6.7 #4", () => {
+  it("warmup pre-spawns sys.shell only, leaves the rest to register()", () => {
+    const { registry } = makeRegistry();
+    // Encode a snapshot with sys.shell + 3 user apps.
+    const blob = encodePkgsBlob([
+      ["sys.shell", "ShellActivity", "Shell"],
+      ["com.akiva.calc", "Calc", "Calculator"],
+      ["com.akiva.hello", "MainActivity", "Hello"],
+      ["com.akiva.ttt", "Game", "Tic-Tac-Toe"],
+    ]);
+    registry.setPackages(blob);
+
+    // Warmup runs after a setTimeout(0); flush microtasks/macrotasks
+    // by manually invoking it (the production timer runs on real
+    // wall time, which we don't want vitest to wait for).
+    registry._warmupWorkers();
+
+    expect(registry._processes.has("sys.shell")).toBe(true);
+    expect(registry._processes.has("com.akiva.calc")).toBe(false);
+    expect(registry._processes.has("com.akiva.hello")).toBe(false);
+    expect(registry._processes.has("com.akiva.ttt")).toBe(false);
+    expect(registry._processes.size).toBe(1);
+  });
+
+  it("an empty package snapshot pre-spawns nothing", () => {
+    const { registry } = makeRegistry();
+    registry.setPackages(encodePkgsBlob([]));
+    registry._warmupWorkers();
+    expect(registry._processes.size).toBe(0);
+  });
+
+  it("a snapshot without sys.shell pre-spawns nothing (no implicit fallback)", () => {
+    const { registry } = makeRegistry();
+    registry.setPackages(encodePkgsBlob([
+      ["com.akiva.calc", "Calc", "Calculator"],
+      ["com.akiva.hello", "MainActivity", "Hello"],
+    ]));
+    registry._warmupWorkers();
+    expect(registry._processes.size).toBe(0);
+  });
+
+  it("register lazily spawns a non-shell package on first use", () => {
+    const { registry } = makeRegistry();
+    registry.setPackages(encodePkgsBlob([
+      ["sys.shell", "ShellActivity", "Shell"],
+      ["com.akiva.calc", "Calc", "Calculator"],
+    ]));
+    registry._warmupWorkers();
+    expect(registry._processes.size).toBe(1);
+
+    // First register on the non-shell package triggers spawn.
+    registry.register("com.akiva.calc", "Calc");
+    expect(registry._processes.has("com.akiva.calc")).toBe(true);
+    expect(registry._processes.size).toBe(2);
+  });
+
+  it("repeated register on the same package keeps the worker alive (no respawn)", () => {
+    const { registry } = makeRegistry();
+    registry.register("com.akiva.calc", "Calc");
+    const procFirst = registry._processes.get("com.akiva.calc");
+    expect(procFirst).toBeDefined();
+
+    // unregister every handle the registry minted (simulates the
+    // app finishing all activities). The proc record stays —
+    // `unregister` only drops handle slots, not the worker.
+    for (const [handle] of registry._slots) {
+      registry.unregister(handle);
+    }
+    expect(registry._processes.get("com.akiva.calc")).toBe(procFirst);
+
+    // Second register reuses the same proc — the existence check
+    // in `register()` short-circuits the spawn.
+    registry.register("com.akiva.calc", "Calc");
+    expect(registry._processes.get("com.akiva.calc")).toBe(procFirst);
+  });
+});
+
 // ── Phase 12.1: per-package memory accounting ─────────────────────────
 
 describe("memoryCurrent — kernel reads last pong-reported byteLength", () => {

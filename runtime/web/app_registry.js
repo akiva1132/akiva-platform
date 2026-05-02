@@ -22,6 +22,15 @@ import { fontString } from "./renderer/canvas2d.js";
 import { STATUS, FIRE, IO } from "./op_kinds.mjs";
 import { WATCHDOG, effectiveWatchdog } from "./config.js";
 
+/**
+ * Package id of the system shell — the launcher activity the
+ * framework brings up at boot. Hot-spawned by `_warmupWorkers` so
+ * the first paint isn't gated on a wasm compile; every other
+ * package spawns lazily via `register()` on first use (Stone
+ * 11.6.7 #4).
+ */
+const HOME_PACKAGE_ID = "sys.shell";
+
 export class AppRegistry {
   /**
    * @param {object} deps
@@ -204,33 +213,39 @@ export class AppRegistry {
   }
 
   /**
-   * Stone 11.4c — proactively spawn workers for every installed
-   * package so the first launch is hot. Driven from the package
-   * snapshot the framework hands us via `setPackages`; missing
-   * wasm in storage is a benign skip (`_spawnProcess` logs and
-   * returns null). Idempotent: re-running is a no-op for already-
-   * spawned packages.
+   * Stone 11.6.7 #4 — pre-spawn only the system shell (`sys.shell`).
+   *
+   * Pre-Stone 11.6.7, this method walked the entire `_packagesBlob`
+   * and spawned a worker for every installed package on boot. With
+   * 4 apps that was fine; with 100 apps it's 100 idle workers
+   * burning ~10 MiB of wasm memory each before the user has clicked
+   * anything. `register(packageId, ...)` already lazily spawns on
+   * first use (see line ~276); the only worker that genuinely needs
+   * to be hot at boot is the home, because the framework launches
+   * it immediately and a cold compile delays the first paint.
+   *
+   * Now: scan the snapshot, find `sys.shell`, spawn it. Every other
+   * package waits for `register` to demand a worker. Cold-start
+   * cost (~150ms wasm compile per app) shifts to first-launch — a
+   * fair price for not running 95 idle workers.
+   *
+   * Future refinement: persist a "recently-used apps" hint to
+   * storage and pre-warm those too. Out of scope for this stone.
    */
   _warmupWorkers() {
-    const decoder = this._decoder;
     const blob = this._packagesBlob;
     if (blob.length < 4) return;
+    // SCHEMA: this format is owned by `wire/src/pkgs.rs` in the
+    // Rust workspace (Stone 11.6.7 #2). Both framework and SDK
+    // pull encode/decode from `akiva-wire`; this JS reader mirrors
+    // the same layout because it can't depend on a Rust crate.
+    // Layout per entry:
+    //   [u16 LE id_len][id][u16 LE class_len][class][u16 LE name_len][name]
+    const decoder = this._decoder;
     const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
     const count = view.getUint32(0, true);
     let off = 4;
     for (let i = 0; i < count; i++) {
-      // SCHEMA: this format is owned by `wire/src/pkgs.rs` in the
-      // Rust workspace (Stone 11.6.7 #2). Both framework and SDK
-      // pull encode/decode from `akiva-wire`; this JS reader mirrors
-      // the same layout because it can't depend on a Rust crate.
-      // When the wire format changes, update both sides in lockstep:
-      //   1. wire/src/pkgs.rs    (the canonical decoder + tests)
-      //   2. this loop           (mirrored byte walk)
-      //
-      // Layout per entry:
-      //   [u16 LE id_len][id][u16 LE class_len][class][u16 LE name_len][name]
-      //
-      // We only need the id here; class + name get skipped past.
       if (off + 2 > blob.length) return;
       const idLen = view.getUint16(off, true); off += 2;
       if (off + idLen > blob.length) return;
@@ -242,8 +257,10 @@ export class AppRegistry {
       if (off + 2 > blob.length) return;
       const nameLen = view.getUint16(off, true); off += 2 + nameLen;
 
-      if (!this._processes.has(id)) {
-        // Fire-and-forget; failures log inside _spawnProcess.
+      if (id === HOME_PACKAGE_ID && !this._processes.has(id)) {
+        // Pre-warm the home. Fire-and-forget; failures log inside
+        // `_spawnProcess`. Every other package id is intentionally
+        // skipped — it spawns lazily on its first `register` call.
         this._spawnProcess(id);
       }
     }

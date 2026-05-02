@@ -270,15 +270,13 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Code surfaces.** [`runtime/web/app_worker_shell.js`](../runtime/web/app_worker_shell.js), [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) (storage_invalidate broadcast on uninstall). `sdk-rust/src/storage.rs` unchanged — the migration is transparent.
 
-### 7.14 🟡 Pre-warm-all workers — promoted to Stone 11.6.7
+### 7.14 ✅ Lazy-spawn workers — fixed (Stone 11.6.7 #4, May 2026)
 
-**Concern.** [`runtime/web/app_registry.js::_warmupWorkers`](../runtime/web/app_registry.js) (Stone 11.4c-6) spawns a Web Worker for every installed package at boot. With 4 apps it's a one-time ~160ms cost; with 100 apps it's ~4 seconds of boot delay plus 100 idle workers consuming memory. Real OSes spawn lazily; Android's zygote even pre-forks for cheap dispatch but doesn't keep idle apps alive.
+**What was wrong.** `_warmupWorkers` (Stone 11.4c-6) spawned a Web Worker for every installed package at boot. 4 apps was fine; 100 apps would burn ~4s of boot delay plus 95 idle workers' worth of wasm memory before the user clicked anything.
 
-**Why deferred (until now).** Pre-warm was the simplest "no first-click latency" fix in 11.4c. The May 2026 audit flagged it as an anti-pattern that won't scale and promoted it to 11.6.7.
+**Fix in place.** `_warmupWorkers` now scans the snapshot, finds `sys.shell`, and spawns only that one worker. Every other package waits for `register(packageId, ...)` to demand a worker — that path was already lazy and just wasn't being exercised because the warmup pre-empted it. `HOME_PACKAGE_ID` is a const at module top so the home identity is one-place to change.
 
-**Trigger.** Stone 11.6.7 owns this. Implementation: pre-warm only `sys.shell` (always needed); spawn-on-demand for everything else; cache by package_id once spawned. See [ROADMAP.md Stone 11.6.7 פריט 4](../ROADMAP.md).
-
-**Code surfaces.** [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) — `_warmupWorkers` and `launch_app` paths.
+**Code.** [`runtime/web/app_registry.js`](../runtime/web/app_registry.js) — `_warmupWorkers` body + new `HOME_PACKAGE_ID` const. Tests: 5 new vitest cases (warmup pre-spawns shell only, empty snapshot is no-op, snapshot without shell is no-op, register lazily spawns non-shell, repeated register doesn't respawn). 73 vitest green.
 
 ---
 
