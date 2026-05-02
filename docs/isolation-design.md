@@ -750,16 +750,13 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
      - Kernel קורא `fw.reap_trapped(timestamp_ms, TRAPPED_GRACE_MS)` כל frame מ-`akiva_frame`. `TRAPPED_GRACE_MS = 30_000.0` (30s) — מספיק זמן ל-debugger pause / tap-to-restart UI עתידי לקחת את ה-record explicitly לפני ה-recycle.
    - **Code.** `framework/src/{activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::{akiva_frame, drain_trapped_packages_into}`. Tests: 5 חדשים (mark_trapped stamps timestamp; reap_trapped_ids filters; reap drops record+instance; reap refuses non-Trapped; reap survives missing timestamp; framework wrapper end-to-end).
 
-4. **🔴 SDK async executor — embassy או ידני (Stone 11.6+4)**
-   - **בעיה הקרדינלית:** ה-`Activity` trait הוא `async fn`, אבל ה-executor (`block_on_ready` ב-`sdk-rust/src/activity.rs`) panics על `Pending`. כל future שלא נפתר ב-poll הראשון (storage::read, network call עתידי, cross-worker host_op) חייב להיות wrapped ב-deferred-handle pattern מסורבל. ה-API מ"async fn מודרני" → "callback-soup with manual handles".
-   - **תיקון מלא (embassy):**
-     - הוספת `embassy-executor` כdep ל-`sdk-rust`
-     - replace `block_on_ready` עם executor שמכין tasks, מחזיק waker registry
-     - שינוי ב-`akiva_app_dispatch` protocol — מסוגל לחזור עם "future_id mid-callback" — ה-worker shell שומר את ה-future state בין postMessages
-     - kernel poll → worker shell wakes the right task → continues execution → eventually posts `dispatch_done`
-   - **תיקון מינימלי (custom):** writeexecutor של פעולות-Pending-yield שהוא יחסית מצומצם ל-host_io_poll case בלבד. פחות גנרי אבל יספיק ל-storage / future capabilities.
-   - **DoD:** `let bytes = storage::read("k").await;` עובד באפליקציה אמיתית. notes app יוכל לקרוא state באופן fluent.
-   - **סקופ:** 1-2 ימי עבודה לembassy מלאה. ~半ה-day לcustom mini-executor.
+4. **✅ SDK async executor — תוקן (P0 #4, May 2026)**
+   - **תיקון בפועל (custom mini-executor + breaking ABI):** ABI חדש (`ABI_VERSION=0.2.0`) — `akiva_app_dispatch(dispatch_id, cmd, ptr, len) -> u32`, `akiva_app_poll_dispatch(dispatch_id) -> u64 packed`, `akiva_app_get_result(dispatch_id, ...)`. הruntime מחזיק `Pin<Box<dyn Future + 'static>>` per-slot, captured-by-raw-ptr ל-(activity, ctx). Self-referential אבל סגור — heap-pinned slots + framework guarantee של dispatch-per-handle אחד.
+   - **App worker shell:** `pendingDispatches: Map`, re-polls על `host_op_done` (כל pending dispatch יכול להיות parked על ה-future הזה).
+   - **Storage::read** הופך ל-real `Future` — `let bytes = storage::read("k").await` עובד fluent. ReadHandle נמחק.
+   - **Render + save_state** נשארים sync-only (`executor::run_to_ready` panics on Pending — paint code לא צריך לחכות).
+   - **Why not embassy:** ~10KB bundle bloat שלא מגיע על features שלא צריך (timer drivers, interrupt wakers). Custom 120-line executor tightly fitted לcase שלנו.
+   - **Code:** `sdk-rust/src/{executor.rs (new), runtime.rs, storage.rs, lib.rs, activity.rs}`, `runtime/web/app_worker_shell.js`, `docs/abi.md §2.2.2/2.2.3`. Tests: 9 חדשים. 407 Rust + 54 vitest green.
 
 #### P1 — אם יש זמן, גם:
 

@@ -99,7 +99,13 @@ function postTrapped(reason) {
   postMessage({ type: "trapped", reason });
 }
 
-// ── Required app exports — same list as AppRegistry post-11.4b-5 ───────
+// ── Required app exports ───────────────────────────────────────────────
+//
+// P0 #4 added `akiva_app_poll_dispatch` to support async-resumable
+// dispatches. The shell allocates a `dispatch_id`, hands it to wasm
+// via the new `dispatch(dispatch_id, cmd, ptr, len)` ABI, polls via
+// `poll_dispatch(dispatch_id)`, and re-polls on every `host_op_done`
+// arrival until the dispatch reaches READY/ERROR.
 
 const REQUIRED_EXPORTS = [
   "memory",
@@ -107,8 +113,31 @@ const REQUIRED_EXPORTS = [
   "akiva_app_dealloc",
   "akiva_app_abi_version",
   "akiva_app_dispatch",
+  "akiva_app_poll_dispatch",
   "akiva_app_get_result",
 ];
+
+/**
+ * In-flight dispatches whose wasm-side future has returned PENDING and
+ * is waiting on a `host_op_done`. Keyed by `dispatch_id` (the same id
+ * `AppRegistry` allocated). Each entry holds the kernel-facing
+ * dispatch metadata so we can post `dispatch_done` once the wasm
+ * resolves.
+ *
+ * P0 #4 — re-polled every time `host_op_done` arrives, since any
+ * pending dispatch could be the one waiting on this exact future.
+ *
+ * @type {Map<bigint, { cmd_kind: number }>}
+ */
+const pendingDispatches = new Map();
+
+/** Status constants mirrored locally so the dispatch loop doesn't
+ *  need to import op_kinds — the wasm uses the same numeric values. */
+const POLL_STATUS = Object.freeze({
+  PENDING: 0,
+  READY:   1,
+  ERROR:   2,
+});
 
 // ── Inbound dispatch ───────────────────────────────────────────────────
 
@@ -197,80 +226,128 @@ function handleInit(msg) {
 
 function handleDispatch(msg) {
   if (!wasmInstance) {
-    postMessage({
-      type: "dispatch_done",
-      dispatch_id: msg.dispatch_id,
-      future_id: 0n,
-      bytes: null,
-    });
+    postDispatchDone(msg.dispatch_id, null);
     return;
   }
   const { dispatch_id, cmd_kind, payload } = msg;
   const bytes = payload instanceof Uint8Array ? payload : new Uint8Array(payload ?? 0);
+  const dispatchId = typeof dispatch_id === "bigint" ? dispatch_id : BigInt(dispatch_id);
 
-  // Two-phase buffer write: alloc, copy, dispatch, optionally fetch
-  // result bytes via get_result, dealloc the input slot. Mirrors the
-  // pre-11.4c AppRegistry.dispatch flow but with all of it on the
-  // app side of the worker boundary.
+  // Two-phase buffer write: alloc, copy, dispatch. The wasm reads
+  // (or doesn't) the bytes synchronously inside `akiva_app_dispatch`,
+  // so we can dealloc the input buffer right after — its contents
+  // have either been consumed or rejected before the call returns.
   const exports = wasmInstance.exports;
   let appPtr = 0;
-  let futureId = 0n;
-  let resultBytes = null;
+  let acceptStatus = 1;  // non-zero = rejected; updated below
   try {
     if (bytes.length > 0) {
       appPtr = exports.akiva_app_alloc(bytes.length);
       if (appPtr === 0) {
         postLog("warn", `alloc(${bytes.length}) for dispatch(${cmd_kind}) returned null`);
-        postMessage({ type: "dispatch_done", dispatch_id, future_id: 0n, bytes: null });
+        postDispatchDone(dispatchId, null);
         return;
       }
       new Uint8Array(wasmMemory.buffer, appPtr, bytes.length).set(bytes);
     }
-    const fid = exports.akiva_app_dispatch(cmd_kind, appPtr, bytes.length);
-    futureId = typeof fid === "bigint" ? fid : BigInt(fid);
-
-    if (futureId !== 0n) {
-      resultBytes = fetchResult(futureId);
-    }
+    acceptStatus = exports.akiva_app_dispatch(dispatchId, cmd_kind, appPtr, bytes.length);
   } catch (err) {
     postLog("error", `dispatch(${cmd_kind}) trapped: ${err?.message ?? err}`);
     postTrapped(`dispatch(${cmd_kind}): ${err?.message ?? err}`);
-    futureId = 0n;
-    resultBytes = null;
+    postDispatchDone(dispatchId, null);
+    return;
   } finally {
     if (appPtr) {
       try { exports.akiva_app_dealloc(appPtr, bytes.length); }
       catch (_) { /* best effort */ }
     }
   }
+  if (acceptStatus !== 0) {
+    // Hard refusal — bad payload, unknown cmd_kind, OOM in slot
+    // construction. Treat as ack with no bytes.
+    postLog("warn", `dispatch(${cmd_kind}) refused: status=${acceptStatus}`);
+    postDispatchDone(dispatchId, null);
+    return;
+  }
 
-  // Transfer the bytes if we have any — saves a copy across the
-  // worker boundary for paint streams (which are by far the largest
-  // payloads).
+  // Try to drive the dispatch to terminal status synchronously. If
+  // it parks on a host_op, we'll re-poll once host_op_done arrives.
+  pendingDispatches.set(dispatchId, { cmd_kind });
+  driveDispatch(dispatchId);
+}
+
+/**
+ * Re-poll `dispatchId` and finalise it if the wasm has reached a
+ * terminal state. Called once from `handleDispatch` and again from
+ * `handleHostOpDone` for every still-pending dispatch (any of them
+ * could have been waiting on the host op that just resolved).
+ *
+ * No-op if `dispatchId` is no longer pending (already finalised in
+ * a prior call).
+ */
+function driveDispatch(dispatchId) {
+  if (!pendingDispatches.has(dispatchId)) return;
+  const exports = wasmInstance.exports;
+  let packed;
+  try {
+    packed = exports.akiva_app_poll_dispatch(dispatchId);
+  } catch (err) {
+    postLog("error", `poll_dispatch(${dispatchId}) trapped: ${err?.message ?? err}`);
+    postTrapped(`poll_dispatch: ${err?.message ?? err}`);
+    pendingDispatches.delete(dispatchId);
+    postDispatchDone(dispatchId, null);
+    return;
+  }
+  // Packed encoding: low 32 bits status, high 32 bits length. We
+  // only need status to gate the next step; length tells us whether
+  // to fetch bytes via get_result.
+  const status = Number(BigInt.asUintN(32, BigInt(packed)));
+  if (status === POLL_STATUS.PENDING) {
+    return;  // leave in pendingDispatches; re-poll on next host_op_done
+  }
+  pendingDispatches.delete(dispatchId);
+  if (status === POLL_STATUS.ERROR) {
+    postLog("error", `dispatch(${dispatchId}) reported ERROR`);
+    postDispatchDone(dispatchId, null);
+    return;
+  }
+  // status === READY
+  let resultBytes = null;
+  try {
+    resultBytes = fetchResult(dispatchId);
+  } catch (err) {
+    postLog("error", `get_result(${dispatchId}) trapped: ${err?.message ?? err}`);
+    postTrapped(`get_result: ${err?.message ?? err}`);
+    postDispatchDone(dispatchId, null);
+    return;
+  }
+  postDispatchDone(dispatchId, resultBytes);
+}
+
+function postDispatchDone(dispatchId, resultBytes) {
   const transfer = resultBytes ? [resultBytes.buffer] : [];
   postMessage(
-    { type: "dispatch_done", dispatch_id, future_id: futureId, bytes: resultBytes },
+    { type: "dispatch_done", dispatch_id: dispatchId, future_id: 0n, bytes: resultBytes },
     transfer,
   );
 }
 
 /**
- * Fetch the bytes the app produced for a non-zero `future_id` returned
- * by `akiva_app_dispatch`. Two-phase buffer convention: app writes
- * length to a 4-byte slot we allocate, returns the source pointer,
- * we slice into a fresh Uint8Array (so the buffer is transferable
- * without aliasing live wasm memory).
+ * Fetch the bytes the app produced for a READY dispatch. Two-phase
+ * buffer: app writes length to a 4-byte slot we allocate, returns
+ * the source pointer, we slice into a fresh Uint8Array (so the buffer
+ * is transferable without aliasing live wasm memory).
  */
-function fetchResult(futureId) {
+function fetchResult(dispatchId) {
   const exports = wasmInstance.exports;
   const lenPtr = exports.akiva_app_alloc(4);
   if (lenPtr === 0) {
-    postLog("warn", `alloc(4) for get_result(${futureId}) returned null`);
+    postLog("warn", `alloc(4) for get_result(${dispatchId}) returned null`);
     return null;
   }
   let len, srcPtr;
   try {
-    srcPtr = exports.akiva_app_get_result(futureId, lenPtr);
+    srcPtr = exports.akiva_app_get_result(dispatchId, lenPtr);
     len = new DataView(wasmMemory.buffer).getUint32(lenPtr, true);
   } finally {
     try { exports.akiva_app_dealloc(lenPtr, 4); }
@@ -282,7 +359,7 @@ function fetchResult(futureId) {
   return new Uint8Array(wasmMemory.buffer, srcPtr, len).slice();
 }
 
-// ── host_op_done (Stone 11.4c-4 wires the request side) ────────────────
+// ── host_op_done ───────────────────────────────────────────────────────
 
 function handleHostOpDone(msg) {
   const fid = typeof msg.future_id === "bigint" ? msg.future_id : BigInt(msg.future_id);
@@ -293,6 +370,18 @@ function handleHostOpDone(msg) {
   }
   entry.status = msg.status;
   entry.payload = msg.payload instanceof Uint8Array ? msg.payload : new Uint8Array(0);
+  // P0 #4 — re-drive every pending dispatch. Any one of them could
+  // have been parked on this exact future, and re-polling them now
+  // is the cheapest way to find out (the wasm side caches terminal
+  // results, so calls into already-resolved dispatches are no-ops).
+  if (pendingDispatches.size > 0) {
+    // Snapshot the keys — driveDispatch may delete entries during
+    // iteration if a dispatch finalises.
+    const ids = [...pendingDispatches.keys()];
+    for (const id of ids) {
+      driveDispatch(id);
+    }
+  }
 }
 
 // ── Host imports the app links against ────────────────────────────────

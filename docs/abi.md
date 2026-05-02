@@ -63,30 +63,53 @@ extern "C" fn akiva_app_dealloc(ptr: *mut u8, size: u32);
 extern "C" fn akiva_app_abi_version() -> *const u8;
 ```
 
-#### 2.2.2 Unified dispatch entry (Stone 11.4b)
+#### 2.2.2 Unified dispatch entry (P0 #4 async-resumable)
 
-ה-Exports החדשים שהוצגו ב-Stone 11.4b ושהפכו ב-11.4b-5 ל-canonical מכווצים את 13 ה-callback exports הנפרדים (lifecycle / input / render / state / intent) ל-export יחיד שמפענח `cmd_kind`. ה-host (kernel + JS) קורא **רק** לזוג הזה — ה-`akiva_app_create`/`akiva_app_render`/.../`akiva_app_activity_result` הפר-callback נמחקו ב-11.4b-5.
+ה-Exports שהוצגו ב-Stone 11.4b הפכו ב-P0 #4 (May 2026) ל-async-resumable. שלושה exports מחליפים את הזוג הקודם:
 
 ```rust
-// Unified dispatch — ה-host מעביר cmd_kind שמזהה את הקריאה (lifecycle
-// transition / input / render / save / restore / intent) ופ-payload שמתחיל
-// תמיד ב-`[handle: u32 LE, ...]`. מחזיר u64 future_id:
-//   0           — sync, no result bytes (כל ack-only).
-//   non-zero    — sync, bytes מוכנים; ה-host קורא ל-akiva_app_get_result
-//                 מיד עם אותו future_id.
-// (ב-11.4c עם workers, future_id non-zero יכול לסמן שהעבודה עוד לא
-// הסתיימה — אז ה-host חוזר ל-poll_future מאוחר יותר.)
+// Hand-off into the SDK runtime. dispatch_id is allocated by the
+// host (the AppRegistry's per-package monotonic counter) and is the
+// stable handle the host uses for all follow-up calls related to
+// this dispatch (poll_dispatch + get_result). Every payload begins
+// with [handle: u32 LE, ...] — the cmd_kind table at §2.2 lists the
+// per-cmd remainder.
+//
+// Returns a status code:
+//   0  — accepted; host should drive to terminal status via
+//        poll_dispatch.
+//   !=0 — hard refusal (bad payload, unknown cmd_kind, OOM during
+//        slot construction). The host treats it as ack-only and
+//        does NOT poll.
 extern "C" fn akiva_app_dispatch(
+    dispatch_id: u64,
     cmd_kind: u32,
     payload_ptr: *const u8,
     payload_len: u32,
-) -> u64;
+) -> u32;
 
-// Companion ל-dispatch — מחזיר ptr ל-buffer app-owned שמכיל את ה-bytes
-// שה-dispatch ייצר (paint stream של RENDER, SavedState של SAVE_STATE).
-// ה-buffer תקף עד ה-dispatch הבא שמייצר bytes על אותו handle.
+// Drive a dispatch one poll forward. Returns packed (status, len):
+//   * status (low 32 bits):
+//       0 PENDING — wasm is parked on a host_op; host should call
+//                   again after `host_op_done` arrives at the shell.
+//       1 READY   — bytes (if any) available via get_result.
+//       2 ERROR   — future trapped, wire bug, or unknown dispatch_id.
+//   * len (high 32 bits): byte count for READY/ERROR; 0 for
+//     PENDING and ack-only dispatches.
+extern "C" fn akiva_app_poll_dispatch(dispatch_id: u64) -> u64;
+
+// Two-phase fetch of the result bytes for a READY dispatch.
+// `*out_len_ptr` receives the length; returned pointer + length are
+// valid until this single call evicts the dispatch_id (single-shot).
+// For ack-only dispatches (lifecycle, input, intent, etc.) the
+// pointer may be null and length 0.
+//
+// DESTROY is special: get_result also tears down the slot once the
+// bytes are drained (which are always 0 for destroy). This delays
+// slot teardown until AFTER any pending future has dropped its
+// borrows into the slot.
 extern "C" fn akiva_app_get_result(
-    future_id: u64,
+    dispatch_id: u64,
     out_len_ptr: *mut u32,
 ) -> *const u8;
 ```
@@ -117,9 +140,24 @@ Payload layout פר-cmd (כל אחד מתחיל ב-`[handle: u32 LE, ...]`):
 | NEW_INTENT        | `intent: encoded Intent`                                                 |
 | ACTIVITY_RESULT   | `request_code: u32, result: encoded ActivityResult`                      |
 
-`future_id` ב-11.4b-3+ encoded כ-`handle as u64` ל-RENDER ו-SAVE_STATE; `0` לכל היתר. ב-11.4c (כשה-app יחיה ב-Worker נפרד) ה-future_id יקבל namespace שונה ויהפוך לאמיתי async — ה-API stays identical.
+`dispatch_id` הוא monotonic counter ש-AppRegistry מקצה כל פעם ש-`hal_app_dispatch` נקרא. ה-id משמש כמפתח גם ב-host-side `_dispatches` map וגם ב-app-side per-handle pending registry — שני הצדדים מסכימים על אותו ערך, מה שעושה את ה-debugging trivial (אותו int במסד נתונים אחד).
 
-ה-buffer שמוחזר מ-`akiva_app_get_result` הוא app-owned: ה-app חייב להחזיק אותו בחיים לפחות עד הקריאה הבאה ל-data-producing dispatch על אותו handle. ה-convention הוא buffer per-handle שנמחזר כל frame — מקצה פעם אחת, מנקה עם `clear()`, ומחזיר את הכתובת שוב.
+ה-buffer שמוחזר מ-`akiva_app_get_result` הוא app-owned ותקף עד הקריאה עצמה תופסת אותו (single-shot consume). למשל ל-RENDER, ה-paint buffer reused על-כל-handle; ה-pointer שמוחזר עתה תקף עד ה-RENDER הבא על אותו handle. ל-SAVE_STATE/ack-only ה-buffer-lifetime זהה.
+
+#### 2.2.3 Async-resumable dispatch — pending → host_op_done → re-poll
+
+P0 #4 (May 2026) שינה את ה-protocol מ-"sync-or-handle" ל-async-resumable כדי לתמוך ב-`storage::read().await` באופן שקוף:
+
+1. App-worker shell מקבל `{type:"dispatch", dispatch_id, cmd_kind, payload}` מ-AppRegistry.
+2. Shell מעתיק את ה-payload לזיכרון של ה-wasm, קורא `akiva_app_dispatch(dispatch_id, cmd, ptr, len)`. ה-runtime ב-wasm בונה future, polls פעם אחת.
+3. Shell קורא `akiva_app_poll_dispatch(dispatch_id)`:
+   * **READY** — שולף bytes (אם יש) דרך `get_result`, שולח `{type:"dispatch_done", dispatch_id, bytes}` ל-AppRegistry.
+   * **PENDING** — שומר ב-`pendingDispatches` Map, **לא** שולח dispatch_done.
+   * **ERROR** — שולח dispatch_done עם null bytes; trapped notice אופציונלי.
+4. עבור pending dispatches: כש-`host_op_done` מגיע ל-shell (storage read resolved, network reply, וכו'), shell עושה re-poll על **כל** ה-pending dispatches. כל אחד מהם יכול להיות parked על ה-future הזה. זה במובן מ-O(n) iteration — אבל n ≤ 1 בפועל (framework allows רק dispatch אחד per handle).
+5. כשה-poll מחזיר READY, הflow ב-§3 ממשיך כרגיל.
+
+ה-AppRegistry על הצד של ה-kernel לא מחליף — הוא ממשיך לראות `dispatch_id` יוצא ו-`dispatch_done` חוזר, איפה שהוא רק חיכה יותר זמן. ה-kernel polling דרך `hal_app_poll_future` ממשיך לראות PENDING עד שה-shell שולח dispatch_done.
 
 ### 2.3 Imports (host → app)
 

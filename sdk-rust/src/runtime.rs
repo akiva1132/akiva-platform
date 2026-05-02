@@ -5,33 +5,55 @@
 //! `extern "C"` exports that funnel through `on_*` helpers here, which
 //! then dispatch to the user's `Activity` impl.
 //!
-//! Stone 11.2 — every dispatch awaits the [`Activity`] future via
-//! [`block_on_ready`]. The wire shape stays identical to ABI v0
-//! (host calls sync `extern "C"` exports); the asynchrony is purely
-//! inside the wasm. Stone 11.3 swaps `block_on_ready` for the embassy
-//! executor when host imports start returning real `Pending`.
+//! ## Dispatch protocol (P0 #4)
 //!
-//! One wasm process can host multiple activity handles (the host creates a
-//! fresh one per framework-side `WasmActivity`), so everything is keyed by
-//! a `u32` handle. The process holds a single `HashMap<u32, Slot>` in
-//! `static mut` — safe because wasm in a worker is single-threaded and the
-//! host calls our exports serially.
+//! Three exports cover every host→app interaction:
 //!
-//! The paint buffer is stored in the slot so the pointer returned by
-//! `akiva_app_render` remains valid until the next render for that
-//! handle — exactly the lifetime rule in [docs/abi.md §2.2].
+//! 1. `akiva_app_dispatch(dispatch_id, cmd_kind, payload_ptr, payload_len) -> u32`
+//!    Accept the dispatch, run it as far as possible synchronously, and
+//!    return `0` on success or a non-zero status code on a malformed
+//!    payload / unknown cmd. The host always allocates `dispatch_id` and
+//!    holds it until the bytes (if any) are pulled via `get_result`.
+//!
+//! 2. `akiva_app_poll_dispatch(dispatch_id) -> u64` — packed
+//!    `(status, len)`. Re-drives the parked future once and reports
+//!    where it stands: `PENDING` (still in flight, host should call
+//!    again after a `host_op_done` arrives), `READY` (bytes available
+//!    via `get_result`), `ERROR` (bad input or future panicked).
+//!
+//! 3. `akiva_app_get_result(dispatch_id, out_len_ptr) -> *const u8`
+//!    Two-phase fetch (pointer + length) of the result bytes. Empty
+//!    return for ack-only dispatches (lifecycle, input). The buffer
+//!    stays valid until the dispatch is consumed (a fitting copy in
+//!    `get_result` evicts the entry).
+//!
+//! The new shape lets app code `.await` on cross-worker host operations
+//! (`storage::read`, future `query_packages`, network) without panicking
+//! — when the inner future returns `Pending`, the dispatch parks; when
+//! the host posts `host_op_done` back, the worker shell calls
+//! `poll_dispatch` to resume. See `executor` for the soundness argument
+//! around the self-referential future storage.
+//!
+//! Render and `save_state` keep the synchronous fast-path: the legacy
+//! `executor::run_to_ready` panics on `Pending` so accidental awaits in
+//! paint code surface immediately. Async storage reads belong in
+//! `on_create` / `on_resume`, not `on_render` (render fires every
+//! frame; paint code shouldn't block on storage).
 
 #![doc(hidden)]
 
 use std::alloc::{alloc as std_alloc, dealloc as std_dealloc, Layout};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::Poll;
 
 use crate::activity::{
-    block_on_ready, Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase,
-    SavedState,
+    Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState,
 };
+use crate::executor;
 use crate::intent::Intent;
-#[cfg(target_arch = "wasm32")]
 use crate::op_kinds;
 use crate::result::ActivityResult;
 
@@ -42,62 +64,13 @@ use crate::result::ActivityResult;
 // approximations when the host isn't available.
 #[cfg(target_arch = "wasm32")]
 extern "C" {
-    // ── Stone 11.3 unified ABI ────────────────────────────────────────
-    //
-    // Three multiplexers that subsume every per-op import the SDK used
-    // to declare. Every host-mediated op gets a stable `op_kind`
-    // (see `crate::op_kinds`, mirrored from `framework::wire::op_kinds`)
-    // and routes through one of these three transports:
-    //
-    //   * `fire`     — fire-and-forget, sync return code.
-    //   * `io_start` — start an async op, returns a future_id.
-    //   * `io_poll`  — poll a future_id for status + payload.
-    //
-    // Today's call sites: every `host_fire` / `host_io_start` /
-    // `host_io_poll` helper below. Legacy per-op imports
-    // (`akiva_host_log`, `akiva_host_finish`, …) have all been
-    // removed from the SDK extern block; the host-side legacy
-    // handlers in `runtime/web/app_registry.js` stay in place until
-    // 11.3-final to keep older app builds operational.
-
-    /// Fire a side-effecting op identified by `op_kind`. The args blob
-    /// layout is op-specific (see `framework::wire::*` encoders). Returns
-    /// `0` on success or a non-zero error code; no result data flows back.
     pub fn akiva_host_fire(op_kind: u32, args_ptr: *const u8, args_len: u32) -> u32;
-
-    /// Start an async op identified by `op_kind`. Returns a `u64`
-    /// `future_id` the caller polls via [`akiva_host_io_poll`] until it
-    /// resolves, or `0` if the op couldn't be started (unknown kind,
-    /// malformed args, denied capability). `0` is the only sentinel —
-    /// real future ids are non-zero.
     pub fn akiva_host_io_start(op_kind: u32, args_ptr: *const u8, args_len: u32) -> u64;
-
-    /// Poll a future started by [`akiva_host_io_start`]. Returns a
-    /// packed `u64`:
-    ///
-    ///   * Low 32 bits: status code (`PENDING` / `READY` / `ERROR` —
-    ///     see `framework::wire::op_kinds::status`).
-    ///   * High 32 bits: payload length in bytes when status is `READY`
-    ///     or `ERROR`; zero when `PENDING`.
-    ///
-    /// On `READY`/`ERROR`, if `payload_len <= out_cap` the host has
-    /// written the payload to `out_ptr`; otherwise the buffer is
-    /// untouched and the caller should realloc to `payload_len` bytes
-    /// and poll again — same two-phase shape as
-    /// [`akiva_host_query_packages`]. Polling an unknown / freed
-    /// future_id resolves as `ERROR` with a zero-length payload.
     pub fn akiva_host_io_poll(future_id: u64, out_ptr: *mut u8, out_cap: u32) -> u64;
 }
 
-/// Request the framework finish this activity. Safe to call from any
-/// lifecycle or input callback on wasm; a no-op on host builds so unit
-/// tests compile without a real host import. Handle is the one the
-/// framework passed to the current callback.
-///
-/// Wire: `fire(FIRE::FINISH, [handle: u32 LE])`. The host's dispatcher
-/// adds the handle to `_pendingFinish`; the framework drains it at
-/// the end of the current callback via the existing
-/// `hal_app_drain_finish` HAL bridge.
+// ── Side-effect raisers (Stone 9.x; unchanged across P0 #4) ────────────
+
 pub fn host_finish(handle: u32) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -109,15 +82,6 @@ pub fn host_finish(handle: u32) {
     }
 }
 
-/// Request the framework resolve and launch an activity matching the
-/// supplied `Intent`. The encoded bytes must outlive this call (the host
-/// copies them out synchronously before we return). On non-wasm this is
-/// a no-op so tests link without a real host.
-///
-/// Wire: `fire(FIRE::START_ACTIVITY, [handle: u32 LE | intent bytes...])`.
-/// Gated by `LAUNCH_ANY_APP` — the dispatcher returns rc=2 (denied) if
-/// the package lacks the grant; this call ignores the rc since the host
-/// already logs the denial.
 pub fn host_start_activity(handle: u32, intent: &Intent) {
     let bytes = intent.encode();
     #[cfg(target_arch = "wasm32")]
@@ -133,13 +97,6 @@ pub fn host_start_activity(handle: u32, intent: &Intent) {
     }
 }
 
-/// Request the framework launch `intent` and record that this activity
-/// expects a result back with `request_code`. Same lifetime rules as
-/// `host_start_activity` (host copies bytes synchronously).
-///
-/// Wire: `fire(FIRE::START_ACTIVITY_FOR_RESULT,
-///   [handle: u32 LE | request_code: u32 LE | intent bytes...])`.
-/// Gated by `LAUNCH_ANY_APP`, same as `host_start_activity`.
 pub fn host_start_activity_for_result(handle: u32, intent: &Intent, request_code: u32) {
     let bytes = intent.encode();
     #[cfg(target_arch = "wasm32")]
@@ -156,13 +113,6 @@ pub fn host_start_activity_for_result(handle: u32, intent: &Intent, request_code
     }
 }
 
-/// Stash a result the framework will deliver back to whoever launched
-/// this activity via `start_activity_for_result`. Callable multiple
-/// times in the activity's lifetime; only the last call's bytes are
-/// delivered. If this activity was not launched for a result, the
-/// framework silently drops the stashed bytes.
-///
-/// Wire: `fire(FIRE::SET_RESULT, [handle: u32 LE | result bytes...])`.
 pub fn host_set_result(handle: u32, result: &ActivityResult) {
     let bytes = result.encode();
     #[cfg(target_arch = "wasm32")]
@@ -178,57 +128,27 @@ pub fn host_set_result(handle: u32, result: &ActivityResult) {
     }
 }
 
-// ── Stone 11.3 unified-ABI thin wrappers ───────────────────────────────
-//
-// These keep the unsafe `extern "C"` calls quarantined here. No SDK
-// call site uses them in 11.3b — the wrappers exist so the imports
-// compile into the wasm without dead-code stripping and so 11.3c can
-// migrate operations one by one (e.g. `pkgs::list` flips from
-// `akiva_host_query_packages` to `host_io(QUERY_PACKAGES, &[])`).
+// ── Unified-ABI thin wrappers around the wasm imports ──────────────────
 
-/// Fire a side-effecting op. See [`akiva_host_fire`]. Wasm-only — the
-/// host isn't reachable from `cargo test`, so callers gate their
-/// wasm-vs-host paths inline.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn host_fire(op_kind: u32, args: &[u8]) -> u32 {
     unsafe { akiva_host_fire(op_kind, args.as_ptr(), args.len() as u32) }
 }
 
-/// Start an async op, returning a future_id. See [`akiva_host_io_start`].
-/// Wasm-only — the host isn't reachable from `cargo test`, so callers
-/// gate their wasm-vs-host paths inline rather than relying on a fake.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn host_io_start(op_kind: u32, args: &[u8]) -> u64 {
     unsafe { akiva_host_io_start(op_kind, args.as_ptr(), args.len() as u32) }
 }
 
-/// Poll an async op. See [`akiva_host_io_poll`]. Wasm-only for the same
-/// reason as [`host_io_start`].
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn host_io_poll(future_id: u64, out: &mut [u8]) -> u64 {
     unsafe { akiva_host_io_poll(future_id, out.as_mut_ptr(), out.len() as u32) }
 }
 
-/// Measure a rendered UTF-8 string's width at `size` pixels. On wasm
-/// this calls through to the host's `CanvasRenderingContext2D.measureText`
-/// against the same font the renderer uses, so SDK layout agrees with
-/// what actually lands on screen. On non-wasm builds (tests) this falls
-/// back to the cheap `chars × size × 0.55` estimate — layout tests that
-/// depend on exact numbers should pass in their own fake to avoid
-/// coupling to this heuristic.
-///
-/// Stone 11.3c-2 — first call site migrated to the unified ABI. Args
-/// are `[size: f32 LE | text: utf8...]`; the host returns the rendered
-/// width as a 4-byte f32 LE result through the FutureRegistry. Falls
-/// back to the cheap estimate on any failure (denied capability,
-/// poll error, malformed result) so a misbehaving host can't crash
-/// app layout — text just measures slightly wrong, which is recoverable.
+/// Measure a rendered UTF-8 string's width at `size` pixels.
 pub fn text_width(text: &str, size: f32) -> f32 {
     #[cfg(target_arch = "wasm32")]
     {
-        // Args: [size: f32 LE | text bytes...]. text.as_bytes() is
-        // already UTF-8; the host decodes with the same encoder/decoder
-        // pair that the legacy `akiva_host_text_width` import used.
         let mut args = Vec::with_capacity(4 + text.len());
         args.extend_from_slice(&size.to_le_bytes());
         args.extend_from_slice(text.as_bytes());
@@ -236,8 +156,6 @@ pub fn text_width(text: &str, size: f32) -> f32 {
         if future_id == 0 {
             return text_width_fallback(text, size);
         }
-        // Single poll: in 11.3 single-worker the future is always
-        // Ready on first poll, so a 4-byte buffer always suffices.
         let mut buf = [0u8; 4];
         let packed = host_io_poll(future_id, &mut buf);
         let (status, len) = op_kinds::unpack_poll(packed);
@@ -253,342 +171,622 @@ pub fn text_width(text: &str, size: f32) -> f32 {
     }
 }
 
-/// Cheap per-char estimate used when the host can't be consulted (non-wasm
-/// builds and the wasm-side error path). Don't write a layout test that
-/// depends on this heuristic — the real wasm measurement uses canvas
-/// `measureText`, which can drift from this by a meaningful amount.
 #[inline]
 fn text_width_fallback(text: &str, size: f32) -> f32 {
     text.chars().count() as f32 * size * 0.55
 }
 
-/// Minimum paint-op capacity we pre-allocate per slot. Grows on demand;
-/// 4 KiB is enough for a typical frame of a hello-world and avoids a
-/// realloc on the first render.
-const INITIAL_PAINT_CAP: usize = 4 * 1024;
+// ── Memory ABI ─────────────────────────────────────────────────────────
 
-// ── Global state ──────────────────────────────────────────────────────
-
-struct Slot {
-    activity: Box<dyn Activity>,
-    paint_buf: Vec<u8>,
-    /// Separate buffer for `on_save_state` output. Kept per-slot (like
-    /// `paint_buf`) so the pointer we return to the host stays valid
-    /// until the next `akiva_app_save_state` for this handle — same
-    /// lifetime rule as render, and it spares us from juggling a
-    /// shared scratch space across handles.
-    save_buf: Vec<u8>,
-    metrics: Metrics,
-    last_pointer: Option<PointerEvent>,
-    /// Stone 11.4b — which buffer holds the bytes the host should
-    /// fetch via `akiva_app_get_result`. Set by the dispatch paths
-    /// that produce bytes (Render → `Paint`, SaveState →
-    /// `SavedState`); cleared back to `None` by every other dispatch
-    /// so a stale render's bytes can't leak into a save_state poll
-    /// that arrived right after.
-    last_result: LastResult,
-}
-
-/// Stone 11.4b — which slot buffer the next `get_result` should hand
-/// back. The dispatch entry point sets this each time it routes to a
-/// per-callback runtime fn.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LastResult {
-    None,
-    Paint,
-    SavedState,
-}
-
-/// Registry keyed by handle. `Option` so we can lazy-init on first use
-/// (`const` ctor for `HashMap` isn't stable).
-static mut SLOTS: Option<HashMap<u32, Slot>> = None;
-
-#[inline]
-fn slots() -> &'static mut HashMap<u32, Slot> {
-    // SAFETY: wasm in a worker is single-threaded; host exports are
-    // invoked serially. No concurrent access possible.
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(SLOTS);
-        if (*ptr).is_none() {
-            *ptr = Some(HashMap::new());
-        }
-        (*ptr).as_mut().unwrap()
-    }
-}
-
-// ── Memory ABI (host ↔ app transfers) ─────────────────────────────────
-
-/// `akiva_app_alloc` implementation. The host calls this when it needs to
-/// place bytes into app memory (e.g. the class name during `on_create`).
-/// Alignment of 1 is fine: the only readers are `DataView` / typed-array
-/// copies on the JS side which don't require alignment.
 pub fn alloc(size: u32) -> *mut u8 {
     if size == 0 { return core::ptr::null_mut(); }
     let layout = match Layout::from_size_align(size as usize, 1) {
         Ok(l) => l,
         Err(_) => return core::ptr::null_mut(),
     };
-    // SAFETY: layout has non-zero size; allocator returns a valid pointer
-    // or null on OOM. Caller pairs every alloc with an exact-sized dealloc.
     unsafe { std_alloc(layout) }
 }
 
-/// Companion to `alloc`. Size must match the one passed to `alloc`.
 pub fn dealloc(ptr: *mut u8, size: u32) {
     if ptr.is_null() || size == 0 { return; }
     let layout = match Layout::from_size_align(size as usize, 1) {
         Ok(l) => l,
         Err(_) => return,
     };
-    // SAFETY: caller guarantees `ptr` came from `alloc(size)`.
     unsafe { std_dealloc(ptr, layout); }
 }
 
-/// Version string the host may read to gate compat checks. Null-terminated
-/// so the host can read until `\0` without tracking a length.
-pub const ABI_VERSION: &[u8] = b"0.1.0\0";
+pub const ABI_VERSION: &[u8] = b"0.2.0\0";
 
-// ── Lifecycle entry points ────────────────────────────────────────────
+// ── Class string interning ─────────────────────────────────────────────
 //
-// Each accepts the raw wire types the host passes through `hal_app_*`.
-// They look up the slot, rebuild a `Context`, and `block_on_ready` the
-// async trait method.
+// Activity callbacks see `Context::class` as `&'static str`. The class
+// string the host hands us in `CMD::CREATE` is borrowed from the
+// payload buffer the host owns for the lifetime of one dispatch — not
+// 'static. To make it safely 'static we intern it: each unique class
+// name leaks into a `Box<str>` once, then every subsequent `on_create`
+// for the same class reuses the same `&'static str`. Bounded leak —
+// an app declares O(activity classes) names total.
 
-pub fn on_create<T: Activity + Default>(handle: u32, class_ptr: *const u8, class_len: u32) {
-    let class = read_utf8(class_ptr, class_len);
-    let mut activity: Box<dyn Activity> = Box::new(T::default());
-    let mut ctx = Context {
-        metrics: Metrics::default(),
-        timestamp_ms: 0.0,
-        pointer: None,
-        class: class.as_str(),
-        handle,
-    };
-    block_on_ready(activity.on_create(&mut ctx));
-    slots().insert(handle, Slot {
-        activity,
-        paint_buf: Vec::with_capacity(INITIAL_PAINT_CAP),
-        save_buf: Vec::new(),
-        metrics: Metrics::default(),
-        last_pointer: None,
-        last_result: LastResult::None,
-    });
+thread_local! {
+    static CLASS_INTERN: RefCell<HashMap<String, &'static str>> =
+        RefCell::new(HashMap::new());
 }
 
-pub fn on_start(handle: u32) {
-    dispatch_lifecycle(handle, |a, c| block_on_ready(a.on_start(c)));
-}
-pub fn on_resume(handle: u32) {
-    dispatch_lifecycle(handle, |a, c| block_on_ready(a.on_resume(c)));
-}
-pub fn on_pause(handle: u32) {
-    dispatch_lifecycle(handle, |a, c| block_on_ready(a.on_pause(c)));
-}
-pub fn on_stop(handle: u32) {
-    dispatch_lifecycle(handle, |a, c| block_on_ready(a.on_stop(c)));
-}
-
-pub fn on_destroy(handle: u32) {
-    if let Some(mut slot) = slots().remove(&handle) {
-        let mut ctx = Context {
-            metrics: slot.metrics,
-            timestamp_ms: 0.0,
-            pointer: slot.last_pointer,
-            class: "",
-            handle,
-        };
-        block_on_ready(slot.activity.on_destroy(&mut ctx));
-    }
+fn intern_class(s: &str) -> &'static str {
+    CLASS_INTERN.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if let Some(&interned) = map.get(s) {
+            return interned;
+        }
+        let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+        map.insert(s.to_string(), leaked);
+        leaked
+    })
 }
 
-fn dispatch_lifecycle(
+// ── Slot + pending dispatch state ──────────────────────────────────────
+
+const INITIAL_PAINT_CAP: usize = 4 * 1024;
+
+/// Per-handle slot. Holds the `Box<dyn Activity>` instance, all
+/// `Context` state, and any in-flight async dispatch that needs to be
+/// resumed across `host_op_done` arrivals.
+///
+/// Slots are stored in a `HashMap<u32, Box<Slot>>` so the heap address
+/// of every field is stable — pending futures borrow into the slot
+/// via raw pointers and rely on this stability across polls.
+pub(crate) struct Slot {
+    /// Field declaration order is load-bearing for drop order: the
+    /// pending future drops FIRST, releasing its raw-pointer borrows
+    /// into `activity` and `ctx`, then those drop in turn. Reordering
+    /// would risk a use-after-free on Drop.
+    pending: Option<PendingDispatch>,
+    activity: Box<dyn Activity>,
+    /// The `'static` lifetime here is a local lie: `class` is a
+    /// `&'static str` from `intern_class`, which actually IS 'static.
+    /// All other fields contain owned data only. The lifetime is never
+    /// inspected by the borrow checker once stored as `'static`.
+    ctx: Context<'static>,
+    paint_buf: Vec<u8>,
+    save_buf: Vec<u8>,
+    /// Which buffer the last completed dispatch produced bytes into.
+    /// Used by `get_result` to pick between `paint_buf` and `save_buf`.
+    last_outcome: DispatchOutcome,
+}
+
+/// What kind of result the last (or in-flight) dispatch is producing.
+/// Maps to which buffer `get_result` should hand back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DispatchOutcome {
+    /// Ack-only — `get_result` returns 0 bytes.
+    NoBytes,
+    /// Bytes are in `slot.paint_buf` (RENDER).
+    Paint,
+    /// Bytes are in `slot.save_buf` (SAVE_STATE).
+    SavedState,
+    /// Slot should be removed after this dispatch finalises (DESTROY).
+    Destroy,
+}
+
+/// One in-flight async dispatch. Holds the future and the cached
+/// result the next `poll_dispatch` should report.
+struct PendingDispatch {
+    /// Borrows from `slot.activity` and `slot.ctx` via raw pointers
+    /// captured in [`build_async_future`]. SAFETY: see `executor`
+    /// module docs — the slot is heap-pinned in `SLOTS` and the
+    /// runtime never moves or drops the slot while this future is
+    /// alive.
+    future: Pin<Box<dyn Future<Output = DispatchOutcome> + 'static>>,
+    /// Once the future resolves we cache the outcome here and stop
+    /// polling. The next `poll_dispatch` call sees `Some(...)` and
+    /// returns `READY` without re-driving the future.
+    completed: Option<DispatchOutcome>,
+}
+
+// ── Global registries ──────────────────────────────────────────────────
+
+thread_local! {
+    static SLOTS: RefCell<HashMap<u32, Box<Slot>>> = RefCell::new(HashMap::new());
+    /// `dispatch_id -> handle`. `dispatch_id` is allocated by the host
+    /// (worker shell) and passed into `akiva_app_dispatch`; we record
+    /// the mapping so `poll_dispatch` and `get_result` can find the
+    /// owning slot from just the dispatch_id.
+    static DISPATCH_TO_HANDLE: RefCell<HashMap<u64, u32>> = RefCell::new(HashMap::new());
+}
+
+fn with_slots<R>(f: impl FnOnce(&mut HashMap<u32, Box<Slot>>) -> R) -> R {
+    SLOTS.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+fn with_dispatches<R>(f: impl FnOnce(&mut HashMap<u64, u32>) -> R) -> R {
+    DISPATCH_TO_HANDLE.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+// ── Future construction ───────────────────────────────────────────────
+//
+// `build_async_future` hands back a `Pin<Box<dyn Future<Output =
+// DispatchOutcome> + 'static>>` that internally borrows the slot's
+// `activity` and `ctx` fields via raw pointers. The async-trait
+// expansion of `Activity::on_*` produces a `Pin<Box<dyn Future<Output
+// = ()> + 'a + 'b>>` where the lifetimes flow from `&mut self` and
+// `&mut ctx`. By feeding it `'static` references (faked via raw
+// pointer cast), the resulting future is `'static` — at which point
+// we can store it in the slot.
+//
+// SAFETY summary: the runtime never mutates `slot.activity` or
+// `slot.ctx` while a `PendingDispatch` exists; the framework's
+// `PendingTransition` discipline guarantees one in-flight dispatch
+// per handle. The slot itself stays in `SLOTS` (heap-stable) until
+// the pending future resolves to `Destroy`, at which point we drop
+// the future first and only then remove the slot.
+
+unsafe fn raw_static_mut<T: ?Sized>(p: *mut T) -> &'static mut T {
+    // SAFETY: caller guarantees `p` points at a heap-stable allocation
+    // that won't move or drop while the resulting reference is alive
+    // (typically: until the storing future is dropped).
+    &mut *(p as *mut T)
+}
+
+fn build_async_future<F>(
+    slot: &mut Slot,
+    outcome: DispatchOutcome,
+    body: F,
+) -> Pin<Box<dyn Future<Output = DispatchOutcome> + 'static>>
+where
+    F: FnOnce(
+            &'static mut Box<dyn Activity>,
+            &'static mut Context<'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + 'static>>
+        + 'static,
+{
+    let activity_ptr: *mut Box<dyn Activity> = &mut slot.activity;
+    let ctx_ptr: *mut Context<'static> = &mut slot.ctx;
+    Box::pin(async move {
+        // SAFETY: see module docs. Pointers come from a heap-pinned
+        // slot owned by SLOTS; the framework guarantees no concurrent
+        // mutation; the future is dropped before slot teardown.
+        let activity = unsafe { raw_static_mut(activity_ptr) };
+        let ctx = unsafe { raw_static_mut(ctx_ptr) };
+        body(activity, ctx).await;
+        outcome
+    })
+}
+
+// ── Dispatch entry points ──────────────────────────────────────────────
+
+/// Build the future for one cmd_kind, install it as the slot's pending
+/// dispatch (replacing any prior — debug_assert there isn't one), and
+/// poll it once. Returns the immediate outcome status: ready bytes
+/// length, pending, or terminal completion.
+fn install_and_poll<T: Activity + Default>(
     handle: u32,
-    f: impl FnOnce(&mut dyn Activity, &mut Context<'_>),
-) {
-    let Some(slot) = slots().get_mut(&handle) else { return; };
-    let mut ctx = Context {
-        metrics: slot.metrics,
-        timestamp_ms: 0.0,
-        pointer: slot.last_pointer,
-        class: "",
-        handle,
-    };
-    f(slot.activity.as_mut(), &mut ctx);
+    dispatch_id: u64,
+    cmd_kind: u32,
+    rest: &[u8],
+) -> Result<(), u32> {
+    use crate::op_kinds::cmd::*;
+
+    // CREATE is special: it constructs the slot if absent.
+    if cmd_kind == CREATE {
+        let class_str = core::str::from_utf8(rest).unwrap_or("");
+        let class_static = intern_class(class_str);
+        let activity: Box<dyn Activity> = Box::new(T::default());
+        let mut new_slot = Box::new(Slot {
+            pending: None,
+            activity,
+            ctx: Context {
+                metrics: Metrics::default(),
+                timestamp_ms: 0.0,
+                pointer: None,
+                class: class_static,
+                handle,
+            },
+            paint_buf: Vec::with_capacity(INITIAL_PAINT_CAP),
+            save_buf: Vec::new(),
+            last_outcome: DispatchOutcome::NoBytes,
+        });
+
+        // Build the on_create future.
+        let fut = build_async_future(&mut *new_slot, DispatchOutcome::NoBytes, |a, c| {
+            Box::pin(async move { a.on_create(c).await; })
+        });
+        new_slot.pending = Some(PendingDispatch {
+            future: fut,
+            completed: None,
+        });
+
+        // Install slot before polling — poll's raw pointers read from
+        // SLOTS-resident memory.
+        with_slots(|s| s.insert(handle, new_slot));
+        with_dispatches(|d| d.insert(dispatch_id, handle));
+        // Initial poll inside its own borrow scope.
+        let _ = drive_pending(dispatch_id);
+        return Ok(());
+    }
+
+    // For non-CREATE cmds the slot must already exist.
+    let exists = with_slots(|s| s.contains_key(&handle));
+    if !exists {
+        return Err(1);
+    }
+
+    // Build the future inside a borrow-scope, then poll separately
+    // (drive_pending takes its own borrow).
+    with_slots(|slots_map| {
+        let slot = slots_map.get_mut(&handle).expect("checked above");
+        // Borrow checker demands disjoint access to slot.* fields below;
+        // we use raw pointers to satisfy it where needed.
+        debug_assert!(
+            slot.pending.is_none(),
+            "P0 #4 — second dispatch arrived before prior pending resolved \
+             (handle={handle}, dispatch_id={dispatch_id}). Framework's \
+             PendingTransition discipline should prevent this; treating as \
+             a wire bug."
+        );
+        slot.last_outcome = DispatchOutcome::NoBytes;
+
+        match cmd_kind {
+            START   => install_lifecycle(slot, |a, c| Box::pin(async move { a.on_start(c).await; })),
+            RESUME  => install_lifecycle(slot, |a, c| Box::pin(async move { a.on_resume(c).await; })),
+            PAUSE   => install_lifecycle(slot, |a, c| Box::pin(async move { a.on_pause(c).await; })),
+            STOP    => install_lifecycle(slot, |a, c| Box::pin(async move { a.on_stop(c).await; })),
+            DESTROY => install_destroy(slot),
+
+            POINTER => install_pointer(slot, rest)?,
+            KEY     => install_key(slot, rest)?,
+            RESIZE  => install_resize(slot, rest)?,
+
+            RENDER => {
+                if rest.len() < 8 { return Err(1); }
+                let ts = read_f64(&rest[..8]);
+                slot.ctx.timestamp_ms = ts;
+                run_render_sync(slot);
+            }
+
+            SAVE_STATE => run_save_state_sync(slot),
+            RESTORE_STATE => {
+                run_restore_state_sync(slot, rest);
+            }
+
+            NEW_INTENT => install_new_intent(slot, rest)?,
+            ACTIVITY_RESULT => install_activity_result(slot, rest)?,
+
+            _ => return Err(1),
+        }
+        Ok::<(), u32>(())
+    })?;
+
+    // Map dispatch_id → handle, then drive the pending (or skip if
+    // sync-completed).
+    with_dispatches(|d| d.insert(dispatch_id, handle));
+    let _ = drive_pending(dispatch_id);
+    Ok(())
 }
 
-// ── Input ─────────────────────────────────────────────────────────────
+/// Install a lifecycle future (Start/Resume/Pause/Stop). The body runs
+/// the corresponding `Activity::on_*(&mut self, &mut ctx)` async fn.
+fn install_lifecycle<F>(slot: &mut Slot, body: F)
+where
+    F: FnOnce(
+            &'static mut Box<dyn Activity>,
+            &'static mut Context<'static>,
+        ) -> Pin<Box<dyn Future<Output = ()> + 'static>>
+        + 'static,
+{
+    let fut = build_async_future(slot, DispatchOutcome::NoBytes, body);
+    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+}
 
-pub fn on_pointer(handle: u32, x: f32, y: f32, button: u32, phase_wire: u32, ts_ms: f64) {
-    let Some(slot) = slots().get_mut(&handle) else { return; };
+fn install_destroy(slot: &mut Slot) {
+    let fut = build_async_future(slot, DispatchOutcome::Destroy, |a, c| {
+        Box::pin(async move { a.on_destroy(c).await; })
+    });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+}
+
+fn install_pointer(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+    if rest.len() < 24 { return Err(1); }
+    let x = f32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    let y = f32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+    let button = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
+    let phase = u32::from_le_bytes([rest[12], rest[13], rest[14], rest[15]]);
+    let ts = read_f64(&rest[16..24]);
+
     let ev = PointerEvent {
         x, y,
         button: button as u8,
-        phase: decode_pointer_phase(phase_wire),
+        phase: decode_pointer_phase(phase),
     };
-    slot.last_pointer = Some(ev);
-    let mut ctx = Context {
-        metrics: slot.metrics,
-        timestamp_ms: ts_ms,
-        pointer: Some(ev),
-        class: "",
-        handle,
-    };
-    block_on_ready(slot.activity.on_pointer(&mut ctx, ev));
+    slot.ctx.pointer = Some(ev);
+    slot.ctx.timestamp_ms = ts;
+
+    let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
+        Box::pin(async move { a.on_pointer(c, ev).await; })
+    });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    Ok(())
 }
 
-pub fn on_key(handle: u32, code: u32, modifiers: u32, phase_wire: u32, ts_ms: f64) {
-    let Some(slot) = slots().get_mut(&handle) else { return; };
+fn install_key(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+    if rest.len() < 20 { return Err(1); }
+    let code = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    let modifiers = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+    let phase = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
+    let ts = read_f64(&rest[12..20]);
+
     let ev = KeyEvent {
         code,
         modifiers: modifiers as u8,
-        phase: decode_key_phase(phase_wire),
+        phase: decode_key_phase(phase),
     };
-    let mut ctx = Context {
-        metrics: slot.metrics,
-        timestamp_ms: ts_ms,
-        pointer: slot.last_pointer,
-        class: "",
-        handle,
-    };
-    block_on_ready(slot.activity.on_key(&mut ctx, ev));
+    slot.ctx.timestamp_ms = ts;
+
+    let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
+        Box::pin(async move { a.on_key(c, ev).await; })
+    });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    Ok(())
 }
 
-pub fn on_resize(handle: u32, width_px: u32, height_px: u32, density: f32) {
-    let Some(slot) = slots().get_mut(&handle) else { return; };
-    let metrics = Metrics { width_px, height_px, density };
-    slot.metrics = metrics;
-    let mut ctx = Context {
-        metrics,
-        timestamp_ms: 0.0,
-        pointer: slot.last_pointer,
-        class: "",
-        handle,
-    };
-    block_on_ready(slot.activity.on_resize(&mut ctx, metrics));
+fn install_resize(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+    if rest.len() < 12 { return Err(1); }
+    let w = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    let h = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+    let d = f32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
+    let metrics = Metrics { width_px: w, height_px: h, density: d };
+    slot.ctx.metrics = metrics;
+
+    let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
+        Box::pin(async move { a.on_resize(c, metrics).await; })
+    });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    Ok(())
 }
 
-// ── Render ────────────────────────────────────────────────────────────
-
-pub fn on_render(handle: u32, ts_ms: f64, out_len_ptr: *mut u32) -> *const u8 {
-    let Some(slot) = slots().get_mut(&handle) else {
-        // SAFETY: host always passes a writable u32 cell on each call;
-        // for handle-misses we write 0 and return null so the host
-        // can short-circuit.
-        unsafe { *out_len_ptr = 0; }
-        return core::ptr::null();
+fn install_new_intent(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+    let intent = match Intent::decode(rest) {
+        Ok(i) => i,
+        Err(_) => {
+            // Drop silently — same policy as the legacy code path.
+            slot.pending = Some(PendingDispatch {
+                future: Box::pin(async move { DispatchOutcome::NoBytes }),
+                completed: None,
+            });
+            return Ok(());
+        }
     };
+    let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
+        Box::pin(async move { a.on_new_intent(c, &intent).await; })
+    });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    Ok(())
+}
+
+fn install_activity_result(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+    if rest.len() < 4 { return Err(1); }
+    let rc = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    let result = match ActivityResult::decode(&rest[4..]) {
+        Ok(r) => r,
+        Err(_) => {
+            slot.pending = Some(PendingDispatch {
+                future: Box::pin(async move { DispatchOutcome::NoBytes }),
+                completed: None,
+            });
+            return Ok(());
+        }
+    };
+    let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
+        Box::pin(async move { a.on_activity_result(c, rc, &result).await; })
+    });
+    slot.pending = Some(PendingDispatch { future: fut, completed: None });
+    Ok(())
+}
+
+/// RENDER is sync-only by design: paint code runs every frame and
+/// shouldn't block on host I/O. The legacy `executor::run_to_ready`
+/// panics on Pending so an accidental `.await` in `on_render` surfaces
+/// loudly. Caches the produced bytes in `slot.paint_buf` and marks the
+/// slot's outcome.
+fn run_render_sync(slot: &mut Slot) {
     slot.paint_buf.clear();
-    let mut ctx = Context {
-        metrics: slot.metrics,
-        timestamp_ms: ts_ms,
-        pointer: slot.last_pointer,
-        class: "",
-        handle,
-    };
-    let mut canvas = crate::canvas::Canvas::new(&mut slot.paint_buf);
-    block_on_ready(slot.activity.on_render(&mut ctx, &mut canvas));
-    let len = slot.paint_buf.len() as u32;
-    let ptr = slot.paint_buf.as_ptr();
-    unsafe { *out_len_ptr = len; }
-    ptr
+    slot.last_outcome = DispatchOutcome::Paint;
+    // SAFETY: render's future borrows &mut activity, &mut ctx, and
+    // &mut paint_buf. We construct all three as &'static via raw
+    // pointer casts, since `executor::run_to_ready` consumes the
+    // future before this fn returns — the 'static lifetime is a
+    // local fiction with no escape.
+    let activity_ptr: *mut Box<dyn Activity> = &mut slot.activity;
+    let ctx_ptr: *mut Context<'static> = &mut slot.ctx;
+    let paint_ptr: *mut Vec<u8> = &mut slot.paint_buf;
+    let activity = unsafe { raw_static_mut(activity_ptr) };
+    let ctx = unsafe { raw_static_mut(ctx_ptr) };
+    let paint = unsafe { raw_static_mut(paint_ptr) };
+    let mut canvas = crate::canvas::Canvas::new(paint);
+    executor::run_to_ready(activity.on_render(ctx, &mut canvas));
+    // Stash a sync-completed marker in the pending slot so
+    // poll_dispatch reports READY without trying to re-poll a future
+    // that doesn't exist.
+    slot.pending = Some(PendingDispatch {
+        future: Box::pin(async move { DispatchOutcome::Paint }),
+        completed: Some(DispatchOutcome::Paint),
+    });
 }
 
-// ── Saved state ───────────────────────────────────────────────────────
-//
-// Symmetric with `on_render`: the app gives the host a pointer + length
-// and guarantees the pointer stays valid until the next call to
-// `akiva_app_save_state` for the same handle. The host copies the bytes
-// into kernel memory, which in turn persists them through the framework.
-//
-// Save/restore are sync on the trait — see crate::activity::Activity for
-// why.
-
-pub fn on_save_state(handle: u32, out_len_ptr: *mut u32) -> *const u8 {
-    let Some(slot) = slots().get_mut(&handle) else {
-        unsafe { *out_len_ptr = 0; }
-        return core::ptr::null();
-    };
+fn run_save_state_sync(slot: &mut Slot) {
     let mut state = SavedState::default();
     slot.activity.on_save_state(&mut state);
     slot.save_buf = state.encode();
-    let len = slot.save_buf.len() as u32;
-    let ptr = slot.save_buf.as_ptr();
-    unsafe { *out_len_ptr = len; }
-    ptr
+    slot.last_outcome = DispatchOutcome::SavedState;
+    slot.pending = Some(PendingDispatch {
+        future: Box::pin(async move { DispatchOutcome::SavedState }),
+        completed: Some(DispatchOutcome::SavedState),
+    });
 }
 
-/// Deliver a re-issued intent to an already-existing activity. Called
-/// from the `akiva_app_new_intent` export generated by the `akiva_app!`
-/// macro. The host arranges bytes in app memory (via `akiva_app_alloc`
-/// + copy) and frees them once the call returns, matching the
-/// `akiva_app_restore_state` contract.
-pub fn on_new_intent(handle: u32, bytes_ptr: *const u8, bytes_len: u32) {
-    let Some(slot) = slots().get_mut(&handle) else { return; };
-    if bytes_ptr.is_null() || bytes_len == 0 { return; }
-    // SAFETY: host guarantees [bytes_ptr, bytes_ptr + bytes_len) is a
-    // valid readable region it copied into app memory.
-    let slice = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len as usize) };
-    let intent = match Intent::decode(slice) {
-        Ok(i) => i,
-        // Malformed blob — can't reach the app's handler meaningfully.
-        // Silently drop rather than trap the whole app.
-        Err(_) => return,
-    };
-    let mut ctx = Context {
-        metrics: slot.metrics,
-        timestamp_ms: 0.0,
-        pointer: slot.last_pointer,
-        class: "",
-        handle,
-    };
-    block_on_ready(slot.activity.on_new_intent(&mut ctx, &intent));
+fn run_restore_state_sync(slot: &mut Slot, rest: &[u8]) {
+    if !rest.is_empty() {
+        if let Ok(state) = SavedState::decode(rest) {
+            slot.activity.on_restore_state(&state);
+        }
+    }
+    slot.last_outcome = DispatchOutcome::NoBytes;
+    slot.pending = Some(PendingDispatch {
+        future: Box::pin(async move { DispatchOutcome::NoBytes }),
+        completed: Some(DispatchOutcome::NoBytes),
+    });
 }
 
-/// Deliver an ActivityResult to the caller. Fired by the framework after
-/// the callee (the one this activity launched via
-/// `start_activity_for_result`) finishes. A malformed blob is treated
-/// as "no result" — silently dropped, same policy as `on_new_intent` and
-/// `on_restore_state`.
-pub fn on_activity_result(
-    handle: u32, request_code: u32, bytes_ptr: *const u8, bytes_len: u32,
-) {
-    let Some(slot) = slots().get_mut(&handle) else { return; };
-    if bytes_ptr.is_null() || bytes_len == 0 { return; }
-    let slice = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len as usize) };
-    let result = match ActivityResult::decode(slice) {
-        Ok(r) => r,
-        Err(_) => return,
+/// Poll the pending future for `dispatch_id` once. Updates
+/// `pending.completed` if it reaches a terminal state.
+fn drive_pending(dispatch_id: u64) -> u32 {
+    let handle = match with_dispatches(|d| d.get(&dispatch_id).copied()) {
+        Some(h) => h,
+        None => return op_kinds::status::ERROR,
     };
-    let mut ctx = Context {
-        metrics: slot.metrics,
-        timestamp_ms: 0.0,
-        pointer: slot.last_pointer,
-        class: "",
-        handle,
-    };
-    block_on_ready(slot.activity.on_activity_result(&mut ctx, request_code, &result));
+    with_slots(|slots_map| {
+        let slot = match slots_map.get_mut(&handle) {
+            Some(s) => s,
+            None => return op_kinds::status::ERROR,
+        };
+        let pending = match slot.pending.as_mut() {
+            Some(p) => p,
+            None => return op_kinds::status::ERROR,
+        };
+        if pending.completed.is_some() {
+            return op_kinds::status::READY;
+        }
+        match executor::poll_once(&mut pending.future) {
+            Poll::Pending => op_kinds::status::PENDING,
+            Poll::Ready(outcome) => {
+                pending.completed = Some(outcome);
+                slot.last_outcome = outcome;
+                op_kinds::status::READY
+            }
+        }
+    })
 }
 
-pub fn on_restore_state(handle: u32, bytes_ptr: *const u8, bytes_len: u32) {
-    let Some(slot) = slots().get_mut(&handle) else { return; };
-    if bytes_ptr.is_null() || bytes_len == 0 { return; }
-    let slice = unsafe { core::slice::from_raw_parts(bytes_ptr, bytes_len as usize) };
-    match SavedState::decode(slice) {
-        Ok(state) => slot.activity.on_restore_state(&state),
-        // A malformed blob is effectively "no saved state" — the app
-        // keeps its default-constructed state. Silently dropping is
-        // deliberate: panicking here would trap the wasm and take the
-        // whole app down on launch, which is worse than starting fresh.
-        Err(_) => {}
+/// `akiva_app_dispatch` body. Returns `0` on accept (the host should
+/// poll via `poll_dispatch` to drive completion); non-zero on a hard
+/// refusal (malformed payload, unknown cmd_kind, out-of-memory, etc.).
+pub fn dispatch<T: Activity + Default>(
+    dispatch_id: u64,
+    cmd_kind: u32,
+    payload_ptr: *const u8,
+    payload_len: u32,
+) -> u32 {
+    if payload_len < 4 || payload_ptr.is_null() {
+        return 1;
+    }
+    // SAFETY: the host owns the buffer for the duration of this call.
+    let payload = unsafe {
+        core::slice::from_raw_parts(payload_ptr, payload_len as usize)
+    };
+    let handle = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let rest = &payload[4..];
+
+    match install_and_poll::<T>(handle, dispatch_id, cmd_kind, rest) {
+        Ok(()) => 0,
+        Err(code) => code,
     }
 }
 
+/// `akiva_app_poll_dispatch` body. Returns `(status, len)` packed:
+/// status in low 32 bits, result-bytes length in high 32 bits.
+/// Idempotent — terminal states cache and report consistently.
+pub fn poll_dispatch(dispatch_id: u64) -> u64 {
+    let status = drive_pending(dispatch_id);
+    if status != op_kinds::status::READY {
+        return pack_poll(status, 0);
+    }
+    let len = result_bytes_len(dispatch_id);
+    pack_poll(status, len)
+}
+
+/// `akiva_app_get_result` body. Two-phase fetch: returns the source
+/// pointer + writes the byte length to `*out_len_ptr`. Buffer stays
+/// valid until the dispatch is consumed by a fitting `get_result`
+/// (which evicts the dispatch_id mapping).
+///
+/// For a `Destroy` outcome, evicts the slot itself once the bytes are
+/// drained (always 0 bytes — destroy is ack-only). The future-drop
+/// happens here, BEFORE slot eviction, so any raw-pointer borrows the
+/// future held into the slot are released first.
+pub fn get_result(dispatch_id: u64, out_len_ptr: *mut u32) -> *const u8 {
+    let handle = match with_dispatches(|d| d.get(&dispatch_id).copied()) {
+        Some(h) => h,
+        None => {
+            // SAFETY: host always passes a writable u32 cell.
+            unsafe { *out_len_ptr = 0; }
+            return core::ptr::null();
+        }
+    };
+    let mut destroy_after = false;
+    let mut bytes_ptr: *const u8 = core::ptr::null();
+    let mut bytes_len: u32 = 0;
+    with_slots(|slots_map| {
+        let Some(slot) = slots_map.get_mut(&handle) else { return; };
+        let outcome = slot.pending.as_ref()
+            .and_then(|p| p.completed)
+            .unwrap_or(slot.last_outcome);
+        match outcome {
+            DispatchOutcome::Paint => {
+                bytes_len = slot.paint_buf.len() as u32;
+                bytes_ptr = slot.paint_buf.as_ptr();
+            }
+            DispatchOutcome::SavedState => {
+                bytes_len = slot.save_buf.len() as u32;
+                bytes_ptr = slot.save_buf.as_ptr();
+            }
+            DispatchOutcome::NoBytes => {
+                bytes_len = 0;
+            }
+            DispatchOutcome::Destroy => {
+                bytes_len = 0;
+                destroy_after = true;
+            }
+        }
+        // Drop the future BEFORE potentially removing the slot — the
+        // future holds raw-pointer borrows into the slot.
+        slot.pending = None;
+    });
+
+    // Always evict the dispatch_id; single-shot semantic.
+    with_dispatches(|d| { d.remove(&dispatch_id); });
+
+    if destroy_after {
+        with_slots(|slots_map| { slots_map.remove(&handle); });
+    }
+
+    // SAFETY: host always passes a writable u32 cell.
+    unsafe { *out_len_ptr = bytes_len; }
+    bytes_ptr
+}
+
+fn result_bytes_len(dispatch_id: u64) -> u32 {
+    let handle = match with_dispatches(|d| d.get(&dispatch_id).copied()) {
+        Some(h) => h,
+        None => return 0,
+    };
+    with_slots(|slots_map| {
+        let Some(slot) = slots_map.get(&handle) else { return 0; };
+        let outcome = slot.pending.as_ref()
+            .and_then(|p| p.completed)
+            .unwrap_or(slot.last_outcome);
+        match outcome {
+            DispatchOutcome::Paint => slot.paint_buf.len() as u32,
+            DispatchOutcome::SavedState => slot.save_buf.len() as u32,
+            DispatchOutcome::NoBytes | DispatchOutcome::Destroy => 0,
+        }
+    })
+}
+
+fn pack_poll(status: u32, length: u32) -> u64 {
+    (status as u64) | ((length as u64) << 32)
+}
+
 // ── Wire decoders ─────────────────────────────────────────────────────
-//
-// These match `pointer_phase_wire` / `key_phase_wire` in framework's
-// `wasm_activity.rs`. Unknown values fall back to a safe default rather
-// than panicking the whole app — the kernel can't easily recover a wasm
-// that trapped.
 
 fn decode_pointer_phase(w: u32) -> PointerPhase {
     match w {
@@ -607,222 +805,88 @@ fn decode_key_phase(w: u32) -> KeyPhase {
     }
 }
 
-fn read_utf8(ptr: *const u8, len: u32) -> String {
-    if ptr.is_null() || len == 0 { return String::new(); }
-    // SAFETY: the host guarantees [ptr, ptr+len) is a valid region it
-    // allocated via `akiva_app_alloc`; we only read. from_utf8_lossy
-    // keeps us safe even if the host passed garbage.
-    let slice = unsafe { core::slice::from_raw_parts(ptr, len as usize) };
-    String::from_utf8_lossy(slice).into_owned()
-}
-
-// ── Stone 11.4b: unified host→app dispatch ────────────────────────────
-//
-// `akiva_app_dispatch(cmd_kind, payload_ptr, payload_len) -> u64`
-// replaces the 12-13 per-callback exports with a single entry point.
-// The host packs per-callback args into the payload (every payload
-// starts with a u32 LE handle); this function decodes, routes to the
-// existing `on_*` helpers above, and returns a `future_id` for the
-// data-returning ops (RENDER, SAVE_STATE) or `0` for ack-only ops.
-//
-// Today the runtime is single-worker so every dispatch resolves
-// inline before the function returns. The non-zero `future_id` for
-// RENDER/SAVE_STATE is just a routing key into the per-handle slot —
-// the host calls `akiva_app_get_result(future_id, out_len_ptr)`
-// immediately to fetch the bytes. Stone 11.4c (workers) will defer
-// the actual work; the wire shape stays identical.
-//
-// Future_id encoding (locked):
-//   - `0` for every ack-only dispatch (lifecycle, input, restore_state,
-//     new_intent, activity_result, restoration variants). Host knows
-//     "no bytes to fetch".
-//   - `handle as u64` for RENDER and SAVE_STATE. Host calls
-//     `get_result(handle as u64, ...)` to fetch the produced bytes.
-//
-//   Handles are non-zero by construction (`AppHandle::new`), so the
-//   `0` sentinel is unambiguous.
-
-/// Unified host→app dispatcher. Called from the `akiva_app_dispatch`
-/// export emitted by the [`akiva_app!`] macro. Generic over the user's
-/// `Activity` type so [`on_create`] can stamp out a fresh instance.
-///
-/// Malformed payload (length too small for the cmd_kind, unknown
-/// cmd_kind) returns `0` and drops the call silently. The wasm app
-/// can't easily report a host bug — trapping would take the whole
-/// process down on a host wire-format slip, which is worse than the
-/// dropped op manifesting as "callback didn't fire".
-pub fn dispatch<T: Activity + Default>(
-    cmd_kind: u32,
-    payload_ptr: *const u8,
-    payload_len: u32,
-) -> u64 {
-    use crate::op_kinds::cmd::*;
-
-    // Empty/null payload is only valid for cmd_kinds that don't carry
-    // a handle, of which there are none today — every cmd starts with
-    // [handle: u32 LE]. Treat as malformed.
-    if payload_len < 4 || payload_ptr.is_null() {
-        return 0;
-    }
-    // SAFETY: the host owns the buffer for the duration of this call
-    // (it allocated via `akiva_app_alloc`, copied bytes in, and frees
-    // after we return). We only read.
-    let payload = unsafe {
-        core::slice::from_raw_parts(payload_ptr, payload_len as usize)
-    };
-    let handle = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let rest = &payload[4..];
-
-    match cmd_kind {
-        CREATE => {
-            // [handle, class: utf8...]
-            on_create::<T>(handle, rest.as_ptr(), rest.len() as u32);
-            mark_no_result(handle);
-            0
-        }
-        START   => { on_start(handle);   mark_no_result(handle); 0 }
-        RESUME  => { on_resume(handle);  mark_no_result(handle); 0 }
-        PAUSE   => { on_pause(handle);   mark_no_result(handle); 0 }
-        STOP    => { on_stop(handle);    mark_no_result(handle); 0 }
-        DESTROY => { on_destroy(handle); mark_no_result(handle); 0 }
-
-        POINTER => {
-            // [handle, x:f32, y:f32, button:u32, phase:u32, ts:f64] = 4+24
-            if rest.len() < 24 { return 0; }
-            let x = f32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
-            let y = f32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
-            let button = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
-            let phase = u32::from_le_bytes([rest[12], rest[13], rest[14], rest[15]]);
-            let ts_ms = read_f64(&rest[16..24]);
-            on_pointer(handle, x, y, button, phase, ts_ms);
-            mark_no_result(handle);
-            0
-        }
-        KEY => {
-            // [handle, code:u32, modifiers:u32, phase:u32, ts:f64] = 4+20
-            if rest.len() < 20 { return 0; }
-            let code = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
-            let modifiers = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
-            let phase = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
-            let ts_ms = read_f64(&rest[12..20]);
-            on_key(handle, code, modifiers, phase, ts_ms);
-            mark_no_result(handle);
-            0
-        }
-        RESIZE => {
-            // [handle, width:u32, height:u32, density:f32] = 4+12
-            if rest.len() < 12 { return 0; }
-            let w = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
-            let h = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
-            let d = f32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
-            on_resize(handle, w, h, d);
-            mark_no_result(handle);
-            0
-        }
-
-        RENDER => {
-            // [handle, ts:f64] = 4+8
-            if rest.len() < 8 { return 0; }
-            let ts_ms = read_f64(&rest[0..8]);
-            // Reuse on_render but discard its (ptr,len) return — the
-            // bytes live in slot.paint_buf and will be retrieved via
-            // get_result. A stack-local u32 satisfies its out_len_ptr
-            // contract; the value goes nowhere.
-            let mut throwaway: u32 = 0;
-            let _ = on_render(handle, ts_ms, &mut throwaway as *mut u32);
-            mark_paint_result(handle);
-            handle as u64
-        }
-
-        SAVE_STATE => {
-            // [handle] only.
-            let mut throwaway: u32 = 0;
-            let _ = on_save_state(handle, &mut throwaway as *mut u32);
-            mark_save_result(handle);
-            handle as u64
-        }
-
-        RESTORE_STATE => {
-            // [handle, state: bytes...]
-            on_restore_state(handle, rest.as_ptr(), rest.len() as u32);
-            mark_no_result(handle);
-            0
-        }
-
-        NEW_INTENT => {
-            // [handle, intent: bytes...]
-            on_new_intent(handle, rest.as_ptr(), rest.len() as u32);
-            mark_no_result(handle);
-            0
-        }
-
-        ACTIVITY_RESULT => {
-            // [handle, request_code:u32, result: bytes...] = 4+(4+...)
-            if rest.len() < 4 { return 0; }
-            let rc = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
-            let bytes = &rest[4..];
-            on_activity_result(handle, rc, bytes.as_ptr(), bytes.len() as u32);
-            mark_no_result(handle);
-            0
-        }
-
-        _ => {
-            // Unknown cmd_kind. Wire bug or version skew — drop.
-            0
-        }
-    }
-}
-
-/// Companion to [`dispatch`]. Returns a pointer + length into the
-/// app's per-handle scratch buffer that holds bytes produced by the
-/// most recent RENDER or SAVE_STATE on `future_id == handle`.
-///
-/// Returns `(null, 0)` when the slot is unknown OR when no
-/// data-producing op ran for that handle. The buffer stays valid
-/// until the next data-producing op for the same handle (matches the
-/// existing `akiva_app_render` / `akiva_app_save_state` lifetime
-/// contract — the dispatcher hasn't relaxed it).
-pub fn get_result(future_id: u64, out_len_ptr: *mut u32) -> *const u8 {
-    // Future_ids in 11.4b are just the handle (since every dispatch
-    // is sync, a "future_id" is really a slot key). 11.5+ may move
-    // to a counter when deferred host calls land.
-    let handle = future_id as u32;
-    let Some(slot) = slots().get(&handle) else {
-        unsafe { *out_len_ptr = 0; }
-        return core::ptr::null();
-    };
-    let buf: &[u8] = match slot.last_result {
-        LastResult::Paint => &slot.paint_buf,
-        LastResult::SavedState => &slot.save_buf,
-        LastResult::None => {
-            unsafe { *out_len_ptr = 0; }
-            return core::ptr::null();
-        }
-    };
-    unsafe { *out_len_ptr = buf.len() as u32; }
-    buf.as_ptr()
-}
-
-fn mark_no_result(handle: u32) {
-    if let Some(slot) = slots().get_mut(&handle) {
-        slot.last_result = LastResult::None;
-    }
-}
-fn mark_paint_result(handle: u32) {
-    if let Some(slot) = slots().get_mut(&handle) {
-        slot.last_result = LastResult::Paint;
-    }
-}
-fn mark_save_result(handle: u32) {
-    if let Some(slot) = slots().get_mut(&handle) {
-        slot.last_result = LastResult::SavedState;
-    }
-}
-
 fn read_f64(bytes: &[u8]) -> f64 {
     debug_assert!(bytes.len() >= 8);
     f64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3],
         bytes[4], bytes[5], bytes[6], bytes[7],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activity::Activity;
+    use crate::op_kinds::cmd;
+    use async_trait::async_trait;
+
+    #[derive(Default)]
+    struct ImmediateActivity {
+        created: bool,
+    }
+
+    #[async_trait(?Send)]
+    impl Activity for ImmediateActivity {
+        async fn on_create(&mut self, _ctx: &mut Context<'_>) {
+            self.created = true;
+        }
+    }
+
+    #[test]
+    fn create_then_poll_resolves_synchronously() {
+        // P0 #4 — when the user's async fn doesn't suspend, the
+        // dispatch should reach READY on the first internal poll
+        // (still inside `dispatch`). poll_dispatch reports READY,
+        // get_result returns 0 bytes for the ack-only outcome.
+        let payload_handle = 1u32;
+        let class = "Main";
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&payload_handle.to_le_bytes());
+        payload.extend_from_slice(class.as_bytes());
+        let dispatch_id = 100u64;
+        let rc = dispatch::<ImmediateActivity>(
+            dispatch_id, cmd::CREATE, payload.as_ptr(), payload.len() as u32,
+        );
+        assert_eq!(rc, 0, "dispatch should accept");
+        let packed = poll_dispatch(dispatch_id);
+        let status = (packed & 0xFFFF_FFFF) as u32;
+        assert_eq!(status, op_kinds::status::READY,
+            "immediate-future should resolve synchronously");
+        let mut len: u32 = 0;
+        let ptr = get_result(dispatch_id, &mut len as *mut u32);
+        assert_eq!(len, 0, "create is ack-only");
+        let _ = ptr;
+        // Cleanup: destroy the slot so subsequent tests see a clean slate.
+        let mut destroy_payload = Vec::new();
+        destroy_payload.extend_from_slice(&payload_handle.to_le_bytes());
+        let did = 101u64;
+        dispatch::<ImmediateActivity>(
+            did, cmd::DESTROY, destroy_payload.as_ptr(), destroy_payload.len() as u32,
+        );
+        let _ = poll_dispatch(did);
+        let mut zero: u32 = 0;
+        get_result(did, &mut zero as *mut u32);
+    }
+
+    #[test]
+    fn dispatch_rejects_short_payload() {
+        let buf = [0u8; 2];
+        let rc = dispatch::<ImmediateActivity>(1, cmd::RESUME, buf.as_ptr(), 2);
+        assert_ne!(rc, 0);
+    }
+
+    #[test]
+    fn pack_poll_round_trips() {
+        assert_eq!(pack_poll(op_kinds::status::READY, 42), 1u64 | (42u64 << 32));
+        assert_eq!(pack_poll(op_kinds::status::PENDING, 0), 0u64);
+    }
+
+    #[test]
+    fn intern_class_dedupes() {
+        let a = intern_class("X");
+        let b = intern_class("X");
+        assert!(core::ptr::eq(a, b));
+        let c = intern_class("Y");
+        assert!(!core::ptr::eq(a, c));
+    }
 }

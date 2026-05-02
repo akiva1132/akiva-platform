@@ -121,15 +121,37 @@ When the first app needs a real text field, the `on_key` path has to grow focus 
 
 A self-audit after Stone 11.5 closed (process isolation + fault containment work) surfaced these gaps. Each is documented in detail elsewhere; this section is the single place that lists them so they don't get lost. See [`docs/isolation-design.md` §10.5 Phase 11 Foundation Gaps](isolation-design.md) for the full work plan.
 
-### 7.1 🔴 SDK async executor missing (cardinal)
+### 7.1 ✅ SDK async executor — fixed (P0 #4, May 2026)
 
-**Concern.** `Activity` callbacks are `async fn`, but the SDK's executor (`block_on_ready`) calls `.poll()` exactly once and panics on `Pending`. Cross-worker host calls (storage::read, future API like network) take a frame to resolve, so `.await` on them would panic. The deferred-handle workaround (`storage::ReadHandle::poll`) works but is a leaky abstraction — apps must manage state across frames manually.
+**Was.** `Activity` callbacks were `async fn`, but `block_on_ready` polled exactly once and panicked on `Pending`. Cross-worker host calls (storage::read) took ≥1 frame to resolve, so `.await` on them would panic. The `ReadHandle::poll()` workaround leaked the multi-frame nature into every app.
 
-**Why deferred.** Embassy executor integration is a 1-2 day refactor that would touch the dispatch protocol on both sides of the worker boundary. We shipped MVP-quality storage SDK first, planning to retrofit once the platform is stable.
+**Fix (~700 lines, breaking ABI bump).** A single-task-per-handle async-resumable runtime, with the dispatch protocol changed to:
 
-**Trigger to promote.** First "real" app that needs more than 1-2 awaits (notes, settings, anything reading user data). Or: when the deferred-handle pattern shows up across 3+ SDK modules and the cost of NOT having async surpasses the cost of the embassy integration.
+```rust
+akiva_app_dispatch(dispatch_id: u64, cmd: u32, ptr, len) -> u32   // 0 accepts, !=0 refuses
+akiva_app_poll_dispatch(dispatch_id: u64) -> u64                   // packed (status, len)
+akiva_app_get_result(dispatch_id: u64, out_len_ptr) -> *const u8   // single-shot
+```
 
-**Code surfaces.** `sdk-rust/src/activity.rs` (replace `block_on_ready`), `sdk-rust/src/runtime.rs` (dispatch glue), `runtime/web/app_worker_shell.js` (resumption protocol), `framework/src/wasm_activity.rs` (lifecycle pipelining). Detailed plan in [`docs/sdk-rust.md` §19.1](sdk-rust.md).
+The wasm side stores the in-flight `Pin<Box<dyn Future + 'static>>` in the slot via raw-pointer borrows into `slot.activity` and `slot.ctx`. Soundness rests on `HashMap<u32, Box<Slot>>` heap-pinning every slot and on the framework's `PendingTransition` discipline guaranteeing no concurrent dispatches per handle. The `executor` module documents the SAFETY invariants.
+
+The worker shell tracks `pendingDispatches: Map<bigint, ...>`. When `host_op_done` arrives the shell re-polls every still-pending dispatch — the wasm side caches terminal results, so re-polls of already-resolved dispatches are no-ops. Storage `read` is now a real `Future`:
+
+```rust
+async fn on_create(&mut self, _ctx: &mut Context<'_>) {
+    if let Some(fut) = storage::read("notes") {
+        if let Ok(Some(bytes)) = fut.await {
+            self.text = String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
+}
+```
+
+Render and `save_state` keep the synchronous fast-path: paint code shouldn't block on host I/O, and `save_state` is `&self` per the trait. `executor::run_to_ready` (the sync drain) still panics on Pending — accidental awaits in render surface immediately.
+
+**Code.** `sdk-rust/src/{executor.rs (new), runtime.rs, storage.rs, lib.rs, activity.rs}`, `runtime/web/app_worker_shell.js`. Tests: `executor::tests::*` (4), `runtime::tests::*` (4), `storage::tests::read_future_resolves_to_none_on_non_wasm_stub` (1). 407 Rust tests + 54 vitest tests green.
+
+**Carry-forward.** `WriteHandle` (P1 §7.x) for write-confirmation futures is a natural follow-up — the same async runtime now supports it.
 
 ### 7.2 ✅ `on_save_state` degraded under cross-worker — fixed (P0 #1, May 2026)
 

@@ -16,6 +16,7 @@ pub mod activity;
 pub mod akml;
 pub mod app;
 pub mod canvas;
+pub mod executor;
 pub mod intent;
 pub mod log;
 pub mod op_kinds;
@@ -94,32 +95,54 @@ macro_rules! akiva_app {
             $crate::runtime::ABI_VERSION.as_ptr()
         }
 
-        // ── Unified host→app dispatch (Stone 11.4b) ─────────────────────
-        // The host packs per-callback args into the payload (every
-        // payload starts with `[handle: u32 LE, ...]`) and the app
-        // demuxes by `cmd_kind`. See docs/abi.md §2.2.2 for the wire.
+        // ── Unified host→app dispatch (P0 #4 — async-aware) ─────────────
         //
-        // Return value:
-        //   `0`             — sync, no bytes to fetch.
-        //   `handle as u64` — sync, RENDER/SAVE_STATE bytes available;
-        //                     host calls `akiva_app_get_result(this, ...)`.
+        // Three exports replace the legacy `dispatch -> u64 future_id`
+        // shape with an async-resumable protocol. The host allocates a
+        // `dispatch_id` (its own monotonic counter), passes it into
+        // `dispatch`, and drives it to terminal status via repeated
+        // `poll_dispatch` calls — typically once after `dispatch`, then
+        // again after each `host_op_done` arrives at the worker shell.
         //
-        // 11.4c will introduce non-handle future_ids when the dispatch
-        // genuinely defers (worker round-trip).
+        // Return values:
+        //   * `dispatch(dispatch_id, cmd, ptr, len) -> u32`
+        //     `0` accepts; non-zero is a hard refusal (bad payload,
+        //     unknown cmd, OOM). The host doesn't poll on refusal.
+        //
+        //   * `poll_dispatch(dispatch_id) -> u64` packed `(status, len)`.
+        //     `status`:
+        //       0 PENDING — host should call again after a `host_op_done`.
+        //       1 READY   — bytes (if any) available via `get_result`.
+        //       2 ERROR   — future trapped or wire bug.
+        //     `len` is the byte count for `READY`/`ERROR`; 0 for
+        //     `PENDING` and ack-only dispatches.
+        //
+        //   * `get_result(dispatch_id, out_len_ptr) -> *const u8`
+        //     Two-phase fetch. Pointer + length stay valid until the
+        //     dispatch_id is consumed by this call (single-shot).
+        //
+        // See `sdk-rust/src/runtime.rs` and `docs/abi.md §2.2` for the
+        // payload encoding per cmd_kind.
         #[no_mangle]
         pub extern "C" fn akiva_app_dispatch(
-            cmd_kind: u32, payload_ptr: *const u8, payload_len: u32,
-        ) -> u64 {
-            $crate::runtime::dispatch::<$ty>(cmd_kind, payload_ptr, payload_len)
+            dispatch_id: u64, cmd_kind: u32,
+            payload_ptr: *const u8, payload_len: u32,
+        ) -> u32 {
+            $crate::runtime::dispatch::<$ty>(
+                dispatch_id, cmd_kind, payload_ptr, payload_len,
+            )
         }
 
-        // Buffer-lifetime contract: pointer stays valid until the next
-        // data-producing dispatch for the same handle.
+        #[no_mangle]
+        pub extern "C" fn akiva_app_poll_dispatch(dispatch_id: u64) -> u64 {
+            $crate::runtime::poll_dispatch(dispatch_id)
+        }
+
         #[no_mangle]
         pub extern "C" fn akiva_app_get_result(
-            future_id: u64, out_len_ptr: *mut u32,
+            dispatch_id: u64, out_len_ptr: *mut u32,
         ) -> *const u8 {
-            $crate::runtime::get_result(future_id, out_len_ptr)
+            $crate::runtime::get_result(dispatch_id, out_len_ptr)
         }
     };
 }

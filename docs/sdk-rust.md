@@ -497,82 +497,39 @@ akiva run
 
 מסמך זה מתעד פערים אמיתיים של ה-SDK שזיהינו אחרי 11.4c (worker-per-app) ו-11.5 (fault containment) על ה-platform. ראה [`docs/isolation-design.md` §10.5 Phase 11 Status](isolation-design.md) ל-full work plan.
 
-### 19.1 🔴 The async executor gap (ה-cardinal issue)
+### 19.1 ✅ The async executor — תוקן (P0 #4, May 2026)
 
-**הבעיה.** ה-`Activity` trait הוא `async fn`:
+**הבעיה הייתה.** ה-`Activity` trait הוא `async fn`, אבל `block_on_ready` עשה `.poll()` פעם אחת בלבד ו-panic על Pending. כל future cross-worker (storage::read) חייב להיות wrapped ב-deferred-handle (`ReadHandle::poll()` ב-on_render) — leaky abstraction שאילצה apps לנהל state ידנית בין frames.
+
+**התיקון בפועל.** ABI חדש (breaking — bumped ABI_VERSION ל-`0.2.0`) + mini-executor משלנו ב-`sdk-rust/src/executor.rs` (~120 שורות, לא embassy). שלושה exports שמחליפים את הזוג הקודם:
 
 ```rust
-async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
-    let bytes = storage::read("notes").await;  // ❌ panics
-    ...
-}
+akiva_app_dispatch(dispatch_id: u64, cmd: u32, ptr, len) -> u32   // 0=accept, !=0=refuse
+akiva_app_poll_dispatch(dispatch_id: u64) -> u64                   // packed (status, len)
+akiva_app_get_result(dispatch_id: u64, out_len_ptr) -> *const u8   // single-shot
 ```
 
-אבל ה-executor של ה-SDK הוא [`block_on_ready`](../sdk-rust/src/activity.rs) שעושה `.poll()` פעם אחת בלבד:
+ה-runtime ב-wasm מחזיק עכשיו `Pin<Box<dyn Future + 'static>>` per-handle, captured-by-raw-ptr ל-`slot.activity` ו-`slot.ctx`. self-referential אבל סגור: ה-Slot יושב ב-`HashMap<u32, Box<Slot>>` (heap-pinned), ה-framework מבטיח dispatch-per-handle אחד בכל זמן (PendingTransition discipline). ראה `crate::executor` ו-`crate::runtime` לכל ה-SAFETY invariants.
+
+**Render ו-save_state נשארים סנכרוניים** — paint code לא צריך לחכות על host I/O, ו-`save_state` הוא `&self` ב-trait. `executor::run_to_ready` עדיין panics על Pending — accidental await ב-on_render יקרוס מיד.
+
+**Storage::read הופך ל-real `Future`:**
 
 ```rust
-pub fn block_on_ready<F: Future>(mut fut: F) -> F::Output {
-    match Future::poll(unsafe { Pin::new_unchecked(&mut fut) }, &mut cx) {
-        Poll::Ready(v) => v,
-        Poll::Pending  => panic!("block_on_ready: future returned Pending"),
-    }
-}
-```
-
-**מה זה אומר בפועל:**
-
-| Operation | Status |
-|---|---|
-| ✅ `async fn` בלי await על futures לא-ready | works |
-| ✅ `await` על future שresolve immediately | works (e.g., a future that returns `Poll::Ready` on first poll) |
-| ❌ `await` על cross-worker host call | panics (release: silent fall-through) |
-| ❌ `await` על channel that hasn't received yet | panics |
-| ❌ `select!`, `join!` עם branch שעוד לא ready | panics |
-
-**למה זה כך נשאר.** הסיבה ההיסטורית — Stone 11.2 הציג את ה-async-shape API כי ה-vision היה Android/iOS parity. הexecutor האמיתי (embassy) נדחה ל-Stone 11.3 וב-11.4 לתת-stones של isolation. בפועל ה-block_on_ready stub שרד — single-worker עבד עם זה. עם cross-worker (11.4c) ה-stub שבר.
-
-**ה-workaround היום: deferred-handle pattern.** ראה [`storage::ReadHandle`](../sdk-rust/src/storage.rs):
-
-```rust
-struct Notes {
-    text: String,
-    loading: Option<storage::ReadHandle>,
-}
-
-impl Activity for Notes {
-    async fn on_create(&mut self, _ctx: &mut Context<'_>) {
-        self.loading = storage::read("notes");  // returns ReadHandle, doesn't await
-    }
-    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
-        if let Some(handle) = &self.loading {
-            if let Some(result) = handle.poll() {        // <-- manual polling
-                if let Ok(Some(bytes)) = result {
-                    self.text = String::from_utf8(bytes).unwrap_or_default();
-                }
-                self.loading = None;
-            }
+async fn on_create(&mut self, _ctx: &mut Context<'_>) {
+    if let Some(fut) = storage::read("notes") {
+        if let Ok(Some(bytes)) = fut.await {
+            self.text = String::from_utf8_lossy(&bytes).into_owned();
         }
-        // ... render ...
     }
 }
 ```
 
-זה עובד אבל מאלץ apps לנהל state ידנית בין frames. ככל שה-SDK מתרחב (network, BLE, camera), הדפוס הזה יתפוצץ.
+ה-`.await` legitimately suspends the dispatch — ה-shell rights `pendingDispatches`, מחכה ל-`host_op_done`, re-polls. ReadHandle נמחק.
 
-**התיקון המלא.** embassy executor (`embassy-executor` + `embassy-sync`):
-- replace `block_on_ready` ב-real executor שmamper Pending ע"י לחזור ל-host
-- שמירת ה-future state בין dispatches (ה-`akiva_app_dispatch` protocol יצטרך להחזיר future_id mid-callback)
-- waker registry ש-`host_op_done` מעיר
-- `let bytes = storage::read("k").await` יעבוד fluent
+**Code:** `sdk-rust/src/{executor.rs (new), runtime.rs, storage.rs, lib.rs, activity.rs}`, `runtime/web/app_worker_shell.js`. Tests: 9 חדשים (executor poll_once/run_to_ready, runtime sync dispatch, intern_class dedupe, ReadFuture stub).
 
-**סקופ:** 1-2 ימים. שינויים:
-- `sdk-rust/Cargo.toml` — `embassy-executor`, `embassy-sync` deps
-- `sdk-rust/src/activity.rs` — replace `block_on_ready`
-- `sdk-rust/src/runtime.rs` — dispatch glue ש-supports resumption
-- `runtime/web/app_worker_shell.js` — handle resumption protocol
-- `framework/src/wasm_activity.rs` — pipelined dispatch הופך גם לlifecycle calls (כמו render כבר היום)
-
-**תיקון ביניים (אופציונלי).** mini-executor שmamper רק את ה-`host_io_poll` case — הרבה פחות גנרי אבל יעיל יותר ל-MVP. נבחר רק אם ה-embassy bundle bloat (~10KB per app) הופך לבעיה אמיתית.
+**Why not embassy?** embassy-executor ~10KB per app, מובנה ל-interrupt-driven wakers ול-timer drivers שלא רלוונטיים ב-wasm worker. Custom 120-line executor משלנו tightly fitted ל-pattern של one-future-per-handle, with re-poll triggered externally by `host_op_done`. Zero bundle bloat over the legacy stub.
 
 ### 19.2 ✅ `save_state` degraded under cross-worker — תוקן (P0 #1, May 2026)
 

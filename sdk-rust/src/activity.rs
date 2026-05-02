@@ -23,7 +23,6 @@
 //! [docs/abi.md §2.2] for how each callback maps to a raw wasm export.
 
 use core::future::Future;
-use core::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -85,43 +84,22 @@ pub struct Context<'a> {
 
 // ── block_on_ready driver ─────────────────────────────────────────────
 
-/// Drive `f` to completion with a no-op waker.
+/// Drive `f` to completion with a no-op waker. Panics on `Pending`.
 ///
-/// Sound for Stone 11.2 only: the contract is that every future returned
-/// by an `Activity` callback resolves on its first poll, because every
-/// host import it can `await` is still synchronous underneath. If that
-/// invariant breaks (Stone 11.3 onward, when host calls return real
-/// `Pending`), this driver gets replaced — the panic is the canary
-/// that flags the violation early.
+/// Pre-P0 #4 the entire SDK runtime drove activity callbacks through
+/// this poller — and the panic was a canary that triggered the moment
+/// any host import returned `Pending`. P0 #4 moved the actual dispatch
+/// path to a real async executor (`crate::runtime`), so the panic is
+/// no longer load-bearing for that path; this fn now wraps
+/// `crate::executor::run_to_ready` purely as a back-compat re-export
+/// for user code that imports the symbol (e.g. tests that drive a
+/// future end-to-end inline).
+///
+/// New code should prefer `crate::executor::run_to_ready` directly,
+/// or — for futures that may genuinely suspend — let the SDK runtime
+/// drive them via `akiva_app_dispatch` + `akiva_app_poll_dispatch`.
 pub fn block_on_ready<F: Future>(f: F) -> F::Output {
-    static NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        // clone
-        |_| RawWaker::new(core::ptr::null(), &NOOP_VTABLE),
-        // wake
-        |_| {},
-        // wake_by_ref
-        |_| {},
-        // drop
-        |_| {},
-    );
-    let raw = RawWaker::new(core::ptr::null(), &NOOP_VTABLE);
-    // SAFETY: the vtable's clone/drop never deref the data pointer; null
-    // is valid input for a waker that does nothing.
-    let waker = unsafe { Waker::from_raw(raw) };
-    let mut cx = TaskContext::from_waker(&waker);
-
-    // Box::pin to dodge the structural-pinning gymnastics on the caller
-    // side. One alloc per poll; cost rounds to noise in 11.2.
-    let mut fut = Box::pin(f);
-    match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => v,
-        Poll::Pending => panic!(
-            "block_on_ready: Activity future returned Pending — \
-             Stone 11.2 invariant violated. Until 11.3 lands an async wire \
-             every host import resolves synchronously, so callbacks must \
-             complete in a single poll."
-        ),
-    }
+    crate::executor::run_to_ready(f)
 }
 
 // ── Lifecycle scopes ──────────────────────────────────────────────────
@@ -570,6 +548,7 @@ pub type ActivityContext<'a> = Context<'a>;
 mod tests {
     use super::*;
     use core::pin::Pin;
+    use core::task::{Context as TaskContext, Poll};
 
     // ── block_on_ready / TaskScope / async ctx methods ────────────────
 
@@ -590,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Stone 11.2 invariant violated")]
+    #[should_panic(expected = "future returned Pending")]
     fn block_on_ready_panics_on_pending() {
         struct Pending;
         impl Future for Pending {

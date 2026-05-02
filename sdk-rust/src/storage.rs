@@ -1,4 +1,4 @@
-//! Storage facade for app code (Stone 11.6).
+//! Storage facade for app code.
 //!
 //! Per-package sandboxed key/value store backed by OPFS. Every key
 //! the app supplies is namespaced under `pkgs/{package_id}/` by the
@@ -6,43 +6,36 @@
 //! same logical key see independent values and one app can't read
 //! another's data even if both have `STORAGE_SANDBOX` granted.
 //!
-//! ## Why reads are deferred (multi-frame polling)
+//! ## API
 //!
-//! Storage handlers run in the kernel-worker, but apps run in their
-//! own per-package workers. A read involves two postMessages: the
-//! app-worker queues a `host_op` request, and the kernel-worker
-//! replies with `host_op_done`. The reply CAN'T arrive while the
-//! current `akiva_app_dispatch` callback is still running — the
-//! worker's JS event loop is blocked by the wasm thread.
-//!
-//! That's why [`read`] returns a [`ReadHandle`] you poll across
-//! frames, not a synchronous `Result`. A typical pattern:
+//! P0 #4 made the SDK's dispatch path async-aware: futures returned by
+//! [`read`] can suspend mid-callback, which lets app code use direct
+//! `.await` instead of the multi-frame `ReadHandle::poll()` pattern
+//! that came before.
 //!
 //! ```ignore
 //! struct Notes {
 //!     ui: UiState,
 //!     text: String,
-//!     loading: Option<storage::ReadHandle>,
 //! }
 //!
 //! #[async_trait(?Send)]
 //! impl Activity for Notes {
 //!     async fn on_create(&mut self, _ctx: &mut Context<'_>) {
-//!         self.loading = storage::read("notes");
-//!     }
-//!     async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
-//!         if let Some(handle) = &self.loading {
-//!             if let Some(result) = handle.poll() {
-//!                 if let Ok(Some(bytes)) = result {
-//!                     self.text = String::from_utf8(bytes).unwrap_or_default();
-//!                 }
-//!                 self.loading = None;
-//!             }
+//!         match storage::read("notes").await {
+//!             Ok(Some(bytes)) => self.text = String::from_utf8_lossy(&bytes).into_owned(),
+//!             Ok(None) => {}                       // first launch
+//!             Err(_) => {}                          // denied / IO failure
 //!         }
-//!         // ... render with self.text ...
 //!     }
 //! }
 //! ```
+//!
+//! The `.await` here legitimately suspends: the kernel-worker has to
+//! round-trip a `host_op` to read OPFS, and the reply only lands on the
+//! NEXT JS event-loop tick. The SDK runtime parks the dispatch's
+//! future, the worker shell waits for `host_op_done`, then re-polls.
+//! From the app's point of view it's a normal `await`.
 //!
 //! ## Why writes are fire-and-forget
 //!
@@ -50,9 +43,17 @@
 //! "did the write succeed" path within the same frame for the same
 //! reason as reads. The kernel logs failures (quota, IO error),
 //! and we accept the standard sandbox-storage discipline that
-//! writes are best-effort and durable when possible.
+//! writes are best-effort and durable when possible. A future
+//! `WriteHandle` returning a confirmation future is filed under
+//! `docs/risks.md` §7.x as a P1 follow-up.
 
-use crate::op_kinds::{io, status, unpack_poll};
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context as TaskContext, Poll};
+
+use crate::op_kinds::io;
+#[cfg(target_arch = "wasm32")]
+use crate::op_kinds::{status, unpack_poll};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
@@ -68,36 +69,51 @@ pub enum StorageError {
     Io,
 }
 
-/// Pending read. Call [`Self::poll`] each render until it returns
-/// `Some`; the round-trip resolves at most one frame after `read`
-/// returned the handle. Single-shot — once `poll` yields `Some`,
-/// the underlying future is consumed and subsequent polls return
-/// `Some(Err(Io))`.
-#[must_use = "ReadHandle is the only way to observe the read; dropping it is a leak"]
-pub struct ReadHandle {
+/// Future returned by [`read`]. Polls `host_io_poll` on each `poll`
+/// call. When the kernel-worker hasn't replied yet, returns
+/// `Poll::Pending`; the SDK runtime parks the parent dispatch and the
+/// worker shell drives a re-poll once `host_op_done` arrives. On
+/// `READY`/`ERROR` the future resolves to the typed result.
+#[must_use = "ReadFuture is the only way to observe the read; dropping it cancels"]
+pub struct ReadFuture {
     future_id: u64,
+    /// Result is cached the first time we hit a terminal status, so
+    /// repeated polls (which Rust forbids in safe code, but no harm
+    /// in defending against) return the same value.
+    cached: Option<Result<Option<Vec<u8>>, StorageError>>,
 }
 
-impl ReadHandle {
-    /// Poll once. Returns:
-    /// - `None` — kernel hasn't replied yet; try again next frame.
-    /// - `Some(Ok(Some(bytes)))` — key existed, value is `bytes`
-    ///   (possibly empty).
-    /// - `Some(Ok(None))` — key not present in this package's sandbox.
-    /// - `Some(Err(...))` — denied / IO failure.
-    pub fn poll(&self) -> Option<Result<Option<Vec<u8>>, StorageError>> {
-        poll_read_inner(self.future_id)
+impl Future for ReadFuture {
+    type Output = Result<Option<Vec<u8>>, StorageError>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if let Some(cached) = self.cached.take() {
+            // Re-arm in case the user polls again; Future::poll's
+            // contract is that returning Ready is terminal but we'd
+            // rather defend than UB. Same value reported each time.
+            self.cached = Some(cached.clone());
+            return Poll::Ready(cached);
+        }
+        match poll_read_inner(self.future_id) {
+            None => Poll::Pending,
+            Some(result) => {
+                self.cached = Some(result.clone());
+                Poll::Ready(result)
+            }
+        }
     }
 }
 
 /// Begin a sandboxed read. Returns `None` if the host rejected the
-/// op outright (no grant, malformed args). Otherwise the caller must
-/// drive the returned handle to completion via [`ReadHandle::poll`].
-pub fn read(key: &str) -> Option<ReadHandle> {
+/// op outright (no grant, malformed args). Otherwise the caller
+/// `.await`s the returned future. With the P0 #4 async runtime the
+/// `.await` legitimately suspends the dispatch when the kernel-worker
+/// hasn't replied yet — no manual polling required.
+pub fn read(key: &str) -> Option<ReadFuture> {
     if key.is_empty() { return None; }
     let fid = io_start(io::STORAGE_GET, key.as_bytes());
     if fid == 0 { return None; }
-    Some(ReadHandle { future_id: fid })
+    Some(ReadFuture { future_id: fid, cached: None })
 }
 
 /// Fire-and-forget write. The kernel logs any underlying failure
@@ -142,12 +158,6 @@ fn poll_read_inner(future_id: u64) -> Option<Result<Option<Vec<u8>>, StorageErro
         status::ERROR => Some(Err(StorageError::Io)),
         status::READY => {
             if len == 0 {
-                // Empty payload means the host rejected the request
-                // post-future-start (shouldn't happen for storage)
-                // or returned present:0 with no value bytes. We
-                // can't disambiguate without a payload, so default
-                // to "not present" — the only way `len==0` happens
-                // for a sandboxed read.
                 return Some(Ok(None));
             }
             if len > buf.len() {
@@ -192,30 +202,47 @@ fn poll_read_inner(_future_id: u64) -> Option<Result<Option<Vec<u8>>, StorageErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn noop_waker() -> Waker {
+        static VT: RawWakerVTable = RawWakerVTable::new(
+            |_| RawWaker::new(core::ptr::null(), &VT),
+            |_| {}, |_| {}, |_| {},
+        );
+        unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) }
+    }
 
     #[test]
     fn read_with_empty_key_returns_none() {
-        // Empty-key reject happens before any host call. On non-wasm
-        // the `io_start` stub also returns 0, so the empty path is
-        // the only observable difference — but it's the right
-        // behavior either way, and pinning it here means the SDK
-        // doesn't accidentally drift if io_start is ever changed
-        // to accept empty keys.
+        // Empty-key reject happens before any host call. The wasm
+        // stub for io_start also returns 0, so empty + non-wasm both
+        // produce None — the typed signature pins it either way.
         assert!(read("").is_none());
     }
 
     #[test]
     fn write_with_empty_key_is_a_silent_no_op() {
-        // No way to observe from a unit test that this didn't post
-        // anything (host_io_start is stubbed on non-wasm). The
-        // contract is "empty key gets dropped" — assert via the
-        // function's typed signature returning `()` and not
-        // panicking.
         write("", b"value");
     }
 
     #[test]
     fn remove_with_empty_key_is_a_silent_no_op() {
         remove("");
+    }
+
+    #[test]
+    fn read_future_resolves_to_none_on_non_wasm_stub() {
+        // The non-wasm `poll_read_inner` returns Some(Ok(None)) on
+        // every call — the tests path doesn't have a real host. So
+        // a fake ReadFuture polled directly should resolve to that
+        // value on the first poll.
+        let mut fut = ReadFuture { future_id: 1, cached: None };
+        let waker = noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        let pinned = Pin::new(&mut fut);
+        match pinned.poll(&mut cx) {
+            Poll::Ready(Ok(None)) => {}
+            other => panic!("expected Ready(Ok(None)), got {other:?}"),
+        }
     }
 }
