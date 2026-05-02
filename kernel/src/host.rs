@@ -45,6 +45,12 @@ extern "C" {
     pub fn hal_draw_rect(x: f32, y: f32, w: f32, h: f32, rgba: u32);
     pub fn hal_draw_round_rect(x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32);
     pub fn hal_draw_text(x: f32, y: f32, size_px: f32, rgba: u32, ptr: *const u8, len: usize);
+    // Stone 13.0prep — outline + line ops. width is the stroke in dp.
+    pub fn hal_draw_stroke_rect(x: f32, y: f32, w: f32, h: f32, width: f32, rgba: u32);
+    pub fn hal_draw_stroke_round_rect(
+        x: f32, y: f32, w: f32, h: f32, radius: f32, width: f32, rgba: u32,
+    );
+    pub fn hal_draw_line(x0: f32, y0: f32, x1: f32, y1: f32, width: f32, rgba: u32);
     pub fn hal_draw_present();
 
     // ── Storage ───────────────────────────────────────────────────────────

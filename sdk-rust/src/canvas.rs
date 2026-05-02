@@ -12,14 +12,18 @@
 
 // ── Opcodes (mirror framework/src/wasm_activity.rs) ───────────────────
 
-const OP_CLEAR:           u8 = 0;
-const OP_FILL_RECT:       u8 = 1;
-const OP_DRAW_TEXT:       u8 = 2;
-const OP_PUSH_CLIP:       u8 = 3;
-const OP_POP_CLIP:        u8 = 4;
-const OP_PUSH_TRANSFORM:  u8 = 5;
-const OP_POP_TRANSFORM:   u8 = 6;
-const OP_FILL_ROUND_RECT: u8 = 7;
+const OP_CLEAR:            u8 = 0;
+const OP_FILL_RECT:        u8 = 1;
+const OP_DRAW_TEXT:        u8 = 2;
+const OP_PUSH_CLIP:        u8 = 3;
+const OP_POP_CLIP:         u8 = 4;
+const OP_PUSH_TRANSFORM:   u8 = 5;
+const OP_POP_TRANSFORM:    u8 = 6;
+const OP_FILL_ROUND_RECT:  u8 = 7;
+// Stone 13.0prep — outline ops. Each carries a `width: f32` LE.
+const OP_STROKE_RECT:       u8 = 8;
+const OP_STROKE_ROUND_RECT: u8 = 9;
+const OP_DRAW_LINE:         u8 = 10;
 
 /// Paint surface handed to `Activity::on_render`. All coordinates are in
 /// dp (density-independent pixels); colors are **`0xAARRGGBB`** — alpha
@@ -114,5 +118,51 @@ impl<'a> Canvas<'a> {
 
     pub fn pop_transform(&mut self) {
         self.buf.push(OP_POP_TRANSFORM);
+    }
+
+    /// Stone 13.0prep — outlined rectangle. `width` is the stroke
+    /// width in dp (renderer applies density). Center-stroked: half the
+    /// width extends inside the rect bounds, half outside, matching
+    /// Canvas 2D `strokeRect` semantics.
+    pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, width: f32, rgba: u32) {
+        self.buf.push(OP_STROKE_RECT);
+        self.buf.extend_from_slice(&x.to_le_bytes());
+        self.buf.extend_from_slice(&y.to_le_bytes());
+        self.buf.extend_from_slice(&w.to_le_bytes());
+        self.buf.extend_from_slice(&h.to_le_bytes());
+        self.buf.extend_from_slice(&width.to_le_bytes());
+        self.buf.extend_from_slice(&rgba.to_le_bytes());
+    }
+
+    /// Stone 13.0prep — outlined rounded rectangle. Same convention as
+    /// [`Self::fill_round_rect`] for `radius`; `width` is the stroke
+    /// width in dp.
+    pub fn stroke_round_rect(
+        &mut self, x: f32, y: f32, w: f32, h: f32,
+        radius: f32, width: f32, rgba: u32,
+    ) {
+        self.buf.push(OP_STROKE_ROUND_RECT);
+        self.buf.extend_from_slice(&x.to_le_bytes());
+        self.buf.extend_from_slice(&y.to_le_bytes());
+        self.buf.extend_from_slice(&w.to_le_bytes());
+        self.buf.extend_from_slice(&h.to_le_bytes());
+        self.buf.extend_from_slice(&radius.to_le_bytes());
+        self.buf.extend_from_slice(&width.to_le_bytes());
+        self.buf.extend_from_slice(&rgba.to_le_bytes());
+    }
+
+    /// Stone 13.0prep — straight line from `(x0, y0)` to `(x1, y1)`.
+    /// `width` is the stroke width in dp; line caps are round.
+    pub fn draw_line(
+        &mut self, x0: f32, y0: f32, x1: f32, y1: f32,
+        width: f32, rgba: u32,
+    ) {
+        self.buf.push(OP_DRAW_LINE);
+        self.buf.extend_from_slice(&x0.to_le_bytes());
+        self.buf.extend_from_slice(&y0.to_le_bytes());
+        self.buf.extend_from_slice(&x1.to_le_bytes());
+        self.buf.extend_from_slice(&y1.to_le_bytes());
+        self.buf.extend_from_slice(&width.to_le_bytes());
+        self.buf.extend_from_slice(&rgba.to_le_bytes());
     }
 }

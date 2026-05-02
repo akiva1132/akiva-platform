@@ -546,14 +546,18 @@ impl Activity for WasmActivity {
 // payload is unknown and skipping would desync the reader.
 
 pub mod opcode {
-    pub const CLEAR:           u8 = 0;
-    pub const FILL_RECT:       u8 = 1;
-    pub const DRAW_TEXT:       u8 = 2;
-    pub const PUSH_CLIP:       u8 = 3;
-    pub const POP_CLIP:        u8 = 4;
-    pub const PUSH_TRANSFORM:  u8 = 5;
-    pub const POP_TRANSFORM:   u8 = 6;
-    pub const FILL_ROUND_RECT: u8 = 7;
+    pub const CLEAR:             u8 = 0;
+    pub const FILL_RECT:         u8 = 1;
+    pub const DRAW_TEXT:         u8 = 2;
+    pub const PUSH_CLIP:         u8 = 3;
+    pub const POP_CLIP:          u8 = 4;
+    pub const PUSH_TRANSFORM:    u8 = 5;
+    pub const POP_TRANSFORM:     u8 = 6;
+    pub const FILL_ROUND_RECT:   u8 = 7;
+    // Stone 13.0prep — outline ops. Each carries `width: f32` LE.
+    pub const STROKE_RECT:       u8 = 8;
+    pub const STROKE_ROUND_RECT: u8 = 9;
+    pub const DRAW_LINE:         u8 = 10;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -619,6 +623,36 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             out.extend_from_slice(&radius.to_le_bytes());
             out.extend_from_slice(&rgba.to_le_bytes());
         }
+        // Stone 13.0prep — outline ops. Same coord layout as their fill
+        // counterparts plus a `width: f32` LE before the rgba.
+        PaintOp::StrokeRect { x, y, w, h, width, rgba } => {
+            out.push(opcode::STROKE_RECT);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&width.to_le_bytes());
+            out.extend_from_slice(&rgba.to_le_bytes());
+        }
+        PaintOp::StrokeRoundRect { x, y, w, h, radius, width, rgba } => {
+            out.push(opcode::STROKE_ROUND_RECT);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&radius.to_le_bytes());
+            out.extend_from_slice(&width.to_le_bytes());
+            out.extend_from_slice(&rgba.to_le_bytes());
+        }
+        PaintOp::DrawLine { x0, y0, x1, y1, width, rgba } => {
+            out.push(opcode::DRAW_LINE);
+            out.extend_from_slice(&x0.to_le_bytes());
+            out.extend_from_slice(&y0.to_le_bytes());
+            out.extend_from_slice(&x1.to_le_bytes());
+            out.extend_from_slice(&y1.to_le_bytes());
+            out.extend_from_slice(&width.to_le_bytes());
+            out.extend_from_slice(&rgba.to_le_bytes());
+        }
     }
 }
 
@@ -678,6 +712,34 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                 let radius = read_f32(&mut bytes)?;
                 let rgba = read_u32(&mut bytes)?;
                 out.push(PaintOp::FillRoundRect { x, y, w, h, radius, rgba });
+            }
+            opcode::STROKE_RECT => {
+                let x = read_f32(&mut bytes)?;
+                let y = read_f32(&mut bytes)?;
+                let w = read_f32(&mut bytes)?;
+                let h = read_f32(&mut bytes)?;
+                let width = read_f32(&mut bytes)?;
+                let rgba = read_u32(&mut bytes)?;
+                out.push(PaintOp::StrokeRect { x, y, w, h, width, rgba });
+            }
+            opcode::STROKE_ROUND_RECT => {
+                let x = read_f32(&mut bytes)?;
+                let y = read_f32(&mut bytes)?;
+                let w = read_f32(&mut bytes)?;
+                let h = read_f32(&mut bytes)?;
+                let radius = read_f32(&mut bytes)?;
+                let width = read_f32(&mut bytes)?;
+                let rgba = read_u32(&mut bytes)?;
+                out.push(PaintOp::StrokeRoundRect { x, y, w, h, radius, width, rgba });
+            }
+            opcode::DRAW_LINE => {
+                let x0 = read_f32(&mut bytes)?;
+                let y0 = read_f32(&mut bytes)?;
+                let x1 = read_f32(&mut bytes)?;
+                let y1 = read_f32(&mut bytes)?;
+                let width = read_f32(&mut bytes)?;
+                let rgba = read_u32(&mut bytes)?;
+                out.push(PaintOp::DrawLine { x0, y0, x1, y1, width, rgba });
             }
             other => return Err(DecodeError::UnknownOp(other)),
         }
@@ -1033,6 +1095,61 @@ mod tests {
         let mut frame = FrameCommands::new();
         decode_frame(&wire, &mut frame).unwrap();
         assert_eq!(frame.ops().len(), inputs.len());
+    }
+
+    /// Stone 13.0prep — encode/decode roundtrip for the three new
+    /// outline ops. Each is byte-identical across encode→decode→encode.
+    #[test]
+    fn outline_ops_roundtrip_byte_identical() {
+        let ops = [
+            PaintOp::StrokeRect {
+                x: 4.0, y: 8.0, w: 200.0, h: 56.0, width: 2.0, rgba: 0xff334455,
+            },
+            PaintOp::StrokeRoundRect {
+                x: 12.0, y: 16.0, w: 80.0, h: 32.0, radius: 6.0, width: 1.5, rgba: 0xff2a3a50,
+            },
+            PaintOp::DrawLine {
+                x0: 0.0, y0: 0.0, x1: 100.0, y1: 50.0, width: 3.0, rgba: 0xffffffff,
+            },
+        ];
+        for op in &ops {
+            let mut wire1 = Vec::new();
+            encode_op(&mut wire1, op);
+            let mut frame = FrameCommands::new();
+            decode_frame(&wire1, &mut frame).unwrap();
+            let mut wire2 = Vec::new();
+            encode_op(&mut wire2, &frame.ops()[0]);
+            assert_eq!(wire1, wire2, "{:?} must round-trip byte-identical", op);
+        }
+    }
+
+    /// Stone 13.0prep — wire sizes for the new opcodes. Each carries
+    /// its opcode byte + 4×n f32 fields + rgba u32; verify exactly.
+    #[test]
+    fn outline_ops_wire_sizes_match_specification() {
+        let mut buf = Vec::new();
+        encode_op(&mut buf, &PaintOp::StrokeRect {
+            x: 0.0, y: 0.0, w: 0.0, h: 0.0, width: 0.0, rgba: 0,
+        });
+        // 1 (opcode) + 4 f32s (x,y,w,h) + 4 (width) + 4 (rgba) = 25
+        assert_eq!(buf.len(), 1 + 4 * 4 + 4 + 4);
+        assert_eq!(buf[0], opcode::STROKE_RECT);
+
+        buf.clear();
+        encode_op(&mut buf, &PaintOp::StrokeRoundRect {
+            x: 0.0, y: 0.0, w: 0.0, h: 0.0, radius: 0.0, width: 0.0, rgba: 0,
+        });
+        // 1 + 5 f32s + width + rgba = 29
+        assert_eq!(buf.len(), 1 + 4 * 5 + 4 + 4);
+        assert_eq!(buf[0], opcode::STROKE_ROUND_RECT);
+
+        buf.clear();
+        encode_op(&mut buf, &PaintOp::DrawLine {
+            x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0, width: 0.0, rgba: 0,
+        });
+        // 1 + 4 f32s (x0,y0,x1,y1) + width + rgba = 25
+        assert_eq!(buf.len(), 1 + 4 * 4 + 4 + 4);
+        assert_eq!(buf[0], opcode::DRAW_LINE);
     }
 
     #[test]

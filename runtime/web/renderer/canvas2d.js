@@ -76,6 +76,41 @@ export class Canvas2DBackend {
     this.ctx.fillText(text, x, y);
   }
 
+  // Stone 13.0prep — outline ops. `width` is the stroke width in dp;
+  // strokes are center-aligned (half inside, half outside) per Canvas
+  // 2D's default.
+
+  strokeRect(x, y, w, h, width, rgba) {
+    if (!this.ctx) return;
+    this.ctx.strokeStyle = rgbaToCss(rgba);
+    this.ctx.lineWidth = width;
+    this.ctx.strokeRect(x, y, w, h);
+  }
+
+  strokeRoundRect(x, y, w, h, radius, width, rgba) {
+    if (!this.ctx) return;
+    this.ctx.strokeStyle = rgbaToCss(rgba);
+    this.ctx.lineWidth = width;
+    if (radius <= 0) {
+      this.ctx.strokeRect(x, y, w, h);
+      return;
+    }
+    this.ctx.beginPath();
+    this.ctx.roundRect(x, y, w, h, radius);
+    this.ctx.stroke();
+  }
+
+  drawLine(x0, y0, x1, y1, width, rgba) {
+    if (!this.ctx) return;
+    this.ctx.strokeStyle = rgbaToCss(rgba);
+    this.ctx.lineWidth = width;
+    this.ctx.lineCap = "round";
+    this.ctx.beginPath();
+    this.ctx.moveTo(x0, y0);
+    this.ctx.lineTo(x1, y1);
+    this.ctx.stroke();
+  }
+
   present() {
     // Canvas2D commits implicitly at end of task. OffscreenCanvas on some
     // browsers requires explicit `commit()`, but that API is deprecated.

@@ -90,6 +90,16 @@ impl DisplayManager {
                         let bytes = text.as_bytes();
                         host::hal_draw_text(*x, *y, *size, *rgba, bytes.as_ptr(), bytes.len());
                     }
+                    // Stone 13.0prep — outline ops.
+                    PaintOp::StrokeRect { x, y, w, h, width, rgba } => {
+                        host::hal_draw_stroke_rect(*x, *y, *w, *h, *width, *rgba);
+                    }
+                    PaintOp::StrokeRoundRect { x, y, w, h, radius, width, rgba } => {
+                        host::hal_draw_stroke_round_rect(*x, *y, *w, *h, *radius, *width, *rgba);
+                    }
+                    PaintOp::DrawLine { x0, y0, x1, y1, width, rgba } => {
+                        host::hal_draw_line(*x0, *y0, *x1, *y1, *width, *rgba);
+                    }
                     // Clip/transform are no-ops against the immediate-mode
                     // HAL for now; Phase 2b renderer backend honours them.
                     PaintOp::PushClip { .. }

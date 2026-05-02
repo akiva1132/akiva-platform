@@ -343,6 +343,13 @@ function buildImports() {
       const text = readUtf8(ptr, len);
       backend?.drawText(x, y, size, rgba >>> 0, text);
     },
+    // Stone 13.0prep — outline ops.
+    hal_draw_stroke_rect: (x, y, w, h, width, rgba) =>
+      backend?.strokeRect(x, y, w, h, width, rgba >>> 0),
+    hal_draw_stroke_round_rect: (x, y, w, h, radius, width, rgba) =>
+      backend?.strokeRoundRect(x, y, w, h, radius, width, rgba >>> 0),
+    hal_draw_line: (x0, y0, x1, y1, width, rgba) =>
+      backend?.drawLine(x0, y0, x1, y1, width, rgba >>> 0),
     hal_draw_present: () => backend?.present(),
 
     hal_storage_read:   (kptr, klen, outLenPtr) => halStorageRead(kptr, klen, outLenPtr),
