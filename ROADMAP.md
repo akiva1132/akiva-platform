@@ -677,7 +677,7 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 - close-on-uninstall protocol.
 - benchmark: read latency direct vs kernel-routed.
 
-### 11.6.5 SDK API completeness pass (3-5 ימים) — **🔴 חוסם את Phase 12**
+### 11.6.5 SDK API completeness pass (3-5 ימים) — **✅ סגור (May 2026)**
 
 **מטרה:** סגירת שני פערים semantically קריטיים ב-SDK שזוהו ב-2026-05-02 audit (אחרי ש-P0/P1 של 11.6 נסגרו). שני הפערים נשמטו ב-Stone 11.2 (התכנון של ה-SDK הסתיים כש-`block_on_ready` עוד היה ה-executor) ולא נחשפו עד שה-executor האמיתי (P0 #4) הפך אותם ל-actionable.
 
@@ -730,7 +730,7 @@ v0.3 סוגר את הפער הזה. הוא בנוי סביב שלושה עמוד
 
 **מטרה:** מערכת יודעת כמה memory וכמה CPU כל app צורך, ויכולה לעצור או להקפיא apps שעוברים את ה-quota.
 
-**🔴 Precondition (mandatory):** Stone **11.6.5** סגור — TaskScope אמיתי + concurrent host calls per activity. בלי זה, 12.4 (App suspension) יורד ל-`worker.terminate()` בלבד (סמנטית = crash, לא suspension), ו-12.1 (memory accounting) מודד baseline שגוי על app שלא יכולה להקצות data באופן מציאותי. ה-design של 12.3 (LMK priority tiers) מניח ש-`Resumed`-scoped tasks מתבטלים ב-pause; אם זה לא קורה, ה-priority tiers איבדו משמעות. ראה [`docs/isolation-design.md` §10.5 Phase 12 readiness](docs/isolation-design.md) ו-[Stone 11.6.5](#1165-sdk-api-completeness-pass-3-5-ימים----חוסם-את-phase-12) לדetailed analysis.
+**✅ Precondition met:** Stone **11.6.5** נסגר ב-May 2026 — TaskScope אמיתי + slot.pending HashMap. ראה [`docs/isolation-design.md` §10.5 Phase 12 readiness](docs/isolation-design.md) לסיכום הfix.
 
 **תלוי ב:** Phase 11 (בלי workers נפרדים, CPU attribution בלתי אפשרית ו-memory eviction מסוכנת) **+ Stone 11.6.5** (semantic foundation ל-suspension).
 

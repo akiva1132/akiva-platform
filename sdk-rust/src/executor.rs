@@ -24,7 +24,7 @@
 //! Each `PendingDispatch` holds a `Pin<Box<dyn Future<Output = ...> +
 //! 'static>>` whose body internally borrows `&mut Box<dyn Activity>`
 //! and `&mut Context` from the same `Slot`. The borrows are encoded
-//! through raw pointers ([`build_dispatch_future`] in `runtime.rs`)
+//! through raw pointers ([`build_async_future`] in `runtime.rs`)
 //! because Rust can't express "two mutable borrows of disjoint
 //! fields, captured into a 'static future."
 //!
@@ -36,13 +36,26 @@
 //! 2. A `PendingDispatch` is associated with exactly one slot. Before
 //!    the slot is removed, every pending dispatch targeting it is
 //!    dropped.
-//! 3. The framework's `PendingTransition` mechanism guarantees only
-//!    one in-flight dispatch per handle — no aliasing of the same
-//!    `&mut Activity` from concurrent futures.
+//! 3. **Callback dispatches** that hold raw-pointer borrows into
+//!    `&mut Activity` / `&mut Context` are serialised per handle by
+//!    the framework's `PendingTransition` discipline — at most one
+//!    callback runs at a time, so the raw-ptr `&mut Activity` borrow
+//!    never aliases. **User-spawned tasks** (Stone 11.6.5 #11) live
+//!    in `Slot.spawned` and DO NOT borrow `&mut Activity`/`&mut
+//!    Context`; they're independent `'static` futures, so multiple
+//!    of them — and concurrent host calls within them — are safe to
+//!    run in parallel with a callback dispatch.
+//!
+//! Stone 11.6.5 (#12) made `Slot.pending` a `HashMap<u64,
+//! PendingDispatch>` so the surface admits multiple concurrent
+//! callback entries in principle. The framework still serialises
+//! today (the soundness above is upheld); the structural change just
+//! removes the false invariant that `slot.pending` is `Option<...>`.
 //!
 //! Violating any of these is undefined behaviour. The runtime asserts
-//! invariant #2 on slot teardown (`debug_assert!`); #3 is upheld by
-//! the framework, not the SDK.
+//! invariant #2 on slot teardown (slot Drop runs spawned + pending
+//! futures' drops before the activity drops, see field declaration
+//! order in `Slot`); #3 is upheld by the framework, not the SDK.
 
 use core::future::Future;
 use core::pin::Pin;

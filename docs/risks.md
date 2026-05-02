@@ -225,25 +225,21 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Trigger to promote.** Phase 11.8 (perf + benchmarks) is a natural pairing — both want a real-browser e2e test bed (Playwright). Build the worker-shell harness as a step on the way there.
 
-### 7.9 🔴 TaskScope cancellation is a façade (Phase-12 blocker)
+### 7.9 ✅ TaskScope cancellation — fixed (Stone 11.6.5 #11, May 2026)
 
-**Concern.** `Context::activity_scope()` and `Context::resumed_scope()` return `&'static TaskScope` whose `spawn(fut)` is literally `block_on_ready(fut)` ([sdk-rust/src/activity.rs:156-159](../sdk-rust/src/activity.rs#L156)). The doc-comment in the file admits it: *"In Stone 11.2 every spawned future completes in a single poll ... TaskScope::spawn is just a renamed block_on_ready."* No cancellation, no cross-callback retention, no lifecycle awareness — only the API name promises Android `lifecycleScope`-equivalence; the body delivers nothing.
+**What was wrong.** `Context::activity_scope()` / `resumed_scope()` returned `&'static TaskScope` whose `spawn(fut)` was literally `block_on_ready(fut)` — no cross-callback retention, no cancellation, no lifecycle awareness. The doc-comment said the quiet part out loud: *"renamed block_on_ready."* Locking that into Stone 11.7's docs would have been bedrock-level damage.
 
-**Why deferred (until now).** Stone 11.2 set the API surface knowing the body would land with the real executor. The real executor (P0 #4) shipped May 2026 but only wired up the Activity-callback futures themselves; user-spawned tasks were left for later. Surfacing this as a tracked gap rather than implementing inline kept the P0 list small.
+**Fix in place.** `TaskScope` carries `(handle, kind)` by value; `spawn<F: Future + 'static>` queues into `SPAWN_QUEUE` (re-borrow-safe), drained into `Slot.spawned: Vec<SpawnedTask>` after each dispatch poll. New SDK export `akiva_app_drive_spawned()` polls every spawned task across every slot; the worker shell calls it after each `host_op_done` and dispatch resolution. Cancellation: `PendingDispatch.cmd_kind` lets `drive_pending` drop `Resumed`-scoped spawns when a `PAUSE` resolves; `DESTROY` evicts the slot which drops `spawned` by Drop.
 
-**Trigger to promote.** Phase 12.4 (App suspension / CACHED state) requires scope-aware cancellation — without it, "suspend" can only do `worker.terminate()`, which is semantically a crash, not a suspension. Also blocks Stone 11.7: documenting `ctx.activity_scope().spawn(...)` as a real API while the body is a no-op-on-cancel locks the lie into bedrock for future devs.
+**Code.** `sdk-rust/src/{activity.rs, runtime.rs, lib.rs}`, `runtime/web/app_worker_shell.js`. Tests: 5 new in `runtime::tests` covering each cancellation edge. ABI still 0.2.0 — purely additive.
 
-**Code surfaces.** `sdk-rust/src/runtime.rs` (`Slot` extension to hold spawned futures by scope), `sdk-rust/src/activity.rs:140-168` (TaskScope body), `runtime/web/app_worker_shell.js` (re-poll integration with the existing `pendingDispatches` mechanism). Detailed plan in [`docs/isolation-design.md` §10.5 #11](isolation-design.md). **Stone 11.6.5 owns this.**
+### 7.10 ✅ Concurrent host calls per activity — fixed (Stone 11.6.5 #12, May 2026)
 
-### 7.10 🔴 Concurrent host calls per activity blocked (Phase-12 blocker)
+**What was wrong.** `Slot.pending: Option<PendingDispatch>` made one-callback-in-flight a structural invariant of the SDK runtime, not just a property of the framework's `PendingTransition` discipline. The executor.rs comment cemented this as "only one in-flight dispatch per handle" — a claim the data structure enforced even for user-spawned tasks that don't go through PendingTransition.
 
-**Concern.** `Slot.pending: Option<PendingDispatch>` enforces one in-flight dispatch per activity handle ([sdk-rust/src/executor.rs:38-42](../sdk-rust/src/executor.rs#L38-L42)). Two `storage::read` calls in the same activity panic or clobber. The invariant is correct for the Framework's lifecycle FIFO (PendingTransition discipline guarantees one callback dispatch in flight) but wrong for user-spawned tasks that don't go through PendingTransition. A future `futures::join!(read("a"), read("b"))` on an activity is a static panic by design.
+**Fix in place.** `Slot.pending` is now `HashMap<u64, PendingDispatch>` keyed by `dispatch_id`. Every `install_*` / `run_*_sync` helper takes a `dispatch_id` parameter and inserts at that key; `drive_pending(id)` and `get_result(id)` operate on the specific entry; the `debug_assert` of "second dispatch arrived" is gone. Soundness for callback dispatches still holds — the framework still serialises them, so the raw-ptr `&mut Activity` borrow inside any callback future never aliases. User-spawned tasks live in `Slot.spawned` (Stone 11.6.5 #11), are `'static` futures with no `&mut Activity` borrow, and run concurrently with whatever callback is in flight.
 
-**Why deferred (until now).** Stone 11.2 picked the simplest single-slot model that satisfies the lifecycle FIFO. The bug only became visible as a "real DX problem" once the real executor (P0 #4) made `.await` work — at which point pattern-matching to iOS's `async let` becomes the natural style for app code, and the single-slot ceiling is a hard-stop.
-
-**Trigger to promote.** Phase 12.1 (memory accounting) measures baseline of a real workload — apps allocate data in parallel batches; serial dispatch silently distorts the baseline and `manifest.runtime.max_memory_mb` enforcement (12.5) won't fire on the real load shape. Also: every Stone 11.7 example using `join!` or two-step `read; read` will be wrong code.
-
-**Code surfaces.** `Slot.pending` becomes `Slab<PendingDispatch>` or `HashMap<u64, _>` keyed by dispatch_id; `akiva_app_poll_dispatch(id)` polls the specific entry; `host_op_done` re-polls only the future parked on that op. Framework callback FIFO unchanged. Tests must cover ordering, mid-flight cancellation, and re-entry. Detailed plan in [`docs/isolation-design.md` §10.5 #12](isolation-design.md). **Stone 11.6.5 owns this.**
+**Code.** `sdk-rust/src/{runtime.rs, executor.rs}`. Tests: `slot_pending_holds_concurrent_entries_keyed_by_dispatch_id`. The executor.rs invariant docstring was updated to articulate the new truth — callback dispatches serialised by framework, user-spawned tasks concurrent.
 
 ### 7.11 🟡 No streams primitive in the ABI
 

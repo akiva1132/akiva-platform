@@ -239,10 +239,20 @@ const INITIAL_PAINT_CAP: usize = 4 * 1024;
 /// via raw pointers and rely on this stability across polls.
 pub(crate) struct Slot {
     /// Field declaration order is load-bearing for drop order: the
-    /// pending future + spawned tasks drop FIRST (both potentially hold
-    /// raw-pointer borrows into `activity` and `ctx`), then those drop
-    /// in turn. Reordering would risk a use-after-free on Drop.
-    pending: Option<PendingDispatch>,
+    /// pending futures + spawned tasks drop FIRST (both potentially
+    /// hold raw-pointer borrows into `activity` and `ctx`), then
+    /// those drop in turn. Reordering would risk a use-after-free on
+    /// Drop.
+    ///
+    /// Stone 11.6.5 (#12) — keyed by `dispatch_id` so multiple
+    /// callback dispatches can coexist in principle. The framework's
+    /// `PendingTransition` discipline still serialises callbacks per
+    /// handle (one `&mut Activity` raw-ptr borrow at a time), so
+    /// today the map holds at most one entry — but the surface no
+    /// longer hard-codes "one in-flight dispatch" as a structural
+    /// invariant. User-spawned tasks live in `spawned` and are
+    /// independently driven by [`drive_spawned`].
+    pending: HashMap<u64, PendingDispatch>,
     /// Stone 11.6.5 (#11) — user-spawned tasks under `activity_scope`
     /// or `resumed_scope`. Polled by [`drive_spawned`] every host
     /// wake-up; cancelled selectively when the activity hits the
@@ -472,7 +482,7 @@ fn install_and_poll<T: Activity + Default>(
         let class_static = intern_class(class_str);
         let activity: Box<dyn Activity> = Box::new(T::default());
         let mut new_slot = Box::new(Slot {
-            pending: None,
+            pending: HashMap::new(),
             spawned: Vec::new(),
             activity,
             ctx: Context {
@@ -491,7 +501,7 @@ fn install_and_poll<T: Activity + Default>(
         let fut = build_async_future(&mut *new_slot, DispatchOutcome::NoBytes, |a, c| {
             Box::pin(async move { a.on_create(c).await; })
         });
-        new_slot.pending = Some(PendingDispatch {
+        new_slot.pending.insert(dispatch_id, PendingDispatch {
             future: fut,
             completed: None,
             cmd_kind: CREATE,
@@ -516,42 +526,41 @@ fn install_and_poll<T: Activity + Default>(
     // (drive_pending takes its own borrow).
     with_slots(|slots_map| {
         let slot = slots_map.get_mut(&handle).expect("checked above");
-        // Borrow checker demands disjoint access to slot.* fields below;
-        // we use raw pointers to satisfy it where needed.
-        debug_assert!(
-            slot.pending.is_none(),
-            "P0 #4 — second dispatch arrived before prior pending resolved \
-             (handle={handle}, dispatch_id={dispatch_id}). Framework's \
-             PendingTransition discipline should prevent this; treating as \
-             a wire bug."
-        );
+        // Stone 11.6.5 (#12) — slot.pending is a HashMap<dispatch_id,
+        // PendingDispatch>, so a fresh callback gets its own slot in
+        // the map keyed by `dispatch_id`. The framework's
+        // PendingTransition discipline still serialises callback
+        // dispatches per handle; what changed is that the surface no
+        // longer requires it as a structural invariant — the map is
+        // keyed by the host's dispatch_id, so concurrent entries
+        // would coexist if the framework ever permitted them.
         slot.last_outcome = DispatchOutcome::NoBytes;
 
         match cmd_kind {
-            START   => install_lifecycle(slot, |a, c| Box::pin(async move { a.on_start(c).await; })),
-            RESUME  => install_lifecycle(slot, |a, c| Box::pin(async move { a.on_resume(c).await; })),
-            PAUSE   => install_lifecycle(slot, |a, c| Box::pin(async move { a.on_pause(c).await; })),
-            STOP    => install_lifecycle(slot, |a, c| Box::pin(async move { a.on_stop(c).await; })),
-            DESTROY => install_destroy(slot),
+            START   => install_lifecycle(slot, dispatch_id, |a, c| Box::pin(async move { a.on_start(c).await; })),
+            RESUME  => install_lifecycle(slot, dispatch_id, |a, c| Box::pin(async move { a.on_resume(c).await; })),
+            PAUSE   => install_lifecycle(slot, dispatch_id, |a, c| Box::pin(async move { a.on_pause(c).await; })),
+            STOP    => install_lifecycle(slot, dispatch_id, |a, c| Box::pin(async move { a.on_stop(c).await; })),
+            DESTROY => install_destroy(slot, dispatch_id),
 
-            POINTER => install_pointer(slot, rest)?,
-            KEY     => install_key(slot, rest)?,
-            RESIZE  => install_resize(slot, rest)?,
+            POINTER => install_pointer(slot, dispatch_id, rest)?,
+            KEY     => install_key(slot, dispatch_id, rest)?,
+            RESIZE  => install_resize(slot, dispatch_id, rest)?,
 
             RENDER => {
                 if rest.len() < 8 { return Err(1); }
                 let ts = read_f64(&rest[..8]);
                 slot.ctx.timestamp_ms = ts;
-                run_render_sync(slot);
+                run_render_sync(slot, dispatch_id);
             }
 
-            SAVE_STATE => run_save_state_sync(slot),
+            SAVE_STATE => run_save_state_sync(slot, dispatch_id),
             RESTORE_STATE => {
-                run_restore_state_sync(slot, rest);
+                run_restore_state_sync(slot, dispatch_id, rest);
             }
 
-            NEW_INTENT => install_new_intent(slot, rest)?,
-            ACTIVITY_RESULT => install_activity_result(slot, rest)?,
+            NEW_INTENT => install_new_intent(slot, dispatch_id, rest)?,
+            ACTIVITY_RESULT => install_activity_result(slot, dispatch_id, rest)?,
 
             _ => return Err(1),
         }
@@ -559,8 +568,8 @@ fn install_and_poll<T: Activity + Default>(
         // pending dispatch so `drive_pending` can apply scope-cancel
         // hooks (PAUSE/DESTROY) when the future resolves. The various
         // install_* helpers default to 0; we patch the truth post-install
-        // here to avoid threading cmd_kind through every helper.
-        if let Some(p) = slot.pending.as_mut() {
+        // here.
+        if let Some(p) = slot.pending.get_mut(&dispatch_id) {
             p.cmd_kind = cmd_kind;
         }
         Ok::<(), u32>(())
@@ -575,7 +584,7 @@ fn install_and_poll<T: Activity + Default>(
 
 /// Install a lifecycle future (Start/Resume/Pause/Stop). The body runs
 /// the corresponding `Activity::on_*(&mut self, &mut ctx)` async fn.
-fn install_lifecycle<F>(slot: &mut Slot, body: F)
+fn install_lifecycle<F>(slot: &mut Slot, dispatch_id: u64, body: F)
 where
     F: FnOnce(
             &'static mut Box<dyn Activity>,
@@ -584,17 +593,17 @@ where
         + 'static,
 {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, body);
-    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
+    slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
 }
 
-fn install_destroy(slot: &mut Slot) {
+fn install_destroy(slot: &mut Slot, dispatch_id: u64) {
     let fut = build_async_future(slot, DispatchOutcome::Destroy, |a, c| {
         Box::pin(async move { a.on_destroy(c).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
+    slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
 }
 
-fn install_pointer(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+fn install_pointer(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) -> Result<(), u32> {
     if rest.len() < 24 { return Err(1); }
     let x = f32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
     let y = f32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
@@ -613,11 +622,11 @@ fn install_pointer(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_pointer(c, ev).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
+    slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
-fn install_key(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+fn install_key(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) -> Result<(), u32> {
     if rest.len() < 20 { return Err(1); }
     let code = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
     let modifiers = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
@@ -634,11 +643,11 @@ fn install_key(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_key(c, ev).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
+    slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
-fn install_resize(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+fn install_resize(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) -> Result<(), u32> {
     if rest.len() < 12 { return Err(1); }
     let w = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
     let h = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
@@ -649,16 +658,16 @@ fn install_resize(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_resize(c, metrics).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
+    slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
-fn install_new_intent(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+fn install_new_intent(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) -> Result<(), u32> {
     let intent = match Intent::decode(rest) {
         Ok(i) => i,
         Err(_) => {
             // Drop silently — same policy as the legacy code path.
-            slot.pending = Some(PendingDispatch {
+            slot.pending.insert(dispatch_id, PendingDispatch {
                 future: Box::pin(async move { DispatchOutcome::NoBytes }),
                 completed: None, cmd_kind: 0,
             });
@@ -668,17 +677,17 @@ fn install_new_intent(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_new_intent(c, &intent).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
+    slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
-fn install_activity_result(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
+fn install_activity_result(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) -> Result<(), u32> {
     if rest.len() < 4 { return Err(1); }
     let rc = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
     let result = match ActivityResult::decode(&rest[4..]) {
         Ok(r) => r,
         Err(_) => {
-            slot.pending = Some(PendingDispatch {
+            slot.pending.insert(dispatch_id, PendingDispatch {
                 future: Box::pin(async move { DispatchOutcome::NoBytes }),
                 completed: None, cmd_kind: 0,
             });
@@ -688,7 +697,7 @@ fn install_activity_result(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_activity_result(c, rc, &result).await; })
     });
-    slot.pending = Some(PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
+    slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())
 }
 
@@ -697,7 +706,7 @@ fn install_activity_result(slot: &mut Slot, rest: &[u8]) -> Result<(), u32> {
 /// panics on Pending so an accidental `.await` in `on_render` surfaces
 /// loudly. Caches the produced bytes in `slot.paint_buf` and marks the
 /// slot's outcome.
-fn run_render_sync(slot: &mut Slot) {
+fn run_render_sync(slot: &mut Slot, dispatch_id: u64) {
     slot.paint_buf.clear();
     slot.last_outcome = DispatchOutcome::Paint;
     // SAFETY: render's future borrows &mut activity, &mut ctx, and
@@ -716,31 +725,31 @@ fn run_render_sync(slot: &mut Slot) {
     // Stash a sync-completed marker in the pending slot so
     // poll_dispatch reports READY without trying to re-poll a future
     // that doesn't exist.
-    slot.pending = Some(PendingDispatch {
+    slot.pending.insert(dispatch_id, PendingDispatch {
         future: Box::pin(async move { DispatchOutcome::Paint }),
         completed: Some(DispatchOutcome::Paint), cmd_kind: 0,
     });
 }
 
-fn run_save_state_sync(slot: &mut Slot) {
+fn run_save_state_sync(slot: &mut Slot, dispatch_id: u64) {
     let mut state = SavedState::default();
     slot.activity.on_save_state(&mut state);
     slot.save_buf = state.encode();
     slot.last_outcome = DispatchOutcome::SavedState;
-    slot.pending = Some(PendingDispatch {
+    slot.pending.insert(dispatch_id, PendingDispatch {
         future: Box::pin(async move { DispatchOutcome::SavedState }),
         completed: Some(DispatchOutcome::SavedState), cmd_kind: 0,
     });
 }
 
-fn run_restore_state_sync(slot: &mut Slot, rest: &[u8]) {
+fn run_restore_state_sync(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) {
     if !rest.is_empty() {
         if let Ok(state) = SavedState::decode(rest) {
             slot.activity.on_restore_state(&state);
         }
     }
     slot.last_outcome = DispatchOutcome::NoBytes;
-    slot.pending = Some(PendingDispatch {
+    slot.pending.insert(dispatch_id, PendingDispatch {
         future: Box::pin(async move { DispatchOutcome::NoBytes }),
         completed: Some(DispatchOutcome::NoBytes), cmd_kind: 0,
     });
@@ -766,7 +775,7 @@ fn drive_pending(dispatch_id: u64) -> u32 {
             Some(s) => s,
             None => return op_kinds::status::ERROR,
         };
-        let pending = match slot.pending.as_mut() {
+        let pending = match slot.pending.get_mut(&dispatch_id) {
             Some(p) => p,
             None => return op_kinds::status::ERROR,
         };
@@ -856,7 +865,7 @@ pub fn get_result(dispatch_id: u64, out_len_ptr: *mut u32) -> *const u8 {
     let mut bytes_len: u32 = 0;
     with_slots(|slots_map| {
         let Some(slot) = slots_map.get_mut(&handle) else { return; };
-        let outcome = slot.pending.as_ref()
+        let outcome = slot.pending.get(&dispatch_id)
             .and_then(|p| p.completed)
             .unwrap_or(slot.last_outcome);
         match outcome {
@@ -876,9 +885,11 @@ pub fn get_result(dispatch_id: u64, out_len_ptr: *mut u32) -> *const u8 {
                 destroy_after = true;
             }
         }
-        // Drop the future BEFORE potentially removing the slot — the
-        // future holds raw-pointer borrows into the slot.
-        slot.pending = None;
+        // Drop the specific dispatch's future BEFORE potentially
+        // removing the slot — the future holds raw-pointer borrows
+        // into the slot. Other dispatches in the same slot's pending
+        // map (Stone 11.6.5 #12) keep running.
+        slot.pending.remove(&dispatch_id);
     });
 
     // Always evict the dispatch_id; single-shot semantic.
@@ -900,7 +911,7 @@ fn result_bytes_len(dispatch_id: u64) -> u32 {
     };
     with_slots(|slots_map| {
         let Some(slot) = slots_map.get(&handle) else { return 0; };
-        let outcome = slot.pending.as_ref()
+        let outcome = slot.pending.get(&dispatch_id)
             .and_then(|p| p.completed)
             .unwrap_or(slot.last_outcome);
         match outcome {
@@ -1086,7 +1097,7 @@ mod tests {
         // we install manually.
         let class_static = intern_class("Test");
         let mut slot = Box::new(Slot {
-            pending: None,
+            pending: HashMap::new(),
             spawned: Vec::new(),
             activity: std::mem::replace(
                 &mut activity,
@@ -1129,7 +1140,7 @@ mod tests {
                     DispatchOutcome::NoBytes
                 };
                 let fut = build_async_future(s, outcome, body);
-                s.pending = Some(PendingDispatch {
+                s.pending.insert(dispatch_id, PendingDispatch {
                     future: fut,
                     completed: None,
                     cmd_kind,
@@ -1148,7 +1159,7 @@ mod tests {
     /// activity field is `Box<dyn Activity>`).
     fn empty_slot() -> Slot {
         Slot {
-            pending: None,
+            pending: HashMap::new(),
             spawned: Vec::new(),
             activity: Box::new(NopActivity::default()),
             ctx: Context {
@@ -1267,6 +1278,81 @@ mod tests {
             &[(99, cmd::DESTROY)]);
         assert_eq!(drive_spawned(), 0,
             "after destroy the slot is gone — no pending tasks anywhere");
+    }
+
+    /// Stone 11.6.5 (#12) — `slot.pending` is a HashMap keyed by
+    /// dispatch_id, so two callbacks with the same handle could
+    /// coexist if the framework ever permitted it. The framework's
+    /// PendingTransition discipline still serialises in production,
+    /// but the surface no longer hard-codes "one in-flight dispatch"
+    /// as a structural invariant. Verify the data structure.
+    #[test]
+    fn slot_pending_holds_concurrent_entries_keyed_by_dispatch_id() {
+        // Build a slot manually, install two pending entries with
+        // distinct dispatch_ids, verify both survive the lookup and
+        // that dropping one leaves the other intact.
+        let handle = 0xc12u32;
+        let class_static = intern_class("ConcurrentDispatch");
+        let mut slot = Box::new(Slot {
+            pending: HashMap::new(),
+            spawned: Vec::new(),
+            activity: Box::new(NopActivity::default()),
+            ctx: Context {
+                metrics: Metrics::default(),
+                timestamp_ms: 0.0,
+                pointer: None,
+                class: class_static,
+                handle,
+            },
+            paint_buf: Vec::new(),
+            save_buf: Vec::new(),
+            last_outcome: DispatchOutcome::NoBytes,
+        });
+        slot.pending.insert(101, PendingDispatch {
+            future: Box::pin(async move { DispatchOutcome::NoBytes }),
+            completed: None,
+            cmd_kind: cmd::RESUME,
+        });
+        slot.pending.insert(202, PendingDispatch {
+            future: Box::pin(async move { DispatchOutcome::Paint }),
+            completed: Some(DispatchOutcome::Paint),
+            cmd_kind: cmd::RENDER,
+        });
+        with_slots(|s| { s.insert(handle, slot); });
+        with_dispatches(|d| {
+            d.insert(101, handle);
+            d.insert(202, handle);
+        });
+
+        // Both polls succeed independently, returning the right state
+        // for each entry without aliasing.
+        let p101 = poll_dispatch(101);
+        let s101 = (p101 & 0xFFFF_FFFF) as u32;
+        // 101 was Pending — a no-op future returning NoBytes resolves
+        // on first poll, so we expect READY here.
+        assert_eq!(s101, op_kinds::status::READY);
+
+        let p202 = poll_dispatch(202);
+        let s202 = (p202 & 0xFFFF_FFFF) as u32;
+        assert_eq!(s202, op_kinds::status::READY);
+
+        // Dropping 101 via get_result must NOT touch 202.
+        let mut len: u32 = 0;
+        get_result(101, &mut len as *mut u32);
+        with_slots(|s| {
+            let slot = s.get(&handle).unwrap();
+            assert!(!slot.pending.contains_key(&101));
+            assert!(slot.pending.contains_key(&202),
+                "the OTHER dispatch in the same slot must survive a peer's drop");
+        });
+
+        // Cleanup.
+        get_result(202, &mut len as *mut u32);
+        with_slots(|s| { s.remove(&handle); });
+        with_dispatches(|d| {
+            d.remove(&101);
+            d.remove(&202);
+        });
     }
 
     #[test]
