@@ -1243,6 +1243,81 @@ new ResizeObserver(entries => {
 
 ---
 
+### Stone 13.0prep — Foundation primitives שחסרים (~2-3 ימים)
+
+audit פוסט-11.6.9 (May 2026) חשף שלושה primitives שלא חוסמים את Phase 12 אבל **חוסמים את 13.x** — עדיף לסגור אותם בפתח Phase 13 לפני שנכנסים ל-WindowManager עצמו.
+
+#### A. Timer primitives (~1 יום) — **חוסם 13.3**
+
+**הבעיה.** ה-SDK חושף `clock_gettime_ms` (Stone 11.6.8 #4) — אבל זה polling. אין primitive שpark future למשך N ms ומעיר אותו. App שרוצה `sleep(500).await` או `timeout(read("k"), 2000).await` חייבת busy-loop על `clock_gettime`, דבר שפיר ה-CPU budget של Stone 12.2. Stone 13.3 (animations) דורש waker-on-tick — לא ניתן לבנות בלי timer.
+
+**Implementation.**
+- Host import חדש ב-[`sdk-rust/src/runtime.rs`](sdk-rust/src/runtime.rs):
+  ```rust
+  /// Arms a one-shot timer. After `delay_ms`, host fires the future.
+  /// Returns 0 on success, non-zero on failure (per-slot quota exceeded).
+  fn akiva_host_timer_arm(future_id: u64, delay_ms: u32) -> u32;
+  fn akiva_host_timer_cancel(future_id: u64);
+  ```
+- New module `sdk-rust/src/time.rs`:
+  ```rust
+  pub async fn sleep(duration_ms: u32);
+  pub async fn timeout<F: Future>(fut: F, ms: u32) -> Result<F::Output, Elapsed>;
+  pub fn interval(period_ms: u32) -> Interval; // poll-driven
+  ```
+- JS-side ב-[`runtime/web/app_worker_shell.js`](runtime/web/app_worker_shell.js): `Map<future_id, setTimeout_handle>`. Drop-on-await → `clearTimeout` + erase מהmap.
+- ABI bump: 0.4.0 → 0.5.0 (MINOR — additive imports).
+
+**DoD.**
+- [ ] `sleep(100).await` returns אחרי ≥ 100ms (validate עם `clock_gettime_ms(Monotonic)`)
+- [ ] `timeout(slow_io(), 50).await` → `Err(Elapsed)` אם io לוקח 200ms
+- [ ] drop של Sleep future לפני wake → ה-timer מבוטל ב-host (vitest spy על `clearTimeout`)
+- [ ] `interval(16)` × 60 ticks ≈ 1000ms ± 50ms (animation frame budget)
+
+#### B. Stroke + line paint ops (~3 שעות) — נצרך ב-13.0/13.2
+
+**הבעיה.** Canvas2D primitives היום: `Clear`, `FillRect`, `FillRoundRect`, `DrawText`, `PushClip/Pop`, `PushTransform/Pop`. אין stroke או line. דיאלוגים ב-13.2 (borders), separators ב-13.0 (panel divider), outlined buttons — כולם דורשים stroke. אפשר לחקות ב-1px-tall fill_rect אבל זה מכוער ולא תומך ב-radius.
+
+**Implementation.**
+- 3 opcodes חדשים ב-[`sdk-rust/src/canvas.rs`](sdk-rust/src/canvas.rs): `OP_STROKE_RECT = 8`, `OP_STROKE_ROUND_RECT = 9`, `OP_DRAW_LINE = 10`. כל אחד עם width param (f32).
+- `encode_op` / `decode_op` ב-[`framework/src/wasm_activity.rs`](framework/src/wasm_activity.rs).
+- [`runtime/web/renderer/canvas2d.js`](runtime/web/renderer/canvas2d.js): `strokeRect`, `roundRect`+`stroke`, `moveTo`+`lineTo`+`stroke`.
+- ABI bump: 0.5.0 → 0.6.0 (MINOR — additive opcodes).
+
+**DoD.**
+- [ ] encode/decode roundtrip בכל ה-3 opcodes — byte-symmetric.
+- [ ] `Canvas::stroke_rect / stroke_round_rect / draw_line` מקמפלים ב-wasm32.
+- [ ] Visual sanity: כפתור outlined עם radius=8 + lineWidth=2 נראה כמו native.
+
+#### C. `@drawable/` + image rendering (~1 יום) — נצרך ב-13.2 ל-icons + Shell
+
+**הבעיה.** `@drawable/` resource type מתועד ב-`docs/resources.md §8` כ"פוסט-MVP". בלי זה אין PNG icons — Shell מציגה כפתורי launcher עם טקסט בלבד; דיאלוגים של 13.2 לא יכולים להראות icon (warning/info/error). זה הופך את "Akiva נראית כמו native OS" ל-vision לא-ממומש בעיני המשתמש.
+
+**Implementation.**
+- ResourceManager: load `res/drawable/<name>.png` ב-boot per package, cache כ-`ImageBitmap` ב-renderer (transferable).
+- Host import: `akiva_host_resource_drawable(name_ptr, name_len) -> u32` (drawable_id; 0 = missing).
+- New opcode `OP_DRAW_IMAGE = 11`: `(drawable_id: u32, x: f32, y: f32, w: f32, h: f32)`.
+- AKML attribute `<Image src="@drawable/icon" w="48" h="48">`.
+- Manifest extension: `app.icon = "@drawable/launcher"` (Stone 13.2 משתמש בזה ב-Shell).
+- ABI bump: 0.6.0 → 0.7.0 (MINOR — opcode + import).
+
+**DoD.**
+- [ ] PNG מ-`apps/calculator/res/drawable/icon.png` נטען ב-boot, מצוייר במסך דרך `<Image>` widget.
+- [ ] missing drawable → magenta box (consistent עם missing color/string fallback).
+- [ ] Shell מציגה icons ל-launcher entries (אם ה-app הצהיר `app.icon`).
+- [ ] uninstall → ה-cache נוקה.
+
+**Code surfaces (כל ה-3 פריטים).** [`sdk-rust/src/{runtime.rs, time.rs, canvas.rs, lib.rs}`](sdk-rust/src/), [`framework/src/{wasm_activity.rs, resources.rs, manifest.rs}`](framework/src/), [`runtime/web/{app_worker_shell.js, renderer/canvas2d.js, worker.js}`](runtime/web/), [`docs/{abi.md, resources.md}`](docs/).
+
+**DoD — Stone 13.0prep כולה.**
+- [ ] ABI bumped ל-`0.7.0`. CHANGELOG entry: `[ABI: MINOR] timer + stroke + image opcodes/imports`.
+- [ ] `docs/sdk-rust.md` עם `time`, stroke ops, drawable דוגמאות.
+- [ ] regression: 4 ה-MVP apps ממשיכות לעבוד.
+
+**הערכת זמן:** 2-3 ימי עבודה.
+
+---
+
 ### Stone 13.0 — Window surface model (~1 שבוע)
 
 **הבעיה.** [`framework/src/window_manager.rs`](framework/src/window_manager.rs) הוא stub — מחזיר `()` על הכל. Compositor עובד עם `FrameCommands` יחיד גלובלי. אין concept של "surface" נפרד מ-"activity" — כל הציור הולך לאותו buffer.
@@ -1391,12 +1466,14 @@ impl AnimationController {
 ---
 
 **Exit criteria — Phase 13:**
-- [ ] 5 stones סגורים.
+- [ ] Stone 13.0prep + 5 stones סגורים.
+- [ ] `sleep`/`timeout`/`interval` עובדים באפליקציה אמיתית; animations של 13.3 רצים על ה-timer primitive.
+- [ ] Stroke + image opcodes מצוירים נכון; Shell מציגה icons אמיתיים.
 - [ ] System dialog מעל app פעיל; tap מחוץ לו סוגר אותו.
 - [ ] Activity push עם animation — לא jump-cut.
 - [ ] שני tabs מציגים שתי tasks שונות.
 
-**הערכת זמן:** 5-7 שבועות.
+**הערכת זמן:** 6-8 שבועות (5-7 stones + 2-3 ימי prep).
 
 ---
 
@@ -1715,7 +1792,7 @@ pub struct GeoPosition { pub lat: f64, pub lng: f64, pub accuracy_m: f32, pub ts
 | 10 | Permission model (capability-via-imports) | 2-3 שבועות |
 | 11 | Process isolation (dedicated workers + ABI) | 13-19 שבועות |
 | 12 | Resource Governance (memory + CPU quota) | 3-5 שבועות |
-| 13 | WindowManager completion (overlays, transitions) | 5-7 שבועות |
+| 13 | WindowManager completion (overlays, transitions) + foundation prep (timers/stroke/drawable) | 6-8 שבועות |
 | 14 | Capabilities (WebSocket, Audio, Notify, Clipboard…) | 5-7 שבועות |
 
 **סה"כ post-MVP v0.2–v0.4: ~8-13 חודשים** נוספים.
@@ -1761,6 +1838,18 @@ pub struct GeoPosition { pub lat: f64, pub lng: f64, pub accuracy_m: f32, pub ts
 - ✅ **`akiva run`** (commit `eb3eff4`) — kernel build + copy + כל האפליקציות + devserver בפקודה אחת. `--no-build` ל-skip, `--debug` ל-dev profile.
 - ✅ **`akiva new <name>`** (commit `8e61a5a`) — scaffolding עם Cargo.toml + manifest.toml + src/lib.rs + .gitignore. שם נורמליזציה ל-kebab-case, Activity class ו-package_id נגזרים אוטומטית. `--force` לoverwrite.
 - `akiva package` / `akiva install` — **יטופלו ב-Phase 8 (v0.2)**. פורמט `.akv` יתועד ב-`docs/archive-format.md`.
+
+**Foundation gaps deferred (audit מאי 2026, post-Stone 11.6.9):**
+
+לא בלוקר ל-Phase 12; לא בלוקר ל-13 (timers + UI primitives טופלו ב-Stone 13.0prep). מתווספים בהמשך לפי ביקוש אמיתי של app:
+
+- **Text input — character data**: היום key events מעבירים `keyCode` (deprecated) בלבד דרך [tab.js:182-185](runtime/web/tab.js#L182). אפליקציה לא יכולה לקבל typed text — אפילו Latin בלבד. כשapp ראשון מצריך typing, הוסף `event.key` + `compositionevent` ל-`tab.js` → `worker.js` event encoder → `kernel/events.rs` → SDK input enum. ~1 יום. גם Hebrew/IME/RTL מחכים פה (mark-out: user preference dictates MVP-skip). חוסם apps של notes/email/chat — לא חוסם calc/games.
+- **`storage::list_keys()` / scan**: היום אין דרך ל-app להציג רשימת keys שלה ב-storage. עוקפים ע"י maintain-an-index ב-key נפרד. SDK addition + `OPFS getDirectoryHandle().keys()` (Chrome 121+ תומך). ~חצי יום.
+- **App icon + display name ב-manifest**: `app.icon = "@drawable/launcher"` + `app.label = "@string/app_name"`. תלוי ב-`@drawable/` (Stone 13.0prep #C). ~חצי יום מעל drawable. במקביל לחיווט ב-Shell.
+- **Crash log persistence**: trapped app מאבד את כל ה-logs שלו ב-`worker.terminate()`. אם רוצים postmortem ("מה ה-`println!` האחרון לפני ה-trap?") — ring buffer ב-kernel שcollect מ-`message: { type:"log", ... }` ב-flight, persisted ל-`sys/crashes/{id}/{ts}.log`. ~1 יום. helpful ל-Phase 12.4 debugging אבל לא חוסם.
+- **`select!` macro**: `Channel`/`Mutex`/`Signal` קיימים מ-Stone 11.6.8 #3. `select!` (לחכות לראשון מבין כמה futures) הוא thin wrapper מעליהם. apps שצריכות יכולות לכתוב match-loop או להשתמש ב-`futures::future::select`. ~3h כשתחושת חסימה.
+- **Multi-key storage atomicity**: היום write יחיד atomic; אין transaction. App ש-crash באמצע multi-key save נשארת half-written. design call — OPFS לא חושף transactions, צריך WAL ב-kernel. ~3-5 ימים. **המלצה: לעולם לא** — עוקפים בblob יחיד דרך `on_save_state` (כבר ב-MVP) או דרך index file pattern.
+- **CI / GitHub Actions**: 414+ Rust + 54+ vitest רצים מקומית. אין pre-merge gate. מתי שcodebase פותח ל-contributors חיצוניים → הוסף `.github/workflows/test.yml`. עד אז: לא חסר.
 
 ה-backlog הזה **לא** בלוקר ל-MVP; כל פריט הוא תוספת שמתלבשת על המבנה הקיים בלי rewrite. אם נרצה לסגור את Phase 2 פורמלית, הפריטים של Phase 2 הם מה שצריך להשלים.
 
