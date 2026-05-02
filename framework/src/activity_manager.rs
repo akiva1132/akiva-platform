@@ -41,6 +41,12 @@ pub enum LifecycleState {
     Paused,
     Stopped,
     Destroyed,
+    /// Stone 11.5 — the worker that owned this activity trapped (panic,
+    /// loop {} caught by the watchdog, OOM, JS-side `worker.onerror`).
+    /// The `Activity` instance still exists but the framework refuses
+    /// every dispatch into it; only edge out is `Destroyed` (driven by
+    /// the user's tap-to-restart or by package uninstall).
+    Trapped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,13 +557,60 @@ impl ActivityManager {
             .map(|(id, _)| *id)
             .collect()
     }
+
+    // ── Stone 11.5: trap handling ─────────────────────────────────────────
+
+    /// Mark `id` as Trapped — the worker that owned it panicked, hung,
+    /// or got terminated by the watchdog. Returns `Some(prev)` on success
+    /// (the activity transitioned from a live state to `Trapped`) or
+    /// `None` if the id is unknown, the instance is gone, or the activity
+    /// was already Trapped/Destroyed (idempotent — re-trap is a no-op).
+    /// Any open pending slot clears: the future will never resolve.
+    pub fn mark_trapped(&mut self, id: ActivityId) -> Option<LifecycleState> {
+        let rec = self.records.get_mut(&id)?;
+        if !legal_transition(rec.state, LifecycleState::Trapped) {
+            return None;
+        }
+        if !self.instances.contains_key(&id) {
+            return None;
+        }
+        let prev = rec.state;
+        rec.state = LifecycleState::Trapped;
+        rec.pending = None;
+        Some(prev)
+    }
+
+    /// All activity ids belonging to `package_id`. Used by the watchdog
+    /// to mark every activity of a terminated worker as Trapped in one
+    /// pass without iterating records externally.
+    pub fn ids_for_package(&self, package_id: &str) -> Vec<ActivityId> {
+        self.records.iter()
+            .filter(|(_, r)| r.package_id == package_id)
+            .map(|(id, _)| *id)
+            .collect()
+    }
 }
 
 /// Decide whether `from → to` is one of the legal one-step transitions in
 /// docs/activity-model.md §2. Treats `from == to` as illegal (idempotent
 /// resume/pause is the caller's job to short-circuit).
+///
+/// `Trapped` is special: every live state can edge into it (a worker can
+/// trap at any moment), and the only edge OUT is to `Destroyed` (which
+/// the user triggers via the Shell's tap-to-restart UI in Stone 11.5d).
 fn legal_transition(from: LifecycleState, to: LifecycleState) -> bool {
     use LifecycleState::*;
+    if matches!(to, Trapped) {
+        // Any live state can trap — `loop {}` in `on_pointer`, panic in
+        // `on_resume`, OOM mid-render. Only Destroyed/Trapped can't
+        // re-trap (already terminal).
+        return !matches!(from, Destroyed | Trapped);
+    }
+    if matches!(from, Trapped) {
+        // The single recovery edge: tear the activity down so the user
+        // can restart with a fresh instance. Stone 11.5d wires the UX.
+        return matches!(to, Destroyed);
+    }
     matches!(
         (from, to),
         (Initial, Created)
@@ -611,6 +664,39 @@ mod tests {
         // behaviour. Lock this edge in so a future matrix cleanup
         // doesn't quietly drop it.
         assert!(legal_transition(LifecycleState::Created, LifecycleState::Destroyed));
+    }
+
+    // ── Stone 11.5: Trapped transition matrix ────────────────────────────
+
+    #[test]
+    fn every_live_state_can_trap() {
+        use LifecycleState::*;
+        for from in [Initial, Created, Started, Resumed, Paused, Stopped] {
+            assert!(legal_transition(from, Trapped),
+                "{:?} → Trapped should be legal — workers can panic from any state",
+                from);
+        }
+    }
+
+    #[test]
+    fn already_dead_states_cannot_re_trap() {
+        use LifecycleState::*;
+        assert!(!legal_transition(Destroyed, Trapped),
+            "Destroyed activities have no instance; trapping them would be a wiring bug");
+        assert!(!legal_transition(Trapped, Trapped),
+            "Re-trap is a no-op — `mark_trapped` is idempotent on already-trapped activities");
+    }
+
+    #[test]
+    fn trapped_only_recovers_via_destroy() {
+        use LifecycleState::*;
+        for to in [Initial, Created, Started, Resumed, Paused, Stopped] {
+            assert!(!legal_transition(Trapped, to),
+                "Trapped → {:?} should be illegal; only Destroyed is the recovery edge",
+                to);
+        }
+        assert!(legal_transition(Trapped, Destroyed),
+            "Tap-to-restart routes Trapped → Destroyed before re-launching the activity fresh");
     }
 
     // ── Driver tests ─────────────────────────────────────────────────────
@@ -670,7 +756,13 @@ mod tests {
             LifecycleState::Paused   => activity.on_pause(&mut ctx),
             LifecycleState::Stopped  => activity.on_stop(&mut ctx),
             LifecycleState::Destroyed => activity.on_destroy(&mut ctx),
-            LifecycleState::Initial => {}  // nothing fires for Initial
+            // Stone 11.5 — Trapped never fires through this path; the
+            // framework refuses dispatches into trapped activities and
+            // only the Trapped → Destroyed recovery edge ever lands
+            // here (which routes via the on_destroy arm above before
+            // mark_trapped flips the state). Initial is the launch-
+            // window state with no callback to run.
+            LifecycleState::Initial | LifecycleState::Trapped => {}
         }
     }
 
@@ -1276,5 +1368,59 @@ mod tests {
 
         am.resolve_pending(a);
         assert_eq!(am.pending_ids(), vec![b]);
+    }
+
+    // ── Stone 11.5: mark_trapped driver ──────────────────────────────────
+
+    #[test]
+    fn mark_trapped_flips_state_and_returns_prev() {
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        // Drive it to Resumed via the existing `resume` driver so we
+        // have a non-trivial prev to assert against. (`advance` directly
+        // would also work but the closure inference around the `cb`
+        // generic is fussy; the driver wraps the `fire` helper for us.)
+        am.resume(id, fire);
+        let prev = am.mark_trapped(id);
+        assert_eq!(prev, Some(LifecycleState::Resumed));
+        assert_eq!(am.state_of(id), Some(LifecycleState::Trapped));
+    }
+
+    #[test]
+    fn mark_trapped_clears_pending_slot() {
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        assert!(am.open_pending(id, LifecycleState::Created, 99, 0.0));
+        am.mark_trapped(id).unwrap();
+        // The future is gone — the worker won't ever resolve it.
+        assert!(am.pending_of(id).is_none());
+        assert!(am.pending_ids().is_empty());
+    }
+
+    #[test]
+    fn mark_trapped_is_idempotent() {
+        let (mut am, _log) = harness();
+        let id = am.launch("test.pkg", "RecMain").unwrap().id;
+        assert!(am.mark_trapped(id).is_some());
+        // Second call: state is already Trapped, no legal edge.
+        assert!(am.mark_trapped(id).is_none());
+        assert_eq!(am.state_of(id), Some(LifecycleState::Trapped));
+    }
+
+    #[test]
+    fn ids_for_package_filters_correctly() {
+        let (mut am, _log) = harness();
+        let log_for_factory = Rc::new(RefCell::new(Vec::new()));
+        let log_b = log_for_factory.clone();
+        am.register("other.pkg", "OtherMain", LaunchMode::Standard,
+            move || Box::new(RecordingActivity { log: log_b.clone() }));
+        let a = am.launch("test.pkg", "RecMain").unwrap().id;
+        let b = am.launch("other.pkg", "OtherMain").unwrap().id;
+        let mut got = am.ids_for_package("test.pkg");
+        got.sort();
+        assert_eq!(got, vec![a]);
+        let mut got_other = am.ids_for_package("other.pkg");
+        got_other.sort();
+        assert_eq!(got_other, vec![b]);
     }
 }

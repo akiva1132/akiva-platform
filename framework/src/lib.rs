@@ -414,6 +414,18 @@ impl Framework {
     pub fn render_frame(&mut self, ts: f64) -> &FrameCommands {
         self.compositor.begin_frame();
         if let Some(id) = self.stack.last().copied() {
+            // Stone 11.5 — Trapped activities don't paint. The empty
+            // FrameCommands here means "nothing changed since last
+            // frame"; the Shell's tap-to-restart UI is the user's
+            // recovery path. Without this guard, render would call
+            // through to the dead worker and the kernel would dispatch
+            // futures that nobody answers — slowly leaking ids.
+            if matches!(
+                self.activities.state_of(id),
+                Some(activity_manager::LifecycleState::Trapped)
+            ) {
+                return self.compositor.finish_frame();
+            }
             let metrics = self.metrics;
             let pointer = self.pointer;
             let mut finish = false;
@@ -484,6 +496,26 @@ impl Framework {
                 }
             }
         }
+    }
+
+    /// Stone 11.5 — every activity belonging to `package_id` is marked
+    /// `Trapped`. Called by the kernel when (a) an app worker reports a
+    /// trap via `{type:"trapped"}`, (b) `worker.onerror` fires, or (c)
+    /// the watchdog's ping/pong times out and the worker is terminated.
+    /// Idempotent: an already-Trapped activity stays Trapped.
+    ///
+    /// Returns the number of activities transitioned (only those in a
+    /// live state count; already-Destroyed/Trapped are skipped). The
+    /// kernel uses this to decide whether to log a notification.
+    pub fn mark_package_trapped(&mut self, package_id: &str) -> usize {
+        let ids = self.activities.ids_for_package(package_id);
+        let mut n = 0;
+        for id in ids {
+            if self.activities.mark_trapped(id).is_some() {
+                n += 1;
+            }
+        }
+        n
     }
 
     // ── Internals ─────────────────────────────────────────────────────
