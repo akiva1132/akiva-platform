@@ -63,14 +63,18 @@ akiva-platform/
 │
 ├── sdk-rust/                 # Rust SDK לאפליקציות
 │   └── src/
-│       ├── lib.rs
-│       ├── app.rs            # App trait, #[akiva::app]
-│       ├── activity.rs
-│       ├── callbacks.rs
-│       ├── res.rs
+│       ├── lib.rs            # akiva_app!() macro
+│       ├── activity.rs       # async Activity trait + Context
+│       ├── canvas.rs         # immediate-mode Canvas
+│       ├── executor.rs       # mini-executor (post-Stone 11.6.5)
+│       ├── runtime.rs        # ABI v0.2 dispatch slot
+│       ├── ui/               # Ui builder + layout + paint
+│       ├── akml/             # parser + inflater + Bindings
+│       ├── storage.rs        # async read/write handles
 │       ├── intent.rs
-│       ├── storage.rs
-│       └── log.rs
+│       ├── res.rs
+│       ├── log.rs
+│       └── op_kinds.rs       # cmd/io/status mirrors of wire crate
 │
 ├── apps/
 │   ├── shell/                # מסך הבית
@@ -88,27 +92,30 @@ akiva-platform/
 
 ## מצב נוכחי
 
-**v0.1 MVP הושלם (אפריל 2026).** ה-POC הוכיח ש-Akiva יכולה לרוץ; ה-v0.2 הבא הופך אותה למערכת הפעלה אמיתית. ראה [docs/v0.2-design.md](docs/v0.2-design.md).
+**Phase 11 (Process / Fault Isolation + Modern Async SDK) הושלם (May 2026).** ה-platform עברה מ-POC ל-OS אמיתי עם isolation מלא, async executor, ו-resource governance ראשוני. Phase 12 בעבודה. ראה [ROADMAP.md](ROADMAP.md) לפירוט.
 
 **מה עובד היום:**
 
-- ✅ Kernel wasm רץ ב-Dedicated Worker עם leader election + multi-tab + failover (Web Locks + BroadcastChannel)
-- ✅ Event pipeline end-to-end (DOM → Worker → Kernel → Canvas)
-- ✅ Storage: OPFS + SyncAccessHandle, KV סינכרוני. ראה [docs/storage.md](docs/storage.md)
-- ✅ Framework: Activity lifecycle state machine, PackageManager (install/uninstall/rehydrate), IntentRouter, ResourceManager (strings + colors)
-- ✅ SavedState: TLV codec, persistence ל-OPFS, חזרה אחרי process kill
-- ✅ Rendering pipeline: AKML (XML-ish declarative UI) + layout engine + Canvas2D backend
-- ✅ Widget toolkit: VStack/HStack/Frame/Grid/Text/Button/Rect/Spacer + `@color/`/`@string/` resource refs
-- ✅ CLI מלא: `akiva new/build/run/devserver`
-- ✅ שתי אפליקציות אמיתיות: calculator + tic-tac-toe
+- ✅ **Process isolation** — worker-per-app (Stone 11.4c), watchdog enforcement, fault containment (`panic!`/`loop {}` בודד את ה-app בלבד)
+- ✅ **Async SDK** — `Activity` trait async, mini-executor אמיתי (post-Stone 11.6.5), `TaskScope` עם cancellation, `Slot.pending` HashMap למקבילות per activity
+- ✅ **Storage hybrid** — direct readonly `SyncAccessHandle` cache (~0.1ms cache hit) + kernel-routed writes; `WriteHandle` למסירת durability ack
+- ✅ Kernel wasm ב-Dedicated Worker עם leader election + multi-tab failover
+- ✅ Framework: Activity lifecycle state machine מלא, PackageManager (install/uninstall/rehydrate), IntentRouter, ResourceManager (strings + colors + night overlay)
+- ✅ SavedState: TLV codec עם cross-worker async persistence pipeline (P0 #1 fix)
+- ✅ Rendering: AKML (declarative) + `Ui` builder (imperative) + Canvas2D backend
+- ✅ Widget toolkit: VStack/HStack/Text/Button/round-rect + `@color/`/`@string/` resource refs
+- ✅ CLI: `akiva new/build/run/devserver/docs` + 3 templates (`default`, `compose-style`, `game`)
+- ✅ **Resource governance partial** — per-app memory accounting (12.1), CPU attribution (12.2), Low-Memory Killer policy (12.3)
+- ✅ אפליקציות אמיתיות: shell, calculator, tic-tac-toe
 
-**מה לא עובד עדיין (מועמדי v0.2):**
+**מה לא עובד עדיין (Phase 12 ואילך):**
 
-- ❌ פורמט הפצה אמיתי — היום `DEV_APPS` hardcoded ב-`worker.js`; `akiva package`/`install` הם stubs
-- ❌ SingleTask/SingleInstance launch modes, back navigation, cross-activity intents
-- ❌ Permissions enforcement — `PermissionController` הוא shell; כל app מקבל את כל ה-imports
+- ❌ App suspension (12.4) ו-manifest enforcement של `max_memory_mb` (12.5)
+- ❌ פורמט הפצה אמיתי — `DEV_APPS` hardcoded; `akiva package`/`install` עוד stubs
+- ❌ WindowManager: Phase 13 (overlays, dialogs, transitions, multi-display)
+- ❌ Capabilities (Phase 14): WebSocket, Notifications, Clipboard, Vibration, Geolocation
 
-**דחוי ל-v0.3+:** Window manager, notifications, Image/Input widgets, animations, network API, עברית/RTL.
+**דחוי ל-Phase 13+:** Stream primitive (§19.7 ב-[docs/sdk-rust.md](docs/sdk-rust.md)), עברית/RTL, mobile baseline (Pixel 7 / iPhone 14).
 
 ראה [ROADMAP.md](ROADMAP.md) לפירוט מלא של פאזות וסטטוס.
 

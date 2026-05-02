@@ -62,73 +62,51 @@ categories = ["akiva.intent.category.LAUNCHER"]
 
 ## 4. Hello World
 
-### res/layout/main.akml
-
-```xml
-<?akml version="1.0"?>
-<VStack padding="16dp" spacing="8dp" background="@color/surface">
-    <Text
-        id="@+id/message"
-        text="@string/click_counter"
-        textSize="20sp"
-        textColor="@color/on_surface" />
-    <Button
-        text="@string/click_me"
-        onClick="on_click" />
-</VStack>
-```
-
-### res/values/strings.toml
-
-```toml
-[strings]
-app_name = "Hello"
-click_counter = "Clicks: 0"
-click_me = "Click me"
-```
-
-### res/values/colors.toml
-
-```toml
-[colors]
-surface = "#FFFFFF"
-on_surface = "#0C0C10"
-```
-
 ### src/lib.rs
 
 ```rust
 use akiva_sdk::prelude::*;
 
-#[akiva::app]
+#[derive(Default)]
 pub struct HelloApp {
     count: i32,
 }
 
-impl App for HelloApp {
-    fn new() -> Self {
-        Self { count: 0 }
+#[async_trait(?Send)]
+impl Activity for HelloApp {
+    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+        c.clear(0xff202030);
+        c.draw_text(
+            20.0, 40.0, 24.0, 0xffffffff,
+            &format!("Clicks: {}", self.count),
+        );
+        c.fill_round_rect(20.0, 60.0, 100.0, 36.0, 4.0, 0xff3070ff);
+        c.draw_text(34.0, 84.0, 16.0, 0xffffffff, "Click me");
+
+        // Pointer state lives on `ctx`; consult it to flip behaviour.
+        let _ = ctx; // unused in this minimal sketch
     }
 
-    fn on_create(&mut self, ctx: &ActivityContext) {
-        ctx.set_content_view("@layout/main");
+    async fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
+        if ev.phase == PointerPhase::Down
+            && (20.0..120.0).contains(&ev.x) && (60.0..96.0).contains(&ev.y)
+        {
+            self.count += 1;
+        }
     }
 
     fn on_save_state(&self, state: &mut SavedState) {
-        state.put_i32("count", self.count);
+        state.put_int("count", self.count as i64);
     }
-
     fn on_restore_state(&mut self, state: &SavedState) {
-        self.count = state.get_i32("count").unwrap_or(0);
+        if let Some(v) = state.get_int("count") { self.count = v as i32; }
     }
 }
 
-#[akiva::callback]
-fn on_click(app: &mut HelloApp, ctx: &CallbackContext) {
-    app.count += 1;
-    ctx.update_text("@id/message", &format!("Clicks: {}", app.count));
-}
+akiva_sdk::akiva_app!(HelloApp);
 ```
+
+ה-app הזה נכתב imperative — משתמש ב-`Canvas` ישירות. ל-app אמיתי תרצה את `Ui` builder (§9) או AKML layout (§10). שלוש דוגמאות מקיפות יותר לפי השלד של `akiva new --template` ב-§16-§18.
 
 ### build
 
@@ -137,140 +115,161 @@ cd apps/my-app
 akiva build        # shortcut ל-cargo build --target wasm32-unknown-unknown + wasm-opt
 ```
 
-## 5. ה-Macros שה-SDK מספק
+## 5. ה-Macro `akiva_app!`
 
-### `#[akiva::app]`
-
-מסמן את ה-struct של האפליקציה. המאקרו מייצר:
-- `akiva_on_create`, `akiva_on_start`, וכו' — כל ה-lifecycle exports
-- `akiva_alloc`, `akiva_free` — memory allocator
-- static instance management (אפליקציה יש לה instance אחד)
-- callback registry
-
-### `#[akiva::callback]`
-
-מסמן פונקציה כ-callback. המאקרו:
-- רושם אותה ב-registry עם id אוטומטי
-- מאפשר referencing מ-AKML (`onClick="on_click"`)
-
-### `#[akiva::activity]`
-
-(עתידי, לאפליקציות עם כמה activities)
+ה-SDK מספק macro יחיד שמוסיף את כל ה-wasm exports שדרושים ל-App ABI v0:
 
 ```rust
-#[akiva::activity(id = "settings")]
-pub struct SettingsActivity { ... }
+akiva_sdk::akiva_app!(HelloApp);
 ```
 
-## 6. ה-`App` trait
+מה הוא מייצר:
+- `#[no_mangle] extern "C" fn akiva_app_dispatch(...)`, `akiva_app_poll_dispatch(...)`, `akiva_app_get_result(...)` — שלוש exports שמחליפות את ה-zoo של per-callback exports שהיה לפני Stone 11.6.5
+- `akiva_app_drive_spawned` — מנגנון re-poll ל-spawned tasks ב-`TaskScope` (נדחה לעת עתה — ראה §19.5)
+- allocator hooks ו-instance management (`Default::default()` נקרא פעם אחת על handle הראשון; instance ממוחזר ל-handles הבאים)
+- כל המנגנון של executor המיני שמריץ את ה-`async fn` callbacks (`crate::executor`)
+
+הקריאה חייבת להיות **פעם אחת בלבד** ב-`lib.rs` של ה-app. שני calls באותו crate הם linker error כי ה-symbols `#[no_mangle]`.
+
+ה-type שמועבר ל-macro חייב להיות `Default` (ה-runtime יוצר instance אחד per handle בלי להעביר constructor דרך ה-ABI) ו-`Activity` (ראה §6).
+
+`#[akiva::activity]` macro לאפליקציות עם כמה activities עוד לא קיים. לעת עתה — manifest יכול להצהיר על מספר activity records, אבל כולם מצביעים על אותו `Activity` impl. הפרדה אמיתית מתוכננת לאחרי Phase 13.
+
+## 6. ה-`Activity` trait
+
+הצורה הנוכחית (post-Stone 11.2). כל ה-callbacks הם `async fn` חוץ מ-`on_save_state`/`on_restore_state` שמכוונים סנכרוניים — ראה הערה ב-`activity.rs:314-321`.
 
 ```rust
-pub trait App: Sized + 'static {
-    // Required
-    fn new() -> Self;
-    fn on_create(&mut self, ctx: &ActivityContext);
+#[async_trait(?Send)]
+pub trait Activity: 'static {
+    // ── Lifecycle (docs/activity-model.md §2) ──────────────────────
+    async fn on_create(&mut self, _ctx: &mut Context<'_>) {}
+    async fn on_start(&mut self, _ctx: &mut Context<'_>) {}
+    async fn on_resume(&mut self, _ctx: &mut Context<'_>) {}
+    async fn on_pause(&mut self, _ctx: &mut Context<'_>) {}
+    async fn on_stop(&mut self, _ctx: &mut Context<'_>) {}
+    async fn on_destroy(&mut self, _ctx: &mut Context<'_>) {}
 
-    // Optional lifecycle
-    fn on_start(&mut self, _ctx: &ActivityContext) {}
-    fn on_resume(&mut self, _ctx: &ActivityContext) {}
-    fn on_pause(&mut self, _ctx: &ActivityContext) {}
-    fn on_stop(&mut self, _ctx: &ActivityContext) {}
-    fn on_destroy(&mut self, _ctx: &ActivityContext) {}
+    // ── Input ───────────────────────────────────────────────────────
+    async fn on_pointer(&mut self, _ctx: &mut Context<'_>, _ev: PointerEvent) {}
+    async fn on_key(&mut self, _ctx: &mut Context<'_>, _ev: KeyEvent) {}
+    async fn on_resize(&mut self, _ctx: &mut Context<'_>, _m: Metrics) {}
 
-    // State persistence
-    fn on_save_state(&self, _state: &mut SavedState) {}
-    fn on_restore_state(&mut self, _state: &SavedState) {}
+    // ── Render ──────────────────────────────────────────────────────
+    /// Paint one frame. Called at rAF cadence (typically 60Hz). Must be
+    /// fast — every op is serialised immediately.
+    async fn on_render(&mut self, _ctx: &mut Context<'_>, _c: &mut Canvas<'_>) {}
 
-    // Intent handling
-    fn on_new_intent(&mut self, _ctx: &ActivityContext, _intent: &Intent) {}
-    fn on_activity_result(
+    // ── Intent redelivery (Stone 9.4) + activity-result (9.5) ───────
+    async fn on_new_intent(&mut self, _ctx: &mut Context<'_>, _intent: &Intent) {}
+    async fn on_activity_result(
         &mut self,
-        _ctx: &ActivityContext,
+        _ctx: &mut Context<'_>,
         _request_code: u32,
-        _result: ActivityResult,
+        _result: &ActivityResult,
     ) {}
 
-    // Config changes (only if declared in manifest)
-    fn on_config_change(&mut self, _ctx: &ActivityContext, _changes: ConfigChanges) {}
-
-    // Custom back handling — return true to consume
-    fn on_back_pressed(&mut self, _ctx: &ActivityContext) -> bool { false }
-
-    // Raw key events
-    fn on_key_event(&mut self, _ctx: &ActivityContext, _event: &KeyEvent) -> bool { false }
+    // ── Saved state (sync on purpose) ───────────────────────────────
+    fn on_save_state(&self, _state: &mut SavedState) {}
+    fn on_restore_state(&mut self, _saved: &SavedState) {}
 }
 ```
 
-## 7. `ActivityContext`
+**מינימום מימוש.** רק `on_render` מתחייב בפועל (המסך תמיד מצריך פאינט); כל השאר defaults.
 
-Handle שמועבר לכל lifecycle callback. דרכו האפליקציה מדברת עם ה-framework.
+**מה השתנה מ-Stone 11.2.** לפני 11.2 ה-trait היה סנכרוני; ה-`async fn` הוצג עם הרצת `block_on_ready` בלולאה אחת לכל callback. החל מ-Stone 11.6.5 ה-runtime מריץ executor אמיתי (ראה §19.1) שיודע לעצור על `Pending` ולחזור ב-frame הבא. אין שינוי ב-trait shape — אפליקציות שעבדו עם `block_on_ready` עובדות גם ב-executor האמיתי.
+
+**`Send` bound.** ה-`async_trait(?Send)` כי wasm worker הוא single-threaded; אין יתרון להוסיף `Send`/`Sync` requirements שיגרמו ל-`Rc`/`RefCell` interior של ה-app להיתקע.
+
+**Saved state — למה sync.** `on_save_state` נקרא מ-destroy path סינכרוני (`framework::wasm_activity::dispatch_save_state_async`). הפיכתו ל-async הייתה כופה future allocation per save בלי benefit; ה-bytes יוצאים מתוך ה-app instance, לא קוראים מ-host.
+
+## 7. `Context`
+
+ה-handle שמועבר לכל async callback. שדה ציבורי `metrics: Metrics` חושף את ה-surface (width/height/density) ו-`timestamp_ms: f64` הוא frame-stable monotonic timestamp. ה-methods מבצעים host calls שיכולים `Pending` — חתום async כי הם משתעבדים ב-frame הבא.
 
 ```rust
-impl ActivityContext {
-    // UI
-    pub fn set_content_view(&self, layout_ref: &str);
-    pub fn find_view(&self, id: &str) -> ViewRef;
-    pub fn inflate(&self, layout_ref: &str) -> ViewRef;
+pub struct Context<'a> {
+    pub metrics: Metrics,           // width_px, height_px, density
+    pub timestamp_ms: f64,          // frame timestamp (monotonic)
+    // … internals (host handle, pending signal slots) …
+}
 
-    // Navigation
-    pub fn start_activity(&self, intent: Intent);
-    pub fn start_activity_for_result(&self, intent: Intent, request_code: u32);
-    pub fn finish(&self);
-    pub fn set_result(&self, code: i32, data: Option<Intent>);
+impl<'a> Context<'a> {
+    // Navigation (async — kernel resolves the dispatch)
+    pub async fn start_activity(&mut self, intent: &Intent);
+    pub async fn start_activity_for_result(
+        &mut self, intent: &Intent, request_code: u32,
+    );
+    pub async fn finish(&mut self);
+    pub async fn set_result(&mut self, result: &ActivityResult);
 
-    // Intent of current launch
-    pub fn intent(&self) -> &Intent;
-
-    // System services
-    pub fn package_manager(&self) -> &PackageManager;
-    pub fn resources(&self) -> &Resources;
-
-    // UI convenience
-    pub fn show_toast(&self, msg: &str);
-    pub fn show_toast_long(&self, msg: &str);
+    // Spawned tasks (Stone 11.6.5; cancellation: ראה §19.5)
+    pub fn activity_scope(&self) -> TaskScope; // lives until on_destroy
+    pub fn resumed_scope(&self) -> TaskScope;  // cancelled at on_pause
 }
 ```
 
-## 8. `ViewRef`
+**שינויים מ-Stone 11.0 baseline.** `set_content_view`, `find_view`, `inflate`, ו-`show_toast` הוסרו — ה-`Canvas` הישיר (§8) ו-`Ui` builder (§9) החליפו את ה-AKML view-handle model. AKML עוד נתמכת (§10) אבל דרך `inflate_str_with` כל frame, לא דרך handles persistent.
 
-Handle ל-widget spec הוא הדרך לעדכן UI בזמן ריצה:
+**`set_content_view` בעבר.** היה דרוש כדי לקשור activity ל-AKML root. עכשיו `on_render` הוא ה-entry point ל-paint; כל frame ה-app בונה את ה-tree ב-`Canvas` או דרך `Ui`/AKML inflate. אין שלב "set the layout" נפרד.
+
+## 8. `Canvas`
+
+Immediate-mode painter. ה-API מחויב לרוץ ב-`on_render`; קריאה מחוץ ל-render context לא תפיק ops לא ברורים אבל אין הגנת compile-time. כל הצבעים הם `u32` ב-`0xAARRGGBB` (alpha first).
 
 ```rust
-impl ViewRef {
-    pub fn set_text(&self, text: &str);
-    pub fn set_visible(&self, visible: Visibility);
-    pub fn set_enabled(&self, enabled: bool);
-    pub fn set_background_color(&self, color: Color);
-    pub fn set_click_handler(&self, callback_name: &str);
-    pub fn set_tag(&self, tag: &str);
+impl<'a> Canvas<'a> {
+    pub fn clear(&mut self, rgba: u32);
+    pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: u32);
+    pub fn fill_round_rect(
+        &mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32,
+    );
+    pub fn draw_text(
+        &mut self, x: f32, y: f32, size: f32, rgba: u32, text: &str,
+    );
 
-    // For containers
-    pub fn clear_children(&self);
-    pub fn add_child(&self, child: ViewRef);
-    pub fn remove(&self);
+    // Clipping + transforms (push/pop pairs)
+    pub fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32);
+    pub fn pop_clip(&mut self);
+    pub fn push_transform(&mut self, dx: f32, dy: f32, scale: f32);
+    pub fn pop_transform(&mut self);
 }
 ```
 
-## 9. `CallbackContext`
+`Canvas` עצמו לא מציג כלום — הוא serialiser. ה-ops זורמים ל-host דרך wire encoding ועוברים ל-Canvas2D / WebGL2 שם. זה אומר ש-paint code חייב להיות זריז (≤ 16ms/frame כולל logic) אבל לא משחקי GPU.
 
-Passed to every `#[akiva::callback]`:
+## 9. `Ui` builder
+
+Builder layer מעל `Canvas` שמטפל ב-layout (VStack/HStack/grid), pointer hit-testing, ו-widget state. שמירת state בין frames — ב-`UiState` שה-app מחזיק כ-field.
 
 ```rust
-impl CallbackContext {
-    pub fn widget_id(&self) -> WidgetId;
-    pub fn tag(&self) -> &str;
-    pub fn activity(&self) -> &ActivityContext;
+impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
+    pub fn new(state: &'s mut UiState, ctx: &'c mut Context<'_>, c: &'b mut Canvas<'_>) -> Self;
 
-    // Shortcut for finding and updating
-    pub fn find(&self, id: &str) -> ViewRef;
-    pub fn update_text(&self, id: &str, text: &str);
+    // Leaf widgets
+    pub fn text(&mut self, text: &str) -> TextBuilder;       // .size(), .color(), .build()
+    pub fn button(&mut self, action: &str, label: &str) -> NodeId;
 
-    // For click callbacks
-    pub fn click_position(&self) -> Option<(f32, f32)>;
-    pub fn key_event(&self) -> Option<&KeyEvent>;
-    pub fn text_input(&self) -> Option<&str>;
+    // Containers
+    pub fn v_stack(&mut self, children: &[NodeId]) -> StackBuilder;
+    pub fn h_stack(&mut self, children: &[NodeId]) -> StackBuilder;
+
+    // Commit + dispatch
+    pub fn present(&mut self, root: NodeId);
+    pub fn was_clicked(&self, action: &str) -> bool;
+    pub fn was_triggered(&self, action: &str) -> bool;  // alias used in compose-style
 }
 ```
+
+`feed_pointer` ב-`UiState` נקרא מ-`on_pointer` כדי להזין את ה-builder ב-coords של ה-event האחרון. הקריאה היא:
+
+```rust
+async fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
+    self.ui.feed_pointer(ev);
+}
+```
+
+ראה §16 לדוגמה מלאה (template `default`).
 
 ## 10. `Intent` construction
 
@@ -307,159 +306,57 @@ let greeting = res::string_fmt("@string/hello_name", &[("name", "Akiva")]);
 
 ## 12. Storage
 
+API async (Stone 11.6.7 #1). `read` מחזיר `Option<ReadFuture>` — `None` אם ה-app אסר על עצמו storage capability ב-manifest (no `STORAGE_SANDBOX` grant); אחרת `Future` שיתחזיר `Result<Option<Vec<u8>>, StorageError>`. `write` מחזיר `WriteHandle` שאם תזרק (`drop` בלי `await`) ה-write נשאר fire-and-forget — אבל `#[must_use]` יכריז warning ב-`storage::write(k, v);` בלי `let _ =`.
+
 ```rust
 use akiva_sdk::storage;
 
-storage::set("last_value", b"42");
-
-if let Some(bytes) = storage::get("last_value") {
-    let s = std::str::from_utf8(&bytes).unwrap_or("");
-    // ...
+async fn on_create(&mut self, _ctx: &mut Context<'_>) {
+    if let Some(fut) = storage::read("notes") {
+        if let Ok(Some(bytes)) = fut.await {
+            self.text = String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
 }
 
-storage::remove("last_value");
+async fn save(&self) {
+    // Awaiting the WriteHandle gets durability confirmation:
+    let _ = storage::write("notes", self.text.as_bytes()).await;
+}
 
-for key in storage::keys() {
-    // ...
+fn fire_and_forget_write(&self, value: &[u8]) {
+    // `let _ =` silences the must_use; the host_op is still sent.
+    let _ = storage::write("ephemeral", value);
 }
 ```
+
+`storage::remove(key)` קיים סנכרוני (אין durability ack). אין `keys()` — Stone 11.6.7 הסיר את זה (כל use case שראינו אפשר להחליף ב-cache פנימי או manifest declaration).
 
 ## 13. Logging
 
-```rust
-use akiva_sdk::log;
-
-log::debug!("Counter is {}", app.count);
-log::info!("App started");
-log::warn!("Unusual value: {:?}", value);
-log::error!("Failed to parse: {:?}", err);
-```
-
-## 14. דוגמה מלאה — Calculator skeleton
-
-### src/lib.rs
+Macros מ-`prelude` (לא module path):
 
 ```rust
 use akiva_sdk::prelude::*;
 
-#[akiva::app]
-pub struct Calculator {
-    display: String,
-    operand: Option<f64>,
-    op: Option<Operation>,
-    new_entry: bool,
-}
-
-#[derive(Clone, Copy)]
-enum Operation { Add, Sub, Mul, Div }
-
-impl App for Calculator {
-    fn new() -> Self {
-        Self {
-            display: "0".into(),
-            operand: None,
-            op: None,
-            new_entry: true,
-        }
-    }
-
-    fn on_create(&mut self, ctx: &ActivityContext) {
-        ctx.set_content_view("@layout/main");
-    }
-
-    fn on_save_state(&self, state: &mut SavedState) {
-        state.put_str("display", &self.display);
-        if let Some(op) = self.operand {
-            state.put_f64("operand", op);
-        }
-        // ... (op serialize as string)
-    }
-
-    fn on_restore_state(&mut self, state: &SavedState) {
-        self.display = state.get_str("display").unwrap_or_else(|| "0".into());
-        self.operand = state.get_f64("operand");
-    }
-}
-
-impl Calculator {
-    fn update_display(&self, ctx: &CallbackContext) {
-        ctx.update_text("@id/display", &self.display);
-    }
-
-    fn current_value(&self) -> f64 {
-        self.display.parse().unwrap_or(0.0)
-    }
-}
-
-#[akiva::callback]
-fn on_digit(app: &mut Calculator, ctx: &CallbackContext) {
-    let digit = ctx.tag();
-    if app.new_entry || app.display == "0" {
-        app.display = digit.to_string();
-        app.new_entry = false;
-    } else {
-        app.display.push_str(digit);
-    }
-    app.update_display(ctx);
-}
-
-#[akiva::callback]
-fn on_op(app: &mut Calculator, ctx: &CallbackContext) {
-    let op = match ctx.tag() {
-        "add" => Operation::Add,
-        "sub" => Operation::Sub,
-        "mul" => Operation::Mul,
-        "div" => Operation::Div,
-        _ => return,
-    };
-    app.operand = Some(app.current_value());
-    app.op = Some(op);
-    app.new_entry = true;
-}
-
-#[akiva::callback]
-fn on_equals(app: &mut Calculator, ctx: &CallbackContext) {
-    if let (Some(lhs), Some(op)) = (app.operand, app.op) {
-        let rhs = app.current_value();
-        let result = match op {
-            Operation::Add => lhs + rhs,
-            Operation::Sub => lhs - rhs,
-            Operation::Mul => lhs * rhs,
-            Operation::Div => if rhs != 0.0 { lhs / rhs } else { f64::NAN },
-        };
-        app.display = format_number(result);
-        app.operand = None;
-        app.op = None;
-        app.new_entry = true;
-        app.update_display(ctx);
-    }
-}
-
-#[akiva::callback]
-fn on_clear(app: &mut Calculator, ctx: &CallbackContext) {
-    app.display = "0".into();
-    app.operand = None;
-    app.op = None;
-    app.new_entry = true;
-    app.update_display(ctx);
-}
-
-fn format_number(v: f64) -> String {
-    if v.is_nan() {
-        "Error".into()
-    } else if v == v.trunc() {
-        format!("{}", v as i64)
-    } else {
-        format!("{}", v)
-    }
-}
+log_debug!("Counter is {}", app.count);
+log_info!("App started");
+log_warn!("Unusual value: {:?}", value);
+log_error!("Failed to parse: {:?}", err);
+log_trace!("very fine-grained: x={x:.4}, y={y:.4}");
 ```
 
-## 15. Build & Run
+ה-macros מקודדים את ה-message + level דרך `akiva_host_log`. ה-host מסנן על `package_id` + level (debug על debug builds; info+ על release). Stone 11.6.7 הוסיף שלb mode שמעביר log emission ב-batch אחת ל-frame כדי לחסוך postMessage overhead — שקוף ל-app.
+
+## 14. Build & Run
 
 ```bash
-# Create new app
+# Create new app — defaults to `default` template (§16). Pass --template
+# compose-style (§17) for AKML+Bindings, --template game (§18) for a
+# per-frame physics scaffold.
 akiva new my-app
+akiva new mynotes --template compose-style
+akiva new pong --template game
 
 # Build wasm
 cd my-app
@@ -467,31 +364,253 @@ akiva build
 
 # Run (dev server + auto-install)
 akiva run
+
+# Open the SDK docs in a browser
+akiva docs
 ```
 
-## 16. מה ה-SDK **לא** חושף (מכוון)
+## 15. שלוש דוגמאות מקיפות — אחת לכל template
 
-- ❌ גישה ל-DOM APIs: אין `document`, `window`, `fetch`
-- ❌ גישה ישירה ל-canvas: רנדור עובר רק דרך widget tree
-- ❌ `std::fs`: storage דרך `storage` API
-- ❌ `std::net`: network ב-v0.2+
-- ❌ threads: wasm הוא single-threaded לעת עתה
-- ❌ JavaScript interop: לא דרוש, ה-runtime כבר מפצה
+ה-`akiva new` CLI מספק 3 templates. כל אחת מציגה דרך עבודה שונה:
 
-## 17. עקרונות API
+| template | UI shape | מתי | §  |
+|---|---|---|---|
+| `default` | imperative `Ui` builder | מתחילים פשוטים, hot-loops state | §16 |
+| `compose-style` | declarative AKML + Bindings | UI טבלאי, theming, RTL | §17 |
+| `game` | direct `Canvas` ב-`on_render`, dt-driven | משחקים, animations, simulations | §18 |
 
-- **Immediate mode friendly**: ViewRef-ים הם סמליים, לא מחזיקים state. האפליקציה יכולה לקבל את אותו ViewRef שוב ושוב.
-- **Strong types**: Color, Dp, Sp, Duration — כולם types נפרדים, לא חשופים כ-u32.
-- **Result-based errors**: API שיכול להיכשל מחזיר `Result<T, AkivaError>`.
-- **Zero-cost abstractions**: ה-macros יוצרים קוד מינימלי נדרש, ללא reflection בזמן ריצה.
+כל הדוגמאות עובדות עם אותו `Activity` trait — הבחירה היא של ה-app author איך לארגן את ה-render. ניתן גם לערבב (game-style canvas + Ui overlay).
 
-## 18. עתיד
+## 16. דוגמה — `default` template (counter)
 
-- `async` API לפעולות ארוכות (network, file I/O)
-- `#[akiva::activity]` macro למספר activities
-- Custom widgets (ירושה מ-widget בסיסי)
-- Animations API
-- Dependency injection של system services
+```rust
+use akiva_sdk::prelude::*;
+
+#[derive(Default)]
+pub struct Counter {
+    ui: UiState,
+    count: i32,
+}
+
+#[async_trait(?Send)]
+impl Activity for Counter {
+    async fn on_create(&mut self, ctx: &mut Context<'_>) {
+        log_info!("Counter created ({}x{} @ {:.1}x)",
+            ctx.metrics.width_px, ctx.metrics.height_px, ctx.metrics.density);
+    }
+
+    async fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
+        self.ui.feed_pointer(ev);
+    }
+
+    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+        c.clear(0xff0f1420);
+        let mut ui = Ui::new(&mut self.ui, ctx, c);
+
+        let title = ui.text("Counter").size(28.0).color(0xfff0f4fa).build();
+        let counter = ui.text(&format!("count = {}", self.count))
+            .size(20.0).color(0xffe0e6f0).build();
+        let inc = ui.button("inc", "+1");
+
+        let root = ui.v_stack(&[title, counter, inc])
+            .gap(16.0).padding(24.0).build();
+        ui.present(root);
+
+        if ui.was_clicked("inc") { self.count += 1; }
+    }
+
+    fn on_save_state(&self, state: &mut SavedState) {
+        state.put_int("count", self.count as i64);
+    }
+    fn on_restore_state(&mut self, state: &SavedState) {
+        if let Some(v) = state.get_int("count") { self.count = v as i32; }
+    }
+}
+
+akiva_sdk::akiva_app!(Counter);
+```
+
+**Notes.** `UiState` שומר על widget state בין frames (focused button, click-in-progress); `feed_pointer` מזין את ה-state ב-coords של ה-event האחרון. ה-`was_clicked("inc")` נבדק רק אחרי `present()` — ה-builder יודע מי נלחץ אחרי ש-layout נסגר. אין ID stability requirements: ה-string `"inc"` הוא ה-action key, hash-able.
+
+## 17. דוגמה — `compose-style` template (notes-like)
+
+ה-UI מוגדר ב-`res/layout/main.akml`:
+
+```xml
+<?akml version="1.0"?>
+<VStack padding="24" gap="16" cross="stretch">
+    <Text text="@string/app_name" size="28" color="@color/title_fg" />
+    <Text text="{greeting}, world!" size="36" color="@color/greeting_fg" />
+    <Text text="Clicks: {count}" size="18" color="@color/body_fg" />
+    <HStack gap="12">
+        <Button id="greet" label="@string/cta_greet" onClick="greet" flex="1" />
+        <Button id="reset" label="@string/cta_reset" onClick="reset" />
+    </HStack>
+</VStack>
+```
+
+```rust
+use akiva_sdk::prelude::*;
+use akiva_sdk::akml::{self, Bindings};
+use akiva_sdk::res;
+
+const LAYOUT: &str = include_str!("../res/layout/main.akml");
+const GREETINGS: &[&str] = &["Hello", "Hola", "Bonjour", "Shalom"];
+
+#[derive(Default)]
+pub struct Greeter {
+    ui: UiState,
+    greeting_idx: i32,
+    count: i32,
+}
+
+#[async_trait(?Send)]
+impl Activity for Greeter {
+    async fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
+        self.ui.feed_pointer(ev);
+    }
+
+    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+        c.clear(res::color("bg_window"));
+
+        let greeting = GREETINGS[(self.greeting_idx as usize) % GREETINGS.len()];
+        let bindings = Bindings::new()
+            .text("greeting", greeting.to_string())
+            .text("count", format!("{}", self.count));
+
+        let mut ui = Ui::new(&mut self.ui, ctx, c);
+        let root = akml::inflate_str_with(&mut ui, LAYOUT, &bindings)
+            .expect("layout is statically valid — inflate failure is a build bug");
+        ui.present(root);
+
+        if ui.was_triggered("greet") {
+            self.greeting_idx = (self.greeting_idx + 1) % (GREETINGS.len() as i32);
+            self.count += 1;
+        }
+        if ui.was_triggered("reset") {
+            self.greeting_idx = 0;
+            self.count = 0;
+        }
+    }
+
+    fn on_save_state(&self, state: &mut SavedState) {
+        state.put_int("greeting_idx", self.greeting_idx as i64);
+        state.put_int("count", self.count as i64);
+    }
+    fn on_restore_state(&mut self, state: &SavedState) {
+        if let Some(v) = state.get_int("greeting_idx") { self.greeting_idx = v as i32; }
+        if let Some(v) = state.get_int("count") { self.count = v as i32; }
+    }
+}
+
+akiva_sdk::akiva_app!(Greeter);
+```
+
+**Notes.** `Bindings` ממלא `{placeholder}` tokens ב-AKML עם strings runtime. `@string/...` ו-`@color/...` נפתרים מ-`res/values/`; `res/values-night/` נטען אוטומטית כשה-OS מדווח על dark mode. ה-`onClick="greet"` ב-AKML מזוהה דרך `ui.was_triggered("greet")` — ה-string הוא הקשר היציב.
+
+ה-AKML inflate מתבצע **כל frame** מחדש. ה-cost ידוע (פרסור ~5µs לפי `bench_akml_parse`); ה-tradeoff מועדף על pretty-printing tree management ב-Rust.
+
+## 18. דוגמה — `game` template (ball physics)
+
+`on_render` רץ ב-rAF cadence; משתמשים ב-`ctx.timestamp_ms` כ-monotonic time source כדי לחשב dt. הדוגמה: כדור שקופץ מהקירות, tap לבעוט.
+
+```rust
+use akiva_sdk::prelude::*;
+
+const BALL_R: f32     = 24.0;
+const INIT_SPEED: f32 = 280.0;
+const MAX_DT_MS: f32  = 100.0;
+const BG_COLOR: u32   = 0xff0a0e1a;
+const BALL_COLOR: u32 = 0xfff97316;
+
+pub struct Ball {
+    cx: f32, cy: f32,
+    vx: f32, vy: f32,
+    last_ts: Option<f64>,
+    bounds: (f32, f32),
+}
+
+impl Default for Ball {
+    fn default() -> Self {
+        Self {
+            cx: 0.0, cy: 0.0, vx: INIT_SPEED, vy: INIT_SPEED * 0.85,
+            last_ts: None, bounds: (1.0, 1.0),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl Activity for Ball {
+    async fn on_create(&mut self, ctx: &mut Context<'_>) {
+        let w = ctx.metrics.width_px as f32;
+        let h = ctx.metrics.height_px as f32;
+        if self.cx == 0.0 && self.cy == 0.0 {
+            self.cx = w * 0.5;
+            self.cy = h * 0.5;
+        }
+        self.bounds = (w, h);
+    }
+
+    async fn on_pointer(&mut self, _ctx: &mut Context<'_>, ev: PointerEvent) {
+        if ev.phase == PointerPhase::Down {
+            self.cx = ev.x; self.cy = ev.y;
+            let (w, h) = self.bounds;
+            let dx = ev.x - w * 0.5;
+            let dy = ev.y - h * 0.5;
+            let len = (dx*dx + dy*dy).sqrt().max(1.0);
+            self.vx = INIT_SPEED * (dx / len);
+            self.vy = INIT_SPEED * (dy / len);
+        }
+    }
+
+    async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
+        let w = ctx.metrics.width_px as f32;
+        let h = ctx.metrics.height_px as f32;
+        self.bounds = (w, h);
+
+        // dt in seconds, clamped — first frame OR resume after suspend
+        // both have stale `last_ts`; clamp prevents tunneling.
+        let dt = match self.last_ts {
+            Some(prev) => ((ctx.timestamp_ms - prev) as f32 / 1000.0)
+                .clamp(0.0, MAX_DT_MS / 1000.0),
+            None => 0.0,
+        };
+        self.last_ts = Some(ctx.timestamp_ms);
+
+        self.cx += self.vx * dt;
+        self.cy += self.vy * dt;
+
+        if self.cx - BALL_R < 0.0 { self.cx = BALL_R;       self.vx = self.vx.abs(); }
+        if self.cx + BALL_R > w   { self.cx = w - BALL_R;   self.vx = -self.vx.abs(); }
+        if self.cy - BALL_R < 0.0 { self.cy = BALL_R;       self.vy = self.vy.abs(); }
+        if self.cy + BALL_R > h   { self.cy = h - BALL_R;   self.vy = -self.vy.abs(); }
+
+        c.clear(BG_COLOR);
+        c.fill_round_rect(
+            self.cx - BALL_R, self.cy - BALL_R,
+            BALL_R * 2.0, BALL_R * 2.0,
+            BALL_R, BALL_COLOR,
+        );
+    }
+
+    fn on_save_state(&self, state: &mut SavedState) {
+        state.put_int("cx", self.cx.to_bits() as i64);
+        state.put_int("cy", self.cy.to_bits() as i64);
+        state.put_int("vx", self.vx.to_bits() as i64);
+        state.put_int("vy", self.vy.to_bits() as i64);
+    }
+    fn on_restore_state(&mut self, state: &SavedState) {
+        if let Some(v) = state.get_int("cx") { self.cx = f32::from_bits(v as u32); }
+        if let Some(v) = state.get_int("cy") { self.cy = f32::from_bits(v as u32); }
+        if let Some(v) = state.get_int("vx") { self.vx = f32::from_bits(v as u32); }
+        if let Some(v) = state.get_int("vy") { self.vy = f32::from_bits(v as u32); }
+    }
+}
+
+akiva_sdk::akiva_app!(Ball);
+```
+
+**Notes.** ה-`f32::to_bits` ↔ `from_bits` round-trip שומר על ה-velocity וה-position דרך SavedState (ש-tags הם integer-only ב-wire format). ה-`MAX_DT_MS` clamp הוא הbarrier להחזרה אחרי tab-switch ארוך — בלי זה frame ראשון אחרי resume היה מקפיץ את הכדור על פני המסך כולו.
 
 ## 19. Known Limitations (Stone 11.6+ backlog)
 
