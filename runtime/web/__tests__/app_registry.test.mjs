@@ -46,15 +46,26 @@ function makeFakeWorker() {
 }
 
 // Build an `AppRegistry` whose `spawnWorker` factory hands back the
-// caller-controlled stub worker. The fake storage returns a tiny
-// placeholder wasm blob for any `packages/<id>/app.wasm` lookup so
-// `_spawnProcess` doesn't bail out on a missing-bytes shortcut.
+// caller-controlled stub worker. The fake storage matches production
+// `Storage`'s semantics: it caches the Uint8Array reference and
+// returns the SAME object every call. This used to be a fresh-copy
+// stub which masked a real bug — `_spawnProcess` transferred
+// `wasmBytes.buffer` directly, detaching storage's live entry, which
+// the test never saw because each `get()` minted fresh bytes.
 function makeRegistry({ log, fakeWorker } = {}) {
   const kernelMemory = new WebAssembly.Memory({ initial: 1 });
-  // Storage stub: one byte for app.wasm so `_spawnProcess` proceeds;
-  // resource lookups return null so `_loadResources` is a no-op.
+  // Per-key cache → same-reference returns. `_loadResources` reads
+  // from the same `storage`; absent keys return null which
+  // `_loadResources` treats as "no values file" (no-op).
+  const cache = new Map();
   const storage = {
-    get: (key) => key.endsWith("/app.wasm") ? new Uint8Array([0]) : null,
+    get: (key) => {
+      if (!cache.has(key)) {
+        if (key.endsWith("/app.wasm")) cache.set(key, new Uint8Array([0]));
+        else cache.set(key, null);
+      }
+      return cache.get(key);
+    },
   };
   const logFn = log ?? vi.fn();
   const worker = fakeWorker ?? makeFakeWorker();
@@ -96,6 +107,29 @@ describe("register / unregister — spawn & teardown", () => {
     const { registry } = makeRegistry();
     registry._storage = { get: () => null };
     expect(registry.register("com.missing.app", "Main")).toBe(0);
+  });
+
+  it("doesn't detach storage's wasm-bytes buffer on init transfer", () => {
+    // Stone 11.5e regression: `Storage.get` returns the SAME Uint8Array
+    // reference each call. If `_spawnProcess` transfers
+    // `wasmBytes.buffer` directly, the storage entry detaches and any
+    // later read for that key crashes with "ArrayBuffer is already
+    // detached." `_spawnProcess` must slice into a fresh buffer first.
+    const { registry, storage } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+
+    // The storage entry should still be readable — accessing
+    // `.byteLength` on a detached Uint8Array returns 0, but the
+    // backing buffer is what we care about. Read it again and assert
+    // the bytes survived.
+    const second = storage.get(`packages/${PACKAGE_ID}/app.wasm`);
+    expect(second).toBeInstanceOf(Uint8Array);
+    expect(second.byteLength).toBeGreaterThan(0);
+    // And a re-spawn (simulated by calling _spawnProcess directly,
+    // since register short-circuits when _processes already has the
+    // entry) must succeed.
+    registry._processes.delete(PACKAGE_ID);
+    expect(() => registry._spawnProcess(PACKAGE_ID)).not.toThrow();
   });
 
   it("unregister clears the slot and per-handle pending state", () => {
@@ -448,6 +482,121 @@ describe("log + trapped messages from worker", () => {
       expect.stringMatching(/com\.test\.app.*trapped.*panic/),
     );
   });
+});
+
+// ── Stone 11.5c: ping/pong watchdog ───────────────────────────────────
+
+describe("watchdog — ping/pong with init_ok gating", () => {
+  // These tests use vi.useFakeTimers() so the 500ms heartbeat fires
+  // synchronously under our control. Production setInterval has jitter
+  // and rAF-induced delay; we don't simulate those, but we DO pin the
+  // contract that healthy workers don't time out and hung ones do.
+
+  function withFakeTimers(fn) {
+    return () => {
+      // `performance` is in `toFake` so `performance.now()` advances
+      // in lockstep with `vi.advanceTimersByTime`. Without this the
+      // watchdog's `now - lastPongAt` calculation would still be on
+      // real wall time and never trip even after virtual seconds pass.
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "performance"] });
+      try { fn(); }
+      finally { vi.useRealTimers(); }
+    };
+  }
+
+  it("doesn't terminate a freshly-spawned worker before init_ok", withFakeTimers(() => {
+    const { registry, worker, log } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    // Heartbeat is gated on init_ok — without it, no setInterval has
+    // started. Advancing 5 seconds shouldn't terminate.
+    vi.advanceTimersByTime(5000);
+    expect(registry._processes.has(PACKAGE_ID)).toBe(true);
+    expect(log.mock.calls.some(([lvl, msg]) =>
+      lvl === "error" && msg.includes("terminating worker"))).toBe(false);
+    void worker;
+  }));
+
+  it("starts the heartbeat only on init_ok", withFakeTimers(() => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    // Pre-init_ok: no pings posted by the watchdog.
+    vi.advanceTimersByTime(2000);
+    expect(worker._posted.some((m) => m.type === "ping")).toBe(false);
+
+    worker._inject({ type: "init_ok" });
+    // First tick lands at +500ms after init_ok.
+    vi.advanceTimersByTime(500);
+    expect(worker._posted.some((m) => m.type === "ping")).toBe(true);
+  }));
+
+  it("terminates a hung worker after 1.5s of pong silence", withFakeTimers(() => {
+    const { registry, worker, log } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+
+    // No `pong` injection — simulate a wasm `loop {}` blocking the
+    // worker's JS event loop. After ~2000ms (next tick after the
+    // 1500ms threshold) the watchdog should fire.
+    let terminated = false;
+    worker.terminate = () => { terminated = true; };
+    vi.advanceTimersByTime(2200);
+    expect(terminated).toBe(true);
+    expect(registry._processes.has(PACKAGE_ID)).toBe(false);
+    expect(registry._pendingTraps.has(PACKAGE_ID)).toBe(true);
+    expect(log.mock.calls.some(([lvl, msg]) =>
+      lvl === "error" && msg.includes("terminating worker"))).toBe(true);
+  }));
+
+  it("a healthy pong-reply worker stays alive indefinitely", withFakeTimers(() => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+
+    // Auto-pong: every ping that gets posted, immediately inject a pong.
+    let originalPost = worker.postMessage.bind(worker);
+    worker.postMessage = (msg, transfer) => {
+      originalPost(msg, transfer);
+      if (msg?.type === "ping") {
+        // Microtask-style — but in fake timers we can run it synchronously.
+        worker._inject({ type: "pong", t: msg.t });
+      }
+    };
+
+    vi.advanceTimersByTime(10_000);  // 10 seconds of healthy pings
+    expect(registry._processes.has(PACKAGE_ID)).toBe(true);
+    expect(registry._pendingTraps.has(PACKAGE_ID)).toBe(false);
+  }));
+
+  it("watchdog termination doesn't clobber other workers' in-flight dispatches",
+    withFakeTimers(() => {
+      // Stone 11.5e regression: previously the watchdog iterated _dispatches
+      // and marked every PENDING entry ERROR, which torched the Shell's
+      // healthy render dispatch every time a peer worker timed out.
+      const { registry, kernelMemory, worker } = makeRegistry();
+      const handle = registry.register(PACKAGE_ID, CLASS_NAME);
+      worker._inject({ type: "init_ok" });
+
+      // Stage a healthy in-flight dispatch from this worker.
+      new DataView(kernelMemory.buffer).setUint32(0, handle, true);
+      const inFlightId = registry.dispatch(CMD.RENDER, 0, 12);
+      expect(registry._dispatches.get(inFlightId).status).toBe(STATUS.PENDING);
+
+      // Spawn a SECOND worker and let it time out without ever ponging.
+      const otherWorker = makeFakeWorker();
+      registry._processes.set("com.b.app", {
+        worker: otherWorker, packageId: "com.b.app",
+        lastPongAt: 0, ready: true, pingInterval: null,
+      });
+      registry._startHeartbeat(registry._processes.get("com.b.app"));
+
+      vi.advanceTimersByTime(2200);
+
+      // The OTHER worker's termination must not have flipped the first
+      // worker's in-flight render to ERROR.
+      const stillThere = registry._dispatches.get(inFlightId);
+      expect(stillThere).toBeDefined();
+      expect(stillThere.status).toBe(STATUS.PENDING);
+    }));
 });
 
 // ── Stone 11.5: trap drain ────────────────────────────────────────────
