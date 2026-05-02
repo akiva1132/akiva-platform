@@ -304,17 +304,19 @@ function buildImports() {
       apps.register(readUtf8(pidPtr, pidLen), readUtf8(clsPtr, clsLen)),
     hal_app_unregister: (handle) => apps.unregister(handle),
 
-    // Stone 11.4b — unified host→app dispatch. The kernel-side
+    // Stone 11.4b/c — unified host→app dispatch. The kernel-side
     // `KernelWasmHost` builds a `[handle: u32 LE, ...]` payload and
-    // calls this with the cmd_kind that identifies the lifecycle /
-    // input / render / state / intent transition. Returns the app's
-    // u64 future_id (0 = sync, no bytes; non-zero = bytes available
-    // via `hal_app_get_result`). Replaced the per-callback
-    // `hal_app_lifecycle/pointer/key/resize/render/save_state/
-    // restore_state/new_intent/activity_result` imports in 11.4b-5.
-    hal_app_dispatch:   (cmdKind, payloadPtr, payloadLen) =>
+    // calls `hal_app_dispatch` with the cmd_kind that identifies the
+    // lifecycle / input / render / state / intent transition. The JS
+    // side allocates a kernel-side future_id, posts the payload to
+    // the package's app-worker, and returns the id immediately —
+    // every dispatch is async post-11.4c. The kernel polls via
+    // `hal_app_poll_future` until READY/ERROR, then optionally fetches
+    // result bytes via `hal_app_get_result` (RENDER/SAVE_STATE).
+    hal_app_dispatch:    (cmdKind, payloadPtr, payloadLen) =>
       apps.dispatch(cmdKind, payloadPtr, payloadLen),
-    hal_app_get_result: (futureId, outPtr, outCap) =>
+    hal_app_poll_future: (futureId) => apps.pollFuture(futureId),
+    hal_app_get_result:  (futureId, outPtr, outCap) =>
       apps.getResult(futureId, outPtr, outCap),
 
     // Stone 9.3 — read + clear the pending-finish flag for `handle`.

@@ -90,26 +90,42 @@ extern "C" {
     // `hal_app_restore_state`/`hal_app_new_intent`/`hal_app_activity_result`
     // imports in Stone 11.4b-5. The JS host reads the `[handle: u32 LE, ...]`
     // prefix from `payload`, looks up the wasm process that owns the handle,
-    // copies the payload into app memory, and forwards to the app's
-    // `akiva_app_dispatch` export. Returns the app's `future_id`:
-    //   - `0`        — sync, no result bytes (every ack-only cmd_kind).
-    //   - non-zero   — sync result bytes available; kernel calls
-    //                  `hal_app_get_result(future_id, ...)` next.
+    // posts the payload to that package's app-worker (Stone 11.4c), and
+    // returns a `future_id` immediately:
+    //   - `0`        — synchronously rejected (handle miss, alloc fail);
+    //                  no follow-up needed.
+    //   - non-zero   — request in-flight; kernel must `hal_app_poll_future`
+    //                  to drive it forward. Once the worker replies the
+    //                  status flips to READY (or ERROR) and the kernel
+    //                  fetches result bytes — when any are produced — via
+    //                  `hal_app_get_result`.
     //
     // CREATE special case: the kernel passes only `[handle]` in the
     // payload; the JS host augments with the slot's class string before
-    // forwarding to `akiva_app_dispatch`.
+    // forwarding to the worker's `akiva_app_dispatch`.
     pub fn hal_app_dispatch(
         cmd_kind: u32,
         payload_ptr: *const u8,
         payload_len: u32,
     ) -> u64;
 
+    /// Stone 11.4c — poll the per-future status the worker reports back
+    /// via `dispatch_done`. Status codes match `op_kinds::STATUS`:
+    ///   0 = PENDING (try again next frame),
+    ///   1 = READY   (kernel may now call `hal_app_get_result`),
+    ///   2 = ERROR   (worker trapped or rejected the dispatch).
+    /// Polling an unknown future_id returns ERROR. A successful READY
+    /// or ERROR poll **does not** evict the entry — `hal_app_get_result`
+    /// is the single-shot consume.
+    pub fn hal_app_poll_future(future_id: u64) -> u32;
+
     /// Companion to `hal_app_dispatch`: fetch the result bytes for a
-    /// non-zero `future_id` returned by a RENDER or SAVE_STATE dispatch.
-    /// Two-phase buffer convention: kernel passes `out_ptr` + `out_cap`,
-    /// host copies up to `out_cap` bytes, returns the *needed* length.
-    /// If the return exceeds `out_cap` the kernel reallocates and retries.
+    /// READY future (RENDER paint stream, SAVE_STATE encoded state, or
+    /// any other byte-producing cmd_kind). Two-phase buffer convention:
+    /// kernel passes `out_ptr` + `out_cap`, host copies up to `out_cap`
+    /// bytes, returns the *needed* length. If the return exceeds
+    /// `out_cap` the kernel reallocates and retries; the entry is
+    /// evicted only when the copy fits.
     pub fn hal_app_get_result(
         future_id: u64,
         out_ptr: *mut u8,

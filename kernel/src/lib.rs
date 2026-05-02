@@ -197,43 +197,22 @@ fn map_storage_err(e: storage::StorageError) -> akiva_framework::storage::Storag
 /// Adapter that routes framework `WasmHost` calls to the matching
 /// `hal_app_*` imports. The host side (worker.js) owns all per-app
 /// state — wasm module, linear memory, paint scratch — keyed by the
-/// returned handle. The two fields here are the framework-side end of
-/// the Stone 11.4a `poll_future` plumbing: `render` and `save_state`
-/// produce paint/state bytes synchronously today (single-worker), but
-/// the trait now hands them back through a `future_id`. We allocate an
-/// id, stash the buffer, and `poll_future` looks it up. 11.4c flips
-/// the producer side to a real Worker without changing this scaffold.
-struct KernelWasmHost {
-    /// `future_id` → resolved bytes. Populated by `render`/`save_state`,
-    /// drained by `poll_future` (the framework calls each id exactly
-    /// once). Empty payloads short-circuit to the `0` sentinel and
-    /// never touch this map.
-    future_results: std::cell::RefCell<std::collections::HashMap<u64, Vec<u8>>>,
-    /// Monotonic counter for `future_id`. Starts at 1; wraps skip 0
-    /// (the reserved "resolved synchronously" sentinel).
-    next_future_id: std::cell::Cell<u64>,
-}
+/// returned handle. Stone 11.4c moved the wasm into a per-package
+/// peer Worker, so every dispatch is async by construction: the JS
+/// AppRegistry allocates a kernel-side `dispatch_id`, posts the
+/// payload, returns the id, and we stash it as the future_id the
+/// framework polls each frame via [`Self::poll_future`].
+struct KernelWasmHost;
 
 impl KernelWasmHost {
-    fn new() -> Self {
-        Self {
-            future_results: std::cell::RefCell::new(std::collections::HashMap::new()),
-            next_future_id: std::cell::Cell::new(1),
-        }
-    }
+    fn new() -> Self { Self }
 
-    fn alloc_future(&self, bytes: Vec<u8>) -> u64 {
-        let id = self.next_future_id.get();
-        let next = id.wrapping_add(1).max(1); // skip 0 on wrap
-        self.next_future_id.set(next);
-        self.future_results.borrow_mut().insert(id, bytes);
-        id
-    }
-
-    /// Stone 11.4b — single-call helper. Builds nothing extra; just
-    /// hands the encoded payload + cmd_kind to the JS host. The
-    /// caller is responsible for appending its per-cmd args after the
-    /// `[handle: u32 LE]` prefix that every payload starts with.
+    /// Stone 11.4b/c — single-call helper. Hands the encoded payload
+    /// + cmd_kind to the JS host. The caller is responsible for
+    /// appending its per-cmd args after the `[handle: u32 LE]` prefix
+    /// that every payload starts with. The return value is whatever
+    /// JS allocated as the kernel-side `dispatch_id` — pass it
+    /// directly to the framework as the future_id.
     fn dispatch(&self, cmd_kind: u32, payload: &[u8]) -> u64 {
         // SAFETY: payload is a borrow of caller-owned bytes; the host
         // copies them into app memory before returning. Ptr can be
@@ -244,14 +223,21 @@ impl KernelWasmHost {
         }
     }
 
-    /// Stone 11.4b — fetch the bytes for a non-zero `future_id`
-    /// returned by [`Self::dispatch`]. Two-phase buffer convention:
-    /// start at `initial_cap`, retry once if the app produced more.
+    /// Stone 11.4c — fetch the bytes for a READY `future_id`. Two-
+    /// phase buffer convention: start at `initial_cap`, retry once if
+    /// the app produced more. The host evicts the entry on a fitting
+    /// copy, so this is single-shot per id.
     fn fetch_result(&self, future_id: u64, initial_cap: usize) -> Vec<u8> {
         let mut buf = vec![0u8; initial_cap];
         let needed = unsafe {
             host::hal_app_get_result(future_id, buf.as_mut_ptr(), buf.len() as u32)
         } as usize;
+        if needed == 0 {
+            // Ack-only cmd: lifecycle, input, restore_state, etc. The
+            // framework still expects a `Vec<u8>` from `poll_future` —
+            // empty conveys "transition done, no payload".
+            return Vec::new();
+        }
         if needed > buf.len() {
             buf = vec![0u8; needed];
             let got = unsafe {
@@ -309,16 +295,10 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
     ) -> u64 {
         // Stone 11.4b — every lifecycle transition is just `[handle]`.
         // CREATE looks identical here; the JS host augments the
-        // payload with the slot's class string (it knows the class
-        // from `register`) before forwarding to `akiva_app_dispatch`.
+        // payload with the slot's class string before forwarding to
+        // the worker's `akiva_app_dispatch`.
         let payload = handle.get().to_le_bytes();
-        let _ = self.dispatch(cmd_for_lifecycle(t), &payload);
-        // Stone 11.4a/b: single-worker — the JS host ran the wasm
-        // export inline before `dispatch` returned. The app's
-        // future_id is always 0 for ack-only ops; we map that to
-        // the framework's `0` sync sentinel. 11.4c flips this when
-        // the app lives in a per-package Worker.
-        0
+        self.dispatch(cmd_for_lifecycle(t), &payload)
     }
 
     fn pointer(
@@ -337,8 +317,7 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
             &akiva_framework::wasm_activity::pointer_phase_wire(ev.phase).to_le_bytes(),
         );
         p[20..28].copy_from_slice(&ts_ms.to_le_bytes());
-        let _ = self.dispatch(akiva_framework::wire::op_kinds::cmd::POINTER, &p);
-        0
+        self.dispatch(akiva_framework::wire::op_kinds::cmd::POINTER, &p)
     }
 
     fn key(
@@ -356,8 +335,7 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
             &akiva_framework::wasm_activity::key_phase_wire(ev.phase).to_le_bytes(),
         );
         p[16..24].copy_from_slice(&ts_ms.to_le_bytes());
-        let _ = self.dispatch(akiva_framework::wire::op_kinds::cmd::KEY, &p);
-        0
+        self.dispatch(akiva_framework::wire::op_kinds::cmd::KEY, &p)
     }
 
     fn resize(
@@ -371,8 +349,7 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         p[4..8].copy_from_slice(&m.width_px.to_le_bytes());
         p[8..12].copy_from_slice(&m.height_px.to_le_bytes());
         p[12..16].copy_from_slice(&m.density.to_le_bytes());
-        let _ = self.dispatch(akiva_framework::wire::op_kinds::cmd::RESIZE, &p);
-        0
+        self.dispatch(akiva_framework::wire::op_kinds::cmd::RESIZE, &p)
     }
 
     fn render(
@@ -384,39 +361,12 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         let mut p = [0u8; 12];
         p[0..4].copy_from_slice(&handle.get().to_le_bytes());
         p[4..12].copy_from_slice(&ts_ms.to_le_bytes());
-        let app_future = self.dispatch(akiva_framework::wire::op_kinds::cmd::RENDER, &p);
-        // App-side `0` means "no result bytes" (idle render). Skip the
-        // fetch and tell the framework "no paint stream this frame".
-        if app_future == 0 {
-            return 0;
-        }
-        // 16 KiB is generous for per-frame paint ops; the retry branch
-        // doubles up if an app ever needs more, at the cost of a
-        // second copy. Apps producing huge frames should use layered
-        // views instead of fat single frames.
-        let bytes = self.fetch_result(app_future, 16 * 1024);
-        // The app may have signalled a non-zero future_id but produced
-        // empty bytes (e.g. canvas-clear-only frame). Treat as idle.
-        if bytes.is_empty() {
-            return 0;
-        }
-        self.alloc_future(bytes)
+        self.dispatch(akiva_framework::wire::op_kinds::cmd::RENDER, &p)
     }
 
     fn save_state(&self, handle: akiva_framework::wasm_activity::AppHandle) -> u64 {
-        // [handle: u32] = 4 bytes
         let payload = handle.get().to_le_bytes();
-        let app_future = self.dispatch(akiva_framework::wire::op_kinds::cmd::SAVE_STATE, &payload);
-        if app_future == 0 {
-            return 0;
-        }
-        // SavedState wire is capped at 64 KiB; 4 KiB initial guess
-        // covers the common case and the retry branch handles larger.
-        let bytes = self.fetch_result(app_future, 4 * 1024);
-        if bytes.is_empty() {
-            return 0;
-        }
-        self.alloc_future(bytes)
+        self.dispatch(akiva_framework::wire::op_kinds::cmd::SAVE_STATE, &payload)
     }
 
     fn restore_state(
@@ -429,11 +379,10 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         let mut payload = Vec::with_capacity(4 + bytes.len());
         payload.extend_from_slice(&handle.get().to_le_bytes());
         payload.extend_from_slice(bytes);
-        let _ = self.dispatch(
+        self.dispatch(
             akiva_framework::wire::op_kinds::cmd::RESTORE_STATE,
             &payload,
-        );
-        0
+        )
     }
 
     fn drain_finish(&self, handle: akiva_framework::wasm_activity::AppHandle) -> bool {
@@ -616,16 +565,31 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
     }
 
     fn poll_future(&self, future_id: u64) -> Option<Result<Vec<u8>, String>> {
-        // Stone 11.4a-4: only `render` and `save_state` allocate ids
-        // here; every other dispatch returns the `0` sentinel and the
-        // framework never polls them. A miss therefore means the
-        // framework polled an id we never minted (or polled twice) —
-        // surface as Err rather than silently resolving empty so a
-        // wiring bug doesn't hide as a black frame.
-        match self.future_results.borrow_mut().remove(&future_id) {
-            Some(bytes) => Some(Ok(bytes)),
-            None => Some(Err(format!(
-                "KernelWasmHost: unknown future_id {future_id:#x}"
+        // Stone 11.4c: every dispatch is async. We poll the JS-side
+        // future cache via `hal_app_poll_future`; READY means the
+        // worker has replied and the bytes are stashed. Empty result
+        // bytes are normal for ack-only cmds (lifecycle/input/etc) —
+        // the framework treats them identically to a render with an
+        // empty paint stream (a successful no-op transition).
+        let status = unsafe { host::hal_app_poll_future(future_id) };
+        match status {
+            // STATUS::PENDING — worker hasn't replied yet; framework
+            // re-polls next frame.
+            0 => None,
+            // STATUS::READY — fetch + return.
+            1 => {
+                // 16 KiB initial cap covers the common per-frame paint
+                // stream; SavedState wire is capped at 64 KiB and the
+                // retry branch handles anything larger. Lifecycle/input
+                // cmds resolve to 0 bytes which `fetch_result` returns
+                // as an empty Vec.
+                let bytes = self.fetch_result(future_id, 16 * 1024);
+                Some(Ok(bytes))
+            }
+            // STATUS::ERROR — worker reported a trap or rejected the
+            // dispatch (unknown handle on its side, etc.).
+            _ => Some(Err(format!(
+                "KernelWasmHost: dispatch {future_id:#x} reported error"
             ))),
         }
     }

@@ -124,6 +124,9 @@ self.addEventListener("message", (e) => {
     case "host_op_done":
       handleHostOpDone(msg);
       break;
+    case "set_grants":
+      grants = new Set(msg.grants ?? []);
+      break;
     default:
       postLog("warn", `unknown message type: ${msg?.type}`);
   }
@@ -347,25 +350,49 @@ function dispatchFire(opKind, args) {
       const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
       const level = view.getUint32(0, true);
       const text = decoder.decode(args.subarray(4));
-      postMessage({ type: "log", level: levelName(level), text: `[worker:${packageId}] ${text}` });
+      postMessage({ type: "log", level: levelName(level), text });
       return 0;
     }
-    case FIRE.FINISH:
-    case FIRE.START_ACTIVITY:
-    case FIRE.START_ACTIVITY_FOR_RESULT:
-    case FIRE.SET_RESULT:
-      // Stone 11.4c-5 forwards these to the kernel-worker as
-      // `side_effect` messages so the existing `_pendingFinish` /
-      // `_pendingIntent` / `_pendingSetResult` /
-      // `_pendingStartForResult` machinery on the kernel side can
-      // serve `hal_app_drain_*` unchanged. Stub for now — record
-      // the call and acknowledge so apps don't see spurious denies.
-      postMessage({ type: "side_effect", op_kind: opKind, args });
+    case FIRE.FINISH: {
+      // No grant required — finish is the app shutting itself down.
+      // Forward to kernel so `hal_app_drain_finish` flips on the
+      // next ctx-bearing callback.
+      if (args.length < 4) return 1;
+      postSideEffect(opKind, args);
       return 0;
+    }
+    case FIRE.START_ACTIVITY:
+    case FIRE.START_ACTIVITY_FOR_RESULT: {
+      if (!grants.has("akiva.permission.LAUNCH_ANY_APP")) {
+        postLog("warn", `fire(0x${opKind.toString(16)}): denied — no LAUNCH_ANY_APP grant`);
+        return 2;
+      }
+      const minLen = opKind === FIRE.START_ACTIVITY ? 4 : 8;
+      if (args.length < minLen) return 1;
+      postSideEffect(opKind, args);
+      return 0;
+    }
+    case FIRE.SET_RESULT: {
+      if (args.length < 4) return 1;
+      postSideEffect(opKind, args);
+      return 0;
+    }
     default:
       postLog("warn", `fire(0x${opKind.toString(16)}): unknown op_kind`);
       return 1;
   }
+}
+
+/**
+ * Ship a side-effect to the kernel-worker for handle-keyed staging
+ * (FINISH/START_ACTIVITY/SET_RESULT). The args buffer is transferred
+ * — caller must not retain a reference after calling this.
+ */
+function postSideEffect(opKind, args) {
+  postMessage(
+    { type: "side_effect", op_kind: opKind, args },
+    [args.buffer],
+  );
 }
 
 // ── IO start/poll dispatch ─────────────────────────────────────────────

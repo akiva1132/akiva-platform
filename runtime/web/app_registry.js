@@ -1,21 +1,25 @@
-// App runtime registry.
+// App runtime registry — Stone 11.4c WorkerPool.
 //
-// Each installed package runs as its own `WebAssembly.Instance` inside
-// this worker, alongside the kernel. The kernel never touches app memory
-// directly — it talks to us through the `hal_app_*` imports, and we
-// route each call to the right app by a `u32` handle we assign.
+// Each installed package runs as its own dedicated `Worker` (one
+// `app_worker_shell.js` per package), spawned by the kernel-worker
+// on first `register`. The kernel never touches app memory directly —
+// it talks to us through the `hal_app_*` imports, and we route each
+// call to the right app worker by a `u32` handle we assign.
 //
-// One wasm *process* per package (shared across all that package's
-// activity instances); one *handle* per framework-side activity. That
-// matches Android's model: the process is the Linux PID; each Activity
-// is its own Java object living inside it.
+// Pre-11.4c the same class held `WebAssembly.Instance`s in this
+// worker; everything ran synchronously inside a single thread. Post-
+// 11.4c the seam shifts: `dispatch` posts to a peer worker, returns
+// a kernel-side `future_id` immediately, and the kernel polls via
+// `hal_app_poll_future` until the worker replies with the bytes
+// (RENDER, SAVE_STATE) or the empty ack (every other cmd_kind).
 //
-// Loading is synchronous end-to-end (OPFS SyncAccessHandle + synchronous
-// WebAssembly compile) so `hal_app_register` can return a ready handle
-// from within kernel code — no promise juggling needed.
+// One `Worker` per package, shared across all that package's activity
+// instances; one `handle` per framework-side activity. The Worker
+// lives until the `unregister` of the last handle (today: no GC; the
+// Worker stays alive — Stone 11.5 adds the cleanup).
 
 import { fontString } from "./renderer/canvas2d.js";
-import { FIRE, IO, STATUS, CMD, packPoll, isFireKind, isIoKind } from "./op_kinds.mjs";
+import { STATUS, packPoll, FIRE } from "./op_kinds.mjs";
 
 export class AppRegistry {
   /**
@@ -23,97 +27,57 @@ export class AppRegistry {
    * @param {{ get(key: string): Uint8Array | null }} deps.storage  Worker Storage (OPFS-backed).
    * @param {() => WebAssembly.Memory} deps.kernelMemory  Returns the live kernel memory reference; re-read every call because wasm memory can grow and the ArrayBuffer detaches.
    * @param {(level: string, text: string) => void} deps.log  Logger (level name, not numeric code).
+   * @param {(packageId: string) => Worker} [deps.spawnWorker]  Override for tests; defaults to `new Worker("./app_worker_shell.js", {type: "module"})`.
    */
-  constructor({ storage, kernelMemory, log }) {
+  constructor({ storage, kernelMemory, log, spawnWorker }) {
     this._storage = storage;
     this._kernelMemory = kernelMemory;
     this._log = log;
+    this._spawnWorker = spawnWorker ?? defaultSpawnWorker;
 
     /** @type {Map<number, {packageId: string, class: string}>} */
     this._slots = new Map();
-    /** @type {Map<string, {module: WebAssembly.Module, instance: WebAssembly.Instance, memory: WebAssembly.Memory}>} */
-    this._processes = new Map();
     /**
-     * Per-package `@string/` and `@color/` resource tables. Populated
-     * when a package's wasm is instantiated and served from the
-     * `akiva_host_resource_*` imports without a round-trip through the
-     * kernel. The framework parses the same TOML on its side
-     * independently, so both caches stay in lock-step with OPFS.
-     * @type {Map<string, {strings: Map<string, string>, colors: Map<string, number>}>}
+     * One worker per installed package. Spawned lazily on first
+     * `register`; never reaped until 11.5's lifecycle GC. The Worker
+     * may still be in `init` (wasm compile in flight) when its first
+     * `dispatch` is posted — postMessage's FIFO ordering inside a
+     * single Worker guarantees `init` is processed first, so callers
+     * never observe the gap.
+     * @type {Map<string, {worker: Worker, packageId: string}>}
      */
-    this._resources = new Map();
+    this._processes = new Map();
     this._nextHandle = 1;
     /**
-     * Handles with a pending app-raised `finish` signal. Populated when
-     * the app calls `akiva_host_finish(handle)`; drained (atomically
-     * cleared + returned) by `drainFinish(handle)` which the kernel's
-     * `hal_app_drain_finish` import reads after each lifecycle/input
-     * callback. A Set rather than a Map because the signal is boolean;
-     * multiple finish calls within one dispatch collapse to one.
+     * Pending app-raised `finish` signals. Populated when the app
+     * calls `akiva_host_fire(FIRE::FINISH, …)` (now in the app
+     * worker; the worker forwards as `{type:"side_effect"}` and we
+     * stage here). Drained by `drainFinish(handle)` from the
+     * kernel's `hal_app_drain_finish` — same contract as 11.3.
      * @type {Set<number>}
      */
     this._pendingFinish = new Set();
-    /**
-     * Stone 9.4 — handles with a pending encoded `Intent` blob the app
-     * staged via `akiva_host_start_activity`. The map stores the most
-     * recent request; multiple start_activity calls within one dispatch
-     * collapse to the last one, matching the single-slot framework
-     * `ctx.launch_requested` semantic. Drained by `drainIntent(handle)`
-     * once per dispatch via `hal_app_drain_intent`.
-     * @type {Map<number, Uint8Array>}
-     */
+    /** Stone 9.4 — handles with a pending encoded `Intent` blob. @type {Map<number, Uint8Array>} */
     this._pendingIntent = new Map();
-    /**
-     * Stone 9.5 — handles with a pending
-     * `start_activity_for_result(intent, request_code)` request. Same
-     * single-slot semantics as `_pendingIntent`; the tuple keeps the
-     * caller-supplied `request_code` paired with the encoded Intent
-     * bytes so the HAL drain can hand back both in one call.
-     * @type {Map<number, { bytes: Uint8Array, requestCode: number }>}
-     */
+    /** Stone 9.5 — pending `start_activity_for_result` requests. @type {Map<number, { bytes: Uint8Array, requestCode: number }>} */
     this._pendingStartForResult = new Map();
-    /**
-     * Stone 9.5 — bytes an activity stashed via `akiva_host_set_result`.
-     * Drained on the destroy-path of the activity, not per callback —
-     * set_result is allowed to be called multiple times in one lifetime,
-     * and only the last one is delivered. Last call wins.
-     * @type {Map<number, Uint8Array>}
-     */
+    /** Stone 9.5 — bytes the activity stashed via `set_result`. @type {Map<number, Uint8Array>} */
     this._pendingSetResult = new Map();
-    /**
-     * Enabled debug categories. Empty Set = quiet (every `_debug` call
-     * short-circuits). Populated via `setDebugCategories` from the main
-     * thread's URL/query parser (e.g. `?debug=lifecycle,intent`). The
-     * wildcard `"*"` enables everything. Kept small by design — each
-     * category is a string, and adding a new one is cheap; avoids the
-     * "log everything at info level" anti-pattern that makes a running
-     * OS's console unreadable.
-     * @type {Set<string>}
-     */
+    /** @type {Set<string>} */
     this._debug = new Set();
     /**
-     * Stone 10.3b — permission grants per package, pushed from
-     * `framework::boot` via `hal_host_set_grants`. Read at
-     * `_instantiateProcess` time to decide which gated
-     * `akiva_host_*` imports are real functions vs deny-stubs. A
-     * missing entry is treated identically to an empty Set: the app
-     * gets the auto import set only. Populated once per boot; on
-     * upgrade `PackageManager::install` re-pushes the full new set
-     * (last-write-wins — replace the stored Set outright).
+     * Stone 10.3b — permission grants per package, pushed via
+     * `setGrants`. Stored on this side so we can include them in the
+     * Worker's `init` message; the dispatcher inside the worker is
+     * the actual gate.
      * @type {Map<string, Set<string>>}
      */
     this._grants = new Map();
     /**
-     * Stone 11.0a — opaque snapshot of the installed-packages list
-     * pushed from `framework::boot` via `hal_host_set_packages`. The
-     * format is the framework's `pkgs_wire::encode` output (length-
-     * prefixed, see framework/src/pkgs_wire.rs); we never decode it on
-     * this side. When an app holding `akiva.permission.QUERY_PACKAGES`
-     * calls `akiva_host_query_packages` we serve these same bytes back
-     * via the standard two-phase HAL pattern.
-     *
-     * Empty Uint8Array on first construction so `query_packages` returns
-     * a clean empty blob if it's ever called before boot finishes.
+     * Stone 11.0a — opaque snapshot of the installed-packages list.
+     * Same as 11.3: stored as a flat byte blob, served back to apps
+     * via the QUERY_PACKAGES io op (round-tripped through the
+     * worker as a `host_op` in 11.4c-3).
      * @type {Uint8Array}
      */
     this._packagesBlob = new Uint8Array(0);
@@ -121,51 +85,29 @@ export class AppRegistry {
     this._encoder = new TextEncoder();
 
     /**
-     * Stone 11.3c — registry of in-flight async ops started via
-     * `akiva_host_io_start`. Single-shot: an entry is removed on the
-     * first `io_poll` that successfully consumes it (READY/ERROR with
-     * a payload that fits in the caller's buffer). If `payload.length
-     * > out_cap` the entry is *retained* so the caller can realloc and
-     * retry, mirroring the two-phase shape of `akiva_host_query_packages`.
+     * Stone 11.4c — kernel-side cache for in-flight dispatches.
+     * Populated when the kernel calls `dispatch` (status=PENDING,
+     * bytes=null) and updated on each `dispatch_done` from the
+     * worker (status=READY/ERROR, bytes=Uint8Array|null). Drained
+     * by `getResult` (single-shot consume — the framework polls
+     * every future_id at most once via `WasmHost::poll_future`).
      *
-     * Cross-package ID guessing is prevented by storing `packageId` per
-     * entry and rejecting polls from a different package: even though
-     * future_ids are an opaque monotonic counter, we don't rely on
-     * obscurity for isolation. Stone 11.4 (worker-per-app) drops the
-     * shared map entirely; until then the ownership check is the
-     * boundary.
-     *
-     * In Stone 11.3 single-worker, every io op resolves synchronously
-     * inside `_dispatchIoStart`, so polls never observe `PENDING`. The
-     * shape is async-ready for 11.4+ where the worker can return
-     * before a real cross-thread handler completes.
-     *
-     * @type {Map<bigint, {packageId: string, status: number, payload: Uint8Array}>}
+     * @type {Map<bigint, { status: number, bytes: Uint8Array | null }>}
      */
-    this._futures = new Map();
-    /**
-     * Monotonic future_id allocator. Starts at 1n — `0n` is reserved as
-     * the "couldn't start" sentinel (`io_start` returns it on unknown
-     * op_kind, denied capability, or malformed args). u64 wraps in 2^64
-     * polls which is not a real concern; reuse-after-wrap would still
-     * be guarded by the per-entry `packageId` check anyway.
-     *
-     * @type {bigint}
-     */
-    this._nextFutureId = 1n;
+    this._dispatches = new Map();
+    /** Monotonic kernel-side dispatch_id allocator. Starts at 1; 0 reserved as the "rejected" sentinel `dispatch` returns when the handle is unknown. */
+    this._nextDispatchId = 1n;
 
     // Dedicated 1×1 context used only for `measureText`. Sharing the
-    // renderer's main context would work but ties measurement to display
-    // readiness — an app can call `text_width` before the display has
-    // attached. Keeping it separate also lets us `font=` it freely
-    // without thrashing the renderer's state.
+    // renderer's main context would work but ties measurement to
+    // display readiness — an app can call `text_width` before the
+    // display has attached. Keeping it separate also lets us `font=`
+    // it freely without thrashing the renderer's state.
     //
-    // Constructed lazily on the first `measureTextWidth` call: the
-    // typical registry lifetime spans boot (where no app has painted
-    // yet) through shutdown, and deferring keeps the constructor
-    // free of `OffscreenCanvas` — a browser/worker-only global that
-    // Node's vitest env doesn't provide, letting these tests run
-    // without a DOM shim.
+    // Constructed lazily on the first `measureTextWidth` call so the
+    // constructor itself has no `OffscreenCanvas` reference — tests
+    // running under vitest jsdom can build a registry without a DOM
+    // shim, as long as they don't exercise the measure path.
     this._measureCanvas = null;
     this._measureCtx = null;
   }
@@ -173,8 +115,7 @@ export class AppRegistry {
   /**
    * Replace the active debug-category Set. `["*"]` enables everything;
    * `[]` disables all debug output. Overrides rather than merges so a
-   * second call is a reset, not an accumulation. Main thread reads
-   * `?debug=<csv>` and forwards via the `set_debug` worker message.
+   * second call is a reset, not an accumulation.
    */
   setDebugCategories(categories) {
     this._debug = new Set(categories);
@@ -182,44 +123,37 @@ export class AppRegistry {
 
   /**
    * Stone 10.3b — record the full list of permissions granted to a
-   * package. Kernel pushes one call per installed package at the end
-   * of `framework::boot` (via `hal_host_set_grants`) and again from
-   * `PackageManager::install` on upgrade. The filter in
-   * `_buildAppImports` consults this map to decide which gated
-   * `akiva_host_*` imports resolve to real functions vs deny-stubs.
-   *
-   * Last-write-wins: a second call for the same `packageId` replaces
-   * the earlier list, matching the Rust-side controller behaviour
-   * where `apply_grants` writes the full new set on upgrade.
+   * package. Called once per installed package at boot, and again on
+   * upgrade. Last-write-wins. The grants are passed to the worker via
+   * the `init` message; in-flight workers receive a `set_grants`
+   * update so a re-grant doesn't require a respawn.
    *
    * @param {string} packageId
-   * @param {string[]} permissionNames  e.g. `["akiva.permission.NETWORK"]`
+   * @param {string[]} permissionNames
    */
   setGrants(packageId, permissionNames) {
-    this._grants.set(packageId, new Set(permissionNames));
+    const set = new Set(permissionNames);
+    this._grants.set(packageId, set);
+    const proc = this._processes.get(packageId);
+    if (proc) {
+      proc.worker.postMessage({ type: "set_grants", grants: [...set] });
+    }
     this._dbg("permissions", `${packageId} grants: [${permissionNames.join(", ")}]`);
   }
 
   /**
-   * Stone 11.0a — replace the cached package-list snapshot. Called once
-   * at boot from `hal_host_set_packages`; future install/uninstall flows
-   * will re-push the full set. The bytes are opaque (the framework's
-   * length-prefixed encoding) and served back verbatim to apps via
-   * `akiva_host_query_packages`.
+   * Stone 11.0a — replace the cached package-list snapshot. Stored
+   * here for cross-worker host_op routing in 11.4c-3 (any worker
+   * doing QUERY_PACKAGES sends a `host_op` to this side; we serve
+   * back the bytes verbatim).
    *
-   * @param {Uint8Array} bytes  framework's encoded package list, or empty
+   * @param {Uint8Array} bytes
    */
   setPackages(bytes) {
     this._packagesBlob = bytes instanceof Uint8Array ? bytes : new Uint8Array(0);
     this._dbg("permissions", `packages snapshot: ${this._packagesBlob.length} bytes`);
   }
 
-  /**
-   * Emit a `debug`-level log tagged with the category if the category
-   * is enabled (or `"*"` is). Category strings are free-form — adding
-   * a new one is as cheap as a string literal at the call site, and
-   * tests/grep find every emitter under one tag.
-   */
   _dbg(category, text) {
     if (this._debug.has(category) || this._debug.has("*")) {
       this._log("debug", `[${category}] ${text}`);
@@ -242,10 +176,9 @@ export class AppRegistry {
   register(packageId, className) {
     if (!packageId || !className) return 0;
 
-    // Lazily instantiate the wasm process on first use of a package.
     let proc = this._processes.get(packageId);
     if (!proc) {
-      proc = this._instantiateProcess(packageId);
+      proc = this._spawnProcess(packageId);
       if (!proc) return 0;
     }
 
@@ -260,58 +193,29 @@ export class AppRegistry {
     if (!slot) return;
     this._slots.delete(handle);
     // Cheap tidy-up; the handle isn't reusable (`_nextHandle` is
-    // monotonic) but a stale flag sitting in the set after destroy
-    // would be harmless — still, belt-and-braces.
+    // monotonic) so a stale flag would be inert anyway.
     this._pendingFinish.delete(handle);
     this._pendingIntent.delete(handle);
     this._pendingStartForResult.delete(handle);
     this._pendingSetResult.delete(handle);
-    // The process is kept alive even when no slots reference it. A future
-    // GC pass could retire idle processes; for MVP the cost is one
-    // `WebAssembly.Instance` per installed package, which is cheap.
+    // The worker is left running even when no slots reference it —
+    // mirrors the pre-11.4c policy where one in-memory `WebAssembly.
+    // Instance` survived per package. Stone 11.5 adds the GC pass.
   }
 
-  /**
-   * Read + clear the pending-finish flag for `handle`. Returns `true` if
-   * the app requested finish via `akiva_host_finish` since the last
-   * drain, `false` otherwise. Called by the kernel's
-   * `hal_app_drain_finish` HAL bridge after every ctx-bearing callback,
-   * so a wasm-app-initiated finish shows up in the framework's
-   * `ActivityContext.finish_requested` identically to an in-kernel
-   * activity writing that flag directly. See docs/abi.md §2.3.
-   */
   drainFinish(handle) {
     const had = this._pendingFinish.delete(handle);
     if (had) this._dbg("intent", `drain_finish[handle=${handle}] → true`);
     return had;
   }
 
-  /**
-   * Read + clear the pending intent blob for `handle`. Returns the bytes
-   * (Uint8Array) the app staged via `akiva_host_start_activity`, or
-   * `null` if no start_activity was raised this dispatch. The kernel's
-   * `hal_app_drain_intent` bridge consumes this with the two-phase
-   * buffer contract: if the requested `outCap` is too small, the buffer
-   * stays armed and the next drain retries. See docs/abi.md §2.3.
-   */
   drainIntent(handle) {
     const bytes = this._pendingIntent.get(handle);
     if (bytes) this._dbg("intent", `drain_intent[handle=${handle}] → ${bytes.length} bytes`);
     return bytes ?? null;
   }
+  _consumeIntent(handle) { this._pendingIntent.delete(handle); }
 
-  /** Clear the intent slot after a successful drain. */
-  _consumeIntent(handle) {
-    this._pendingIntent.delete(handle);
-  }
-
-  /**
-   * Stone 9.5 — read the pending `start_activity_for_result` entry for
-   * `handle`. Returns `{ bytes, requestCode }` or `null`. Does NOT
-   * clear; clearing happens in `_consumeStartForResult` once the HAL
-   * has successfully copied the bytes into kernel memory (same
-   * two-phase contract as `drainIntent`).
-   */
   drainStartForResult(handle) {
     const entry = this._pendingStartForResult.get(handle);
     if (entry) {
@@ -319,163 +223,159 @@ export class AppRegistry {
     }
     return entry ?? null;
   }
-  _consumeStartForResult(handle) {
-    this._pendingStartForResult.delete(handle);
-  }
+  _consumeStartForResult(handle) { this._pendingStartForResult.delete(handle); }
 
-  /**
-   * Stone 9.5 — read the pending set_result bytes for `handle`. Returns
-   * a `Uint8Array` or `null`. Does NOT clear; see `_consumeSetResult`.
-   */
   drainSetResult(handle) {
     const bytes = this._pendingSetResult.get(handle);
-    if (bytes) {
-      this._dbg("intent", `drain_set_result[handle=${handle}] → ${bytes.length} bytes`);
-    }
+    if (bytes) this._dbg("intent", `drain_set_result[handle=${handle}] → ${bytes.length} bytes`);
     return bytes ?? null;
   }
-  _consumeSetResult(handle) {
-    this._pendingSetResult.delete(handle);
-  }
+  _consumeSetResult(handle) { this._pendingSetResult.delete(handle); }
 
-  // ── Stone 11.4b: unified host→app dispatch ─────────────────────────────
-  //
-  // `dispatch(cmdKind, payloadPtr, payloadLen)` is the JS handler for the
-  // `hal_app_dispatch` import the kernel calls. The kernel-side payload
-  // always starts with `[handle: u32 LE, ...]`, so we read the handle to
-  // find the wasm process, copy the payload into app memory, fire
-  // `akiva_app_dispatch`, and return its u64 future_id.
-  //
-  // CREATE special case: the kernel only emits `[handle]` (it doesn't
-  // know the class string — the class lives on the JS side, set during
-  // `register`). We splice the encoded class onto the payload before
-  // forwarding.
+  // ── Stone 11.4c: dispatch / pollFuture / getResult ─────────────────────
 
-  /** Dispatch a host→app command. Returns the u64 future_id (BigInt). */
+  /**
+   * Post a host→app command to the package's worker and return a
+   * BigInt `future_id` the kernel polls until READY/ERROR.
+   *
+   * The kernel-side payload always starts with `[handle: u32 LE, ...]`,
+   * so we read the handle to find the package, then forward the
+   * payload as-is. CREATE is special-cased here: the kernel only
+   * emits `[handle]` (it doesn't know the class string), so we
+   * splice the encoded class onto the payload before forwarding,
+   * matching the legacy `_dispatchCreate` path.
+   *
+   * Returns `0n` if the handle is unknown (caller never gets a
+   * future to poll). Otherwise returns the kernel-side dispatch_id.
+   */
   dispatch(cmdKind, payloadPtr, payloadLen) {
     if (payloadLen < 4) return 0n;
     const kernelBuf = this._kernelMemory().buffer;
     const handle = new DataView(kernelBuf).getUint32(payloadPtr, true);
-    const ctx = this._lookup(handle);
-    if (!ctx) return 0n;
-    const { slot, proc } = ctx;
+    const slot = this._slots.get(handle);
+    if (!slot) return 0n;
+    const proc = this._processes.get(slot.packageId);
+    if (!proc) return 0n;
 
-    // Build the app-side payload. CREATE gets the class string
-    // appended; every other cmd_kind passes through unchanged.
-    let bytes;
-    if (cmdKind === CMD.CREATE) {
+    // CREATE augmentation: append the class string after the handle.
+    let payload;
+    if (cmdKind === 0x01 /* CMD.CREATE */) {
       const cls = this._encoder.encode(slot.class);
-      bytes = new Uint8Array(4 + cls.length);
-      bytes.set(new Uint8Array(kernelBuf, payloadPtr, 4), 0);  // handle
-      bytes.set(cls, 4);
+      payload = new Uint8Array(4 + cls.length);
+      payload.set(new Uint8Array(kernelBuf, payloadPtr, 4), 0);
+      payload.set(cls, 4);
     } else {
-      bytes = this._copyKernelSlice(payloadPtr, payloadLen);
+      payload = this._copyKernelSlice(payloadPtr, payloadLen);
     }
 
-    // Allocate in app memory, copy, dispatch, dealloc. Buffer life
-    // spans only the dispatch call — the app's runtime decodes
-    // synchronously, so we can free immediately on return.
-    let appPtr;
-    try {
-      appPtr = proc.instance.exports.akiva_app_alloc(bytes.length);
-      if (appPtr === 0) {
-        this._log("warn",
-          `app ${slot.packageId}: alloc(${bytes.length}) for dispatch(${cmdKind}) returned null`);
-        return 0n;
-      }
-      new Uint8Array(proc.memory.buffer, appPtr, bytes.length).set(bytes);
-      // Wasm i64 returns as BigInt on the JS side; pass through to the
-      // kernel as-is (the `hal_app_dispatch` env entry expects BigInt).
-      const futureId = proc.instance.exports.akiva_app_dispatch(cmdKind, appPtr, bytes.length);
-      this._dbg("dispatch",
-        `${slot.packageId}[handle=${handle}] cmd=${cmdKind.toString(16)} → ${futureId}`);
-      return typeof futureId === "bigint" ? futureId : BigInt(futureId);
-    } catch (err) {
-      this._log("error",
-        `app ${slot.packageId}.dispatch(${cmdKind}): ${err?.message ?? err}`);
-      return 0n;
-    } finally {
-      if (appPtr) {
-        try { proc.instance.exports.akiva_app_dealloc(appPtr, bytes.length); }
-        catch (_) { /* best effort */ }
-      }
-    }
+    const dispatchId = this._nextDispatchId++;
+    this._dispatches.set(dispatchId, { status: STATUS.PENDING, bytes: null });
+    proc.worker.postMessage(
+      { type: "dispatch", dispatch_id: dispatchId, cmd_kind: cmdKind, payload },
+      [payload.buffer],
+    );
+    this._dbg("dispatch",
+      `${slot.packageId}[handle=${handle}] cmd=0x${cmdKind.toString(16)} → dispatch_id=${dispatchId}`);
+    return dispatchId;
   }
 
   /**
-   * Fetch result bytes for a non-zero `future_id` returned by
-   * `dispatch`. The future_id encodes the handle in its low 32 bits
-   * (single-worker mode); 11.4c's worker path uses the same shape.
-   * Same two-phase buffer contract as `render` / `saveState`: returns
-   * the *needed* length, copies up to `outCap` bytes into kernel
-   * memory at `outPtr`.
+   * Poll the kernel-side cache for a future started via `dispatch`.
+   * The `hal_app_poll_future` import returns this value verbatim;
+   * the kernel's framework state machine only calls `get_result`
+   * after seeing READY here.
+   */
+  pollFuture(futureId) {
+    const fid = typeof futureId === "bigint" ? futureId : BigInt(futureId);
+    const entry = this._dispatches.get(fid);
+    if (!entry) return STATUS.ERROR;
+    return entry.status;
+  }
+
+  /**
+   * Copy the result bytes for a READY dispatch into kernel memory.
+   * Two-phase buffer contract: returns the *needed* length; if
+   * `len > outCap` the caller reallocates and retries — the entry
+   * stays alive across that retry. A successful copy (or a copy of
+   * 0 bytes for ack-only cmds) evicts the entry — single-shot.
    */
   getResult(futureId, outPtr, outCap) {
-    const handle = Number(futureId & 0xFFFFFFFFn);
-    return this._copyAppToKernel(handle, "get_result", outPtr, outCap,
-      (proc, lenPtr) => proc.instance.exports.akiva_app_get_result(futureId, lenPtr));
+    const fid = typeof futureId === "bigint" ? futureId : BigInt(futureId);
+    const entry = this._dispatches.get(fid);
+    if (!entry) return 0;
+    if (entry.status === STATUS.PENDING) return 0;  // shouldn't happen — caller checks pollFuture first
+    const bytes = entry.bytes;
+    const len = bytes ? bytes.length : 0;
+    if (len > outCap) return len;
+    if (len > 0) {
+      const kernelBuf = this._kernelMemory().buffer;
+      new Uint8Array(kernelBuf, outPtr, len).set(bytes);
+    }
+    this._dispatches.delete(fid);
+    return len;
   }
 
   // ── Internals ───────────────────────────────────────────────────────────
 
-  _instantiateProcess(packageId) {
-    const key = `packages/${packageId}/app.wasm`;
-    const bytes = this._storage.get(key);
-    if (!bytes) {
-      this._log("warn", `app register: no wasm at ${key}`);
+  /**
+   * Spawn the per-package Worker, post the `init` message, and wire
+   * its inbound channel. Synchronous from the kernel's POV — the
+   * Worker may still be compiling the wasm when `register` returns,
+   * but postMessage FIFO guarantees the first `dispatch` arrives
+   * after `init`.
+   */
+  _spawnProcess(packageId) {
+    const wasmBytes = this._storage.get(`packages/${packageId}/app.wasm`);
+    if (!wasmBytes) {
+      this._log("warn", `app register: no wasm at packages/${packageId}/app.wasm`);
       return null;
     }
 
-    // Reserve the slot BEFORE instantiation so host imports closing over
-    // `packageId` can look up the (still partial) record if the wasm
-    // start function happens to call into the host. Memory is only bound
-    // after construction succeeds; calls from inside start that need
-    // memory will see a null and silently drop — apps that need the
-    // log during start should fire it from on_create instead.
-    const proc = { module: null, instance: null, memory: null };
-    this._processes.set(packageId, proc);
+    const resources = this._loadResources(packageId);
+    const grants = [...(this._grants.get(packageId) ?? new Set())];
 
-    let module, instance;
+    let worker;
     try {
-      module = new WebAssembly.Module(bytes);
-      const imports = this._buildAppImports(packageId);
-      instance = new WebAssembly.Instance(module, imports);
+      worker = this._spawnWorker(packageId);
     } catch (err) {
-      this._processes.delete(packageId);
-      this._log("error", `app ${packageId}: instantiate failed: ${err?.message ?? err}`);
+      this._log("error", `app ${packageId}: spawn worker failed: ${err?.message ?? err}`);
       return null;
     }
+    worker.onerror = (e) => {
+      // Stone 11.5 hooks `LifecycleState::Trapped` here. For 11.4c we
+      // surface the error so a regression is observable.
+      this._log("error", `app ${packageId}: worker.onerror: ${e?.message ?? e}`);
+    };
+    worker.addEventListener("message", (e) => this._onWorkerMessage(packageId, e.data));
 
-    const exports = instance.exports;
-    for (const req of REQUIRED_EXPORTS) {
-      if (typeof exports[req] !== "function" && req !== "memory") {
-        this._processes.delete(packageId);
-        this._log("error", `app ${packageId}: missing export '${req}'`);
-        return null;
-      }
-    }
-    if (!(exports.memory instanceof WebAssembly.Memory)) {
-      this._processes.delete(packageId);
-      this._log("error", `app ${packageId}: missing 'memory' export`);
-      return null;
-    }
+    // wasmBytes ownership: storage hands us a fresh-copy Uint8Array
+    // backed by its own ArrayBuffer (see `Storage.get`), so transferring
+    // is safe and saves a structured-clone of the wasm bytes.
+    worker.postMessage(
+      {
+        type: "init",
+        packageId,
+        wasmBytes,
+        grants,
+        resources,
+      },
+      [wasmBytes.buffer],
+    );
 
-    proc.module = module;
-    proc.instance = instance;
-    proc.memory = exports.memory;
-
-    // Load this package's value tables once, before any host import
-    // can fire. If either file is absent the corresponding map is
-    // empty; parse failures are logged but don't block instantiation
-    // — a broken colors.toml just means `@color/` refs return magenta.
-    this._loadResources(packageId);
-
+    const proc = { worker, packageId };
+    this._processes.set(packageId, proc);
     return proc;
   }
 
+  /**
+   * Read the package's resource tables from storage and parse them
+   * into plain-object form for the worker's init payload. Errors
+   * are logged but don't block the spawn — a broken `colors.toml`
+   * just means `@color/` refs return magenta.
+   */
   _loadResources(packageId) {
-    const strings = new Map();
-    const colors = new Map();
+    const strings = {};
+    const colors = {};
     const tryParse = (leaf, parseFn, target) => {
       const key = `packages/${packageId}/res/values/${leaf}.toml`;
       const bytes = this._storage.get(key);
@@ -496,468 +396,128 @@ export class AppRegistry {
     };
     tryParse("strings", parseStringsToml, strings);
     tryParse("colors", parseColorsToml, colors);
-    this._resources.set(packageId, { strings, colors });
-  }
-
-  _buildAppImports(packageId) {
-    // Imports close over `packageId` so log lines carry the app tag
-    // automatically. Memory is resolved lazily because it isn't bound
-    // until after `new WebAssembly.Instance` returns.
-    const self = this;
-    const readName = (ptr, len) => {
-      const proc = self._processes.get(packageId);
-      if (len === 0 || !proc?.memory) return null;
-      return self._decoder.decode(new Uint8Array(proc.memory.buffer, ptr, len));
-    };
-    const full = {
-      env: {
-        akiva_host_resource_color: (ptr, len) => {
-          const name = readName(ptr, len);
-          if (name === null) return MISSING_COLOR;
-          const table = self._resources.get(packageId);
-          const value = table?.colors.get(name);
-          if (value === undefined) {
-            self._log("warn", `[${packageId}] @color/${name}: undefined (using magenta placeholder)`);
-            return MISSING_COLOR;
-          }
-          return value >>> 0;  // force unsigned so WASI u32 round-trip is clean
-        },
-        akiva_host_resource_string: (ptr, len, outPtr, outCap) => {
-          const proc = self._processes.get(packageId);
-          if (!proc?.memory) return 0;
-          const name = readName(ptr, len);
-          if (name === null) return 0;
-          const table = self._resources.get(packageId);
-          let value = table?.strings.get(name);
-          if (value === undefined) {
-            self._log("warn", `[${packageId}] @string/${name}: undefined (using placeholder)`);
-            value = `⟨missing:${name}⟩`;
-          }
-          const bytes = self._encoder.encode(value);
-          // Contract: if the caller's buffer is too small, write
-          // nothing and return the required length so they can
-          // realloc and try again. The SDK wrapper handles this.
-          if (bytes.length > outCap) return bytes.length;
-          new Uint8Array(proc.memory.buffer, outPtr, bytes.length).set(bytes);
-          return bytes.length;
-        },
-        akiva_host_resource_has_color: (ptr, len) => {
-          const name = readName(ptr, len);
-          if (name === null) return 0;
-          return self._resources.get(packageId)?.colors.has(name) ? 1 : 0;
-        },
-        akiva_host_resource_has_string: (ptr, len) => {
-          const name = readName(ptr, len);
-          if (name === null) return 0;
-          return self._resources.get(packageId)?.strings.has(name) ? 1 : 0;
-        },
-
-        // Stone 11.3c — three multiplexers that route every host-mediated
-        // op through a single dispatch table. The op_kind constants live
-        // in `op_kinds.mjs` (mirror of `framework/src/wire/op_kinds.rs`);
-        // every op_kind has a fixed args layout decoded inside the
-        // dispatcher (no central registry of decoders — keeps the call
-        // graph readable, and a missing case in the switch is a hard
-        // tripwire rather than a silent pass).
-        //
-        // Capability gating moves into the dispatch helpers (one import
-        // serves many op_kinds — some always-available, some gated). The
-        // `_applyPermissionFilter` mechanism above remains for the legacy
-        // per-op imports; both gates stay in sync because the dispatcher
-        // consults the same `_grants` map.
-        //
-        // Args copying: the dispatcher reads `args_ptr..args_ptr+args_len`
-        // out of app memory into a Uint8Array. We copy (`slice()`) rather
-        // than view because the args may be re-read during the op (e.g.
-        // an intent decode) and any subsequent wasm call could grow
-        // memory and detach the underlying ArrayBuffer.
-        akiva_host_fire: (opKind, argsPtr, argsLen) => {
-          const proc = self._processes.get(packageId);
-          if (!proc?.memory) return 1;
-          const args = self._readArgs(proc, argsPtr, argsLen);
-          if (args === null) return 1;
-          return self._dispatchFire(packageId, opKind, args);
-        },
-        akiva_host_io_start: (opKind, argsPtr, argsLen) => {
-          const proc = self._processes.get(packageId);
-          if (!proc?.memory) return 0n;
-          const args = self._readArgs(proc, argsPtr, argsLen);
-          if (args === null) return 0n;
-          return self._dispatchIoStart(packageId, opKind, args);
-        },
-        akiva_host_io_poll: (futureId, outPtr, outCap) => {
-          return self._pollFuture(packageId, futureId, outPtr, outCap);
-        },
-      },
-    };
-    return this._applyPermissionFilter(packageId, full);
+    return { strings, colors };
   }
 
   /**
-   * Stone 10.3b — apply the capability→imports filter to the fully
-   * built `env` object. Every import is classified:
-   *
-   *   1. **Auto** (`AUTO_IMPORTS`): passes through untouched. Every app
-   *      gets these — log, resource lookups, text measurement, finish,
-   *      set_result. Gating them would mean the app can't even draw.
-   *   2. **Gated + granted**: passes through untouched. The controller
-   *      stored this grant via `setGrants` (Stone 10.3b push from
-   *      Rust), so the app earned access at install time.
-   *   3. **Gated + NOT granted**: replaced with a deny-stub that logs
-   *      a warning and returns a zero-shaped value. An app shouldn't
-   *      import these in the first place (Stone 10.3b-true / LinkError
-   *      enforcement waits for SDK build-tooling that conditions
-   *      extern emission on manifest). Until then, soft deny is the
-   *      shippable enforcement: deterministic no-op, not silent pass.
-   *   4. **Unknown** (present in `env` but not in AUTO + any capability
-   *      list): treated as auto. This is the tripwire slot for a new
-   *      host import that was added in JS but never mapped in Rust;
-   *      worth noting in logs but not blocking. The Rust-side Vitest
-   *      mirror test catches a persistent drift.
+   * Inbound message handler for a peer Worker. Routes by `type`:
+   * `dispatch_done` populates `_dispatches`; `side_effect` stages
+   * into the matching `_pending*` map; `host_op` is wired in
+   * 11.4c-3; `log` and `trapped` flow through the registry log.
    */
-  _applyPermissionFilter(packageId, env) {
-    const grants = this._grants.get(packageId) ?? new Set();
-    const allowedGated = new Set();
-    for (const capability of grants) {
-      const mapped = CAPABILITY_IMPORTS[capability];
-      if (mapped) for (const name of mapped) allowedGated.add(name);
-    }
-    // Build the reverse map: import name → capability that gates it.
-    // Used only to shape the deny-stub's log message; fast enough to
-    // rebuild per instantiation since it's ~15 strings.
-    const gatedBy = new Map();
-    for (const [cap, names] of Object.entries(CAPABILITY_IMPORTS)) {
-      for (const name of names) gatedBy.set(name, cap);
-    }
-    const filtered = {};
-    const envImports = env.env;
-    const autoSet = new Set(AUTO_IMPORTS);
-    for (const [name, fn] of Object.entries(envImports)) {
-      if (autoSet.has(name)) {
-        filtered[name] = fn;
-        continue;
+  _onWorkerMessage(packageId, msg) {
+    if (!msg || typeof msg.type !== "string") return;
+    switch (msg.type) {
+      case "init_ok":
+        this._dbg("lifecycle", `${packageId}: worker init_ok`);
+        break;
+      case "init_failed":
+        this._log("error", `${packageId}: worker init_failed: ${msg.reason}`);
+        break;
+      case "dispatch_done": {
+        const fid = typeof msg.dispatch_id === "bigint" ? msg.dispatch_id : BigInt(msg.dispatch_id);
+        const entry = this._dispatches.get(fid);
+        if (!entry) {
+          this._log("warn", `${packageId}: dispatch_done for unknown id ${fid}`);
+          return;
+        }
+        const futureId = typeof msg.future_id === "bigint" ? msg.future_id : BigInt(msg.future_id ?? 0);
+        const bytes = msg.bytes instanceof Uint8Array ? msg.bytes
+          : (msg.bytes ? new Uint8Array(msg.bytes) : null);
+        // App-side future_id of 0 means "no result bytes" (ack-only
+        // cmd). Any non-zero id and `bytes != null` means RENDER /
+        // SAVE_STATE produced a stream.
+        entry.status = STATUS.READY;
+        entry.bytes = futureId !== 0n ? (bytes ?? null) : null;
+        break;
       }
-      const cap = gatedBy.get(name);
-      if (cap === undefined) {
-        // Unknown import — not in AUTO and not in any capability list.
-        // Pass through, but flag once in logs so the mapping drift is
-        // observable.
-        this._log("warn",
-          `[${packageId}] host import '${name}' is not in AUTO_IMPORTS or any capability mapping — passing through. Update runtime/web/app_registry.js and framework/src/permissions.rs in lockstep.`);
-        filtered[name] = fn;
-        continue;
-      }
-      if (allowedGated.has(name)) {
-        filtered[name] = fn;
-      } else {
-        filtered[name] = this._makeDenyStub(packageId, name, cap, fn);
-      }
+      case "side_effect":
+        this._handleSideEffect(packageId, msg);
+        break;
+      case "host_op":
+        // Stone 11.4c-3 routes QUERY_PACKAGES / STORAGE_* here.
+        // Until then, app-worker resolves locally to ERROR.
+        this._log("warn", `${packageId}: host_op routing not wired yet (op_kind=0x${(msg.op_kind ?? 0).toString(16)})`);
+        break;
+      case "log":
+        this._log(msg.level ?? "info", msg.text ?? "");
+        break;
+      case "trapped":
+        this._log("error", `${packageId}: app trapped: ${msg.reason}`);
+        break;
+      default:
+        this._log("warn", `${packageId}: unknown worker message type ${msg.type}`);
     }
-    return { env: filtered };
   }
 
   /**
-   * Build a no-op stand-in for a gated import the package doesn't have
-   * the capability for. Logs once per call so a silent call site is
-   * observable; returns a zero-shaped value matching the wasm function
-   * signature (we can't know the signature statically, but returning
-   * `0` is safe for every import in the current set — all of them are
-   * `() -> ()` or `() -> i32`-or-smaller). `originalFn` is kept in the
-   * closure for diagnostics only; we never call it.
+   * Stage the `_pending*` entry the legacy in-process `_dispatchFire`
+   * handler used to populate. The kernel-side `hal_app_drain_*`
+   * imports read these maps unchanged from pre-11.4c — only the
+   * source moved (from in-process import callbacks to peer-worker
+   * messages).
    */
-  _makeDenyStub(packageId, importName, capability, originalFn) {
-    void originalFn;  // retained so a future audit can show what was blocked
-    const self = this;
-    return function permissionDeniedStub(..._args) {
-      self._log("warn",
-        `[${packageId}] permission denied: '${importName}' requires '${capability}' which is not granted. Call returned no-op (0).`);
-      return 0;
-    };
+  _handleSideEffect(packageId, msg) {
+    const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(msg.args ?? 0);
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    switch (msg.op_kind) {
+      case FIRE.FINISH: {
+        if (args.length < 4) return;
+        const handle = view.getUint32(0, true);
+        this._pendingFinish.add(handle);
+        this._dbg("intent", `${packageId}: side_effect FINISH handle=${handle}`);
+        return;
+      }
+      case FIRE.START_ACTIVITY: {
+        if (!this._hasGrant(packageId, "akiva.permission.LAUNCH_ANY_APP")) {
+          this._log("warn", `[${packageId}] side_effect START_ACTIVITY: denied — no LAUNCH_ANY_APP grant`);
+          return;
+        }
+        if (args.length < 4) return;
+        const handle = view.getUint32(0, true);
+        const intentBytes = args.slice(4);
+        if (intentBytes.length === 0) return;
+        this._pendingIntent.set(handle, intentBytes);
+        this._dbg("intent", `${packageId}: side_effect START_ACTIVITY handle=${handle} bytes=${intentBytes.length}`);
+        return;
+      }
+      case FIRE.START_ACTIVITY_FOR_RESULT: {
+        if (!this._hasGrant(packageId, "akiva.permission.LAUNCH_ANY_APP")) {
+          this._log("warn", `[${packageId}] side_effect START_ACTIVITY_FOR_RESULT: denied — no LAUNCH_ANY_APP grant`);
+          return;
+        }
+        if (args.length < 8) return;
+        const handle = view.getUint32(0, true);
+        const requestCode = view.getUint32(4, true);
+        const intentBytes = args.slice(8);
+        if (intentBytes.length === 0) return;
+        this._pendingStartForResult.set(handle, { bytes: intentBytes, requestCode });
+        this._dbg("intent", `${packageId}: side_effect START_ACTIVITY_FOR_RESULT handle=${handle} rc=${requestCode}`);
+        return;
+      }
+      case FIRE.SET_RESULT: {
+        if (args.length < 4) return;
+        const handle = view.getUint32(0, true);
+        const resultBytes = args.slice(4);
+        if (resultBytes.length === 0) return;
+        this._pendingSetResult.set(handle, resultBytes);
+        this._dbg("intent", `${packageId}: side_effect SET_RESULT handle=${handle} bytes=${resultBytes.length}`);
+        return;
+      }
+      default:
+        this._log("warn", `[${packageId}] unknown side_effect op_kind=0x${(msg.op_kind ?? 0).toString(16)}`);
+    }
   }
 
-  // ── Stone 11.3c — unified ABI dispatcher ─────────────────────────────
-  //
-  // `akiva_host_fire` / `akiva_host_io_start` / `akiva_host_io_poll`
-  // funnel here. Each op_kind has a fixed args layout decoded inside
-  // its branch; results for io ops are stored in the FutureRegistry
-  // (`this._futures`) so `io_poll` can serve them through the same
-  // two-phase buffer protocol as the legacy per-op imports.
-  //
-  // Why a single switch instead of a registry of decoders: the op set
-  // is small (~10 today, capped at ~250 by the disjoint-range layout
-  // in op_kinds.rs) and a missing case is a hard tripwire. A registry
-  // would let an op silently default to "unknown" if the registration
-  // line were ever lost in a merge.
-
-  /**
-   * Copy `len` bytes from `proc`'s memory at `ptr` into a fresh
-   * Uint8Array. Returns `null` on bounds violation (length zero is
-   * legitimate — returns an empty array, not null). Always copies:
-   * the args may outlive subsequent wasm calls that grow memory and
-   * detach the live buffer.
-   */
-  _readArgs(proc, ptr, len) {
-    if (len === 0) return new Uint8Array(0);
-    const bufLen = proc.memory.buffer.byteLength;
-    if (ptr < 0 || ptr + len > bufLen) return null;
-    const copy = new Uint8Array(len);
-    copy.set(new Uint8Array(proc.memory.buffer, ptr, len));
-    return copy;
-  }
-
-  /** True iff `packageId` has been granted `capability`. */
   _hasGrant(packageId, capability) {
     return this._grants.get(packageId)?.has(capability) ?? false;
   }
 
   /**
-   * Dispatch a fire-and-forget op. Returns 0 on success, non-zero on
-   * any failure — unknown op_kind, malformed args, denied capability.
-   * Side effects (pendingFinish, pendingIntent, etc.) happen inline
-   * and the kernel drains them at the end of the dispatch via the
-   * existing `hal_app_drain_*` HAL bridges, identical to the legacy
-   * per-op imports.
-   */
-  _dispatchFire(packageId, opKind, args) {
-    if (!isFireKind(opKind)) {
-      this._log("warn",
-        `[${packageId}] fire(0x${opKind.toString(16)}): not a fire op_kind (range 0x0001..0x00FF)`);
-      return 1;
-    }
-    switch (opKind) {
-      case FIRE.LOG: {
-        // Args: [level: u32 LE | msg_bytes...]
-        if (args.length < 4) return 1;
-        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
-        const level = view.getUint32(0, true);
-        const text = this._decoder.decode(args.subarray(4));
-        this._log(LEVEL_NAMES[level] ?? "info", `[${packageId}] ${text}`);
-        return 0;
-      }
-      case FIRE.FINISH: {
-        // Args: [handle: u32 LE]
-        if (args.length < 4) return 1;
-        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
-        const handle = view.getUint32(0, true);
-        this._pendingFinish.add(handle);
-        return 0;
-      }
-      case FIRE.START_ACTIVITY: {
-        // Args: [handle: u32 LE | intent_bytes...]
-        if (!this._hasGrant(packageId, "akiva.permission.LAUNCH_ANY_APP")) {
-          this._log("warn",
-            `[${packageId}] fire(START_ACTIVITY): denied — no LAUNCH_ANY_APP grant`);
-          return 2;
-        }
-        if (args.length < 4) return 1;
-        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
-        const handle = view.getUint32(0, true);
-        const intentBytes = args.slice(4);
-        if (intentBytes.length === 0) return 1;
-        this._pendingIntent.set(handle, intentBytes);
-        return 0;
-      }
-      case FIRE.START_ACTIVITY_FOR_RESULT: {
-        // Args: [handle: u32 LE | request_code: u32 LE | intent_bytes...]
-        if (!this._hasGrant(packageId, "akiva.permission.LAUNCH_ANY_APP")) {
-          this._log("warn",
-            `[${packageId}] fire(START_ACTIVITY_FOR_RESULT): denied — no LAUNCH_ANY_APP grant`);
-          return 2;
-        }
-        if (args.length < 8) return 1;
-        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
-        const handle = view.getUint32(0, true);
-        const requestCode = view.getUint32(4, true);
-        const intentBytes = args.slice(8);
-        if (intentBytes.length === 0) return 1;
-        this._pendingStartForResult.set(handle, { bytes: intentBytes, requestCode });
-        return 0;
-      }
-      case FIRE.SET_RESULT: {
-        // Args: [handle: u32 LE | result_bytes...]
-        if (args.length < 4) return 1;
-        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
-        const handle = view.getUint32(0, true);
-        const resultBytes = args.slice(4);
-        if (resultBytes.length === 0) return 1;
-        this._pendingSetResult.set(handle, resultBytes);
-        return 0;
-      }
-      default:
-        this._log("warn",
-          `[${packageId}] fire(0x${opKind.toString(16)}): unknown op_kind`);
-        return 1;
-    }
-  }
-
-  /**
-   * Dispatch an async op. In Stone 11.3 single-worker every op resolves
-   * synchronously inside this method and the result is staged in
-   * `_futures` for the imminent `io_poll`. Stone 11.4 (worker-per-app)
-   * lets some branches return a real `PENDING` future the kernel
-   * resolves on a later turn of the event loop.
-   *
-   * Returns the future_id on success, `0n` on failure (unknown op_kind,
-   * denied capability, malformed args). `0n` is the only sentinel —
-   * real future_ids are non-zero.
-   */
-  _dispatchIoStart(packageId, opKind, args) {
-    if (!isIoKind(opKind)) {
-      this._log("warn",
-        `[${packageId}] io_start(0x${opKind.toString(16)}): not an io op_kind (range 0x0101..0x01FF)`);
-      return 0n;
-    }
-    let payload;
-    let status = STATUS.READY;
-    switch (opKind) {
-      case IO.TEXT_WIDTH: {
-        // Args: [size: f32 LE | text_bytes...] -> [width: f32 LE]
-        if (args.length < 4) return 0n;
-        const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
-        const size = view.getFloat32(0, true);
-        const text = this._decoder.decode(args.subarray(4));
-        const width = this.measureTextWidth(text, size);
-        const out = new Uint8Array(4);
-        new DataView(out.buffer).setFloat32(0, width, true);
-        payload = out;
-        break;
-      }
-      case IO.QUERY_PACKAGES: {
-        // Args: [] -> [pkgs_wire blob...]
-        if (!this._hasGrant(packageId, "akiva.permission.QUERY_PACKAGES")) {
-          this._log("warn",
-            `[${packageId}] io_start(QUERY_PACKAGES): denied — no QUERY_PACKAGES grant`);
-          return 0n;
-        }
-        // Slice so a later setPackages reassignment can't mutate the
-        // staged payload out from under a pending poll.
-        payload = this._packagesBlob.slice();
-        break;
-      }
-      case IO.STORAGE_GET:
-      case IO.STORAGE_SET:
-        // Stone 11.6 wires storage onto OPFS handles. Until then, ERROR.
-        // Keeping the op_kind reachable (rather than rejecting) means
-        // the SDK wrapper can be written today and naturally start
-        // working when the handler lands.
-        if (!this._hasGrant(packageId, "akiva.permission.STORAGE_SANDBOX")) {
-          this._log("warn",
-            `[${packageId}] io_start(0x${opKind.toString(16)}): denied — no STORAGE_SANDBOX grant`);
-          return 0n;
-        }
-        status = STATUS.ERROR;
-        payload = new Uint8Array(0);
-        break;
-      default:
-        this._log("warn",
-          `[${packageId}] io_start(0x${opKind.toString(16)}): unknown op_kind`);
-        return 0n;
-    }
-    const futureId = this._nextFutureId++;
-    this._futures.set(futureId, { packageId, status, payload });
-    return futureId;
-  }
-
-  /**
-   * Resolve a future started via `io_start`. Returns the packed
-   * `(status, length)` u64 the SDK side decodes. Behaviour matrix:
-   *
-   *   - unknown future_id, or owned by a different package → ERROR, len 0.
-   *   - payload fits in `outCap` → write it, status=READY/ERROR, len=actual,
-   *     evict the entry (single-shot).
-   *   - payload too large → don't write, status=READY, len=actual,
-   *     KEEP the entry so the caller can realloc and retry. Same shape
-   *     as `akiva_host_query_packages`'s legacy two-phase contract.
-   *   - PENDING (not used in 11.3 single-worker; reserved for 11.4+)
-   *     → status=PENDING, len 0, KEEP the entry.
-   */
-  _pollFuture(packageId, futureId, outPtr, outCap) {
-    const entry = this._futures.get(futureId);
-    if (!entry) return packPoll(STATUS.ERROR, 0);
-    if (entry.packageId !== packageId) {
-      // Cross-package poll attempt. Treat as unknown — don't even
-      // confirm the future exists. The originator can still poll;
-      // log once so the attempt is observable.
-      this._log("warn",
-        `[${packageId}] io_poll(${futureId}): not owned by this package — ignored`);
-      return packPoll(STATUS.ERROR, 0);
-    }
-    if (entry.status === STATUS.PENDING) {
-      return packPoll(STATUS.PENDING, 0);
-    }
-    const len = entry.payload.length;
-    if (len > outCap) {
-      // Two-phase retry: keep the entry, return the required length.
-      return packPoll(entry.status, len);
-    }
-    if (len > 0) {
-      const proc = this._processes.get(packageId);
-      if (!proc?.memory) {
-        // Process gone — drop the future. Don't try to write to a
-        // detached buffer.
-        this._futures.delete(futureId);
-        return packPoll(STATUS.ERROR, 0);
-      }
-      new Uint8Array(proc.memory.buffer, outPtr, len).set(entry.payload);
-    }
-    // Single-shot consume.
-    this._futures.delete(futureId);
-    return packPoll(entry.status, len);
-  }
-
-  _lookup(handle) {
-    const slot = this._slots.get(handle);
-    if (!slot) return null;
-    const proc = this._processes.get(slot.packageId);
-    if (!proc || !proc.instance) return null;
-    return { slot, proc };
-  }
-
-  /**
-   * Two-phase buffer read for `getResult`. The app-side export produces
-   * a byte stream in its own memory; we copy up to `outCap` bytes into
-   * kernel memory at `outPtr`. `invoke(proc, lenPtr)` calls the export
-   * and returns the source pointer in app memory. Returns the total
-   * length the app produced; `len > outCap` means nothing was copied
-   * and the caller should retry with a larger buffer.
-   */
-  _copyAppToKernel(handle, opLabel, outPtr, outCap, invoke) {
-    const ctx = this._lookup(handle);
-    if (!ctx) return 0;
-    const { slot, proc } = ctx;
-
-    let len, srcPtr;
-    try {
-      const lenPtr = proc.instance.exports.akiva_app_alloc(4);
-      if (lenPtr === 0) {
-        this._log("warn", `app ${slot.packageId}: alloc(4) for ${opLabel} len returned null`);
-        return 0;
-      }
-      try {
-        srcPtr = invoke(proc, lenPtr);
-        len = new DataView(proc.memory.buffer).getUint32(lenPtr, true);
-      } finally {
-        proc.instance.exports.akiva_app_dealloc(lenPtr, 4);
-      }
-    } catch (err) {
-      this._log("error", `app ${slot.packageId}.${opLabel}: ${err?.message ?? err}`);
-      return 0;
-    }
-
-    if (len === 0 || srcPtr === 0) return 0;
-    if (len > outCap) return len;  // caller retries with a larger buffer
-
-    const src = new Uint8Array(proc.memory.buffer, srcPtr, len);
-    const kernelBuf = this._kernelMemory().buffer;
-    new Uint8Array(kernelBuf, outPtr, len).set(src);
-    return len;
-  }
-
-  /**
    * Copy `len` bytes out of kernel memory at `ptr` into an owned
-   * `Uint8Array`. Necessary before any call that may detach the kernel
-   * buffer — `WebAssembly.Memory.grow` on either side invalidates
-   * existing views.
+   * `Uint8Array`. Necessary before any postMessage that may detach
+   * the kernel buffer — `WebAssembly.Memory.grow` on either side
+   * invalidates existing views.
    */
   _copyKernelSlice(ptr, len) {
     const kernelBuf = this._kernelMemory().buffer;
@@ -967,49 +527,40 @@ export class AppRegistry {
   }
 }
 
+// ── Worker spawn helper ─────────────────────────────────────────────────
+
+function defaultSpawnWorker(_packageId) {
+  // `import.meta.url` resolves to the kernel-worker's URL; the shell
+  // sits next to it under runtime/web/. Module workers let the shell
+  // `import` the shared op_kinds + renderer modules without bundling.
+  return new Worker(new URL("./app_worker_shell.js", import.meta.url), { type: "module" });
+}
+
 // ── Constants ────────────────────────────────────────────────────────────
 
-// Stone 10.3b — mirror of Rust's `framework::permissions::AUTO_IMPORTS` +
-// `imports_for_capability`. Must stay byte-for-byte in sync with
-// `framework/src/permissions.rs`; a Vitest test asserts the same shape
-// by round-tripping an app through `setGrants` + `_buildAppImports`,
-// and a Rust test in the same stone pins the canonical list. If you
-// add a new host import, update BOTH sides or the filter will either
-// stub a real function or ship an ungated one.
-// Stone 11.3-final: every fire/io op runs through the unified-ABI
-// multiplexers (`fire`, `io_start`, `io_poll`). The legacy per-op
-// imports (akiva_host_log, akiva_host_finish, akiva_host_text_width,
-// akiva_host_query_packages, akiva_host_set_result, and the
-// `start_activity` pair) are gone from both sides of the boundary.
+// Stone 11.3 / 11.4c — every app gets resource lookups + the unified-ABI
+// trio. Capability gating happens inside the worker's dispatcher (one
+// import serves many op_kinds), not at the import surface — kernel-side
+// AppRegistry no longer builds imports at all (the worker does).
 //
-// AUTO_IMPORTS is now resource-lookups (4) plus the trio (3). Resource
-// lookups stay legacy intentionally — they're per-package readonly
-// queries that don't fit the fire/io shape (no async, no side effect,
-// no handle context), and consolidating them under op_kinds would
-// just add encode/decode overhead for no benefit.
+// AUTO_IMPORTS is preserved as the cross-side parity contract: the
+// Rust `framework::permissions::AUTO_IMPORTS` round-trips against
+// this list in the vitest mirror test.
 export const AUTO_IMPORTS = Object.freeze([
   "akiva_host_resource_color",
   "akiva_host_resource_string",
   "akiva_host_resource_has_color",
   "akiva_host_resource_has_string",
-  // Stone 11.3 unified-ABI multiplexers. Capability gating happens
-  // inside the dispatcher (one import serves many op_kinds), not at
-  // the import surface. Mirror in framework/src/permissions.rs.
   "akiva_host_fire",
   "akiva_host_io_start",
   "akiva_host_io_poll",
 ]);
 
-// Capability → gated imports. After 11.3 every capability gate lives
-// inside the unified-ABI dispatcher (the multiplexers are auto, but
-// op_kinds like QUERY_PACKAGES and START_ACTIVITY are checked against
-// `_grants` per call). The map is preserved for two reasons:
-//   * If a future capability lands a per-op import that doesn't fit
-//     the fire/io shape (e.g. a streaming surface), it slots in here
-//     without the dispatcher having to know about it.
-//   * Vitest mirror tests assert that no capability has accidentally
-//     re-acquired imports — drift would silently bypass the
-//     in-dispatcher gating.
+// Capability → gated imports. Empty everywhere after 11.3 — gating
+// happens inside the unified-ABI dispatcher inside the worker. The
+// map is preserved as a tripwire: any future capability that lands a
+// per-op import (e.g. a streaming surface that doesn't fit fire/io)
+// must register here, otherwise the cross-side mirror test fails.
 export const CAPABILITY_IMPORTS = Object.freeze({
   "akiva.permission.LAUNCH_ANY_APP":  Object.freeze([]),
   "akiva.permission.QUERY_PACKAGES":  Object.freeze([]),
@@ -1019,29 +570,6 @@ export const CAPABILITY_IMPORTS = Object.freeze({
   "akiva.permission.CAMERA":          Object.freeze([]),
 });
 
-const LEVEL_NAMES = ["trace", "debug", "info", "warn", "error"];
-
-// Every app MUST expose these — see docs/abi.md §2.2. Missing any of them
-// means the wasm wasn't built against sdk-rust (or was built for a
-// different ABI) and we refuse to load it rather than discovering the
-// gap at first dispatch call.
-//
-// Stone 11.4b-5 collapsed the per-callback exports
-// (`akiva_app_create`/`...`/`akiva_app_activity_result`) into the
-// unified `akiva_app_dispatch` + `akiva_app_get_result` pair.
-const REQUIRED_EXPORTS = [
-  "memory",
-  "akiva_app_alloc",
-  "akiva_app_dealloc",
-  "akiva_app_abi_version",
-  "akiva_app_dispatch",
-  "akiva_app_get_result",
-];
-
-// Loud-and-obvious placeholder when an `@color/` ref is undefined.
-// Mirrors `akiva_sdk::res::MISSING_COLOR`. Packed 0xAARRGGBB.
-const MISSING_COLOR = 0xFFFF00FF;
-
 // ── Tiny TOML parsers for values files ──────────────────────────────────
 //
 // The values files are deliberately trivial — flat `key = "value"` pairs,
@@ -1050,13 +578,6 @@ const MISSING_COLOR = 0xFFFF00FF;
 // (Rust side) uses the full `toml` crate, which catches anything our
 // hand rolled parser misses and reports via `BootReport.resource_errors`.
 
-/** Iterate non-comment, non-blank lines. Strips leading/trailing
- * whitespace and cuts trailing `#` comments — but only when the hash
- * sits outside a double-quoted string. The naive `indexOf("#")` would
- * have eaten `"#ff15172a"` as a comment; colour literals start with
- * `#` and live inside quotes, so the scanner has to track quote
- * state. TOML doesn't permit `"` inside a `"..."` literal without an
- * escape, so a simple `\"` check is sufficient. */
 function* valuesLines(src) {
   for (let raw of src.split(/\r?\n/)) {
     raw = stripTrailingComment(raw).trim();
@@ -1068,24 +589,19 @@ function stripTrailingComment(line) {
   let inQuote = false;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
-    if (c === '\\' && inQuote) { i++; continue; }  // skip escaped char inside quote
+    if (c === '\\' && inQuote) { i++; continue; }
     if (c === '"') { inQuote = !inQuote; continue; }
     if (c === '#' && !inQuote) return line.slice(0, i);
   }
   return line;
 }
 
-/** Parse `key = "value"` lines into `target`. `onBad(key, reason)` runs
- * for malformed rows instead of throwing — one bad line shouldn't mask
- * the rest of the file. */
 function parseStringsToml(src, target, onBad) {
   for (const line of valuesLines(src)) {
     const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$/);
     if (!m) { onBad(line, `doesn't match key = "value"`); continue; }
-    // Strings values only need to unescape the pair we emit ourselves;
-    // the framework-side full parser validates anything more exotic.
     const value = m[2].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
-    target.set(m[1], value);
+    target[m[1]] = value;
   }
 }
 
@@ -1098,12 +614,10 @@ function parseColorsToml(src, target, onBad) {
       onBad(m[1], `'${m[2]}' isn't a valid color`);
       continue;
     }
-    target.set(m[1], argb);
+    target[m[1]] = argb;
   }
 }
 
-/** Parse `#RGB`, `#RRGGBB`, `#AARRGGBB`, or `0xAARRGGBB` to a 32-bit
- * ARGB integer. Mirrors `framework::resources::parse_color_literal`. */
 function parseColorLiteral(s) {
   const trimmed = s.trim();
   let hex;
