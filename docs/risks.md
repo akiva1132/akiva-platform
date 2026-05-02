@@ -197,13 +197,13 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Code.** `framework/src/{activity.rs, wasm_activity.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Tests: `drive_pending_signals_invokes_foreground_with_writable_ctx`, `drive_pending_signals_is_noop_on_empty_stack` (174 framework tests green).
 
-### 7.6 🔴 `pkgs_wire` decoder duplicated 3x — promoted to Stone 11.6.7
+### 7.6 ✅ `pkgs_wire` decoder dedup — fixed (Stone 11.6.7 #2, May 2026)
 
-**Concern.** `framework::wire::pkgs::decode`, `sdk-rust::pkgs::decode`, and `runtime/web/app_registry.js::_warmupWorkers` each parse the same length-prefixed binary blob. Adding a field to `PackageEntry` means three coordinated changes.
+**What was wrong.** Three independent decoders for the same length-prefixed blob (`framework::wire::pkgs`, `sdk::pkgs`, `runtime/web/app_registry.js::_warmupWorkers`) — every `PackageEntry` field addition meant three coordinated edits with drift risk between them.
 
-**Status.** Promoted from "deferred" to "blocking 11.7" by the May 2026 architectural audit. Stone 11.6.7 owns the fix. See [ROADMAP.md Stone 11.6.7 פריט 2](../ROADMAP.md). Recommended approach: shared `akiva-wire` crate (no_std + no_alloc) re-exported by both framework and sdk-rust; JS side gets a schema-comment pointer.
+**Fix in place.** New workspace crate `akiva-wire` (at `wire/src/pkgs.rs`) holds the canonical encode/decode + types. Both Rust crates depend on it via `workspace.dependencies`; `framework/src/wire/pkgs.rs` and `sdk-rust/src/pkgs.rs` are now thin re-exports. The JS side stays separate (it can't import a Rust crate) but `app_registry.js::_warmupWorkers` now carries a `// SCHEMA:` comment pointing back at `wire/src/pkgs.rs` so drift surfaces at code review when the layout changes.
 
-**Code surfaces.** New shared crate or refactor of `sdk-rust/src/pkgs.rs` ↔ `framework/src/wire/pkgs.rs`. JS-side: comment + reference fix.
+**Code.** New `wire/Cargo.toml` + `wire/src/{lib.rs, pkgs.rs}`; thin wrappers in `framework/src/wire/pkgs.rs` and `sdk-rust/src/pkgs.rs`. SDK-side `PackageEntry.entry_class` was renamed to `class` for consistency with the wire type (apps only used `id` and `name`, no migration needed). 8 wire-crate tests cover roundtrip, unicode, truncation, oversize-truncation, bad UTF-8.
 
 ### 7.7 ✅ Magic numbers — fixed (P1 #2, May 2026), tuning gap promoted to 11.6.7
 

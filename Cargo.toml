@@ -5,6 +5,7 @@ members = [
     "framework",
     "sdk-rust",
     "cli",
+    "wire",
 ]
 # Apps are excluded from the workspace: each app is built independently
 # (potentially with cargo-component targeting wasm32-wasip2), and must not
@@ -22,6 +23,7 @@ repository = "https://github.com/akiva-platform/akiva"
 [workspace.dependencies]
 akiva-framework = { path = "framework" }
 akiva-sdk = { path = "sdk-rust" }
+akiva-wire = { path = "wire" }
 
 [profile.release]
 opt-level = "z"

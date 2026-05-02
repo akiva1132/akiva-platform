@@ -23,6 +23,8 @@ bindings = []
 # (deferred to a follow-up commit in 11.2), `async_trait` is the
 # pragmatic bridge.
 async-trait = "0.1"
+# Stone 11.6.7 #2 — shared wire-format codecs.
+akiva-wire = { workspace = true }
 
 [package.metadata.akiva]
 role = "sdk"

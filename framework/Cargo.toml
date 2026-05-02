@@ -18,6 +18,9 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 # Transitive dep of `toml`; pinned below 2.10 because 2.10+ requires
 # edition2024 (Rust ≥1.85) and we support stable Rust 1.82+.
 indexmap = { version = ">=2, <2.10", default-features = false }
+# Stone 11.6.7 #2 — single source of truth for byte layouts crossing
+# the kernel/SDK ABI. Both framework and sdk-rust pull from here.
+akiva-wire = { workspace = true }
 
 [dev-dependencies]
 # Used only for the `cross_crate_op_kinds_match` test in `wire/op_kinds.rs`,

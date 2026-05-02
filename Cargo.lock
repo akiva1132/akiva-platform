@@ -11,6 +11,7 @@ name = "akiva-framework"
 version = "0.0.1"
 dependencies = [
  "akiva-sdk",
+ "akiva-wire",
  "indexmap",
  "serde",
  "toml",
@@ -27,8 +28,13 @@ dependencies = [
 name = "akiva-sdk"
 version = "0.0.1"
 dependencies = [
+ "akiva-wire",
  "async-trait",
 ]
+
+[[package]]
+name = "akiva-wire"
+version = "0.0.1"
 
 [[package]]
 name = "async-trait"

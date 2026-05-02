@@ -206,10 +206,18 @@ export class AppRegistry {
     const count = view.getUint32(0, true);
     let off = 4;
     for (let i = 0; i < count; i++) {
-      // Wire format mirrors framework/src/pkgs_wire.rs::encode:
-      //   [u16 LE id_len][id][u16 LE class_len][class]
-      //   [u16 LE name_len][name]
-      // We only need the id; skip the rest.
+      // SCHEMA: this format is owned by `wire/src/pkgs.rs` in the
+      // Rust workspace (Stone 11.6.7 #2). Both framework and SDK
+      // pull encode/decode from `akiva-wire`; this JS reader mirrors
+      // the same layout because it can't depend on a Rust crate.
+      // When the wire format changes, update both sides in lockstep:
+      //   1. wire/src/pkgs.rs    (the canonical decoder + tests)
+      //   2. this loop           (mirrored byte walk)
+      //
+      // Layout per entry:
+      //   [u16 LE id_len][id][u16 LE class_len][class][u16 LE name_len][name]
+      //
+      // We only need the id here; class + name get skipped past.
       if (off + 2 > blob.length) return;
       const idLen = view.getUint16(off, true); off += 2;
       if (off + idLen > blob.length) return;

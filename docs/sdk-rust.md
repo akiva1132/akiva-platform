@@ -551,9 +551,15 @@ In-process activities (תsts, future built-ins) ממשיכים להשתמש ב-`
 
 **Code.** `sdk-rust/src/storage.rs::{WriteHandle, write, poll_write_inner}`. אין שינוי ב-`runtime/web/app_registry.js::_dispatchStorage` — ה-host כבר היה שולח host_op_done עם status מתאים. 174 sdk tests green (3 חדשים: empty-key BadKey, non-wasm stub Denied, must_use shape).
 
-### 19.4 🟢 Other minor SDK gaps
+### 19.4 ✅ `pkgs_wire` decoder dedup — fixed (Stone 11.6.7 #2, May 2026)
 
-- **`pkgs_wire` decoder duplicated 3x.** [`framework/src/wire/pkgs.rs`](../framework/src/wire/pkgs.rs), [`sdk-rust/src/pkgs.rs`](../sdk-rust/src/pkgs.rs), ו-`runtime/web/app_registry.js::_warmupWorkers` משתפים את אותו פורמט. drift risk כשmosbim שדה. הפתרון או JSON (לpaths שאינם performance-critical), או schema-driven generation. ~1-2h.
+**מה היה הבעיה.** ה-decoder היה משוכפל 3 פעמים: [`framework/src/wire/pkgs.rs`](../framework/src/wire/pkgs.rs), [`sdk-rust/src/pkgs.rs`](../sdk-rust/src/pkgs.rs), ו-`runtime/web/app_registry.js::_warmupWorkers`. drift risk כשמוסיפים שדה.
+
+**התיקון.** crate חדש בworkspace `akiva-wire` (ב-`wire/src/pkgs.rs`) הוא ה-canonical source. שני ה-Rust crates שעובדים עם הwire format (framework + sdk-rust) מייבאים משם דרך `workspace.dependencies.akiva-wire`; הקבצים הקיימים שלהם הופכים thin re-exports. הJS side לא מסוגל לייבא Rust crate, אבל `_warmupWorkers` נושא עכשיו `// SCHEMA:` comment שמצביע על `wire/src/pkgs.rs` — drift נתפס בcode review כשהlayout משתנה.
+
+תוצאת המעבר: `PackageEntry.entry_class` ב-SDK שונה ל-`PackageEntry.class` (consistency עם wire crate; apps השתמשו רק ב-`id` ו-`name` ולכן אין migration). 8 wire tests + 2 wrapper tests + cross-crate parity מובטח by-construction (שני הצרכנים ה-Rust עוברים דרך אותה פונקציה).
+
+### 19.4a 🟢 Other minor SDK gaps
 
 - **No public `ctx.is_trapped(other_handle)` query.** Activity לא יכולה לזהות אם activity אחרת ש-launched להיא קרסה. relevant ל-launcher UI (Stone 11.5d UI נדחה לעת אחרי הבסיס).
 
