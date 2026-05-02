@@ -31,6 +31,43 @@ export const IO = Object.freeze({
   STORAGE_SET:    0x0104,
 });
 
+// Stone 11.4b — host→app dispatch op kinds. Mirror of
+// `framework::wire::op_kinds::cmd` and `akiva_sdk::op_kinds::cmd`.
+// The host calls `akiva_app_dispatch(cmd_kind, payload_ptr,
+// payload_len) -> u64` for every per-callback transition; the wasm
+// app demuxes by `cmd_kind`. Result bytes (RENDER, SAVE_STATE) flow
+// back via `akiva_app_get_result(future_id, out_len_ptr) -> *const u8`.
+//
+// Layout:
+//   Lifecycle: 0x01..=0x0F   (Create has a class-string payload;
+//                             Start/Resume/Pause/Stop/Destroy carry
+//                             only the handle.)
+//   Input:     0x10..=0x1F
+//   Render:    0x20..=0x2F
+//   State:     0x30..=0x3F
+//   Intent:    0x40..=0x4F
+//   reserved:  0x50+
+export const CMD = Object.freeze({
+  CREATE:          0x01,
+  START:           0x02,
+  RESUME:          0x03,
+  PAUSE:           0x04,
+  STOP:            0x05,
+  DESTROY:         0x06,
+
+  POINTER:         0x10,
+  KEY:             0x11,
+  RESIZE:          0x12,
+
+  RENDER:          0x20,
+
+  SAVE_STATE:      0x30,
+  RESTORE_STATE:   0x31,
+
+  NEW_INTENT:      0x40,
+  ACTIVITY_RESULT: 0x41,
+});
+
 // `akiva_host_io_poll` packs status + length into a single u64:
 //   low 32 bits  = status (PENDING / READY / ERROR)
 //   high 32 bits = payload length (when READY or ERROR; 0 when PENDING)
@@ -56,4 +93,9 @@ export function isFireKind(kind) {
 /** True iff `kind` is a valid io op_kind in the locked range. */
 export function isIoKind(kind) {
   return kind >= 0x0101 && kind <= 0x01FF;
+}
+
+/** True iff `kind` is a valid host→app dispatch cmd_kind. (Stone 11.4b) */
+export function isCmdKind(kind) {
+  return kind >= 0x01 && kind <= 0x4F;
 }

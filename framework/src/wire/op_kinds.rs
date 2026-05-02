@@ -78,6 +78,82 @@ pub mod io {
     pub const STORAGE_SET: u32 = 0x0104;
 }
 
+/// Stone 11.4b — host→app dispatch op kinds.
+///
+/// The single export `akiva_app_dispatch(cmd_kind, payload_ptr,
+/// payload_len) -> u64` replaces the 13 per-callback exports
+/// (`akiva_app_create`, `..._start`, `..._render`, …). The host packs
+/// the per-callback args into the payload and the wasm app demuxes by
+/// `cmd_kind`. Result bytes (render, save_state) flow back via a
+/// separate `akiva_app_get_result(future_id, out_len_ptr) -> *const u8`
+/// export (Stone 11.4b-2).
+///
+/// Layout:
+/// - **Lifecycle:** `0x01..=0x0F` — six transitions; only `CREATE`
+///   carries a payload (the activity class string).
+/// - **Input:**     `0x10..=0x1F` — pointer/key/resize, fixed-size
+///   payloads.
+/// - **Render:**    `0x20..=0x2F`.
+/// - **State:**     `0x30..=0x3F` — save/restore.
+/// - **Intent:**    `0x40..=0x4F` — new_intent + activity_result.
+/// - **Reserved:**  `0x50..=` for streams / pushed events when 11.5+
+///   wants them.
+///
+/// Disjoint from the host-direction `fire::*` (`0x0001..=0x00FF`) and
+/// `io::*` (`0x0101..=0x01FF`) ranges by construction — the
+/// `akiva_app_dispatch` import and the `akiva_host_*` imports are
+/// separate functions, so a corrupted blob can't cross-route, but the
+/// disjoint ranges keep the constants searchable in one grep without
+/// false matches.
+///
+/// Numbering is locked forever once assigned — wire format. See
+/// [`docs/abi.md §2.2`](../../../../docs/abi.md).
+pub mod cmd {
+    /// Args: `[handle: u32 LE, class: utf8...]`. Class string is
+    /// `payload[4..]`. Mirrors the old `akiva_app_create(handle,
+    /// class_ptr, class_len)`.
+    pub const CREATE: u32 = 0x01;
+    /// Args: `[handle: u32 LE]`. Mirrors `akiva_app_start(handle)`.
+    pub const START: u32 = 0x02;
+    /// Args: `[handle: u32 LE]`. Mirrors `akiva_app_resume(handle)`.
+    pub const RESUME: u32 = 0x03;
+    /// Args: `[handle: u32 LE]`. Mirrors `akiva_app_pause(handle)`.
+    pub const PAUSE: u32 = 0x04;
+    /// Args: `[handle: u32 LE]`. Mirrors `akiva_app_stop(handle)`.
+    pub const STOP: u32 = 0x05;
+    /// Args: `[handle: u32 LE]`. Mirrors `akiva_app_destroy(handle)`.
+    pub const DESTROY: u32 = 0x06;
+
+    /// Args: `[handle: u32 LE, x: f32 LE, y: f32 LE, button: u32 LE,
+    /// phase: u32 LE, ts_ms: f64 LE]`. 28 bytes.
+    pub const POINTER: u32 = 0x10;
+    /// Args: `[handle: u32 LE, code: u32 LE, modifiers: u32 LE,
+    /// phase: u32 LE, ts_ms: f64 LE]`. 24 bytes.
+    pub const KEY: u32 = 0x11;
+    /// Args: `[handle: u32 LE, width_px: u32 LE, height_px: u32 LE,
+    /// density: f32 LE]`. 16 bytes.
+    pub const RESIZE: u32 = 0x12;
+
+    /// Args: `[handle: u32 LE, ts_ms: f64 LE]`. 12 bytes. Result
+    /// bytes (paint stream) fetched via `akiva_app_get_result`.
+    pub const RENDER: u32 = 0x20;
+
+    /// Args: `[handle: u32 LE]`. Result bytes (encoded `SavedState`)
+    /// fetched via `akiva_app_get_result`.
+    pub const SAVE_STATE: u32 = 0x30;
+    /// Args: `[handle: u32 LE, state: bytes...]`. State is
+    /// `payload[4..]`.
+    pub const RESTORE_STATE: u32 = 0x31;
+
+    /// Args: `[handle: u32 LE, intent: encoded Intent...]`. Intent is
+    /// `payload[4..]`.
+    pub const NEW_INTENT: u32 = 0x40;
+    /// Args: `[handle: u32 LE, request_code: u32 LE,
+    /// result: encoded ActivityResult...]`. Result bytes are
+    /// `payload[8..]`.
+    pub const ACTIVITY_RESULT: u32 = 0x41;
+}
+
 /// Status codes returned by [`akiva_host_io_poll`].
 pub mod status {
     /// Future is not yet resolved. App should yield (return Pending
@@ -161,6 +237,40 @@ mod tests {
         assert_eq!(status::PENDING,                 sdk::status::PENDING);
         assert_eq!(status::READY,                   sdk::status::READY);
         assert_eq!(status::ERROR,                   sdk::status::ERROR);
+        // Stone 11.4b — host→app dispatch kinds.
+        assert_eq!(cmd::CREATE,           sdk::cmd::CREATE);
+        assert_eq!(cmd::START,            sdk::cmd::START);
+        assert_eq!(cmd::RESUME,           sdk::cmd::RESUME);
+        assert_eq!(cmd::PAUSE,            sdk::cmd::PAUSE);
+        assert_eq!(cmd::STOP,             sdk::cmd::STOP);
+        assert_eq!(cmd::DESTROY,          sdk::cmd::DESTROY);
+        assert_eq!(cmd::POINTER,          sdk::cmd::POINTER);
+        assert_eq!(cmd::KEY,              sdk::cmd::KEY);
+        assert_eq!(cmd::RESIZE,           sdk::cmd::RESIZE);
+        assert_eq!(cmd::RENDER,           sdk::cmd::RENDER);
+        assert_eq!(cmd::SAVE_STATE,       sdk::cmd::SAVE_STATE);
+        assert_eq!(cmd::RESTORE_STATE,    sdk::cmd::RESTORE_STATE);
+        assert_eq!(cmd::NEW_INTENT,       sdk::cmd::NEW_INTENT);
+        assert_eq!(cmd::ACTIVITY_RESULT,  sdk::cmd::ACTIVITY_RESULT);
+    }
+
+    #[test]
+    fn cmd_kinds_are_unique() {
+        let cmds = [
+            cmd::CREATE, cmd::START, cmd::RESUME, cmd::PAUSE, cmd::STOP, cmd::DESTROY,
+            cmd::POINTER, cmd::KEY, cmd::RESIZE,
+            cmd::RENDER,
+            cmd::SAVE_STATE, cmd::RESTORE_STATE,
+            cmd::NEW_INTENT, cmd::ACTIVITY_RESULT,
+        ];
+        for k in cmds {
+            assert!((0x01..=0x4F).contains(&k), "cmd op {k:#x} out of range");
+        }
+        for (i, a) in cmds.iter().enumerate() {
+            for b in &cmds[i + 1..] {
+                assert_ne!(a, b, "duplicate cmd op kind {a:#x}");
+            }
+        }
     }
 
     #[test]

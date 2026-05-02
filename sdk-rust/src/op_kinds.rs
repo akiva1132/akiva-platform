@@ -42,6 +42,34 @@ pub mod io {
     pub const STORAGE_SET: u32 = 0x0104;
 }
 
+/// Stone 11.4b — host→app dispatch op kinds. Mirror of
+/// `framework::wire::op_kinds::cmd`. Used by the `akiva_app_dispatch`
+/// glue inside the `akiva_app!` macro to demux a single export back
+/// into the right `Activity` callback.
+///
+/// Numbering is locked forever once assigned — wire format. See
+/// [`docs/abi.md §2.2`](../../../../docs/abi.md).
+pub mod cmd {
+    pub const CREATE: u32 = 0x01;
+    pub const START: u32 = 0x02;
+    pub const RESUME: u32 = 0x03;
+    pub const PAUSE: u32 = 0x04;
+    pub const STOP: u32 = 0x05;
+    pub const DESTROY: u32 = 0x06;
+
+    pub const POINTER: u32 = 0x10;
+    pub const KEY: u32 = 0x11;
+    pub const RESIZE: u32 = 0x12;
+
+    pub const RENDER: u32 = 0x20;
+
+    pub const SAVE_STATE: u32 = 0x30;
+    pub const RESTORE_STATE: u32 = 0x31;
+
+    pub const NEW_INTENT: u32 = 0x40;
+    pub const ACTIVITY_RESULT: u32 = 0x41;
+}
+
 /// Status codes returned by `akiva_host_io_poll`'s low 32 bits.
 pub mod status {
     pub const PENDING: u32 = 0;
@@ -81,5 +109,30 @@ mod tests {
         assert_eq!(status::PENDING, 0);
         assert_eq!(status::READY,   1);
         assert_eq!(status::ERROR,   2);
+    }
+
+    #[test]
+    fn cmd_kinds_are_unique_and_in_range() {
+        // Stone 11.4b — host→app dispatch op kinds live in `0x01..=0x4F`,
+        // disjoint from fire (`0x0001..=0x00FF`) and io
+        // (`0x0101..=0x01FF`). The numerical disjointness isn't load-
+        // bearing (different export, different import set) but a single
+        // grep for `0x01` should never confuse the two without a `cmd::`
+        // / `fire::` qualifier — keep the ranges visibly separate.
+        let cmds = [
+            cmd::CREATE, cmd::START, cmd::RESUME, cmd::PAUSE, cmd::STOP, cmd::DESTROY,
+            cmd::POINTER, cmd::KEY, cmd::RESIZE,
+            cmd::RENDER,
+            cmd::SAVE_STATE, cmd::RESTORE_STATE,
+            cmd::NEW_INTENT, cmd::ACTIVITY_RESULT,
+        ];
+        for k in cmds {
+            assert!((0x01..=0x4F).contains(&k), "cmd op {k:#x} out of range");
+        }
+        for (i, a) in cmds.iter().enumerate() {
+            for b in &cmds[i + 1..] {
+                assert_ne!(a, b, "duplicate cmd op kind {a:#x}");
+            }
+        }
     }
 }
