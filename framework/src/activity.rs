@@ -179,4 +179,19 @@ pub trait Activity: 'static {
     /// before `on_start` if the framework found bytes in storage keyed to
     /// this activity's `(package_id, class)`. Default is a no-op.
     fn restore_state_bytes(&mut self, bytes: &[u8]) { let _ = bytes; }
+
+    /// P1 #3 — drain any host-side signals (`finish`, `start_activity`,
+    /// `set_result`) the activity raised since the last callback, into
+    /// the supplied [`ActivityContext`] so [`crate::Framework::apply_post`]
+    /// can route them. Called once per frame on the foreground activity
+    /// from [`crate::Framework::drive_pending_signals`].
+    ///
+    /// Default is a no-op — in-process activities raise side-effects
+    /// synchronously inside their callback, so there is nothing async
+    /// to drain. `WasmActivity` overrides this to pull the kernel's
+    /// per-handle pending queues, which fill on cross-worker `host_op`
+    /// arrivals between the original input dispatch and now.
+    fn drive_pending_signals(&mut self, ctx: &mut ActivityContext<'_>) {
+        let _ = ctx;
+    }
 }

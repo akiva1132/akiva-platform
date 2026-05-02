@@ -189,15 +189,13 @@ In-process activities are unchanged — they still go through the sync `save_sta
 
 **Code.** `framework/src/{activity_manager.rs, lib.rs}`, `kernel/src/lib.rs::{akiva_frame, drain_trapped_packages_into}`. Tests: `reap_trapped_ids_returns_only_aged_records`, `reap_drops_record_and_instance_for_trapped`, `reap_refuses_non_trapped_records`, `reap_trapped_ids_skips_records_without_timestamp`, `reap_trapped_recycles_records_older_than_grace_window`. The 30s constant lands in the runtime config block planned for P1 (`runtime/web/config.js`).
 
-### 7.5 🟡 `drain_post` on every render is concept-muddy
+### 7.5 ✅ `drain_post` separated from render — fixed (P1 #3, May 2026)
 
-**Concern.** Stone 11.4c-5 added `self.drain_post(ctx)` at the start of `WasmActivity::render` to fix the "first click ignored" bug. But render is conceptually "produce a frame", not "process pending app signals." Mixing the two makes the contract harder to reason about.
+**What was wrong.** Stone 11.4c-5 had bolted `self.drain_post(ctx)` to the top of `WasmActivity::render` to fix the "first click ignored" bug. Render is conceptually "produce paint commands", not "process pending app signals" — mixing the two muddied the contract.
 
-**Why deferred.** Works correctly today (drain is idempotent). The cleanup is architectural, not functional.
+**Fix in place.** New `Activity::drive_pending_signals(&mut self, ctx)` trait method (default no-op), overridden on `WasmActivity` to call `drain_post`. `Framework::drive_pending_signals(ts)` walks the foreground activity through that hook + `apply_post`. The kernel calls it once per frame in `akiva_frame`, BEFORE `render_frame`. Render is now purely paint, drain has its own phase. The first-click property survives — drive runs every frame, render or not.
 
-**Trigger to promote.** Either (a) when adding another deferred-signal type that needs the same drain (e.g. notification post-callback), or (b) the foundation polish pass.
-
-**Code surfaces.** `framework/src/lib.rs` (new `drive_pending_signals(ts)` phase in the kernel's frame loop). Move `drain_post` out of `render`.
+**Code.** `framework/src/{activity.rs, wasm_activity.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Tests: `drive_pending_signals_invokes_foreground_with_writable_ctx`, `drive_pending_signals_is_noop_on_empty_stack` (174 framework tests green).
 
 ### 7.6 🟡 `pkgs_wire` decoder duplicated 3x
 

@@ -480,6 +480,34 @@ impl Framework {
         self.compositor.finish_frame()
     }
 
+    /// P1 #3 — drain per-frame async signals (`finish`,
+    /// `start_activity`, `set_result`) raised by the foreground
+    /// activity since the last callback fired, and route them via
+    /// [`apply_post`]. Runs once per frame before [`render_frame`];
+    /// keeps render conceptually pure ("produce paint commands") and
+    /// guarantees that a side-effect arriving on a frame WITHOUT new
+    /// input still gets picked up — the property Stone 11.4c-5 fixed
+    /// by adding a drain to render itself.
+    ///
+    /// Skips Trapped activities for the same reason render does — the
+    /// dead worker can't be answering anything.
+    ///
+    /// In-process activities (default `drive_pending_signals` no-op)
+    /// pay nothing for this hook; only `WasmActivity` overrides.
+    pub fn drive_pending_signals(&mut self, ts: f64) {
+        let Some(id) = self.stack.last().copied() else { return; };
+        if matches!(
+            self.activities.state_of(id),
+            Some(activity_manager::LifecycleState::Trapped)
+        ) {
+            return;
+        }
+        let (post, _) = self.with_ctx(id, ts, |a, ctx| {
+            a.drive_pending_signals(ctx);
+        });
+        self.apply_post(post, id, ts);
+    }
+
     /// Stone 11.4a-5 — poll every activity with an open
     /// [`activity_manager::PendingTransition`] slot. Resolved futures
     /// flip the activity's lifecycle state and clear the slot; pending
@@ -2628,6 +2656,91 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
         assert_eq!(fw.activities.state_of(id), Some(activity_manager::LifecycleState::Created));
         assert!(fw.activities.pending_of(id).is_none(),
             "slot must clear once the future resolves");
+    }
+
+    /// P1 #3 — verify `Framework::drive_pending_signals` fires the
+    /// foreground activity's trait method exactly once per call, and
+    /// hands it a writable `ActivityContext`. The "post-callback ends
+    /// up at apply_post" half is implicitly covered by the same
+    /// `with_ctx` + `apply_post` pair render_frame uses (and that's
+    /// already exercised by other tests in this module).
+    #[test]
+    fn drive_pending_signals_invokes_foreground_with_writable_ctx() {
+        use crate::activity::Activity;
+        use std::cell::Cell;
+
+        struct SignalRecorder {
+            calls: Rc<Cell<u32>>,
+            saw_writable_ctx: Rc<Cell<bool>>,
+        }
+        impl Activity for SignalRecorder {
+            fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+            fn drive_pending_signals(&mut self, ctx: &mut ActivityContext<'_>) {
+                self.calls.set(self.calls.get() + 1);
+                // Exercise ctx mutability — the production override on
+                // WasmActivity writes into these out-params, so a
+                // regression that hands us a non-mutable view would be
+                // a soundness break, not a behavioural one.
+                *ctx.finish_requested = false;
+                self.saw_writable_ctx.set(true);
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0u32));
+        let saw_ctx = Rc::new(Cell::new(false));
+        let calls_for_factory = calls.clone();
+        let ctx_for_factory = saw_ctx.clone();
+
+        let host = DeferredMockHost::new();
+        let mut fw = Framework {
+            activities: ActivityManager::new(),
+            packages: package_manager::PackageManager::new(),
+            windows: window_manager::WindowManager::new(),
+            resources: resources::ResourceManager::new(),
+            intents: intent::IntentRouter::new(),
+            permissions: permissions::PermissionController::new(),
+            compositor: Compositor::new(),
+            metrics: SurfaceMetrics::default(),
+            pointer: None,
+            stack: Vec::new(),
+            storage: None,
+            pending_result_for: HashMap::new(),
+            pending_result: HashMap::new(),
+            task_history: Vec::new(),
+            host: host.clone(),
+            pending_saves: Vec::new(),
+        };
+        fw.activities.register(
+            "test.pkg",
+            "Recorder",
+            activity_manager::LaunchMode::Standard,
+            move || Box::new(SignalRecorder {
+                calls: calls_for_factory.clone(),
+                saw_writable_ctx: ctx_for_factory.clone(),
+            }),
+        );
+        let id = fw.activities.launch("test.pkg", "Recorder").unwrap().id;
+        fw.stack.push(id);
+
+        fw.drive_pending_signals(0.0);
+        assert_eq!(calls.get(), 1);
+        assert!(saw_ctx.get(), "activity must receive a writable ActivityContext");
+
+        fw.drive_pending_signals(1.0);
+        assert_eq!(calls.get(), 2,
+            "each frame should fire drive_pending_signals once");
+    }
+
+    /// P1 #3 — empty stack is a legitimate state during boot before
+    /// the home activity launches; drive_pending_signals must no-op,
+    /// not panic.
+    #[test]
+    fn drive_pending_signals_is_noop_on_empty_stack() {
+        let mut fw = empty_framework();
+        fw.drive_pending_signals(0.0);
+        // No panic, no observable state change. The smoke test is the
+        // absence of a panic from `self.stack.last().copied()` being
+        // None.
     }
 
     #[test]

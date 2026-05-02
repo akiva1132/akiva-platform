@@ -767,7 +767,10 @@ App שעברה Trapped יכולה להיפתח שוב מ-Shell — kernel ירא
    - **Rust-side:** הconst block בראש `kernel/src/lib.rs` מאחד `TRAPPED_GRACE_MS` (קיים) עם שני חדשים: `POLL_RESULT_INITIAL_CAP = 16 KiB`, `TRAP_DRAIN_INITIAL_CAP = 256`. כל קבוע נושא הערת `Why:` כך שהשיקול שורד retune.
    - **תוצאה:** קריאה אחת לכל magic number, כל שינוי tuning עובר דרך פיגום אחד. 54 vitest + 172 framework + 0 kernel(no test crate yet) green.
 
-7. **`drain_post` separation** — להוציא מ-`render` לframework phase נפרד `drive_pending_signals(ts)` שrun-it כל frame בkernel. clarity in concept. ~30 דק'.
+7. **✅ `drain_post` separation — תוקן (P1 #3, May 2026)**
+   - **תיקון בפועל:** trait method חדש `Activity::drive_pending_signals(&mut self, ctx)` (default no-op), `WasmActivity` override קורא ל-`self.drain_post(ctx)`. `Framework::drive_pending_signals(ts)` משתמש ב-`with_ctx` + `apply_post` הקיימים על הforeground activity. Kernel קורא ל-`fw.drive_pending_signals(timestamp_ms)` פעם בפריים מ-`akiva_frame`, לפני `render_frame`. הdrain שהיה בראש `WasmActivity::render` הוסר.
+   - **תוצאה:** render הפך פיור-paint, drain נפרד לphase משלו. תכונת ה"first-click" של 11.4c-5 נשמרת — הdrain רץ כל פריים ללא קשר ל-render.
+   - **Code:** `framework/src/{activity.rs, wasm_activity.rs, lib.rs}`, `kernel/src/lib.rs::akiva_frame`. Tests: `drive_pending_signals_invokes_foreground_with_writable_ctx`, `drive_pending_signals_is_noop_on_empty_stack`. 174 framework + 167 sdk + 68 cli + 54 vitest = 463 ירוקים.
 
 8. **pkgs_wire decoder dedup** — היום משוכפל ב-`framework::wire::pkgs`, `sdk-rust::pkgs`, `runtime/web/app_registry.js::_warmupWorkers`. drift risk כשמוסיפים שדה. אפשרויות: switch to JSON in non-perf paths, or introduce schema-driven generation. ~1-2h.
 

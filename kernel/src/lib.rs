@@ -699,6 +699,16 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
 
     k.scheduler.run_ready(timestamp_ms);
 
+    // P1 #3 — drain async signals (finish / start_activity / set_result)
+    // the foreground activity raised since its last callback. Done as a
+    // dedicated frame phase so render stays purely "produce paint
+    // commands". Pre-P1 #3 this drain piggybacked at the top of render;
+    // moving it out keeps the contract clean and catches signals on
+    // frames that don't repaint.
+    if let Some(fw) = k.framework.as_mut() {
+        fw.drive_pending_signals(timestamp_ms);
+    }
+
     // Render through the framework, then flush the resulting command
     // buffer to the HAL. The split keeps HAL calls confined to the kernel
     // crate so the framework stays wasm-target-agnostic.

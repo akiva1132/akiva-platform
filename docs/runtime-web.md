@@ -277,9 +277,7 @@ Stone 11.4c-6. כש-`setPackages` נקרא (ב-boot ובכל install/uninstall),
 
 ### 9.6 Foundation gaps relevant to runtime-web
 
-ראה [`docs/risks.md` §7](risks.md) ו-[`docs/isolation-design.md` §10.5](isolation-design.md):
-- §7.1 SDK async executor missing — affects how `host_op` results land in apps
-- §7.5 `drain_post` on every render — should be its own framework phase
+ראה [`docs/risks.md` §7](risks.md) ו-[`docs/isolation-design.md` §10.5](isolation-design.md). הסעיפים שהיו רלוונטיים ל-runtime-web (§7.1 SDK async executor, §7.5 drain_post phase) נסגרו תחת P0 #4 ו-P1 #3 בהתאמה.
 
 ### 9.7 Graceful shutdown checkpoint (P0 #2, May 2026)
 

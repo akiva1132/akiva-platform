@@ -419,16 +419,13 @@ impl Activity for WasmActivity {
     }
 
     fn render(&mut self, ctx: &mut ActivityContext<'_>, out: &mut FrameCommands) {
-        // Stone 11.4c — drain any host-side signals (`finish`,
-        // `start_activity`, `set_result`, …) that the worker emitted
-        // since the last input/lifecycle callback. With cross-worker
-        // dispatch the side-effect for a click arrives one or more
-        // frames AFTER the pointer dispatch returned, and there's
-        // nothing else that drains them before the next user input —
-        // without this hook, "first click does nothing, second click
-        // launches the app from the FIRST click's queued intent" is
-        // the user-visible symptom.
-        self.drain_post(ctx);
+        // P1 #3 — the per-frame `drain_post` that used to sit at the top
+        // of this method moved to [`Activity::drive_pending_signals`],
+        // which the kernel calls once per frame BEFORE render_frame.
+        // Render is now purely "produce paint commands"; signal drain
+        // is its own phase. The fix-the-first-click property
+        // (Stone 11.4c-5) is preserved — drive_pending_signals fires
+        // every frame, render or not.
 
         // Stone 11.4c — render pipeline. Each frame:
         //   1. If a prior render is still in-flight, poll it. READY
@@ -528,6 +525,15 @@ impl Activity for WasmActivity {
             "activity_result",
             self.host.activity_result(self.handle, request_code, &bytes),
         );
+        self.drain_post(ctx);
+    }
+
+    fn drive_pending_signals(&mut self, ctx: &mut ActivityContext<'_>) {
+        // P1 #3 — pull the kernel's per-handle pending queues into the
+        // foreground activity's ctx every frame. The per-callback
+        // `drain_post` calls above stay (immediate-drain after a sync
+        // host_op fires); this method catches anything that arrived
+        // between the last callback and the current frame.
         self.drain_post(ctx);
     }
 }
