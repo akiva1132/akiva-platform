@@ -17,6 +17,7 @@ mod install;
 mod new;
 mod package;
 mod run;
+mod templates;
 mod uninstall;
 mod workspace;
 
