@@ -186,24 +186,31 @@ fn build_one(root: &Path, name: &str, debug: bool) -> io::Result<()> {
     }
     std::fs::copy(&manifest_src, dest_dir.join("manifest.toml"))?;
 
-    // Refresh res/values/ so deletions in the source tree propagate:
-    // remove any existing staged copies first, then re-copy whichever
-    // of strings/colors.toml actually exist. Mirrors the build.sh rule
-    // that calculator added in its own file.
-    let src_values = app_dir.join("res/values");
-    let dst_values = dest_dir.join("res/values");
-    if src_values.is_dir() {
-        std::fs::create_dir_all(&dst_values)?;
-        for leaf in ["strings.toml", "colors.toml"] {
-            let dst = dst_values.join(leaf);
-            if dst.exists() { std::fs::remove_file(&dst)?; }
-            let src = src_values.join(leaf);
-            if src.is_file() { std::fs::copy(&src, &dst)?; }
+    // Refresh res/values/ + res/values-night/ so deletions in the
+    // source tree propagate: remove any existing staged copies first,
+    // then re-copy whichever of strings/colors.toml actually exist.
+    // Mirrors the build.sh rule that calculator added in its own file.
+    //
+    // Stone 11.6.9 #3 — `values-night/` is the dark-mode qualifier
+    // overlay; it travels through the dev-apps stage exactly like
+    // `values/` so toggling `prefers-color-scheme` in the browser
+    // picks up the freshly-built bytes without rebuilding the package.
+    for qualifier in ["values", "values-night"] {
+        let src_values = app_dir.join("res").join(qualifier);
+        let dst_values = dest_dir.join("res").join(qualifier);
+        if src_values.is_dir() {
+            std::fs::create_dir_all(&dst_values)?;
+            for leaf in ["strings.toml", "colors.toml"] {
+                let dst = dst_values.join(leaf);
+                if dst.exists() { std::fs::remove_file(&dst)?; }
+                let src = src_values.join(leaf);
+                if src.is_file() { std::fs::copy(&src, &dst)?; }
+            }
+        } else if dst_values.is_dir() {
+            // App removed this qualifier dir entirely — clean the stage
+            // so stale entries don't keep getting installed.
+            let _ = std::fs::remove_dir_all(&dst_values);
         }
-    } else if dst_values.is_dir() {
-        // App removed its res/values/ entirely — clean the stage dir
-        // so stale strings/colors don't keep getting installed.
-        let _ = std::fs::remove_dir_all(&dst_values);
     }
 
     let staged = dest_dir.join("app.wasm");

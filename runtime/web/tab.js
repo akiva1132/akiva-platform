@@ -95,6 +95,7 @@ session.addEventListener("panic", (e) => onPanic(e.detail.text));
 // care of routing to the right place based on its current role.
 installInputForwarding(surfaceEl);
 installResizeHandler(surfaceEl);
+installColorSchemeWatcher();
 
 session.start().catch((err) => onPanic(`boot failed: ${err?.message ?? err}`));
 
@@ -252,6 +253,25 @@ function installResizeHandler(canvas) {
     session.send({ type: "resize", tabId, metrics: m });
   });
   ro.observe(canvas);
+}
+
+function installColorSchemeWatcher() {
+  // Stone 11.6.9 #3 — observe the OS-level dark-mode preference.
+  // `matchMedia` is universally supported; the `change` event is
+  // emitted whenever the user (or system) flips the setting at
+  // runtime. We post the value through the Session so it lands in
+  // the kernel-worker just like resize / input forwarding does;
+  // the kernel turns it into a `set_resources` broadcast and an
+  // `akiva_config_change(night)` export call.
+  //
+  // Initial send is unconditional — at boot the kernel hasn't
+  // observed any signal and assumes light mode, so we always
+  // surface the actual current value once even when night=false,
+  // to make the kernel-side state explicit rather than implicit.
+  const mq = window.matchMedia("(prefers-color-scheme: dark)");
+  const send = () => session.send({ type: "config-change", tabId, night: mq.matches });
+  mq.addEventListener("change", send);
+  send();
 }
 
 function encodeModifiers(e) {

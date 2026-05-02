@@ -851,6 +851,33 @@ pub extern "C" fn akiva_shutdown() {
 /// pass it straight through so the future's `started_at_ms` is on the
 /// same clock as the watchdog's deadline check.
 ///
+/// Stone 11.6.9 #3 — host-driven device-config change. Today the
+/// only dimension is the dark-mode `night` bit; the body of this
+/// export will fan out to additional flags as `values-he/`,
+/// `values-land/`, etc. land. The host calls this whenever the
+/// browser's `prefers-color-scheme` resolves to a new value (boot,
+/// or a runtime change observed via `matchMedia`).
+///
+/// `night != 0` selects the `values-night/` overlay for subsequent
+/// `@string/` / `@color/` lookups; the call is idempotent on the
+/// current state, so duplicate matchMedia notifications are cheap.
+/// Pre-boot calls are silently dropped — `akiva_boot` will see the
+/// host's then-current value through its own initialiser path.
+#[no_mangle]
+pub extern "C" fn akiva_config_change(night: i32) {
+    let k = kernel();
+    let Some(fw) = k.framework.as_mut() else {
+        return;
+    };
+    let _changed = fw.resources.set_night_mode(night != 0);
+    // No request-redraw call yet — every running activity already
+    // re-renders next frame because the kernel's rAF tick polls all
+    // dirty slots, and `set_resources` (the JS-side companion) flushes
+    // the new colour map to each app worker. If a future
+    // background-only activity caches a resolved colour, it will need
+    // its own invalidation hook here.
+}
+
 /// Returns the number of save dispatches issued — 0 means nothing to
 /// checkpoint (no foreground, already in flight, in-process activity).
 /// The HAL logs the value for visibility but doesn't act on it.

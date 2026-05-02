@@ -127,9 +127,17 @@ fn package(staged: &Path, out_path: &Path) -> io::Result<u64> {
 
     // Resources are optional — an app with no user-visible strings or
     // custom palette still packages fine. Iterate the known set
-    // explicitly: there's no glob of res/values/ because the framework
-    // only reads these two files (see package_manager.rs).
-    for leaf in ["res/values/strings.toml", "res/values/colors.toml"] {
+    // explicitly: there's no glob of res/values*/ because the framework
+    // only reads these specific files (see package_manager.rs).
+    //
+    // Stone 11.6.9 #3 — `values-night/` is the dark-mode overlay; same
+    // include-or-skip rule.
+    for leaf in [
+        "res/values/strings.toml",
+        "res/values/colors.toml",
+        "res/values-night/strings.toml",
+        "res/values-night/colors.toml",
+    ] {
         let src = staged.join(leaf);
         if src.is_file() {
             let data = std::fs::read(&src)?;

@@ -239,6 +239,20 @@ self.addEventListener("message", (e) => {
     case "set_packages":
       packagesBlob = msg.packagesBlob instanceof Uint8Array ? msg.packagesBlob : new Uint8Array(0);
       break;
+    case "set_resources":
+      // Stone 11.6.9 #3 — kernel re-sends the resolved resource bag
+      // when a device-config qualifier (today: night mode) flips.
+      // Replace wholesale; the bag already has values-night/ overlaid
+      // when night=true, so the worker just sees a fresh strings/colors
+      // map and serves subsequent @string/@color lookups out of it.
+      // Payload shape matches `init.resources`.
+      if (msg.resources) {
+        resources = {
+          strings: new Map(Object.entries(msg.resources.strings ?? {})),
+          colors:  new Map(Object.entries(msg.resources.colors ?? {})),
+        };
+      }
+      break;
     case "storage_invalidate":
       // Stone 11.6.7 #3 — kernel just wrote/deleted this key (or the
       // whole package, if userKey === null). Drop any cached

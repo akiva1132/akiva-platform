@@ -1291,3 +1291,87 @@ describe("debug categories — toggleable per-site tracing", () => {
     expect(log).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("night mode — Stone 11.6.9 #3", () => {
+  // Helper: install a `values/colors.toml` for our test package, plus
+  // optionally a `values-night/colors.toml` overlay. Storage values
+  // must be UTF-8 bytes — same as the live OPFS bridge stores them.
+  function seedResources(storage, packageId, day, night) {
+    const enc = new TextEncoder();
+    if (day != null) {
+      storage.set(`packages/${packageId}/res/values/colors.toml`, enc.encode(day));
+    }
+    if (night != null) {
+      storage.set(`packages/${packageId}/res/values-night/colors.toml`, enc.encode(night));
+    }
+  }
+
+  it("default mode loads only values/, ignoring values-night/", () => {
+    const { registry, storage } = makeRegistry();
+    seedResources(storage, PACKAGE_ID,
+      `bg = "#ffffffff"`,
+      `bg = "#ff111111"`,
+    );
+    const { colors } = registry._loadResources(PACKAGE_ID);
+    expect(colors.bg).toBe(0xffffffff);
+    expect(registry.nightMode).toBe(false);
+  });
+
+  it("night mode overlays values-night/ on top of values/, last-write-wins per key", () => {
+    const { registry, storage } = makeRegistry();
+    seedResources(storage, PACKAGE_ID,
+      `bg = "#ffffffff"
+fg = "#ff000000"`,
+      `bg = "#ff111111"`,
+    );
+    registry.setNightMode(true);
+    const { colors } = registry._loadResources(PACKAGE_ID);
+    // bg overridden, fg falls through to values/
+    expect(colors.bg).toBe(0xff111111);
+    expect(colors.fg).toBe(0xff000000);
+  });
+
+  it("setNightMode posts set_resources to every running app, returns true on change", () => {
+    const { registry, storage, worker } = makeRegistry();
+    seedResources(storage, PACKAGE_ID,
+      `bg = "#ffffffff"`,
+      `bg = "#ff111111"`,
+    );
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._posted.length = 0; // ignore init payload
+    expect(registry.setNightMode(true)).toBe(true);
+    const update = worker._posted.find((m) => m.type === "set_resources");
+    expect(update).toBeDefined();
+    expect(update.resources.colors.bg).toBe(0xff111111);
+  });
+
+  it("setNightMode no-ops when value unchanged — no postMessage, no log", () => {
+    const { registry, storage, worker } = makeRegistry();
+    seedResources(storage, PACKAGE_ID, `bg = "#ffffffff"`, null);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._posted.length = 0;
+    expect(registry.setNightMode(false)).toBe(false);
+    expect(worker._posted.find((m) => m.type === "set_resources")).toBeUndefined();
+  });
+
+  it("init resources reflect current night mode at register time", () => {
+    const { registry, storage, worker } = makeRegistry();
+    seedResources(storage, PACKAGE_ID,
+      `bg = "#ffffffff"`,
+      `bg = "#ff111111"`,
+    );
+    registry.setNightMode(true);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    const init = worker._posted.find((m) => m.type === "init");
+    expect(init.resources.colors.bg).toBe(0xff111111);
+  });
+
+  it("missing values-night/ falls through to values/ silently", () => {
+    const { registry, storage } = makeRegistry();
+    // Only `values/` defined; no overlay file at all.
+    seedResources(storage, PACKAGE_ID, `bg = "#ff222222"`, null);
+    registry.setNightMode(true);
+    const { colors } = registry._loadResources(PACKAGE_ID);
+    expect(colors.bg).toBe(0xff222222);
+  });
+});

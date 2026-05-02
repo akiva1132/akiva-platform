@@ -116,6 +116,16 @@ export class AppRegistry {
      */
     this._watchdogTimeoutMs = new Map();
 
+    /**
+     * Stone 11.6.9 #3 — current value of the night-mode device
+     * config qualifier. `false` selects only `values/`; `true`
+     * overlays `values-night/` on top of `values/` per-key.
+     * Toggled by `setNightMode()` from the kernel-worker after
+     * `tab.js` observes `matchMedia('(prefers-color-scheme: dark)')`.
+     * @type {boolean}
+     */
+    this._nightMode = false;
+
     this._decoder = new TextDecoder("utf-8");
     this._encoder = new TextEncoder();
 
@@ -690,32 +700,75 @@ export class AppRegistry {
    * into plain-object form for the worker's init payload. Errors
    * are logged but don't block the spawn — a broken `colors.toml`
    * just means `@color/` refs return magenta.
+   *
+   * Stone 11.6.9 #3 — qualifier-aware. Always loads `values/`. When
+   * `this._nightMode` is true, also loads `values-night/` and
+   * overlays each entry on top (last-write-wins per key). An app
+   * without a `values-night/` directory simply behaves as before.
    */
   _loadResources(packageId) {
     const strings = {};
     const colors = {};
-    const tryParse = (leaf, parseFn, target) => {
-      const key = `packages/${packageId}/res/values/${leaf}.toml`;
+    const tryParse = (qualifierDir, leaf, parseFn, target) => {
+      const key = `packages/${packageId}/res/${qualifierDir}/${leaf}.toml`;
       const bytes = this._storage.get(key);
       if (!bytes) return;
       let text;
       try {
         text = this._decoder.decode(bytes);
       } catch (err) {
-        this._log("warn", `[${packageId}] ${leaf}.toml: not valid UTF-8`);
+        this._log("warn", `[${packageId}] ${qualifierDir}/${leaf}.toml: not valid UTF-8`);
         return;
       }
       try {
         parseFn(text, target, (key, reason) =>
-          this._log("warn", `[${packageId}] ${leaf}.toml: '${key}' ${reason}`));
+          this._log("warn", `[${packageId}] ${qualifierDir}/${leaf}.toml: '${key}' ${reason}`));
       } catch (err) {
-        this._log("warn", `[${packageId}] ${leaf}.toml: ${err?.message ?? err}`);
+        this._log("warn", `[${packageId}] ${qualifierDir}/${leaf}.toml: ${err?.message ?? err}`);
       }
     };
-    tryParse("strings", parseStringsToml, strings);
-    tryParse("colors", parseColorsToml, colors);
+    // Default `values/` first — populates the base map. Then night
+    // overlay (if enabled) writes on top, so its keys win and
+    // anything it doesn't define falls through.
+    tryParse("values", "strings", parseStringsToml, strings);
+    tryParse("values", "colors",  parseColorsToml,  colors);
+    if (this._nightMode) {
+      tryParse("values-night", "strings", parseStringsToml, strings);
+      tryParse("values-night", "colors",  parseColorsToml,  colors);
+    }
     return { strings, colors };
   }
+
+  /**
+   * Stone 11.6.9 #3 — toggle the night-mode qualifier. Re-resolves
+   * resources for every running app and posts `set_resources` so
+   * `@string/` / `@color/` lookups pick up the new overlay on the
+   * next paint, without restarting any worker.
+   *
+   * No-op when `night` already matches the current state — saves a
+   * pile of postMessage/parse work on duplicate matchMedia
+   * notifications (browsers do fire spurious change events when the
+   * underlying setting hasn't actually moved).
+   *
+   * @param {boolean} night
+   * @returns {boolean} true if the value changed, false if no-op.
+   */
+  setNightMode(night) {
+    const next = !!night;
+    if (this._nightMode === next) return false;
+    this._nightMode = next;
+    for (const [packageId, proc] of this._processes) {
+      const resources = this._loadResources(packageId);
+      proc.worker.postMessage({ type: "set_resources", resources });
+    }
+    this._dbg("lifecycle", `night-mode → ${next ? "on" : "off"}`);
+    return true;
+  }
+
+  /** Read-only accessor — the kernel-worker queries this when
+   *  building the host_op response for any future `night-mode` query
+   *  primitive, and tests use it to assert state after a toggle. */
+  get nightMode() { return this._nightMode; }
 
   /**
    * Inbound message handler for a peer Worker. Routes by `type`:

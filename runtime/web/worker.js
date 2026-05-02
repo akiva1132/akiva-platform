@@ -101,6 +101,20 @@ self.addEventListener("message", (e) => {
         catch (err) { log("warn", `checkpoint failed: ${err?.message ?? err}`); }
       }
       break;
+    case "config-change":
+      // Stone 11.6.9 #3 — tab observed an OS-level
+      // `prefers-color-scheme` change (or boot-time current value).
+      // Two consequences:
+      //   1. AppRegistry re-resolves resources for every running app
+      //      and posts `set_resources`, so subsequent @string/@color
+      //      lookups read the new overlay.
+      //   2. Kernel-side ResourceManager flag flips so any framework
+      //      code that consults it (Shell title bars, future inflate
+      //      previews) tracks the same state.
+      // Pre-boot the kernel-side call is skipped — the framework will
+      // observe the live MQ during `akiva_boot` itself if needed.
+      handleConfigChange(msg);
+      break;
     default:
       log("warn", `unknown message type: ${msg?.type}`);
   }
@@ -228,13 +242,18 @@ async function installOneDevApp(name, log) {
   // them, copy into OPFS alongside the manifest so the framework's
   // ResourceManager picks them up at boot. Either file may be absent;
   // the 404 path is a quiet no-op.
-  for (const leaf of ["strings", "colors"]) {
-    const resp = await fetch(`./dev-apps/${name}/res/values/${leaf}.toml`);
-    if (resp.ok) {
-      const text = await resp.text();
-      storage.set(`packages/${packageId}/res/values/${leaf}.toml`, enc.encode(text));
-    } else if (resp.status !== 404) {
-      log("warn", `dev-apps/${name}/res/values/${leaf}.toml: ${resp.status}`);
+  //
+  // Stone 11.6.9 #3 — `values-night/` is the dark-mode overlay; same
+  // copy-or-quiet-404 contract as `values/`.
+  for (const qualifier of ["values", "values-night"]) {
+    for (const leaf of ["strings", "colors"]) {
+      const resp = await fetch(`./dev-apps/${name}/res/${qualifier}/${leaf}.toml`);
+      if (resp.ok) {
+        const text = await resp.text();
+        storage.set(`packages/${packageId}/res/${qualifier}/${leaf}.toml`, enc.encode(text));
+      } else if (resp.status !== 404) {
+        log("warn", `dev-apps/${name}/res/${qualifier}/${leaf}.toml: ${resp.status}`);
+      }
     }
   }
 
@@ -249,6 +268,20 @@ async function installOneDevApp(name, log) {
     storage.set("sys/packages/index", enc.encode(ids.join("\n")));
   }
   log("info", `dev install: ${packageId} (${wasmBytes.byteLength} bytes${fresh ? ", new" : ", refreshed"})`);
+}
+
+function handleConfigChange(msg) {
+  // Stone 11.6.9 #3 — receive the OS dark-mode signal from a tab.
+  // Idempotent: AppRegistry.setNightMode and the kernel export both
+  // short-circuit if the value is unchanged, so duplicate notifications
+  // (browsers fire spurious matchMedia change events on some platforms)
+  // don't cause repeated reloads.
+  const night = !!msg.night;
+  apps.setNightMode(night);
+  if (booted && instance) {
+    try { instance.exports.akiva_config_change(night ? 1 : 0); }
+    catch (err) { log("warn", `akiva_config_change failed: ${err?.message ?? err}`); }
+  }
 }
 
 function attachDisplay(msg) {

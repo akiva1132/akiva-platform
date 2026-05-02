@@ -1,12 +1,20 @@
 //! Resource tables — per-package lookup of `@string/name` and
 //! `@color/name` references from `res/values/*.toml`.
 //!
-//! MVP scope (April 2026):
-//!   - Strings and colors only. Dimens and drawables deferred.
-//!   - Single default set per package (no qualifier matching — no
-//!     `values-he/`, `values-night/`, `values-land/`). The structure
-//!     here lets us add qualifiers later as a second indexing key
-//!     without changing the public API.
+//! Stone 11.6.9 #3 brought in the first qualifier dimension —
+//! `values-night/` for dark mode. The structure mirrors Android's
+//! qualifier resolution: a `default` set is always present (the
+//! `values/` directory) and zero or more **overlays** (e.g.
+//! `values-night/`) layer on top when a matching device-config flag
+//! is set. Lookups consult the active overlay first and fall back to
+//! `default` on miss — so an app that defines `colors.toml` once
+//! gets the same value in both modes, while `values-night/colors.toml`
+//! lets it customise per qualifier without duplicating the whole map.
+//!
+//! Currently-supported qualifier dimensions: `night` (dark/light).
+//! `values-he/` (locale) and `values-land/` (orientation) are next;
+//! both will plug into the same overlay slot scheme without
+//! breaking the public API.
 //!
 //! The framework parses and owns a Rust-side copy so future
 //! framework code (e.g. Shell showing `@string/app_name`) can query
@@ -17,19 +25,20 @@
 
 use std::collections::HashMap;
 
-/// A single package's values resources. Name is deliberately boring —
-/// future qualifier support will add a second `HashMap<Qualifiers, ...>`
-/// layer around this, not replace it.
+/// Per-qualifier-set values bag. One of these per `values*/` directory
+/// in a package — `default` for `values/`, and one for each overlay
+/// such as `values-night/`. Maps are flat; missing entries fall
+/// through to `default`.
 #[derive(Debug, Default, Clone)]
-pub struct ResourceTable {
+pub struct ValueSet {
     strings: HashMap<String, String>,
     colors: HashMap<String, u32>,
 }
 
-impl ResourceTable {
-    /// Parse a `values/strings.toml` + `values/colors.toml` pair into a
-    /// ready-to-serve table. Either file may be absent (pass `None`) —
-    /// an app that declares no strings or colors is legal.
+impl ValueSet {
+    /// Parse a `strings.toml` + `colors.toml` pair into a ready-to-serve
+    /// set. Either input may be absent — an app that declares no
+    /// strings / colors in this qualifier directory is legal.
     pub fn parse(
         strings_toml: Option<&str>,
         colors_toml: Option<&str>,
@@ -53,8 +62,6 @@ impl ResourceTable {
         self.colors.get(name).copied()
     }
 
-    /// Iterate `(name, value)` pairs. Used by the runtime-bridge layer
-    /// that mirrors the table into worker.js at app instantiation.
     pub fn iter_strings(&self) -> impl Iterator<Item = (&str, &str)> {
         self.strings.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
@@ -64,14 +71,108 @@ impl ResourceTable {
     }
 }
 
+/// A single package's resources, indexed by qualifier overlay. Lookups
+/// take a [`DeviceConfig`] and walk the active overlays from
+/// most-specific to default — first hit wins.
+#[derive(Debug, Default, Clone)]
+pub struct ResourceTable {
+    /// `values/` — required (may be empty). Backstop for any name not
+    /// found in an active overlay.
+    default: ValueSet,
+    /// `values-night/` — consulted when `DeviceConfig::night` is true.
+    /// `None` means the package didn't ship a night overlay; lookups
+    /// fall straight through to `default`.
+    night: Option<ValueSet>,
+}
+
+impl ResourceTable {
+    /// Construct from a default `values/` set only — the no-overlay
+    /// case. Keeps existing call sites compiling.
+    pub fn parse(
+        strings_toml: Option<&str>,
+        colors_toml: Option<&str>,
+    ) -> Result<Self, ResourceError> {
+        Ok(Self {
+            default: ValueSet::parse(strings_toml, colors_toml)?,
+            night: None,
+        })
+    }
+
+    /// Construct from a default set + an optional night overlay.
+    /// Either overlay TOML pair may be absent; if both `night_*` are
+    /// `None` this is equivalent to [`Self::parse`].
+    pub fn parse_with_night(
+        default_strings: Option<&str>,
+        default_colors: Option<&str>,
+        night_strings: Option<&str>,
+        night_colors: Option<&str>,
+    ) -> Result<Self, ResourceError> {
+        let default = ValueSet::parse(default_strings, default_colors)?;
+        let night = if night_strings.is_some() || night_colors.is_some() {
+            Some(ValueSet::parse(night_strings, night_colors)?)
+        } else {
+            None
+        };
+        Ok(Self { default, night })
+    }
+
+    /// Set the night overlay after construction. Used by hot-reload
+    /// paths that pick up `values-night/*.toml` independently of the
+    /// default `values/`.
+    pub fn set_night_overlay(&mut self, night: Option<ValueSet>) {
+        self.night = night;
+    }
+
+    pub fn default_set(&self) -> &ValueSet { &self.default }
+    pub fn night_set(&self) -> Option<&ValueSet> { self.night.as_ref() }
+
+    /// Resolve `name` to a string under `cfg`. Walks `night` first
+    /// when `cfg.night` is set, then falls back to `default`.
+    pub fn string(&self, name: &str, cfg: &DeviceConfig) -> Option<&str> {
+        if cfg.night {
+            if let Some(s) = self.night.as_ref().and_then(|n| n.string(name)) {
+                return Some(s);
+            }
+        }
+        self.default.string(name)
+    }
+
+    /// Resolve `name` to a color under `cfg`. See [`Self::string`].
+    pub fn color(&self, name: &str, cfg: &DeviceConfig) -> Option<u32> {
+        if cfg.night {
+            if let Some(c) = self.night.as_ref().and_then(|n| n.color(name)) {
+                return Some(c);
+            }
+        }
+        self.default.color(name)
+    }
+}
+
+/// Active device configuration consulted by qualifier-aware resource
+/// lookups. Add a field per dimension as new qualifiers come online —
+/// keep [`ResourceTable`]'s overlay slots in lockstep.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceConfig {
+    /// True when the OS is in dark mode (`prefers-color-scheme: dark`
+    /// in the browser; equivalent on native targets later). Selects
+    /// the `values-night/` overlay.
+    pub night: bool,
+}
+
 /// Registry of tables keyed by installed package id. Rust-side counterpart
 /// of the JS-side `AppRegistry._resources`. Populated at boot by
 /// `PackageManager::load_installed`; queried by the Shell and by any
 /// framework code that wants a user-facing string without reaching into
 /// the host-imports layer.
+///
+/// Owns the active [`DeviceConfig`] so per-package lookups don't
+/// have to thread it through every call site. Mutate via
+/// [`Self::set_night_mode`] (or the future `set_device_config` once
+/// more dimensions land) and the next lookup picks the new overlay.
 #[derive(Debug, Default)]
 pub struct ResourceManager {
     tables: HashMap<String, ResourceTable>,
+    config: DeviceConfig,
 }
 
 impl ResourceManager {
@@ -89,14 +190,30 @@ impl ResourceManager {
         self.tables.get(package_id)
     }
 
-    /// Convenience: resolve `@string/name` for a given package.
-    pub fn string(&self, package_id: &str, name: &str) -> Option<&str> {
-        self.tables.get(package_id).and_then(|t| t.string(name))
+    /// Active device configuration. Cheap (`Copy`); callers that need
+    /// to thread it into a sub-system (e.g. JS bridge for inflate
+    /// previews) can grab it without holding a borrow.
+    pub fn device_config(&self) -> DeviceConfig { self.config }
+
+    /// Toggle the night-mode bit. Returns `true` if the value changed
+    /// — callers can use the return as a "needs repaint" signal so a
+    /// noop call doesn't cascade into an unnecessary frame.
+    pub fn set_night_mode(&mut self, night: bool) -> bool {
+        if self.config.night == night { return false; }
+        self.config.night = night;
+        true
     }
 
-    /// Convenience: resolve `@color/name` for a given package.
+    /// Convenience: resolve `@string/name` for a given package under
+    /// the manager's active device config.
+    pub fn string(&self, package_id: &str, name: &str) -> Option<&str> {
+        self.tables.get(package_id).and_then(|t| t.string(name, &self.config))
+    }
+
+    /// Convenience: resolve `@color/name` for a given package under
+    /// the manager's active device config.
     pub fn color(&self, package_id: &str, name: &str) -> Option<u32> {
-        self.tables.get(package_id).and_then(|t| t.color(name))
+        self.tables.get(package_id).and_then(|t| t.color(name, &self.config))
     }
 }
 
@@ -259,8 +376,48 @@ mod tests {
     #[test]
     fn resource_table_absent_files_mean_empty_maps() {
         let t = ResourceTable::parse(None, None).unwrap();
-        assert!(t.string("anything").is_none());
-        assert!(t.color("anything").is_none());
+        let cfg = DeviceConfig::default();
+        assert!(t.string("anything", &cfg).is_none());
+        assert!(t.color("anything", &cfg).is_none());
+    }
+
+    #[test]
+    fn resource_table_night_overlay_wins_when_night_on() {
+        // Night defines its own `bg`, but only default defines `fg`.
+        // night-on: bg comes from night, fg falls through to default.
+        // night-off: both come from default.
+        let t = ResourceTable::parse_with_night(
+            Some(r#"label = "Light""#),
+            Some(r##"bg = "#ffffffff"
+fg = "#ff000000""##),
+            Some(r#"label = "Dark""#),
+            Some(r##"bg = "#ff111111""##),
+        ).unwrap();
+
+        let day = DeviceConfig { night: false };
+        let nite = DeviceConfig { night: true };
+
+        assert_eq!(t.string("label", &day),  Some("Light"));
+        assert_eq!(t.string("label", &nite), Some("Dark"));
+        assert_eq!(t.color("bg", &day),  Some(0xffffffff));
+        assert_eq!(t.color("bg", &nite), Some(0xff111111));
+        // fg is only in default — night-on must fall through.
+        assert_eq!(t.color("fg", &day),  Some(0xff000000));
+        assert_eq!(t.color("fg", &nite), Some(0xff000000));
+    }
+
+    #[test]
+    fn resource_table_no_night_overlay_falls_through() {
+        // App without `values-night/` — night=true behaves identically
+        // to night=false because there's no overlay to consult.
+        let t = ResourceTable::parse(
+            Some(r#"label = "Hello""#),
+            Some(r##"bg = "#ff222222""##),
+        ).unwrap();
+        let nite = DeviceConfig { night: true };
+        assert_eq!(t.string("label", &nite), Some("Hello"));
+        assert_eq!(t.color("bg", &nite), Some(0xff222222));
+        assert!(t.night_set().is_none());
     }
 
     #[test]
@@ -293,5 +450,23 @@ mod tests {
         assert!(mgr.table("com.app.a").is_some());
         mgr.remove("com.app.a");
         assert!(mgr.table("com.app.a").is_none());
+    }
+
+    #[test]
+    fn resource_manager_set_night_mode_swaps_overlay() {
+        // Stone 11.6.9 #3 — flipping the night flag changes which
+        // overlay subsequent lookups consult, without re-parsing or
+        // re-registering the table.
+        let mut mgr = ResourceManager::new();
+        mgr.register("com.app.a", ResourceTable::parse_with_night(
+            None, Some(r##"bg = "#ffffffff""##),
+            None, Some(r##"bg = "#ff111111""##),
+        ).unwrap());
+        assert_eq!(mgr.color("com.app.a", "bg"), Some(0xffffffff));
+        assert!(mgr.set_night_mode(true), "first toggle should report change");
+        assert_eq!(mgr.color("com.app.a", "bg"), Some(0xff111111));
+        assert!(!mgr.set_night_mode(true), "noop set should report no change");
+        assert!(mgr.set_night_mode(false));
+        assert_eq!(mgr.color("com.app.a", "bg"), Some(0xffffffff));
     }
 }

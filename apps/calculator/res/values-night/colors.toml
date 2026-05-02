@@ -1,0 +1,17 @@
+# Calculator palette — dark theme (values-night/ overlay).
+#
+# Stone 11.6.9 #3. Activated when `DeviceConfig::night` is true (i.e.
+# the OS is in dark mode and the browser reports
+# `prefers-color-scheme: dark`). Every key here overrides the matching
+# entry in res/values/colors.toml; keys not listed here fall through.
+#
+# Designed alongside the light theme: same hue cluster, deeper and
+# higher-contrast for low-light viewing. Pre-Stone-11.6.9 this *was*
+# the calculator's default palette — the qualifier system moved it
+# under the dark-mode overlay so light-mode users see a bright theme.
+
+bg_window         = "#ff15172a"
+display_panel_bg  = "#ff2d3460"
+display_fg        = "#fff8faff"
+display_fg_error  = "#ffff7b7b"
+hint_fg           = "#ff7a8398"

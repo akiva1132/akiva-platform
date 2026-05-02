@@ -130,6 +130,12 @@ fn key_manifest(id: &str) -> String { format!("packages/{id}/manifest.toml") }
 fn key_wasm(id: &str) -> String { format!("packages/{id}/app.wasm") }
 fn key_values_strings(id: &str) -> String { format!("packages/{id}/res/values/strings.toml") }
 fn key_values_colors(id: &str) -> String { format!("packages/{id}/res/values/colors.toml") }
+fn key_values_night_strings(id: &str) -> String {
+    format!("packages/{id}/res/values-night/strings.toml")
+}
+fn key_values_night_colors(id: &str) -> String {
+    format!("packages/{id}/res/values-night/colors.toml")
+}
 
 /// Storage key for the LF-separated list of permissions granted to a
 /// package. Written on install, deleted on uninstall, read at boot so
@@ -230,7 +236,23 @@ impl PackageManager {
                 Ok(v) => v,
                 Err(e) => { on_error(id, e); None }
             };
-            let table = match ResourceTable::parse(strings.as_deref(), colors.as_deref()) {
+            // Stone 11.6.9 #3 — load `values-night/` overlay alongside
+            // the default. Missing files are fine; a parse error here
+            // surfaces through `on_error` but the default still
+            // succeeds, so the package boots in light mode without a
+            // working dark mode rather than failing to boot entirely.
+            let night_strings = match read_optional_text(storage, &key_values_night_strings(id)) {
+                Ok(v) => v,
+                Err(e) => { on_error(id, e); None }
+            };
+            let night_colors = match read_optional_text(storage, &key_values_night_colors(id)) {
+                Ok(v) => v,
+                Err(e) => { on_error(id, e); None }
+            };
+            let table = match ResourceTable::parse_with_night(
+                strings.as_deref(), colors.as_deref(),
+                night_strings.as_deref(), night_colors.as_deref(),
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     on_error(id, ResourceLoadError::Parse(e));
@@ -369,6 +391,8 @@ impl PackageManager {
         let _ = storage.delete(&key_manifest(id));
         let _ = storage.delete(&key_values_strings(id));
         let _ = storage.delete(&key_values_colors(id));
+        let _ = storage.delete(&key_values_night_strings(id));
+        let _ = storage.delete(&key_values_night_colors(id));
         let _ = storage.delete(&key_permissions(id));
         // Drop in-memory grants for this package (Stone 10.5 — keeps
         // `fw.permissions` from holding stale grants against a dead
@@ -849,13 +873,14 @@ entry = true
         assert_eq!(tables.len(), 2);
 
         let by_id: std::collections::HashMap<_, _> = tables.into_iter().collect();
+        let cfg = crate::resources::DeviceConfig::default();
         let hello = &by_id["com.akiva.hello"];
-        assert_eq!(hello.string("greeting"), Some("hi"));
-        assert_eq!(hello.color("bg"), Some(0xff101418));
+        assert_eq!(hello.string("greeting", &cfg), Some("hi"));
+        assert_eq!(hello.color("bg", &cfg), Some(0xff101418));
 
         let world = &by_id["com.akiva.world"];
-        assert!(world.string("greeting").is_none());
-        assert!(world.color("bg").is_none());
+        assert!(world.string("greeting", &cfg).is_none());
+        assert!(world.color("bg", &cfg).is_none());
     }
 
     #[test]
@@ -879,7 +904,8 @@ entry = true
         // Still registered — just with empty contents, so @color/bg lookups
         // cleanly return "not found" rather than randomly crashing later.
         assert_eq!(tables.len(), 1);
-        assert!(tables[0].1.color("bg").is_none());
+        let cfg = crate::resources::DeviceConfig::default();
+        assert!(tables[0].1.color("bg", &cfg).is_none());
     }
 
     #[test]
@@ -893,11 +919,50 @@ entry = true
             "packages/com.akiva.hello/res/values/strings.toml",
             br#"x = "y""#,
         ).unwrap();
+        // Stone 11.6.9 #3 — values-night/ overlay must also disappear
+        // on uninstall so a future reinstall of a different package at
+        // the same id can't inherit stale dark-mode colours.
+        store.write(
+            "packages/com.akiva.hello/res/values-night/colors.toml",
+            br##"bg = "#ff111111""##,
+        ).unwrap();
         pm.uninstall(&mut store, &mut pc, "com.akiva.hello");
         assert!(matches!(
             store.read("packages/com.akiva.hello/res/values/strings.toml"),
             Err(StorageError::NotFound),
         ));
+        assert!(matches!(
+            store.read("packages/com.akiva.hello/res/values-night/colors.toml"),
+            Err(StorageError::NotFound),
+        ));
+    }
+
+    #[test]
+    fn resource_tables_load_values_night_overlay() {
+        // Stone 11.6.9 #3 — `values-night/` overrides `values/` when
+        // the device is in night mode. Lookups under DeviceConfig
+        // { night: true } see the overlay; under default they don't.
+        let mut store = MemoryStorage::new();
+        let mut pm = PackageManager::new();
+        let mut pc = PermissionController::new();
+        crate::permissions::declare_mvp_permissions(&mut pc);
+        pm.install(&mut store, &mut pc, HELLO, b"x").unwrap();
+
+        store.write(
+            "packages/com.akiva.hello/res/values/colors.toml",
+            br##"bg = "#ffffffff""##,
+        ).unwrap();
+        store.write(
+            "packages/com.akiva.hello/res/values-night/colors.toml",
+            br##"bg = "#ff111111""##,
+        ).unwrap();
+
+        let tables = pm.read_resource_tables(&store, |_, _| {});
+        let table = &tables[0].1;
+        let day = crate::resources::DeviceConfig { night: false };
+        let nite = crate::resources::DeviceConfig { night: true };
+        assert_eq!(table.color("bg", &day),  Some(0xffffffff));
+        assert_eq!(table.color("bg", &nite), Some(0xff111111));
     }
 
     // ── Stone 10.2: install-time grants + persistence ───────────────────

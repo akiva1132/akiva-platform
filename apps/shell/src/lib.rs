@@ -23,15 +23,16 @@
 
 use akiva_sdk::pkgs::{self, PackageEntry};
 use akiva_sdk::prelude::*;
+use akiva_sdk::res;
 
-const BG: u32             = 0xff101418;
-const FG: u32             = 0xffe0e0e0;
-const FG_DIM: u32         = 0xff8a94a8;
-const BUTTON_BG: u32      = 0xff1f2a3a;
-const BUTTON_BG_HOVER: u32= 0xff2a3a50;
-const BUTTON_BG_PRESS: u32= 0xff3a5070;
-const BUTTON_FG: u32      = 0xfff0f4fa;
-const BUTTON_SUB: u32     = 0xff9aa8bc;
+// Stone 11.6.9 #3 — Shell switched from hardcoded `const u32` palette
+// to qualifier-aware `@color/` lookups so dark mode auto-switching
+// works. The keys live in `res/values/colors.toml` (light defaults)
+// and are overridden under `res/values-night/colors.toml` when the
+// device is in dark mode. Lookup is a HashMap hit on the host side
+// — cheap to call per-frame, which is exactly what we do so a
+// run-time night-mode flip is visible on the very next paint without
+// caching invalidation in the activity.
 
 const HEADER_PAD_X: f32    = 24.0;
 const HEADER_TITLE_Y: f32  = 48.0;
@@ -165,17 +166,29 @@ impl Activity for ShellActivity {
 
     async fn on_render(&mut self, ctx: &mut Context<'_>, c: &mut Canvas<'_>) {
         let surface_w = ctx.metrics.width_px as f32;
-        c.clear(BG);
+
+        // Resolve once per frame — keeps the inner loops branch-free
+        // and dodges a `res::color` per row × per glyph.
+        let bg              = res::color("bg");
+        let fg              = res::color("fg");
+        let fg_dim          = res::color("fg_dim");
+        let button_bg       = res::color("button_bg");
+        let button_bg_hover = res::color("button_bg_hover");
+        let button_bg_press = res::color("button_bg_press");
+        let button_fg       = res::color("button_fg");
+        let button_sub      = res::color("button_sub");
+
+        c.clear(bg);
 
         // Header.
-        c.draw_text(HEADER_PAD_X, HEADER_TITLE_Y, 24.0, FG, "Akiva");
+        c.draw_text(HEADER_PAD_X, HEADER_TITLE_Y, 24.0, fg, "Akiva");
         let sub = if self.apps.is_empty() {
             "no apps installed".to_string()
         } else {
             format!("{} app{}", self.apps.len(),
                 if self.apps.len() == 1 { "" } else { "s" })
         };
-        c.draw_text(HEADER_PAD_X, HEADER_SUB_Y, 13.0, FG_DIM, &sub);
+        c.draw_text(HEADER_PAD_X, HEADER_SUB_Y, 13.0, fg_dim, &sub);
 
         // Launcher list.
         let width = Self::row_width(surface_w);
@@ -184,28 +197,28 @@ impl Activity for ShellActivity {
             .and_then(|p| self.hit_row(p.x, p.y, surface_w));
         for (i, app) in self.apps.iter().enumerate() {
             let top = Self::row_top(i);
-            let bg = if self.pressed_row == Some(i) {
-                BUTTON_BG_PRESS
+            let row_bg = if self.pressed_row == Some(i) {
+                button_bg_press
             } else if hovered == Some(i) {
-                BUTTON_BG_HOVER
+                button_bg_hover
             } else {
-                BUTTON_BG
+                button_bg
             };
-            c.fill_rect(ROW_PAD_X, top, width, ROW_HEIGHT, bg);
+            c.fill_rect(ROW_PAD_X, top, width, ROW_HEIGHT, row_bg);
             // Text baseline sits at the y arg, so we offset from `top`
             // into the row, not to its edge.
             c.draw_text(
                 ROW_PAD_X + ROW_INSET_LEFT,
                 top + 24.0,
                 16.0,
-                BUTTON_FG,
+                button_fg,
                 &app.name,
             );
             c.draw_text(
                 ROW_PAD_X + ROW_INSET_LEFT,
                 top + 44.0,
                 12.0,
-                BUTTON_SUB,
+                button_sub,
                 &app.id,
             );
         }
@@ -217,7 +230,7 @@ impl Activity for ShellActivity {
                 HEADER_PAD_X,
                 LIST_TOP + 24.0,
                 13.0,
-                FG_DIM,
+                fg_dim,
                 "No apps installed. Drop one into runtime/web/dev-apps/ and reboot.",
             );
         }
@@ -229,7 +242,7 @@ impl Activity for ShellActivity {
             HEADER_PAD_X,
             ctx.metrics.height_px as f32 - 16.0,
             11.0,
-            FG_DIM,
+            fg_dim,
             "Press Escape to return here from an app.",
         );
     }

@@ -1,19 +1,23 @@
-# Calculator palette.
+# Calculator palette — light theme (default).
 #
 # Consumed by res/layout/main.akml via `@color/name` refs and by
 # src/lib.rs via `akiva_sdk::res::color("name")`. The framework parses
 # this file at boot; the worker.js runtime parses the same bytes for
 # the host-import side. Both stay in lock-step because they derive
 # from one OPFS file.
+#
+# Stone 11.6.9 #3 — same key set lives in res/values-night/colors.toml
+# with dark-theme overrides; the framework selects between them based
+# on the device-config night flag.
 
 # Window background — everything renders against this.
-bg_window         = "#ff15172a"
+bg_window         = "#fff5f5fa"
 
 # Display panel: the framed area up top that shows the current number.
-display_panel_bg  = "#ff2d3460"
-display_fg        = "#fff8faff"
-display_fg_error  = "#ffff7b7b"
+display_panel_bg  = "#ffe8edf3"
+display_fg        = "#ff15172a"
+display_fg_error  = "#ffd64545"
 
 # Small glyph next to the number that shows the pending operator
 # (+ / − / × / ÷), dimmer so it doesn't fight the number for attention.
-hint_fg           = "#ff7a8398"
+hint_fg           = "#ff6c7686"
