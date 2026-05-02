@@ -421,6 +421,23 @@ export class AppRegistry {
     return len;
   }
 
+  /**
+   * Phase 12.1 — last-known `WebAssembly.Memory.buffer.byteLength`
+   * for `packageId`. Returns `0` when the package has no spawned
+   * process or the process has not yet replied to a pong (init not
+   * yet done, or first pong still in flight). Read by the kernel-
+   * side `hal_app_memory_current` import once per frame.
+   *
+   * Cheap — O(1) Map lookup plus a property access. Memory readings
+   * advance lazily through the heartbeat (every 500ms by default),
+   * which is plenty for an accounting view that only changes on
+   * `WebAssembly.Memory.grow`.
+   */
+  memoryCurrent(packageId) {
+    const proc = this._processes.get(packageId);
+    return proc?.memoryBytes ?? 0;
+  }
+
   // ── Internals ───────────────────────────────────────────────────────────
 
   /**
@@ -482,7 +499,7 @@ export class AppRegistry {
       [wasmCopy.buffer],
     );
 
-    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingTimer: null };
+    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingTimer: null, memoryBytes: 0 };
     this._processes.set(packageId, proc);
     // Heartbeat doesn't start until `init_ok` lands — kicking the
     // watchdog while the worker is mid-wasm-compile would mean every
@@ -628,8 +645,19 @@ export class AppRegistry {
       case "pong": {
         // Stone 11.5c — heartbeat reply. Update the watchdog clock so
         // the next interval check sees the worker as alive.
+        //
+        // Phase 12.1 — pong also carries the worker's current
+        // `WebAssembly.Memory.buffer.byteLength`. Stash it on the
+        // process record so `memoryCurrent()` (called from the
+        // kernel-side HAL) can return a fresh value without
+        // round-tripping into the worker each frame.
         const proc = this._processes.get(packageId);
-        if (proc) proc.lastPongAt = performance.now();
+        if (proc) {
+          proc.lastPongAt = performance.now();
+          if (typeof msg.memory_bytes === "number" && msg.memory_bytes >= 0) {
+            proc.memoryBytes = msg.memory_bytes;
+          }
+        }
         break;
       }
       case "log":

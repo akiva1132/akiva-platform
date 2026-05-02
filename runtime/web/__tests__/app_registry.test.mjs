@@ -777,6 +777,45 @@ describe("watchdog — ping/pong with init_ok gating", () => {
     }));
 });
 
+// ── Phase 12.1: per-package memory accounting ─────────────────────────
+
+describe("memoryCurrent — kernel reads last pong-reported byteLength", () => {
+  it("returns 0 for unknown packages", () => {
+    const { registry } = makeRegistry();
+    expect(registry.memoryCurrent("never.installed")).toBe(0);
+  });
+
+  it("returns 0 before the first pong arrives", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+    // No pong yet — proc exists but `memoryBytes` defaults to 0.
+    expect(registry.memoryCurrent(PACKAGE_ID)).toBe(0);
+  });
+
+  it("returns the latest memory_bytes carried on a pong", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+    worker._inject({ type: "pong", t: 100, memory_bytes: 1_048_576 });
+    expect(registry.memoryCurrent(PACKAGE_ID)).toBe(1_048_576);
+    // Subsequent pong replaces the reading.
+    worker._inject({ type: "pong", t: 200, memory_bytes: 2_097_152 });
+    expect(registry.memoryCurrent(PACKAGE_ID)).toBe(2_097_152);
+  });
+
+  it("ignores pongs with malformed memory_bytes (negative or non-numeric)", () => {
+    const { registry, worker } = makeRegistry();
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({ type: "init_ok" });
+    worker._inject({ type: "pong", t: 100, memory_bytes: 4096 });
+    worker._inject({ type: "pong", t: 200, memory_bytes: "lots" });
+    worker._inject({ type: "pong", t: 300, memory_bytes: -1 });
+    // The 4096 reading sticks — bad readings don't clobber a good one.
+    expect(registry.memoryCurrent(PACKAGE_ID)).toBe(4096);
+  });
+});
+
 // ── Stone 11.5: trap drain ────────────────────────────────────────────
 
 describe("drainTrappedPackages — kernel pulls trap notifications", () => {

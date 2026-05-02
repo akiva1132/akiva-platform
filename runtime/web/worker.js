@@ -341,6 +341,15 @@ function buildImports() {
     // a dead worker.
     hal_drain_trapped_packages: (outPtr, outCap) => apps.drainTrappedPackages(outPtr, outCap),
 
+    // Phase 12.1 — return the most recent
+    // `WebAssembly.Memory.buffer.byteLength` the package's app-worker
+    // reported on its last pong. The kernel walks the installed
+    // package list once per frame and forwards the value to
+    // `Framework::record_app_memory`. Returns 0 for packages with no
+    // spawned process or no pong reply yet.
+    hal_app_memory_current: (pidPtr, pidLen) =>
+      BigInt(apps.memoryCurrent(readUtf8(pidPtr, pidLen))),
+
     // Stone 9.3 — read + clear the pending-finish flag for `handle`.
     // Returns 1 if the app called `akiva_host_finish` since the last
     // drain, 0 otherwise.

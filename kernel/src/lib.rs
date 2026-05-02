@@ -692,6 +692,16 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
         }
     }
 
+    // Phase 12.1 — sample each installed package's
+    // WebAssembly.Memory.buffer.byteLength via the host and forward
+    // to MemoryManager. The host caches the last pong-reported value
+    // per process so this loop is one HAL call per package per frame
+    // (cheap; 5–10 packages typical). Phase 12.3 (LMK) and Phase 12.5
+    // (manifest enforcement) read what we record here.
+    if let Some(fw) = k.framework.as_mut() {
+        sample_app_memory_into(fw);
+    }
+
     // Drain all queued events and dispatch.
     while let Some(ev) = k.events.pop() {
         k.handle_event(ev);
@@ -715,6 +725,26 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
     if let Some(fw) = k.framework.as_mut() {
         let frame = fw.render_frame(timestamp_ms);
         k.display.flush(frame);
+    }
+}
+
+/// Phase 12.1 — host → framework memory sampler. Walks every
+/// installed package, asks the host for its current
+/// `WebAssembly.Memory.buffer.byteLength` (zero for never-spawned or
+/// pre-pong workers), and forwards each reading into
+/// [`Framework::record_app_memory`].
+///
+/// Cheap: one HAL call per package per frame (5–10 packages typical).
+/// The host's reading is updated lazily via the heartbeat pong, so
+/// this loop is essentially a copy from the host's per-process
+/// snapshot into the framework's accumulator.
+fn sample_app_memory_into(fw: &mut akiva_framework::Framework) {
+    let ids: Vec<String> = fw.packages.list().map(|rec| rec.id.clone()).collect();
+    for id in ids {
+        let bytes = unsafe {
+            host::hal_app_memory_current(id.as_ptr(), id.len())
+        };
+        fw.record_app_memory(&id, bytes);
     }
 }
 

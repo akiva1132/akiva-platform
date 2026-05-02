@@ -170,7 +170,17 @@ self.addEventListener("message", (e) => {
       // pong. If wasm is stuck in a `loop {}` the handler doesn't
       // run at all (single-threaded worker) — that's exactly what
       // the kernel's timeout uses to detect a hang.
-      postMessage({ type: "pong", t: msg.t });
+      //
+      // Phase 12.1 — piggyback the app's current
+      // `WebAssembly.Memory.buffer.byteLength` on every pong so the
+      // kernel-side `MemoryManager` gets a fresh sample without an
+      // extra round-trip. Pre-init `wasmMemory` is null; reporting 0
+      // matches "no instance yet, nothing to charge".
+      postMessage({
+        type: "pong",
+        t: msg.t,
+        memory_bytes: wasmMemory ? wasmMemory.buffer.byteLength : 0,
+      });
       break;
     default:
       postLog("warn", `unknown message type: ${msg?.type}`);

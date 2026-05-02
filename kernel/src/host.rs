@@ -147,6 +147,21 @@ extern "C" {
     // pending future slots.
     pub fn hal_drain_trapped_packages(out_ptr: *mut u8, out_cap: u32) -> u32;
 
+    // ── Phase 12.1: per-package memory accounting ─────────────────────────
+    //
+    // `hal_app_memory_current(package_id)` returns the most recent
+    // `WebAssembly.Memory.buffer.byteLength` reported by the named
+    // app's worker on its last pong. The kernel calls this once per
+    // frame for every installed package and forwards the value to
+    // `Framework::record_app_memory`, which keeps a `(current, peak)`
+    // entry per package for Phase 12.3 / 12.5 to consult.
+    //
+    // Returns 0 when the package has no spawned worker yet (e.g. a
+    // freshly installed package between manifest registration and
+    // first activity launch) or the worker hasn't replied to a pong
+    // yet (cold boot before the first heartbeat lands).
+    pub fn hal_app_memory_current(pid_ptr: *const u8, pid_len: usize) -> u64;
+
     // ── App → host signals (Stone 9.3) ────────────────────────────────────
     //
     // The app imports `akiva_host_finish()` to ask the platform to tear it
