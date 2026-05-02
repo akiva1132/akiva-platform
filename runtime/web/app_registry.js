@@ -468,9 +468,53 @@ export class AppRegistry {
       [wasmBytes.buffer],
     );
 
-    const proc = { worker, packageId };
+    const proc = { worker, packageId, lastPongAt: performance.now() };
     this._processes.set(packageId, proc);
+    this._startHeartbeat(proc);
     return proc;
+  }
+
+  /**
+   * Stone 11.5c — JS-level ping/pong watchdog. Sends a `ping` every
+   * 500ms; if no `pong` arrives within 1.5s the worker is treated
+   * as hung (typically a `loop {}` inside an `akiva_app_dispatch`
+   * call — the worker's single thread can't pump message events
+   * while wasm runs). We `worker.terminate()` from the kernel side
+   * (browser kills the OS thread), stage the package in the trap
+   * queue for the next frame's drain, and let `Framework::
+   * mark_package_trapped` do the rest.
+   *
+   * Why JS-level pong, not wasm: a wasm app's job is to process
+   * dispatches, not to acknowledge heartbeats. Routing the pong
+   * through wasm would put the heartbeat's liveness on the same
+   * thread that we're trying to detect as wedged — pointless.
+   */
+  _startHeartbeat(proc) {
+    proc.pingInterval = setInterval(() => {
+      const now = performance.now();
+      if (now - proc.lastPongAt > 1500) {
+        this._log("error",
+          `app ${proc.packageId}: no pong in ${(now - proc.lastPongAt).toFixed(0)}ms — terminating worker`);
+        clearInterval(proc.pingInterval);
+        try { proc.worker.terminate(); } catch (_) { /* best effort */ }
+        this._pendingTraps.add(proc.packageId);
+        // Mark every in-flight dispatch for this package as ERROR
+        // so the kernel's poll_future doesn't wait forever. We
+        // can't tell from _dispatches alone which entries belong
+        // to this worker, so just iterate. Stone 11.5d will
+        // shape the user-facing recovery (tap-to-restart).
+        for (const [fid, entry] of this._dispatches) {
+          if (entry.status === STATUS.PENDING) {
+            entry.status = STATUS.ERROR;
+            entry.bytes = null;
+          }
+          void fid;
+        }
+        this._processes.delete(proc.packageId);
+        return;
+      }
+      proc.worker.postMessage({ type: "ping", t: now });
+    }, 500);
   }
 
   /**
@@ -543,6 +587,13 @@ export class AppRegistry {
       case "host_op":
         this._handleHostOp(packageId, msg);
         break;
+      case "pong": {
+        // Stone 11.5c — heartbeat reply. Update the watchdog clock so
+        // the next interval check sees the worker as alive.
+        const proc = this._processes.get(packageId);
+        if (proc) proc.lastPongAt = performance.now();
+        break;
+      }
       case "log":
         this._log(msg.level ?? "info", msg.text ?? "");
         break;

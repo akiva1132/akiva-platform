@@ -130,6 +130,15 @@ self.addEventListener("message", (e) => {
     case "set_packages":
       packagesBlob = msg.packagesBlob instanceof Uint8Array ? msg.packagesBlob : new Uint8Array(0);
       break;
+    case "ping":
+      // Stone 11.5c — JS-level heartbeat. Replied to in the message
+      // handler itself, BEFORE we ever touch the wasm instance, so a
+      // dispatch that's about to recurse into wasm doesn't delay the
+      // pong. If wasm is stuck in a `loop {}` the handler doesn't
+      // run at all (single-threaded worker) — that's exactly what
+      // the kernel's timeout uses to detect a hang.
+      postMessage({ type: "pong", t: msg.t });
+      break;
     default:
       postLog("warn", `unknown message type: ${msg?.type}`);
   }
