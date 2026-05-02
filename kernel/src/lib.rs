@@ -713,6 +713,16 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
         sample_app_resources_into(fw, timestamp_ms);
     }
 
+    // Phase 12.5 — manifest enforcement. Runs BEFORE the LMK so a
+    // package that's over its own declared `max_memory_mb` budget gets
+    // killed regardless of system pressure. The contract is one-sided:
+    // the manifest declared a limit, and we hold the app to it. The
+    // LMK below is system-wide pressure response; this is per-app
+    // contract enforcement.
+    if let Some(fw) = k.framework.as_mut() {
+        enforce_memory_budgets_into(fw, timestamp_ms);
+    }
+
     // Phase 12.3 — Low-Memory Killer. Runs after the resource sample
     // (so accounting is fresh) and before event dispatch (so a click
     // doesn't land on an activity that's about to be evicted). Ordered
@@ -790,6 +800,30 @@ fn sample_app_resources_into(fw: &mut akiva_framework::Framework, frame_ts: f64)
 /// that the package is gone either way; if the worker was already
 /// dead (race vs the watchdog), framework-side cleanup is still useful
 /// because it recovers memory accounting.
+/// Phase 12.5 — kill any package whose current memory exceeds its
+/// manifest-declared `runtime.max_memory_mb`. Same `hal_evict_package`
+/// + `Framework::evict_package` cleanup as the LMK kill path; logged
+/// with a distinct prefix so post-mortems can tell budget violation
+/// from pressure eviction.
+///
+/// Cheap when no app is over budget — `over_budget_packages` short-
+/// circuits to an empty Vec without reading any storage.
+fn enforce_memory_budgets_into(fw: &mut akiva_framework::Framework, now_ms: f64) {
+    let violators = fw.over_budget_packages();
+    for pkg in violators {
+        let report = fw.memory_usage(&pkg);
+        log::error(&format!(
+            "memory budget exceeded — terminating {} (current={}MB, limit={}MB)",
+            pkg,
+            report.map(|r| r.current_bytes  / (1024 * 1024)).unwrap_or(0),
+            report.map(|r| r.limit_bytes    / (1024 * 1024)).unwrap_or(0),
+        ));
+        let bytes = pkg.as_bytes();
+        let _terminated = unsafe { host::hal_evict_package(bytes.as_ptr(), bytes.len()) };
+        fw.evict_package(&pkg, now_ms);
+    }
+}
+
 fn drive_lmk_into(fw: &mut akiva_framework::Framework, now_ms: f64) {
     use akiva_framework::lmk::{Action, KillReason};
     let victims = fw.drive_lmk(KillReason::SystemPressure);

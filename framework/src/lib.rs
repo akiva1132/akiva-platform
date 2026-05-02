@@ -738,6 +738,31 @@ impl Framework {
         n
     }
 
+    /// Phase 12.5 — walk every tracked package and return the ids of
+    /// those whose `current_bytes` exceeds the manifest-declared
+    /// `runtime.max_memory_mb`. Pure read; the caller is expected to
+    /// follow up with `hal_evict_package` + [`Framework::evict_package`]
+    /// for each id.
+    ///
+    /// Why this is its own method (not inlined into `drive_lmk`):
+    /// budget enforcement is unconditional — an app over its declared
+    /// limit gets killed regardless of system pressure or priority,
+    /// because the developer made a contract with the platform when
+    /// they wrote `max_memory_mb` in the manifest. LMK is best-effort
+    /// system-pressure response; this is contract enforcement.
+    ///
+    /// Packages with no manifest record (test fixtures, mid-uninstall
+    /// window) have `limit_bytes = u64::MAX` so they never trip — only
+    /// real installed packages with declared limits get enforced.
+    pub fn over_budget_packages(&self) -> Vec<String> {
+        self.memory.iter()
+            .filter_map(|(pkg, _, _)| {
+                let report = self.memory_usage(pkg)?;
+                report.over_budget().then(|| pkg.to_string())
+            })
+            .collect()
+    }
+
     /// Phase 12.4 — soft-evict a package: drive each live activity
     /// through `pause → save_state → stop → Suspended`, drop the
     /// `Activity` instances, forget memory + CPU accounting. Distinct
@@ -3277,6 +3302,107 @@ optional = []
         // Second call: nothing left at Resumed/Stopped to transition.
         assert_eq!(fw.suspend_package("dozy", 1.0), 0);
         assert_eq!(fw.activities.state_of(outcome.id), Some(LifecycleState::Suspended));
+    }
+
+    /// Phase 12.5 — `over_budget_packages` returns an empty vec when
+    /// every tracked package is within (or below) its manifest budget.
+    /// Untracked-limit packages (no manifest entry) get `u64::MAX` so
+    /// they never trip — that's the cold-start safety property.
+    #[test]
+    fn over_budget_returns_empty_when_all_within_limits() {
+        let mut fw = empty_framework();
+        // No manifest installed → limit_bytes = u64::MAX. 200MB is fine.
+        fw.record_app_memory("untracked", 200 * 1024 * 1024);
+        assert!(fw.over_budget_packages().is_empty());
+    }
+
+    /// Phase 12.5 — installed package over its declared `max_memory_mb`
+    /// shows up. Side-by-side with a within-budget peer to check the
+    /// filter is per-package.
+    #[test]
+    fn over_budget_flags_only_violators() {
+        let manifest = |id: &str, limit_mb: u32| format!(r#"
+[app]
+id = "{id}"
+name = "Test"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+authors = ["test"]
+description = ""
+category = "utilities"
+
+[runtime]
+wasm = "app.wasm"
+min_memory_mb = 1
+max_memory_mb = {limit_mb}
+
+[[activities]]
+id = "main"
+class = "Main"
+entry = true
+launch_mode = "standard"
+
+[permissions]
+required = []
+optional = []
+"#);
+        let mut fw = empty_framework();
+        let mut store = storage::MemoryStorage::new();
+        let mut pc = permissions::PermissionController::new();
+        permissions::declare_mvp_permissions(&mut pc);
+        fw.packages.install(&mut store, &mut pc, &manifest("ok.app", 32),    b"\0asm\x01\x00\x00\x00").unwrap();
+        fw.packages.install(&mut store, &mut pc, &manifest("hog.app", 16),   b"\0asm\x01\x00\x00\x00").unwrap();
+
+        fw.record_app_memory("ok.app",   8 * 1024 * 1024);
+        fw.record_app_memory("hog.app", 32 * 1024 * 1024);  // 2x its declared 16MB
+
+        let violators = fw.over_budget_packages();
+        assert_eq!(violators, vec!["hog.app".to_string()]);
+    }
+
+    /// Phase 12.5 — once a violator is evict_package-d, its accounting
+    /// is forgotten so `over_budget_packages` no longer returns it
+    /// (the framework should never re-flag it without fresh samples).
+    #[test]
+    fn over_budget_clears_after_evict() {
+        let manifest = r#"
+[app]
+id = "tight.app"
+name = "Tight"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+authors = ["test"]
+description = ""
+category = "utilities"
+
+[runtime]
+wasm = "app.wasm"
+min_memory_mb = 1
+max_memory_mb = 8
+
+[[activities]]
+id = "main"
+class = "Main"
+entry = true
+launch_mode = "standard"
+
+[permissions]
+required = []
+optional = []
+"#;
+        let mut fw = empty_framework();
+        let mut store = storage::MemoryStorage::new();
+        let mut pc = permissions::PermissionController::new();
+        permissions::declare_mvp_permissions(&mut pc);
+        fw.packages.install(&mut store, &mut pc, manifest, b"\0asm\x01\x00\x00\x00").unwrap();
+        fw.record_app_memory("tight.app", 64 * 1024 * 1024);  // 8x over
+
+        assert_eq!(fw.over_budget_packages(), vec!["tight.app".to_string()]);
+        fw.evict_package("tight.app", 0.0);
+        assert!(fw.over_budget_packages().is_empty(),
+            "evict forgets accounting → no longer flagged as violator");
     }
 
     /// Phase 12.4b — re-launching a (pkg, class) that has a Suspended
