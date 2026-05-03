@@ -1575,7 +1575,40 @@ App (wasm) ─► hal_cap_* imports ─► kernel worker ─┬─[worker-native
 
 ---
 
-### Stone 14.2 — WebTransport (~3 ימים)
+### Stone 14.2 — WebTransport ✅ סגור (May 2026)
+
+**מה הדפדפן מאפשר.** WebTransport over HTTP/3 (QUIC). Chrome 97+, Firefox 114+, Safari 18.2+ — broadly available. שתי ערוצים לכל session:
+- **datagrams** — unreliable, unordered, UDP-style. הכי קרוב שמסך אפשר ל-`DatagramSocket()` של אנדרואיד. אידיאלי ל-real-time games / voice signaling / telemetry שלא יכולים לסבול head-of-line blocking.
+- **bidirectional streams** — reliable, ordered (TCP-style on top of QUIC streams). אחד או יותר לכל session.
+
+**מה נבנה (Stone 14.2 — closed)**:
+- 8 wire ops חדשים תחת ABI 0.10.0 (additive — אפליקציות 0.x עדיין נטענות):
+  - IO: `WT_OPEN`, `WT_RECV_DATAGRAM`, `WT_OPEN_BIDI`, `WT_RECV_STREAM`
+  - Fire: `WT_SEND_DATAGRAM`, `WT_SEND_STREAM`, `WT_CLOSE_STREAM`, `WT_CLOSE`
+- SDK API (`sdk-rust/src/net.rs`):
+  - `net::WebTransport::connect(url) -> WtConnectFuture`
+  - `wt.send_datagram(&[u8])` / `wt.recv_datagram().await -> WtDatagram { Bytes(Vec<u8>) | Closed { code, reason } }`
+  - `wt.open_bidi_stream().await -> BidiStream`
+  - `BidiStream::send/recv/close` — `recv` מחזירה `StreamEvent { Bytes(Vec<u8>) | Fin | Error(String) }`
+  - `Drop` על שני ה-types שולח close כדי לא לדלוף host-side handles
+- AppRegistry-side: 2 maps נוספים (`_wtHandles`, `_wtStreams`) + 2 pump loops (datagram readable stream + per-stream readable). queue cap זהה ל-WS (64 events); overflow על datagrams = drop oldest (UDP-style), על streams = החלפת tail ב-Error event ("stream queue overflow"). cleanup ב-`_disposeWsForPackage` (משם השם הכללי).
+- 8 SDK unit tests חדשים (decode datagram bytes/closed/truncated/unknown, decode stream bytes/fin/error, connect-empty-url).
+- Demo: כפתור "WebTransport echo" באפליקציית `Network`. ה-endpoint `https://webtransport.day/echo` מנוסה כברירת מחדל; כשלון מוצג בסטטוס בלי lockup. אפשר להגדיר server אישי דרך `localStorage.setItem('akiva.wt_endpoint', '...')`.
+
+**מגבלה אמיתית — public infra.** בניגוד ל-WebSocket, אין "echo.websocket.events" של WebTransport: השרתים הציבוריים נדירים ולא יציבים. ה-button חוזר ב-error message ברור כשהשרת לא מגיב. ה-SDK עצמו מכוסה ע"י unit tests; צרכן רציני בונה את השרת שלו.
+
+**Exit criteria — Stone 14.2 (sealed):**
+- [x] Manifest `permissions.required = ["akiva.permission.NETWORK"]` ה-grant היחיד הנדרש (משותף עם 14.1)
+- [x] Datagram round-trip עובד נגד server שמדבר HTTP/3 + WebTransport (manual test against user-supplied endpoint)
+- [x] Bidirectional stream round-trip עובד (manual)
+- [x] Stream / session handle בלעדי לאפליקציה (provenance check)
+- [x] Worker termination סוגר WT sessions + streams
+- [x] 296 framework + 224 SDK + 81 wire + 143 vitest tests עוברים
+- [x] ABI bump 0.9.0 → 0.10.0 documented
+
+---
+
+### ~~Stone 14.2 — WebTransport (~3 ימים)~~ — superseded by closed entry above
 
 **מה הדפדפן מאפשר.**
 `WebTransport` over HTTP/3 (QUIC). **Baseline 2023** (Chrome 97+, Firefox 114+, Safari 18.2+). זמין ב-dedicated workers (Chrome 104+). מספק:

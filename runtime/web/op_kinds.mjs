@@ -24,6 +24,10 @@ export const FIRE = Object.freeze({
   SET_RESULT:                0x0005,
   WS_SEND:                   0x0006,  // Stone 14.1
   WS_CLOSE:                  0x0007,  // Stone 14.1
+  WT_SEND_DATAGRAM:          0x0008,  // Stone 14.2
+  WT_SEND_STREAM:            0x0009,  // Stone 14.2
+  WT_CLOSE_STREAM:           0x000A,  // Stone 14.2
+  WT_CLOSE:                  0x000B,  // Stone 14.2
 });
 
 export const IO = Object.freeze({
@@ -37,6 +41,10 @@ export const IO = Object.freeze({
   HTTP_FETCH:        0x0108,  // Stone 14.1
   WS_OPEN:           0x0109,  // Stone 14.1
   WS_RECV:           0x010A,  // Stone 14.1
+  WT_OPEN:           0x010B,  // Stone 14.2
+  WT_RECV_DATAGRAM:  0x010C,  // Stone 14.2
+  WT_OPEN_BIDI:      0x010D,  // Stone 14.2
+  WT_RECV_STREAM:    0x010E,  // Stone 14.2
 });
 
 // Stone 11.4b — host→app dispatch op kinds. Mirror of

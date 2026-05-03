@@ -179,6 +179,41 @@ export class AppRegistry {
     this._wsHandles = new Map();
     /** Monotonic WebSocket handle allocator. Starts at 1; 0 is the "rejected" sentinel. */
     this._nextWsHandle = 1;
+
+    /**
+     * Stone 14.2 — open WebTransport sessions, keyed by handle.
+     * Each entry pins:
+     * - `wt`         the live `WebTransport` instance
+     * - `packageId`  owning package (provenance)
+     * - `dgQueue`    buffered datagrams (Uint8Array per entry)
+     * - `pendingDg`  in-flight `WT_RECV_DATAGRAM` future awaiting
+     *                the next datagram. At most one — the SDK
+     *                serialises by construction.
+     * - `closed`     `true` once a Closed event has been delivered
+     * - `dgPumpAbort` AbortController that stops the datagram
+     *                ReadableStream pump when the entry is reaped.
+     *
+     * @type {Map<number, { wt: WebTransport, packageId: string, dgQueue: Array<Uint8Array>, pendingDg: { futureId: bigint } | null, closed: boolean, dgPumpAbort: AbortController }>}
+     */
+    this._wtHandles = new Map();
+    /**
+     * Stone 14.2 — open bidirectional streams across all sessions.
+     * Stream handles share the same monotonic counter as WS / WT
+     * handles (no namespace collision because they live in different
+     * maps and the SDK presents them through different types).
+     *
+     * - `reader`/`writer`  underlying `ReadableStreamDefaultReader`
+     *                      and `WritableStreamDefaultWriter`
+     * - `parentWt`         handle of the owning `WebTransport`
+     * - `recvQueue`/`pendingRecv`  same queue / one-pending-recv
+     *                      shape as WS
+     * - `closed`           `true` once Fin or Error has been
+     *                      delivered or [`fire::WT_CLOSE_STREAM`]
+     *                      tore down the writer.
+     *
+     * @type {Map<number, { reader: any, writer: any, packageId: string, parentWt: number, recvQueue: Array<Uint8Array>, pendingRecv: { futureId: bigint } | null, closed: boolean }>}
+     */
+    this._wtStreams = new Map();
     /**
      * Stone 13.2 — kernel-side bridge symbols. Looked up lazily on the
      * first dialog open after `setKernelInstance` has wired them in
@@ -1260,15 +1295,28 @@ export class AppRegistry {
     const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(msg.args ?? 0);
     if (args.length < 4) return;
 
-    // Stone 14.1 — net fire ops use a separate handle namespace
-    // (WebSocket handles allocated by AppRegistry, not activity slot
-    // ids). Branch out before the activity-handle ownership check.
+    // Stone 14.1/14.2 — net fire ops use a separate handle namespace
+    // (WebSocket / WebTransport / stream handles allocated by
+    // AppRegistry, not activity slot ids). Branch out before the
+    // activity-handle ownership check.
     switch (msg.op_kind) {
       case FIRE.WS_SEND:
         this._handleWsSend(packageId, args);
         return;
       case FIRE.WS_CLOSE:
         this._handleWsClose(packageId, args);
+        return;
+      case FIRE.WT_SEND_DATAGRAM:
+        this._handleWtSendDatagram(packageId, args);
+        return;
+      case FIRE.WT_SEND_STREAM:
+        this._handleWtSendStream(packageId, args);
+        return;
+      case FIRE.WT_CLOSE_STREAM:
+        this._handleWtCloseStream(packageId, args);
+        return;
+      case FIRE.WT_CLOSE:
+        this._handleWtClose(packageId, args);
         return;
     }
 
@@ -1510,6 +1558,47 @@ export class AppRegistry {
         const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
         this._handleWsRecv(packageId, futureId, args);
         return; // resolves on next ws.onmessage / onclose
+      }
+      // Stone 14.2 — WebTransport ops, gated by NETWORK same as WS.
+      case IO.WT_OPEN: {
+        if (!this._hasGrant(packageId, "akiva.permission.NETWORK")) {
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("net: denied (no NETWORK grant)");
+          break;
+        }
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        this._handleWtOpen(packageId, futureId, args);
+        return;
+      }
+      case IO.WT_RECV_DATAGRAM: {
+        if (!this._hasGrant(packageId, "akiva.permission.NETWORK")) {
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("net: denied (no NETWORK grant)");
+          break;
+        }
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        this._handleWtRecvDatagram(packageId, futureId, args);
+        return;
+      }
+      case IO.WT_OPEN_BIDI: {
+        if (!this._hasGrant(packageId, "akiva.permission.NETWORK")) {
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("net: denied (no NETWORK grant)");
+          break;
+        }
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        this._handleWtOpenBidi(packageId, futureId, args);
+        return;
+      }
+      case IO.WT_RECV_STREAM: {
+        if (!this._hasGrant(packageId, "akiva.permission.NETWORK")) {
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("net: denied (no NETWORK grant)");
+          break;
+        }
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        this._handleWtRecvStream(packageId, futureId, args);
+        return;
       }
       default:
         this._log("warn", `[${packageId}] host_op unknown op_kind=0x${(msg.op_kind ?? 0).toString(16)}`);
@@ -1903,6 +1992,392 @@ export class AppRegistry {
       // (Not strictly necessary if the worker is gone, but avoids
       // pinning the future entry in any zombie state map.)
       this._wsHandles.delete(handle);
+    }
+    // Stone 14.2 — same idea for WebTransport. Sessions and the
+    // streams under them go away with the package.
+    for (const [streamHandle, entry] of this._wtStreams) {
+      if (entry.packageId !== packageId) continue;
+      try { entry.reader.cancel("package terminated"); } catch (_) {}
+      try { entry.writer.close(); } catch (_) {}
+      this._wtStreams.delete(streamHandle);
+    }
+    for (const [handle, entry] of this._wtHandles) {
+      if (entry.packageId !== packageId) continue;
+      try { entry.dgPumpAbort.abort(); } catch (_) {}
+      try { entry.wt.close({ closeCode: 0, reason: "" }); } catch (_) {}
+      this._wtHandles.delete(handle);
+    }
+  }
+
+  // ── Stone 14.2 — WebTransport handlers ────────────────────────────────
+
+  /**
+   * Open a WebTransport session. Returns immediately after kicking
+   * off the handshake; resolves the futureId once `wt.ready` settles.
+   */
+  _handleWtOpen(packageId, futureId, args) {
+    if (typeof globalThis.WebTransport !== "function") {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: WebTransport not supported in this runtime"));
+      return;
+    }
+    if (args.length < 2) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: open args truncated"));
+      return;
+    }
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const urlLen = view.getUint16(0, true);
+    if (2 + urlLen > args.length) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: url length exceeds args"));
+      return;
+    }
+    const url = this._decoder.decode(args.subarray(2, 2 + urlLen));
+
+    let wt;
+    try {
+      wt = new globalThis.WebTransport(url);
+    } catch (err) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode(`wt: construct failed: ${err?.message ?? err}`));
+      return;
+    }
+
+    const wtHandle = this._nextWsHandle++;
+    const dgPumpAbort = new AbortController();
+    const entry = {
+      wt,
+      packageId,
+      dgQueue: [],
+      pendingDg: null,
+      closed: false,
+      dgPumpAbort,
+    };
+    this._wtHandles.set(wtHandle, entry);
+
+    const proc = this._processes.get(packageId);
+    let readySettled = false;
+
+    wt.ready.then(() => {
+      if (readySettled) return;
+      readySettled = true;
+      if (this._processes.get(packageId) !== proc) {
+        // Worker terminated mid-handshake — tear down.
+        try { wt.close({ closeCode: 0, reason: "" }); } catch (_) {}
+        this._wtHandles.delete(wtHandle);
+        return;
+      }
+      // Start the datagram pump.
+      this._pumpWtDatagrams(wtHandle, entry);
+      // Wire transport-level closed → enqueue Closed event.
+      wt.closed.then((info) => this._onWtClosed(wtHandle, info, false))
+              .catch((info) => this._onWtClosed(wtHandle, info, true));
+      const out = new Uint8Array(4);
+      new DataView(out.buffer).setUint32(0, wtHandle, true);
+      this._postHostOpDone(packageId, futureId, STATUS.READY, out);
+    }).catch((err) => {
+      if (readySettled) return;
+      readySettled = true;
+      this._wtHandles.delete(wtHandle);
+      if (this._processes.get(packageId) !== proc) return;
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode(`wt: ready rejected: ${err?.message ?? err}`));
+    });
+  }
+
+  /** Run the datagram ReadableStream pump until aborted or session
+   *  closes. Each chunk becomes one entry in `dgQueue`; if a
+   *  `pendingDg` recv is parked we satisfy it instead of queueing. */
+  async _pumpWtDatagrams(wtHandle, entry) {
+    const reader = entry.wt.datagrams.readable.getReader();
+    try {
+      while (!entry.dgPumpAbort.signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        if (entry.closed) return;
+        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        const payload = new Uint8Array(1 + chunk.length);
+        payload[0] = 0; // datagram bytes
+        payload.set(chunk, 1);
+        if (entry.pendingDg) {
+          const { futureId } = entry.pendingDg;
+          entry.pendingDg = null;
+          this._postHostOpDone(entry.packageId, futureId, STATUS.READY, payload);
+          continue;
+        }
+        if (entry.dgQueue.length >= AppRegistry._WS_RECV_QUEUE_CAP) {
+          // Drop oldest — datagrams are unreliable by design.
+          entry.dgQueue.shift();
+        }
+        entry.dgQueue.push(payload);
+      }
+    } catch (err) {
+      this._log("warn", `[${entry.packageId}] wt#${wtHandle} datagram pump error: ${err?.message ?? err}`);
+    } finally {
+      try { reader.releaseLock(); } catch (_) {}
+    }
+  }
+
+  _onWtClosed(wtHandle, info, _wasError) {
+    const entry = this._wtHandles.get(wtHandle);
+    if (!entry || entry.closed) return;
+    entry.closed = true;
+    const reasonStr = typeof info?.reason === "string" ? info.reason : "";
+    const reasonBytes = this._encoder.encode(reasonStr);
+    const code = (typeof info?.closeCode === "number") ? info.closeCode : 0;
+    const payload = new Uint8Array(1 + 4 + reasonBytes.length);
+    payload[0] = 1; // closed
+    new DataView(payload.buffer).setUint32(1, code, true);
+    payload.set(reasonBytes, 5);
+    if (entry.pendingDg) {
+      const { futureId } = entry.pendingDg;
+      entry.pendingDg = null;
+      this._postHostOpDone(entry.packageId, futureId, STATUS.READY, payload);
+    } else {
+      if (entry.dgQueue.length >= AppRegistry._WS_RECV_QUEUE_CAP) {
+        entry.dgQueue.pop();
+      }
+      entry.dgQueue.push(payload);
+    }
+    // Streams under this session inherit the close — surface Fin
+    // via their queues so any pending recvs unblock.
+    for (const [streamHandle, sEntry] of this._wtStreams) {
+      if (sEntry.parentWt !== wtHandle || sEntry.closed) continue;
+      this._enqueueWtStreamEvent(streamHandle, sEntry, new Uint8Array([1])); // fin
+    }
+  }
+
+  _handleWtRecvDatagram(packageId, futureId, args) {
+    if (args.length < 4) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: recv_datagram args truncated"));
+      return;
+    }
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const wtHandle = view.getUint32(0, true);
+    const entry = this._wtHandles.get(wtHandle);
+    if (!entry || entry.packageId !== packageId) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: unknown handle"));
+      return;
+    }
+    if (entry.dgQueue.length > 0) {
+      const ev = entry.dgQueue.shift();
+      this._postHostOpDone(packageId, futureId, STATUS.READY, ev);
+      return;
+    }
+    if (entry.pendingDg) {
+      this._postHostOpDone(entry.packageId, entry.pendingDg.futureId,
+        STATUS.ERROR,
+        this._encoder.encode("wt: superseded by another recv"));
+    }
+    entry.pendingDg = { futureId };
+  }
+
+  _handleWtOpenBidi(packageId, futureId, args) {
+    if (args.length < 4) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: open_bidi args truncated"));
+      return;
+    }
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const wtHandle = view.getUint32(0, true);
+    const entry = this._wtHandles.get(wtHandle);
+    if (!entry || entry.packageId !== packageId) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: unknown handle"));
+      return;
+    }
+    if (entry.closed) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: session closed"));
+      return;
+    }
+
+    entry.wt.createBidirectionalStream().then((stream) => {
+      const proc = this._processes.get(packageId);
+      if (!proc) {
+        try { stream.readable.cancel("package gone"); } catch (_) {}
+        try { stream.writable.close(); } catch (_) {}
+        return;
+      }
+      const reader = stream.readable.getReader();
+      const writer = stream.writable.getWriter();
+      const streamHandle = this._nextWsHandle++;
+      const sEntry = {
+        reader,
+        writer,
+        packageId,
+        parentWt: wtHandle,
+        recvQueue: [],
+        pendingRecv: null,
+        closed: false,
+      };
+      this._wtStreams.set(streamHandle, sEntry);
+      this._pumpWtStream(streamHandle, sEntry);
+      const out = new Uint8Array(4);
+      new DataView(out.buffer).setUint32(0, streamHandle, true);
+      this._postHostOpDone(packageId, futureId, STATUS.READY, out);
+    }).catch((err) => {
+      if (this._processes.get(packageId)) {
+        this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+          this._encoder.encode(`wt: open_bidi rejected: ${err?.message ?? err}`));
+      }
+    });
+  }
+
+  /** Drain a stream's reader; surface Bytes / Fin / Error events. */
+  async _pumpWtStream(streamHandle, sEntry) {
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { value, done } = await sEntry.reader.read();
+        if (sEntry.closed) return;
+        if (done) {
+          this._enqueueWtStreamEvent(streamHandle, sEntry, new Uint8Array([1])); // fin
+          return;
+        }
+        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        const payload = new Uint8Array(1 + chunk.length);
+        payload[0] = 0; // bytes
+        payload.set(chunk, 1);
+        this._enqueueWtStreamEvent(streamHandle, sEntry, payload);
+      }
+    } catch (err) {
+      const reasonBytes = this._encoder.encode(String(err?.message ?? err));
+      const payload = new Uint8Array(1 + reasonBytes.length);
+      payload[0] = 2; // error
+      payload.set(reasonBytes, 1);
+      this._enqueueWtStreamEvent(streamHandle, sEntry, payload);
+    } finally {
+      try { sEntry.reader.releaseLock(); } catch (_) {}
+    }
+  }
+
+  _enqueueWtStreamEvent(_streamHandle, sEntry, payload) {
+    if (sEntry.pendingRecv) {
+      const { futureId } = sEntry.pendingRecv;
+      sEntry.pendingRecv = null;
+      this._postHostOpDone(sEntry.packageId, futureId, STATUS.READY, payload);
+      return;
+    }
+    if (sEntry.recvQueue.length >= AppRegistry._WS_RECV_QUEUE_CAP) {
+      // Streams are reliable — dropping bytes silently would lie. Replace
+      // the tail with an Error event so the next recv surfaces overflow.
+      const errBytes = this._encoder.encode("wt: stream queue overflow");
+      const errPayload = new Uint8Array(1 + errBytes.length);
+      errPayload[0] = 2;
+      errPayload.set(errBytes, 1);
+      sEntry.recvQueue.length = 0;
+      sEntry.recvQueue.push(errPayload);
+      return;
+    }
+    sEntry.recvQueue.push(payload);
+  }
+
+  _handleWtRecvStream(packageId, futureId, args) {
+    if (args.length < 4) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: recv_stream args truncated"));
+      return;
+    }
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const streamHandle = view.getUint32(0, true);
+    const sEntry = this._wtStreams.get(streamHandle);
+    if (!sEntry || sEntry.packageId !== packageId) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("wt: unknown stream handle"));
+      return;
+    }
+    if (sEntry.recvQueue.length > 0) {
+      const ev = sEntry.recvQueue.shift();
+      this._postHostOpDone(packageId, futureId, STATUS.READY, ev);
+      return;
+    }
+    if (sEntry.pendingRecv) {
+      this._postHostOpDone(sEntry.packageId, sEntry.pendingRecv.futureId,
+        STATUS.ERROR,
+        this._encoder.encode("wt: stream recv superseded"));
+    }
+    sEntry.pendingRecv = { futureId };
+  }
+
+  _handleWtSendDatagram(packageId, args) {
+    if (args.length < 4) return;
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const wtHandle = view.getUint32(0, true);
+    const entry = this._wtHandles.get(wtHandle);
+    if (!entry || entry.packageId !== packageId) {
+      this._log("warn", `[${packageId}] wt_send_datagram: unknown or foreign handle ${wtHandle} — dropped`);
+      return;
+    }
+    if (entry.closed) return;
+    const data = args.subarray(4);
+    const buf = data.length > 0 ? data.slice() : new Uint8Array(0);
+    // Datagrams are best-effort — backpressure is handled by silently
+    // dropping rather than queueing in the writer. Browser
+    // `WritableStream.getWriter().write()` returns a promise that
+    // resolves when the chunk is accepted; we ignore the promise to
+    // keep the SDK's fire-and-forget contract.
+    try {
+      entry.wt.datagrams.writable.getWriter().write(buf).catch((err) => {
+        this._log("warn", `[${packageId}] wt#${wtHandle} datagram write rejected: ${err?.message ?? err}`);
+      });
+    } catch (err) {
+      this._log("warn", `[${packageId}] wt#${wtHandle} datagram write threw: ${err?.message ?? err}`);
+    }
+  }
+
+  _handleWtSendStream(packageId, args) {
+    if (args.length < 4) return;
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const streamHandle = view.getUint32(0, true);
+    const sEntry = this._wtStreams.get(streamHandle);
+    if (!sEntry || sEntry.packageId !== packageId) {
+      this._log("warn", `[${packageId}] wt_send_stream: unknown/foreign stream ${streamHandle} — dropped`);
+      return;
+    }
+    if (sEntry.closed) return;
+    const data = args.subarray(4);
+    const buf = data.length > 0 ? data.slice() : new Uint8Array(0);
+    sEntry.writer.write(buf).catch((err) => {
+      this._log("warn", `[${packageId}] wt stream#${streamHandle} write rejected: ${err?.message ?? err}`);
+    });
+  }
+
+  _handleWtCloseStream(packageId, args) {
+    if (args.length < 8) return;
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const streamHandle = view.getUint32(0, true);
+    const sEntry = this._wtStreams.get(streamHandle);
+    if (!sEntry || sEntry.packageId !== packageId) {
+      this._log("warn", `[${packageId}] wt_close_stream: unknown/foreign stream ${streamHandle} — dropped`);
+      return;
+    }
+    if (sEntry.closed) return;
+    sEntry.closed = true;
+    sEntry.writer.close().catch(() => {});
+  }
+
+  _handleWtClose(packageId, args) {
+    if (args.length < 10) return;
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const wtHandle = view.getUint32(0, true);
+    const entry = this._wtHandles.get(wtHandle);
+    if (!entry || entry.packageId !== packageId) {
+      this._log("warn", `[${packageId}] wt_close: unknown/foreign handle ${wtHandle} — dropped`);
+      return;
+    }
+    const code = view.getUint32(4, true);
+    const reasonLen = view.getUint16(8, true);
+    const reasonBytes = (10 + reasonLen <= args.length)
+      ? args.subarray(10, 10 + reasonLen) : new Uint8Array(0);
+    const reason = reasonBytes.length > 0 ? this._decoder.decode(reasonBytes) : "";
+    try {
+      entry.wt.close({ closeCode: code, reason });
+    } catch (err) {
+      this._log("warn", `[${packageId}] wt_close threw: ${err?.message ?? err}`);
     }
   }
 

@@ -713,6 +713,30 @@ function dispatchFire(opKind, args) {
       postSideEffect(opKind, args);
       return 0;
     }
+    // Stone 14.2 — WebTransport fire ops. Same NETWORK gate; the
+    // handle byte layout differs per op but every variant starts
+    // with [handle:u32].
+    case FIRE.WT_SEND_DATAGRAM:
+    case FIRE.WT_SEND_STREAM:
+    case FIRE.WT_CLOSE_STREAM:
+    case FIRE.WT_CLOSE: {
+      if (!grants.has("akiva.permission.NETWORK")) {
+        postLog("warn", `fire(0x${opKind.toString(16)}): denied — no NETWORK grant`);
+        return 2;
+      }
+      // Minimum lengths:
+      //   WT_SEND_DATAGRAM: [handle:4]                       = 4 (data optional, can be 0 bytes)
+      //   WT_SEND_STREAM:   [handle:4]                       = 4
+      //   WT_CLOSE_STREAM:  [handle:4 | code:4]              = 8
+      //   WT_CLOSE:         [handle:4 | code:4 | rlen:2]     = 10
+      let minLen;
+      if (opKind === FIRE.WT_SEND_DATAGRAM || opKind === FIRE.WT_SEND_STREAM) minLen = 4;
+      else if (opKind === FIRE.WT_CLOSE_STREAM) minLen = 8;
+      else minLen = 10;
+      if (args.length < minLen) return 1;
+      postSideEffect(opKind, args);
+      return 0;
+    }
     default:
       postLog("warn", `fire(0x${opKind.toString(16)}): unknown op_kind`);
       return 1;
@@ -848,9 +872,14 @@ function dispatchIoStart(opKind, args) {
     // app sees a clean Denied without a kernel round-trip. Each op
     // forwards to AppRegistry via host_op; the kernel-worker calls
     // browser fetch / WebSocket APIs and posts host_op_done back.
+    // Stone 14.2 — WebTransport rides the same path.
     case IO.HTTP_FETCH:
     case IO.WS_OPEN:
-    case IO.WS_RECV: {
+    case IO.WS_RECV:
+    case IO.WT_OPEN:
+    case IO.WT_RECV_DATAGRAM:
+    case IO.WT_OPEN_BIDI:
+    case IO.WT_RECV_STREAM: {
       if (!grants.has("akiva.permission.NETWORK")) {
         postLog("warn", `io_start(0x${opKind.toString(16)}): denied — no NETWORK grant`);
         return 0n;

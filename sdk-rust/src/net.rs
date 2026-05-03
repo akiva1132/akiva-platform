@@ -522,6 +522,383 @@ pub(crate) fn decode_ws_event(buf: &[u8]) -> Result<WsEvent, NetError> {
     }
 }
 
+// ── WebTransport ────────────────────────────────────────────────────────
+//
+// HTTP/3 + QUIC. Two channels per session:
+//
+//   * Datagrams — unreliable, unordered, UDP-like. Frames may be
+//     dropped under congestion (RFC 9221). `send_datagram` /
+//     `recv_datagram`.
+//   * Bidirectional streams — reliable, ordered, with backpressure.
+//     One QUIC stream per [`BidiStream`]. Many streams per session.
+//
+// The shape matches `tokio-tungstenite`-ish ergonomics: `connect()`
+// hands back the session; the session vends streams; streams have
+// `send`/`recv`/`close`. `Drop` impls send the appropriate close so
+// stray drops don't leak host-side handles.
+//
+// Browser support: Chrome 97+, Firefox 114+, Safari 18.2+. Servers
+// must speak HTTP/3 + WebTransport ALPN (`h3` + WT extension).
+// Unlike WebSocket, public WT echo servers are sparse — for local
+// testing apps typically run their own WT endpoint behind a valid
+// TLS cert (or `chrome --ignore-certificate-errors-spki-list` for
+// self-signed dev work).
+
+const WT_DG_KIND_BYTES: u8 = 0;
+const WT_DG_KIND_CLOSED: u8 = 1;
+
+const WT_STREAM_KIND_BYTES: u8 = 0;
+const WT_STREAM_KIND_FIN: u8 = 1;
+const WT_STREAM_KIND_ERROR: u8 = 2;
+
+/// One event surfaced by [`WebTransport::recv_datagram`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WtDatagram {
+    Bytes(Vec<u8>),
+    Closed { code: u32, reason: String },
+}
+
+/// One event surfaced by [`BidiStream::recv`]. Streams are reliable
+/// and ordered; `Fin` arrives once when the peer closes their write
+/// side (the local writer can still flow until [`BidiStream::close`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent {
+    Bytes(Vec<u8>),
+    /// Peer closed their write side — no more bytes will arrive on
+    /// this stream. Subsequent `recv` calls return `Fin` immediately.
+    Fin,
+    /// Transport-level error. `String` carries the host's reason.
+    Error(String),
+}
+
+/// An open WebTransport session. Owns the per-session datagram queue
+/// and acts as the parent for any [`BidiStream`] it opens.
+#[derive(Debug)]
+pub struct WebTransport {
+    handle: u32,
+    closed: Cell<bool>,
+}
+
+impl WebTransport {
+    /// Open a WebTransport session. Resolves on the underlying
+    /// session's `ready` promise; `NetError::Network` on a
+    /// handshake / HTTP/3 / TLS failure.
+    pub fn connect(url: impl Into<String>) -> WtConnectFuture {
+        let url: String = url.into();
+        if url.is_empty() {
+            return WtConnectFuture::pre_resolved(Err(NetError::BadUrl));
+        }
+        let mut args = Vec::with_capacity(2 + url.len());
+        let url_len = url.len().min(u16::MAX as usize) as u16;
+        args.extend_from_slice(&url_len.to_le_bytes());
+        args.extend_from_slice(&url.as_bytes()[..url_len as usize]);
+        let fid = io_start(io::WT_OPEN, &args);
+        if fid == 0 {
+            return WtConnectFuture::pre_resolved(Err(NetError::Denied));
+        }
+        WtConnectFuture { future_id: fid, cached: None }
+    }
+
+    /// Send a datagram. Best-effort, fire-and-forget. Frames larger
+    /// than the connection's max datagram size are silently dropped
+    /// by the host (matching browser `WebTransport.datagrams.writable`
+    /// semantics — write returns success but the wire frame may not
+    /// reach the peer).
+    pub fn send_datagram(&self, data: &[u8]) {
+        if self.closed.get() { return; }
+        let mut args = Vec::with_capacity(4 + data.len());
+        args.extend_from_slice(&self.handle.to_le_bytes());
+        args.extend_from_slice(data);
+        host_fire(fire::WT_SEND_DATAGRAM, &args);
+    }
+
+    /// Pull the next datagram. After a [`WtDatagram::Closed`] every
+    /// further recv resolves `Err(NetError::Closed)` so loops
+    /// terminate naturally.
+    pub fn recv_datagram(&self) -> WtRecvDatagramFuture {
+        if self.closed.get() {
+            return WtRecvDatagramFuture::pre_resolved(Err(NetError::Closed));
+        }
+        let fid = io_start(io::WT_RECV_DATAGRAM, &self.handle.to_le_bytes());
+        if fid == 0 {
+            return WtRecvDatagramFuture::pre_resolved(Err(NetError::Denied));
+        }
+        WtRecvDatagramFuture {
+            future_id: fid,
+            cached: None,
+            owner_closed_flag_addr: &self.closed as *const _,
+        }
+    }
+
+    /// Open a bidirectional stream under this session.
+    pub fn open_bidi_stream(&self) -> WtOpenStreamFuture {
+        if self.closed.get() {
+            return WtOpenStreamFuture::pre_resolved(Err(NetError::Closed));
+        }
+        let fid = io_start(io::WT_OPEN_BIDI, &self.handle.to_le_bytes());
+        if fid == 0 {
+            return WtOpenStreamFuture::pre_resolved(Err(NetError::Denied));
+        }
+        WtOpenStreamFuture { future_id: fid, cached: None }
+    }
+
+    /// Close the session and all streams under it. Idempotent.
+    pub fn close(&self, code: u32, reason: &str) {
+        if self.closed.replace(true) { return; }
+        let reason_bytes = reason.as_bytes();
+        let reason_len = reason_bytes.len().min(u16::MAX as usize) as u16;
+        let mut args = Vec::with_capacity(4 + 4 + 2 + reason_len as usize);
+        args.extend_from_slice(&self.handle.to_le_bytes());
+        args.extend_from_slice(&code.to_le_bytes());
+        args.extend_from_slice(&reason_len.to_le_bytes());
+        args.extend_from_slice(&reason_bytes[..reason_len as usize]);
+        host_fire(fire::WT_CLOSE, &args);
+    }
+
+    pub fn handle(&self) -> u32 { self.handle }
+}
+
+impl Drop for WebTransport {
+    fn drop(&mut self) {
+        if !self.closed.get() {
+            self.close(0, "");
+        }
+    }
+}
+
+/// One bidirectional stream over a [`WebTransport`] session.
+#[derive(Debug)]
+pub struct BidiStream {
+    handle: u32,
+    closed: Cell<bool>,
+}
+
+impl BidiStream {
+    /// Send bytes. Fire-and-forget; backpressure is handled by the
+    /// host (browser `WritableStream` flow control). For now apps
+    /// don't observe it — large bursts can be dropped if the host
+    /// queue fills, with a warning logged.
+    pub fn send(&self, data: &[u8]) {
+        if self.closed.get() { return; }
+        let mut args = Vec::with_capacity(4 + data.len());
+        args.extend_from_slice(&self.handle.to_le_bytes());
+        args.extend_from_slice(data);
+        host_fire(fire::WT_SEND_STREAM, &args);
+    }
+
+    /// Pull the next chunk. Returns `Fin` when the peer closes their
+    /// write side, then `Fin` for every subsequent call.
+    pub fn recv(&self) -> WtRecvStreamFuture {
+        if self.closed.get() {
+            return WtRecvStreamFuture::pre_resolved(Err(NetError::Closed));
+        }
+        let fid = io_start(io::WT_RECV_STREAM, &self.handle.to_le_bytes());
+        if fid == 0 {
+            return WtRecvStreamFuture::pre_resolved(Err(NetError::Denied));
+        }
+        WtRecvStreamFuture {
+            future_id: fid,
+            cached: None,
+            owner_closed_flag_addr: &self.closed as *const _,
+        }
+    }
+
+    /// Close the writer side. Idempotent. Reads continue to flow
+    /// until the peer closes theirs.
+    pub fn close(&self, code: u32) {
+        if self.closed.replace(true) { return; }
+        let mut args = Vec::with_capacity(8);
+        args.extend_from_slice(&self.handle.to_le_bytes());
+        args.extend_from_slice(&code.to_le_bytes());
+        host_fire(fire::WT_CLOSE_STREAM, &args);
+    }
+
+    pub fn handle(&self) -> u32 { self.handle }
+}
+
+impl Drop for BidiStream {
+    fn drop(&mut self) {
+        if !self.closed.get() {
+            self.close(0);
+        }
+    }
+}
+
+#[must_use]
+pub struct WtConnectFuture {
+    future_id: u64,
+    cached: Option<Result<u32, NetError>>,
+}
+
+impl WtConnectFuture {
+    fn pre_resolved(r: Result<WebTransport, NetError>) -> Self {
+        match r {
+            Ok(_) => Self { future_id: 0, cached: Some(Err(NetError::Denied)) },
+            Err(e) => Self { future_id: 0, cached: Some(Err(e)) },
+        }
+    }
+}
+
+impl Future for WtConnectFuture {
+    type Output = Result<WebTransport, NetError>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if let Some(cached) = self.cached.take() {
+            self.cached = Some(cached.clone());
+            return Poll::Ready(cached.map(|h| WebTransport { handle: h, closed: Cell::new(false) }));
+        }
+        match poll_wt_open_inner(self.future_id) {
+            None => Poll::Pending,
+            Some(result) => {
+                self.cached = Some(result.clone());
+                Poll::Ready(result.map(|h| WebTransport { handle: h, closed: Cell::new(false) }))
+            }
+        }
+    }
+}
+
+#[must_use]
+pub struct WtOpenStreamFuture {
+    future_id: u64,
+    cached: Option<Result<u32, NetError>>,
+}
+
+impl WtOpenStreamFuture {
+    fn pre_resolved(r: Result<BidiStream, NetError>) -> Self {
+        match r {
+            Ok(_) => Self { future_id: 0, cached: Some(Err(NetError::Denied)) },
+            Err(e) => Self { future_id: 0, cached: Some(Err(e)) },
+        }
+    }
+}
+
+impl Future for WtOpenStreamFuture {
+    type Output = Result<BidiStream, NetError>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if let Some(cached) = self.cached.take() {
+            self.cached = Some(cached.clone());
+            return Poll::Ready(cached.map(|h| BidiStream { handle: h, closed: Cell::new(false) }));
+        }
+        match poll_wt_open_stream_inner(self.future_id) {
+            None => Poll::Pending,
+            Some(result) => {
+                self.cached = Some(result.clone());
+                Poll::Ready(result.map(|h| BidiStream { handle: h, closed: Cell::new(false) }))
+            }
+        }
+    }
+}
+
+#[must_use]
+pub struct WtRecvDatagramFuture {
+    future_id: u64,
+    cached: Option<Result<WtDatagram, NetError>>,
+    owner_closed_flag_addr: *const Cell<bool>,
+}
+
+impl WtRecvDatagramFuture {
+    fn pre_resolved(r: Result<WtDatagram, NetError>) -> Self {
+        Self { future_id: 0, cached: Some(r), owner_closed_flag_addr: core::ptr::null() }
+    }
+}
+
+impl Future for WtRecvDatagramFuture {
+    type Output = Result<WtDatagram, NetError>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if let Some(cached) = self.cached.take() {
+            self.cached = Some(cached.clone());
+            return Poll::Ready(cached);
+        }
+        match poll_wt_recv_datagram_inner(self.future_id) {
+            None => Poll::Pending,
+            Some(result) => {
+                if let Ok(WtDatagram::Closed { .. }) = &result {
+                    if !self.owner_closed_flag_addr.is_null() {
+                        // SAFETY: owner WebTransport outlives this future
+                        // (recv borrows &self) and wasm is single-threaded.
+                        unsafe { (*self.owner_closed_flag_addr).set(true); }
+                    }
+                }
+                self.cached = Some(result.clone());
+                Poll::Ready(result)
+            }
+        }
+    }
+}
+
+#[must_use]
+pub struct WtRecvStreamFuture {
+    future_id: u64,
+    cached: Option<Result<StreamEvent, NetError>>,
+    owner_closed_flag_addr: *const Cell<bool>,
+}
+
+impl WtRecvStreamFuture {
+    fn pre_resolved(r: Result<StreamEvent, NetError>) -> Self {
+        Self { future_id: 0, cached: Some(r), owner_closed_flag_addr: core::ptr::null() }
+    }
+}
+
+impl Future for WtRecvStreamFuture {
+    type Output = Result<StreamEvent, NetError>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if let Some(cached) = self.cached.take() {
+            self.cached = Some(cached.clone());
+            return Poll::Ready(cached);
+        }
+        match poll_wt_recv_stream_inner(self.future_id) {
+            None => Poll::Pending,
+            Some(result) => {
+                if matches!(&result, Ok(StreamEvent::Fin) | Ok(StreamEvent::Error(_))) {
+                    if !self.owner_closed_flag_addr.is_null() {
+                        unsafe { (*self.owner_closed_flag_addr).set(true); }
+                    }
+                }
+                self.cached = Some(result.clone());
+                Poll::Ready(result)
+            }
+        }
+    }
+}
+
+/// Decode a [`io::WT_RECV_DATAGRAM`] reply.
+pub(crate) fn decode_wt_datagram(buf: &[u8]) -> Result<WtDatagram, NetError> {
+    if buf.is_empty() {
+        return Err(NetError::Network("wt: empty datagram reply".into()));
+    }
+    match buf[0] {
+        WT_DG_KIND_BYTES => Ok(WtDatagram::Bytes(buf[1..].to_vec())),
+        WT_DG_KIND_CLOSED => {
+            if buf.len() < 5 {
+                return Ok(WtDatagram::Closed { code: 0, reason: String::new() });
+            }
+            let code = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+            let reason = String::from_utf8_lossy(&buf[5..]).into_owned();
+            Ok(WtDatagram::Closed { code, reason })
+        }
+        other => Err(NetError::Network(format!("wt: unknown datagram kind {other}"))),
+    }
+}
+
+/// Decode a [`io::WT_RECV_STREAM`] reply.
+pub(crate) fn decode_wt_stream_event(buf: &[u8]) -> Result<StreamEvent, NetError> {
+    if buf.is_empty() {
+        return Err(NetError::Network("wt: empty stream reply".into()));
+    }
+    match buf[0] {
+        WT_STREAM_KIND_BYTES => Ok(StreamEvent::Bytes(buf[1..].to_vec())),
+        WT_STREAM_KIND_FIN => Ok(StreamEvent::Fin),
+        WT_STREAM_KIND_ERROR => {
+            let reason = String::from_utf8_lossy(&buf[1..]).into_owned();
+            Ok(StreamEvent::Error(reason))
+        }
+        other => Err(NetError::Network(format!("wt: unknown stream kind {other}"))),
+    }
+}
+
 // ── wasm/non-wasm io_start + poll glue ─────────────────────────────────
 
 #[cfg(target_arch = "wasm32")]
@@ -640,6 +1017,125 @@ fn poll_ws_recv_inner(future_id: u64) -> Option<Result<WsEvent, NetError>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn poll_ws_recv_inner(_future_id: u64) -> Option<Result<WsEvent, NetError>> {
+    Some(Err(NetError::Denied))
+}
+
+// ── WebTransport poll glue ─────────────────────────────────────────────
+
+#[cfg(target_arch = "wasm32")]
+fn poll_wt_open_inner(future_id: u64) -> Option<Result<u32, NetError>> {
+    use crate::runtime::host_io_poll;
+    if future_id == 0 { return Some(Err(NetError::Denied)); }
+    let mut buf = [0u8; 4];
+    let packed = host_io_poll(future_id, &mut buf);
+    let (st, len) = unpack_poll(packed);
+    match st {
+        status::PENDING => None,
+        status::READY if len == 4 => Some(Ok(u32::from_le_bytes(buf))),
+        status::READY => Some(Err(NetError::Network(format!("wt: open reply len {len}")))),
+        status::ERROR => Some(Err(NetError::Network("wt: open failed".into()))),
+        status::BUSY => Some(Err(NetError::Busy)),
+        _ => Some(Err(NetError::Network("wt: open unknown status".into()))),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_wt_open_inner(_future_id: u64) -> Option<Result<u32, NetError>> {
+    Some(Err(NetError::Denied))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn poll_wt_open_stream_inner(future_id: u64) -> Option<Result<u32, NetError>> {
+    use crate::runtime::host_io_poll;
+    if future_id == 0 { return Some(Err(NetError::Denied)); }
+    let mut buf = [0u8; 4];
+    let packed = host_io_poll(future_id, &mut buf);
+    let (st, len) = unpack_poll(packed);
+    match st {
+        status::PENDING => None,
+        status::READY if len == 4 => Some(Ok(u32::from_le_bytes(buf))),
+        status::READY => Some(Err(NetError::Network(format!("wt: open_bidi reply len {len}")))),
+        status::ERROR => Some(Err(NetError::Network("wt: open_bidi failed".into()))),
+        status::BUSY => Some(Err(NetError::Busy)),
+        _ => Some(Err(NetError::Network("wt: open_bidi unknown status".into()))),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_wt_open_stream_inner(_future_id: u64) -> Option<Result<u32, NetError>> {
+    Some(Err(NetError::Denied))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn poll_wt_recv_datagram_inner(future_id: u64) -> Option<Result<WtDatagram, NetError>> {
+    use crate::runtime::host_io_poll;
+    if future_id == 0 { return Some(Err(NetError::Denied)); }
+    // 1500 byte initial guess covers MTU-sized datagrams; any larger
+    // and we retry. Datagrams larger than the path MTU are dropped at
+    // the QUIC layer anyway.
+    let mut buf = vec![0u8; 1500];
+    let packed = host_io_poll(future_id, &mut buf);
+    let (st, len) = unpack_poll(packed);
+    let len = len as usize;
+    match st {
+        status::PENDING => None,
+        status::READY => {
+            if len > buf.len() {
+                buf = vec![0u8; len];
+                let packed = host_io_poll(future_id, &mut buf);
+                let (st2, len2) = unpack_poll(packed);
+                if st2 != status::READY {
+                    return Some(Err(NetError::Network("wt: dg retry not READY".into())));
+                }
+                buf.truncate((len2 as usize).min(buf.len()));
+            } else {
+                buf.truncate(len);
+            }
+            Some(decode_wt_datagram(&buf))
+        }
+        status::ERROR => Some(Err(NetError::Network("wt: recv_datagram failed".into()))),
+        status::BUSY => Some(Err(NetError::Busy)),
+        _ => Some(Err(NetError::Network("wt: recv_datagram unknown status".into()))),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_wt_recv_datagram_inner(_future_id: u64) -> Option<Result<WtDatagram, NetError>> {
+    Some(Err(NetError::Denied))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn poll_wt_recv_stream_inner(future_id: u64) -> Option<Result<StreamEvent, NetError>> {
+    use crate::runtime::host_io_poll;
+    if future_id == 0 { return Some(Err(NetError::Denied)); }
+    let mut buf = vec![0u8; 4096];
+    let packed = host_io_poll(future_id, &mut buf);
+    let (st, len) = unpack_poll(packed);
+    let len = len as usize;
+    match st {
+        status::PENDING => None,
+        status::READY => {
+            if len > buf.len() {
+                buf = vec![0u8; len];
+                let packed = host_io_poll(future_id, &mut buf);
+                let (st2, len2) = unpack_poll(packed);
+                if st2 != status::READY {
+                    return Some(Err(NetError::Network("wt: stream retry not READY".into())));
+                }
+                buf.truncate((len2 as usize).min(buf.len()));
+            } else {
+                buf.truncate(len);
+            }
+            Some(decode_wt_stream_event(&buf))
+        }
+        status::ERROR => Some(Err(NetError::Network("wt: recv_stream failed".into()))),
+        status::BUSY => Some(Err(NetError::Busy)),
+        _ => Some(Err(NetError::Network("wt: recv_stream unknown status".into()))),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_wt_recv_stream_inner(_future_id: u64) -> Option<Result<StreamEvent, NetError>> {
     Some(Err(NetError::Denied))
 }
 
@@ -824,5 +1320,77 @@ mod tests {
         assert_eq!(Method::Delete.code(), 3);
         assert_eq!(Method::Patch.code(), 4);
         assert_eq!(Method::Head.code(), 5);
+    }
+
+    // ── WebTransport — Stone 14.2 ────────────────────────────────────────
+
+    #[test]
+    fn decode_wt_datagram_bytes() {
+        let wire = [WT_DG_KIND_BYTES, 9, 8, 7];
+        assert_eq!(decode_wt_datagram(&wire).unwrap(), WtDatagram::Bytes(vec![9, 8, 7]));
+    }
+
+    #[test]
+    fn decode_wt_datagram_closed_with_code_and_reason() {
+        let mut wire = vec![WT_DG_KIND_CLOSED];
+        wire.extend_from_slice(&7u32.to_le_bytes());
+        wire.extend_from_slice(b"server gone");
+        match decode_wt_datagram(&wire).unwrap() {
+            WtDatagram::Closed { code, reason } => {
+                assert_eq!(code, 7);
+                assert_eq!(reason, "server gone");
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_wt_datagram_closed_truncated_yields_zero() {
+        // No code byte present — synthesize 0/empty rather than error,
+        // matching the WS truncated-Closed path.
+        match decode_wt_datagram(&[WT_DG_KIND_CLOSED]).unwrap() {
+            WtDatagram::Closed { code, reason } => {
+                assert_eq!(code, 0);
+                assert_eq!(reason, "");
+            }
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_wt_datagram_unknown_kind_is_an_error() {
+        assert!(matches!(decode_wt_datagram(&[0xEE, 1]), Err(NetError::Network(_))));
+    }
+
+    #[test]
+    fn decode_wt_stream_bytes() {
+        let wire = [WT_STREAM_KIND_BYTES, 1, 2, 3];
+        assert_eq!(decode_wt_stream_event(&wire).unwrap(), StreamEvent::Bytes(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn decode_wt_stream_fin() {
+        assert_eq!(decode_wt_stream_event(&[WT_STREAM_KIND_FIN]).unwrap(), StreamEvent::Fin);
+    }
+
+    #[test]
+    fn decode_wt_stream_error_carries_reason() {
+        let mut wire = vec![WT_STREAM_KIND_ERROR];
+        wire.extend_from_slice(b"reset");
+        match decode_wt_stream_event(&wire).unwrap() {
+            StreamEvent::Error(s) => assert_eq!(s, "reset"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wt_connect_empty_url_resolves_bad_url() {
+        let mut f = WebTransport::connect("");
+        let waker = noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        match Pin::new(&mut f).poll(&mut cx) {
+            Poll::Ready(Err(NetError::BadUrl)) => {}
+            other => panic!("expected Ready(Err(BadUrl)), got {other:?}"),
+        }
     }
 }

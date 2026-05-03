@@ -65,6 +65,24 @@ pub mod fire {
     ///
     /// Args: `(ws_handle: u32, code: u16, reason: &str)`.
     pub const WS_CLOSE: u32 = 0x0007;
+
+    /// Stone 14.2 — Send a WebTransport datagram. Datagrams are
+    /// unreliable + unordered (UDP-style). Args:
+    /// `(wt_handle: u32, data: bytes)`.
+    pub const WT_SEND_DATAGRAM: u32 = 0x0008;
+
+    /// Stone 14.2 — Send bytes on an open bidirectional stream.
+    /// Args: `(stream_handle: u32, data: bytes)`.
+    pub const WT_SEND_STREAM: u32 = 0x0009;
+
+    /// Stone 14.2 — Close the writer side of a bidirectional
+    /// stream. Args: `(stream_handle: u32, code: u32)`. Idempotent.
+    pub const WT_CLOSE_STREAM: u32 = 0x000A;
+
+    /// Stone 14.2 — Close a WebTransport session and every stream
+    /// under it. Args: `(wt_handle: u32, code: u32, reason: &str)`.
+    /// Idempotent.
+    pub const WT_CLOSE: u32 = 0x000B;
 }
 
 /// I/O operations — the app calls `akiva_host_io_start(op_kind, args…)`
@@ -214,6 +232,54 @@ pub mod io {
     /// After a close event every further `WS_RECV` on the
     /// handle resolves immediately as closed.
     pub const WS_RECV: u32 = 0x010A;
+
+    /// Stone 14.2 — Open a WebTransport (HTTP/3) session. Gated
+    /// by `akiva.permission.NETWORK`.
+    ///
+    /// Args: `[url_len: u16 LE | url: utf8...]`.
+    ///
+    /// Resolves READY with `[wt_handle: u32 LE]` once the
+    /// underlying session's `ready` promise fulfills; ERROR with
+    /// a UTF-8 reason on handshake failure (HTTP/3 negotiation
+    /// refused, server unavailable, TLS, or `closed` rejecting
+    /// before `ready`). Browsers gate WebTransport behind
+    /// HTTPS-only and require the server to advertise HTTP/3 +
+    /// WebTransport ALPN.
+    pub const WT_OPEN: u32 = 0x010B;
+
+    /// Stone 14.2 — Pull the next datagram (or transport close
+    /// notification) off a session.
+    ///
+    /// Args: `[wt_handle: u32 LE]`. Result:
+    /// `[event_kind: u8 | data: bytes...]` where:
+    /// - `0` datagram (data = frame bytes; ≤ ~1200 bytes typical),
+    /// - `1` closed (data = `[code: u32 LE | reason: utf8]`).
+    ///
+    /// Datagrams are unreliable + unordered: the host pump may
+    /// drop frames under backpressure (RFC 9221 — datagrams "MAY
+    /// be dropped") rather than block; the SDK treats lost
+    /// frames as fact-of-life UDP-style behaviour.
+    pub const WT_RECV_DATAGRAM: u32 = 0x010C;
+
+    /// Stone 14.2 — Open a bidirectional stream under an open
+    /// session. Streams are reliable + ordered (TCP-style on top
+    /// of QUIC streams).
+    ///
+    /// Args: `[wt_handle: u32 LE]`. Result:
+    /// `[stream_handle: u32 LE]`.
+    pub const WT_OPEN_BIDI: u32 = 0x010D;
+
+    /// Stone 14.2 — Pull the next chunk off a bidirectional stream.
+    ///
+    /// Args: `[stream_handle: u32 LE]`. Result:
+    /// `[event_kind: u8 | data: bytes...]`:
+    /// - `0` bytes (data = chunk; size up to host pump),
+    /// - `1` fin (peer closed their write side; data empty),
+    /// - `2` error (data = utf8 reason).
+    ///
+    /// After fin or error every further recv resolves with the
+    /// same event so app loops terminate naturally.
+    pub const WT_RECV_STREAM: u32 = 0x010E;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds.
@@ -326,12 +392,16 @@ mod tests {
             fire::LOG, fire::FINISH, fire::START_ACTIVITY,
             fire::START_ACTIVITY_FOR_RESULT, fire::SET_RESULT,
             fire::WS_SEND, fire::WS_CLOSE,
+            fire::WT_SEND_DATAGRAM, fire::WT_SEND_STREAM,
+            fire::WT_CLOSE_STREAM, fire::WT_CLOSE,
         ];
         let io = [
             io::TEXT_WIDTH, io::QUERY_PACKAGES,
             io::STORAGE_GET, io::STORAGE_SET, io::STORAGE_DELETE,
             io::TIMER_SLEEP, io::SHOW_DIALOG,
             io::HTTP_FETCH, io::WS_OPEN, io::WS_RECV,
+            io::WT_OPEN, io::WT_RECV_DATAGRAM,
+            io::WT_OPEN_BIDI, io::WT_RECV_STREAM,
         ];
         for k in fire { assert!((0x0001..=0x00FF).contains(&k), "fire op {k:#x} out of range"); }
         for k in io   { assert!((0x0101..=0x01FF).contains(&k), "io op {k:#x} out of range"); }
@@ -348,6 +418,8 @@ mod tests {
             fire::LOG, fire::FINISH, fire::START_ACTIVITY,
             fire::START_ACTIVITY_FOR_RESULT, fire::SET_RESULT,
             fire::WS_SEND, fire::WS_CLOSE,
+            fire::WT_SEND_DATAGRAM, fire::WT_SEND_STREAM,
+            fire::WT_CLOSE_STREAM, fire::WT_CLOSE,
         ];
         for (i, a) in fire.iter().enumerate() {
             for b in &fire[i + 1..] {
@@ -359,6 +431,8 @@ mod tests {
             io::STORAGE_GET, io::STORAGE_SET, io::STORAGE_DELETE,
             io::TIMER_SLEEP, io::SHOW_DIALOG,
             io::HTTP_FETCH, io::WS_OPEN, io::WS_RECV,
+            io::WT_OPEN, io::WT_RECV_DATAGRAM,
+            io::WT_OPEN_BIDI, io::WT_RECV_STREAM,
         ];
         for (i, a) in io.iter().enumerate() {
             for b in &io[i + 1..] {
@@ -383,6 +457,10 @@ mod tests {
         assert_eq!(fire::SET_RESULT,                sdk::fire::SET_RESULT);
         assert_eq!(fire::WS_SEND,                   sdk::fire::WS_SEND);
         assert_eq!(fire::WS_CLOSE,                  sdk::fire::WS_CLOSE);
+        assert_eq!(fire::WT_SEND_DATAGRAM,          sdk::fire::WT_SEND_DATAGRAM);
+        assert_eq!(fire::WT_SEND_STREAM,            sdk::fire::WT_SEND_STREAM);
+        assert_eq!(fire::WT_CLOSE_STREAM,           sdk::fire::WT_CLOSE_STREAM);
+        assert_eq!(fire::WT_CLOSE,                  sdk::fire::WT_CLOSE);
         assert_eq!(io::TEXT_WIDTH,                  sdk::io::TEXT_WIDTH);
         assert_eq!(io::QUERY_PACKAGES,              sdk::io::QUERY_PACKAGES);
         assert_eq!(io::STORAGE_GET,                 sdk::io::STORAGE_GET);
@@ -393,6 +471,10 @@ mod tests {
         assert_eq!(io::HTTP_FETCH,                  sdk::io::HTTP_FETCH);
         assert_eq!(io::WS_OPEN,                     sdk::io::WS_OPEN);
         assert_eq!(io::WS_RECV,                     sdk::io::WS_RECV);
+        assert_eq!(io::WT_OPEN,                     sdk::io::WT_OPEN);
+        assert_eq!(io::WT_RECV_DATAGRAM,            sdk::io::WT_RECV_DATAGRAM);
+        assert_eq!(io::WT_OPEN_BIDI,                sdk::io::WT_OPEN_BIDI);
+        assert_eq!(io::WT_RECV_STREAM,              sdk::io::WT_RECV_STREAM);
         assert_eq!(status::PENDING,                 sdk::status::PENDING);
         assert_eq!(status::READY,                   sdk::status::READY);
         assert_eq!(status::ERROR,                   sdk::status::ERROR);

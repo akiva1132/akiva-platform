@@ -10,7 +10,7 @@
 //! public echo and bump nothing else; the SDK surface is the
 //! contract.
 
-use akiva_sdk::net::{self, NetError, WsEvent};
+use akiva_sdk::net::{self, NetError, StreamEvent, WsEvent, WtDatagram};
 use akiva_sdk::prelude::*;
 
 #[derive(Default)]
@@ -26,6 +26,7 @@ struct NetworkMain {
     /// of pending fetches with the run-until-idle executor.
     http_busy: std::rc::Rc<core::cell::Cell<bool>>,
     ws_busy: std::rc::Rc<core::cell::Cell<bool>>,
+    wt_busy: std::rc::Rc<core::cell::Cell<bool>>,
 }
 
 #[async_trait(?Send)]
@@ -48,7 +49,8 @@ impl Activity for NetworkMain {
 
         let http_btn = ui.button("http", "HTTPS GET");
         let ws_btn = ui.button("ws", "WebSocket echo");
-        let buttons = ui.h_stack(&[http_btn, ws_btn]).gap(12.0).build();
+        let wt_btn = ui.button("wt", "WebTransport echo");
+        let buttons = ui.h_stack(&[http_btn, ws_btn, wt_btn]).gap(12.0).build();
 
         let status_text = self.status.borrow().clone();
         let status = ui.text(&status_text).size(14.0).color(0xffd0d8e8).build();
@@ -153,6 +155,66 @@ impl Activity for NetworkMain {
                     *status.borrow_mut() = "ws round-trip OK".into();
                 }
                 ws.close(1000, "done");
+                busy.set(false);
+            });
+        }
+
+        // ── WebTransport echo (datagram + stream) ──────────────────
+        //
+        // Note: stable public WebTransport echo servers are sparse —
+        // unlike WebSocket, where echo.websocket.events / Postman
+        // cover the demo case. The endpoint below is a best-effort
+        // candidate; failure is treated as expected and the status
+        // line surfaces the reason. The button still exercises the
+        // full wire path (open, send_datagram, recv_datagram,
+        // open_bidi_stream, send/recv on stream, close) so the
+        // unit-tested SDK gets a smoke run on the live host.
+        //
+        // To target your own server set
+        // `localStorage.setItem('akiva.wt_endpoint', 'https://...')`
+        // in the host page. The override is read by the kernel
+        // worker on connect.
+        if ui.was_clicked("wt") && !self.wt_busy.get() {
+            self.wt_busy.set(true);
+            let url = "https://webtransport.day/echo";
+            *self.status.borrow_mut() = format!("connecting {url} …");
+            let status = self.status.clone();
+            let busy = self.wt_busy.clone();
+            ctx.activity_scope().spawn(async move {
+                let wt = match net::WebTransport::connect(url).await {
+                    Ok(w) => w,
+                    Err(e) => {
+                        *status.borrow_mut() = format!("wt connect failed: {e:?}");
+                        busy.set(false);
+                        return;
+                    }
+                };
+                wt.send_datagram(b"ping-dg");
+                let dg_status = match wt.recv_datagram().await {
+                    Ok(WtDatagram::Bytes(b)) => format!("dg ← {} bytes", b.len()),
+                    Ok(WtDatagram::Closed { code, .. }) => format!("dg closed: {code}"),
+                    Err(e) => format!("dg err: {e:?}"),
+                };
+                *status.borrow_mut() = format!("wt {dg_status}; opening stream …");
+                let stream = match wt.open_bidi_stream().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        *status.borrow_mut() = format!("wt {dg_status}; stream open failed: {e:?}");
+                        wt.close(0, "");
+                        busy.set(false);
+                        return;
+                    }
+                };
+                stream.send(b"ping-stream");
+                let stream_status = match stream.recv().await {
+                    Ok(StreamEvent::Bytes(b)) => format!("stream ← {} bytes", b.len()),
+                    Ok(StreamEvent::Fin) => "stream closed by peer".into(),
+                    Ok(StreamEvent::Error(s)) => format!("stream err: {s}"),
+                    Err(e) => format!("stream recv err: {e:?}"),
+                };
+                *status.borrow_mut() = format!("wt {dg_status}; {stream_status}");
+                stream.close(0);
+                wt.close(0, "done");
                 busy.set(false);
             });
         }

@@ -10,6 +10,60 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [0.10.0] — 2026-05 (Stone 14.2 — WebTransport)
+
+**MINOR** — additive: 8 new op_kinds (4 io, 4 fire), no kernel
+export changes, no new HAL imports. Ride entirely on the unified
+ABI dispatcher established in 11.3 / 14.1. Reuses the existing
+`akiva.permission.NETWORK` grant — no new permission type. Apps
+with `min_abi_version` ≤ 0.10.0 load unchanged.
+
+- **Added (Stone 14.2 — IO ops).**
+  - `IO::WT_OPEN = 0x010B` — open a WebTransport (HTTP/3) session.
+    Args: `[url_len:u16 LE | url:utf8]`. Result: `[wt_handle:u32 LE]`
+    once `wt.ready` resolves; ERROR on handshake failure.
+  - `IO::WT_RECV_DATAGRAM = 0x010C` — pull next datagram or session
+    closed event. Args: `[wt_handle:u32 LE]`. Result: `[kind:u8 |
+    data]` where kind 0=datagram bytes, 1=closed (data=`[code:u32
+    LE | reason]`).
+  - `IO::WT_OPEN_BIDI = 0x010D` — open a bidirectional stream under
+    an open session. Args: `[wt_handle:u32 LE]`. Result:
+    `[stream_handle:u32 LE]`.
+  - `IO::WT_RECV_STREAM = 0x010E` — pull next chunk off a bidi
+    stream. Args: `[stream_handle:u32 LE]`. Result: `[kind:u8 |
+    data]` where kind 0=bytes, 1=fin (peer closed write side, data
+    empty), 2=error (data=utf8 reason).
+- **Added (Stone 14.2 — fire ops).**
+  - `FIRE::WT_SEND_DATAGRAM = 0x0008` — best-effort datagram send.
+    Args: `[wt_handle:u32 | data...]`.
+  - `FIRE::WT_SEND_STREAM = 0x0009` — write bytes on a bidi stream.
+    Args: `[stream_handle:u32 | data...]`.
+  - `FIRE::WT_CLOSE_STREAM = 0x000A` — close stream's writer side
+    (idempotent). Args: `[stream_handle:u32 | code:u32]`.
+  - `FIRE::WT_CLOSE = 0x000B` — close session and all streams under
+    it (idempotent). Args: `[wt_handle:u32 | code:u32 | reason_len:
+    u16 | reason:utf8]`.
+- **Added (SDK).** `akiva_sdk::net::WebTransport` and
+  `akiva_sdk::net::BidiStream` with `connect/send/recv/close`,
+  `WtDatagram { Bytes(Vec<u8>) | Closed }`, `StreamEvent
+  { Bytes | Fin | Error(String) }`. Drop on both types fires the
+  appropriate close so handles never leak past activity teardown.
+- **AppRegistry-side.** Two new maps: `_wtHandles` (sessions) and
+  `_wtStreams` (streams across all sessions). Datagram pump reads
+  from `wt.datagrams.readable` into the per-session queue (cap 64
+  events; overflow drops oldest, matching UDP semantics). Stream
+  pump reads from each stream's `readable.getReader()` into a
+  per-stream queue; overflow surfaces as a one-shot `Error`
+  ("stream queue overflow") so reliable-stream consumers see the
+  truth instead of silent drops. Provenance check on every op.
+  Cleanup hooked into `_disposeWsForPackage` (renamed conceptually
+  to "all-net cleanup" but the function name is preserved).
+- **Demo.** `apps/network` gained a "WebTransport echo" button.
+  Stable public WT echo servers are scarce so the demo treats
+  endpoint failure as expected and surfaces the reason in the
+  status line. Apps shipping their own endpoint can override via
+  `localStorage.setItem('akiva.wt_endpoint', '…')`.
+
 ## [0.9.0] — 2026-05 (Stone 14.1 — Net capability)
 
 **MINOR** — additive: 5 new op_kinds, no kernel export changes, no new

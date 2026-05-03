@@ -40,6 +40,25 @@ pub mod fire {
     ///   | reason: utf8...]`. Idempotent; subsequent ops on the
     /// handle are no-ops.
     pub const WS_CLOSE: u32 = 0x0007;
+    /// Stone 14.2 — WebTransport datagram (unreliable, unordered,
+    /// the closest a browser exposes to UDP). Args:
+    /// `[wt_handle: u32 LE | data: bytes...]`. Silent no-op on a
+    /// closed handle. Capability gated by `NETWORK` at the dispatcher.
+    pub const WT_SEND_DATAGRAM: u32 = 0x0008;
+    /// Stone 14.2 — Send bytes on an open bidirectional stream.
+    /// Args: `[stream_handle: u32 LE | data: bytes...]`. The handle
+    /// was returned by [`io::WT_OPEN_BIDI`].
+    pub const WT_SEND_STREAM: u32 = 0x0009;
+    /// Stone 14.2 — Close a WebTransport bidirectional stream
+    /// (writer side). Args: `[stream_handle: u32 LE | code: u32 LE]`.
+    /// Idempotent. The peer's writer can still flow until they
+    /// close their side; `WT_RECV_STREAM` keeps draining until then.
+    pub const WT_CLOSE_STREAM: u32 = 0x000A;
+    /// Stone 14.2 — Close a WebTransport session (and every
+    /// stream under it). Args:
+    /// `[wt_handle: u32 LE | code: u32 LE | reason_len: u16 LE
+    ///   | reason: utf8...]`. Idempotent.
+    pub const WT_CLOSE: u32 = 0x000B;
 }
 
 /// I/O operations. Range `0x0101..=0x01FF`.
@@ -110,6 +129,40 @@ pub mod io {
     ///   | reason: utf8...]`). After a close event every
     /// further `WS_RECV` resolves immediately as closed.
     pub const WS_RECV: u32 = 0x010A;
+    /// Stone 14.2 — Open a WebTransport session. Gated by
+    /// `akiva.permission.NETWORK`. Args:
+    /// `[url_len: u16 LE | url: utf8...]`. Resolves READY with
+    /// `[wt_handle: u32 LE]` on the underlying transport's `ready`
+    /// promise; ERROR with utf8 reason on a handshake failure
+    /// (HTTP/3 negotiation refused, server unavailable, TLS).
+    pub const WT_OPEN: u32 = 0x010B;
+    /// Stone 14.2 — Pull the next datagram or transport-level event.
+    /// Args: `[wt_handle: u32 LE]`. Result:
+    /// ```text
+    /// [event_kind: u8 | data: bytes...]
+    /// ```
+    /// `event_kind == 0` datagram (data = the frame bytes).
+    /// `event_kind == 1` closed (data = `[code: u32 LE
+    ///   | reason: utf8...]`); every further recv on the handle
+    /// resolves immediately as closed.
+    pub const WT_RECV_DATAGRAM: u32 = 0x010C;
+    /// Stone 14.2 — Open a bidirectional stream under an open
+    /// WebTransport session. Args: `[wt_handle: u32 LE]`. Result:
+    /// `[stream_handle: u32 LE]`. The stream stays open until
+    /// either side calls [`fire::WT_CLOSE_STREAM`] or the parent
+    /// session closes.
+    pub const WT_OPEN_BIDI: u32 = 0x010D;
+    /// Stone 14.2 — Pull the next chunk off a bidirectional stream.
+    /// Args: `[stream_handle: u32 LE]`. Result:
+    /// ```text
+    /// [event_kind: u8 | data: bytes...]
+    /// ```
+    /// `event_kind == 0` bytes (data = the chunk; chunk size is up
+    /// to the host's pump).
+    /// `event_kind == 1` fin (peer closed their write side; data
+    /// is empty). Subsequent recvs return fin.
+    /// `event_kind == 2` error (data = utf8 reason).
+    pub const WT_RECV_STREAM: u32 = 0x010E;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds. Mirror of
@@ -182,6 +235,10 @@ mod tests {
         assert!(fire::SET_RESULT <= 0x00FF);
         assert!(fire::WS_SEND <= 0x00FF);
         assert!(fire::WS_CLOSE <= 0x00FF);
+        assert!(fire::WT_SEND_DATAGRAM <= 0x00FF);
+        assert!(fire::WT_SEND_STREAM <= 0x00FF);
+        assert!(fire::WT_CLOSE_STREAM <= 0x00FF);
+        assert!(fire::WT_CLOSE <= 0x00FF);
         assert!(io::TEXT_WIDTH >= 0x0101 && io::TEXT_WIDTH <= 0x01FF);
         assert!(io::STORAGE_SET >= 0x0101 && io::STORAGE_SET <= 0x01FF);
         assert!(io::STORAGE_DELETE >= 0x0101 && io::STORAGE_DELETE <= 0x01FF);
@@ -189,6 +246,10 @@ mod tests {
         assert!(io::HTTP_FETCH >= 0x0101 && io::HTTP_FETCH <= 0x01FF);
         assert!(io::WS_OPEN >= 0x0101 && io::WS_OPEN <= 0x01FF);
         assert!(io::WS_RECV >= 0x0101 && io::WS_RECV <= 0x01FF);
+        assert!(io::WT_OPEN >= 0x0101 && io::WT_OPEN <= 0x01FF);
+        assert!(io::WT_RECV_DATAGRAM >= 0x0101 && io::WT_RECV_DATAGRAM <= 0x01FF);
+        assert!(io::WT_OPEN_BIDI >= 0x0101 && io::WT_OPEN_BIDI <= 0x01FF);
+        assert!(io::WT_RECV_STREAM >= 0x0101 && io::WT_RECV_STREAM <= 0x01FF);
         assert_eq!(status::PENDING, 0);
         assert_eq!(status::READY,   1);
         assert_eq!(status::ERROR,   2);
