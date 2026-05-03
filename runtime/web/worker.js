@@ -517,6 +517,15 @@ function buildImports() {
     // shape stays consistent with Canvas2D defaults.
     hal_draw_image: (drawable_id, x, y, w, h) =>
       backend?.drawImage(drawable_id >>> 0, x, y, w, h),
+    // Foundation gap — foreign-package drawable. The kernel passes
+    // `(pkgPtr, pkgLen, namePtr, nameLen, x, y, w, h)`; the host
+    // reads both UTF-8 strings out of kernel memory and looks up
+    // `(packageId, name)` in the renderer's foreign-drawable cache.
+    hal_draw_foreign_image: (pkgPtr, pkgLen, namePtr, nameLen, x, y, w, h) => {
+      const pkg = readUtf8(pkgPtr, pkgLen);
+      const name = readUtf8(namePtr, nameLen);
+      backend?.drawForeignImage(pkg, name, x, y, w, h);
+    },
     // Stone 13.3 — transform + clip stack. Pre-13.3 these were no-ops
     // in the kernel display flush, so my Stone 13.3 animation
     // rewriting (`apply_props` wrapping ops with PushTransform) had

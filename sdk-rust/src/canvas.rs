@@ -28,6 +28,11 @@ const OP_DRAW_LINE:         u8 = 10;
 // `res::drawable(name)` from the host; `0` means missing (renderer
 // paints a magenta placeholder, matching @color/@string fallback).
 const OP_DRAW_IMAGE:        u8 = 11;
+// Foundation gap — bitmap blit by `(package_id, drawable_name)`.
+// Used by the Shell to render foreign-package launcher icons. The
+// renderer's foreign-drawable cache is populated when each package's
+// `_loadDrawableBitmaps` runs.
+const OP_DRAW_FOREIGN_IMAGE: u8 = 12;
 
 /// Paint surface handed to `Activity::on_render`. All coordinates are in
 /// dp (density-independent pixels); colors are **`0xAARRGGBB`** — alpha
@@ -182,6 +187,34 @@ impl<'a> Canvas<'a> {
     ) {
         self.buf.push(OP_DRAW_IMAGE);
         self.buf.extend_from_slice(&drawable_id.to_le_bytes());
+        self.buf.extend_from_slice(&x.to_le_bytes());
+        self.buf.extend_from_slice(&y.to_le_bytes());
+        self.buf.extend_from_slice(&w.to_le_bytes());
+        self.buf.extend_from_slice(&h.to_le_bytes());
+    }
+
+    /// Foundation gap — blit a drawable owned by another package.
+    /// Looked up against the renderer's foreign-drawable cache by
+    /// `(package_id, name)` — see [`crate::pkgs::PackageEntry`].
+    /// Empty `name` (the package declared no `app.icon`) paints the
+    /// magenta missing-drawable placeholder, same fallback shape as
+    /// every other drawable miss.
+    ///
+    /// The Shell uses this to render launcher icons; ordinary apps
+    /// almost never need it (their own drawables go through the
+    /// faster [`Self::draw_image`] path).
+    pub fn draw_foreign_image(
+        &mut self, package_id: &str, name: &str, x: f32, y: f32, w: f32, h: f32,
+    ) {
+        self.buf.push(OP_DRAW_FOREIGN_IMAGE);
+        let pkg_bytes = package_id.as_bytes();
+        let name_bytes = name.as_bytes();
+        let pkg_len = pkg_bytes.len().min(u16::MAX as usize);
+        let name_len = name_bytes.len().min(u16::MAX as usize);
+        self.buf.extend_from_slice(&(pkg_len as u16).to_le_bytes());
+        self.buf.extend_from_slice(&pkg_bytes[..pkg_len]);
+        self.buf.extend_from_slice(&(name_len as u16).to_le_bytes());
+        self.buf.extend_from_slice(&name_bytes[..name_len]);
         self.buf.extend_from_slice(&x.to_le_bytes());
         self.buf.extend_from_slice(&y.to_le_bytes());
         self.buf.extend_from_slice(&w.to_le_bytes());

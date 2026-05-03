@@ -28,9 +28,70 @@
 
 use std::collections::HashMap;
 
-use akiva_framework::compositor::{FrameCommands, PaintOp};
+use akiva_framework::compositor::{dispatch_paint_op, DrawHal, FrameCommands};
 
 use crate::host;
+
+/// `DrawHal` impl that forwards every method to its `extern "C" hal_draw_*`
+/// counterpart. The trait + `dispatch_paint_op` live in the framework so
+/// they can be unit-tested with a recording mock; this struct is the
+/// production glue that runs in the wasm kernel.
+struct ExternDrawHal;
+
+impl DrawHal for ExternDrawHal {
+    fn clear(&mut self, rgba: u32) {
+        unsafe { host::hal_draw_clear(rgba) }
+    }
+    fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: u32) {
+        unsafe { host::hal_draw_rect(x, y, w, h, rgba) }
+    }
+    fn fill_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32) {
+        unsafe { host::hal_draw_round_rect(x, y, w, h, radius, rgba) }
+    }
+    fn draw_text(&mut self, x: f32, y: f32, size: f32, rgba: u32, text: &str) {
+        let bytes = text.as_bytes();
+        unsafe { host::hal_draw_text(x, y, size, rgba, bytes.as_ptr(), bytes.len()) }
+    }
+    fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, width: f32, rgba: u32) {
+        unsafe { host::hal_draw_stroke_rect(x, y, w, h, width, rgba) }
+    }
+    fn stroke_round_rect(
+        &mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, width: f32, rgba: u32,
+    ) {
+        unsafe { host::hal_draw_stroke_round_rect(x, y, w, h, radius, width, rgba) }
+    }
+    fn draw_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, rgba: u32) {
+        unsafe { host::hal_draw_line(x0, y0, x1, y1, width, rgba) }
+    }
+    fn draw_image(&mut self, drawable_id: u32, x: f32, y: f32, w: f32, h: f32) {
+        unsafe { host::hal_draw_image(drawable_id, x, y, w, h) }
+    }
+    fn draw_foreign_image(
+        &mut self, package_id: &str, name: &str, x: f32, y: f32, w: f32, h: f32,
+    ) {
+        let pkg = package_id.as_bytes();
+        let nm = name.as_bytes();
+        unsafe {
+            host::hal_draw_foreign_image(
+                pkg.as_ptr(), pkg.len(),
+                nm.as_ptr(), nm.len(),
+                x, y, w, h,
+            )
+        }
+    }
+    fn push_transform(&mut self, dx: f32, dy: f32, scale: f32) {
+        unsafe { host::hal_draw_push_transform(dx, dy, scale) }
+    }
+    fn pop_transform(&mut self) {
+        unsafe { host::hal_draw_pop_transform() }
+    }
+    fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        unsafe { host::hal_draw_push_clip(x, y, w, h) }
+    }
+    fn pop_clip(&mut self) {
+        unsafe { host::hal_draw_pop_clip() }
+    }
+}
 
 pub type DisplayId = u32;
 
@@ -161,56 +222,12 @@ impl DisplayManager {
     }
 
     fn flush_primary(&mut self, frame: &FrameCommands) {
-        // SAFETY: all HAL draw calls take primitives or pointers into
-        // UTF-8 slices we own for the duration of the call.
-        unsafe {
-            for op in frame.ops() {
-                match op {
-                    PaintOp::Clear { rgba } => host::hal_draw_clear(*rgba),
-                    PaintOp::FillRect { x, y, w, h, rgba } => {
-                        host::hal_draw_rect(*x, *y, *w, *h, *rgba);
-                    }
-                    PaintOp::FillRoundRect { x, y, w, h, radius, rgba } => {
-                        host::hal_draw_round_rect(*x, *y, *w, *h, *radius, *rgba);
-                    }
-                    PaintOp::DrawText { x, y, size, rgba, text } => {
-                        let bytes = text.as_bytes();
-                        host::hal_draw_text(*x, *y, *size, *rgba, bytes.as_ptr(), bytes.len());
-                    }
-                    // Stone 13.0prep — outline ops.
-                    PaintOp::StrokeRect { x, y, w, h, width, rgba } => {
-                        host::hal_draw_stroke_rect(*x, *y, *w, *h, *width, *rgba);
-                    }
-                    PaintOp::StrokeRoundRect { x, y, w, h, radius, width, rgba } => {
-                        host::hal_draw_stroke_round_rect(*x, *y, *w, *h, *radius, *width, *rgba);
-                    }
-                    PaintOp::DrawLine { x0, y0, x1, y1, width, rgba } => {
-                        host::hal_draw_line(*x0, *y0, *x1, *y1, *width, *rgba);
-                    }
-                    PaintOp::DrawImage { drawable_id, x, y, w, h } => {
-                        host::hal_draw_image(*drawable_id, *x, *y, *w, *h);
-                    }
-                    // Stone 13.3 — wire clip/transform to the Canvas 2D
-                    // state stack. Pre-13.3 these were dropped on the
-                    // floor (a TODO from Phase 2b that bit Stone 13.3's
-                    // animation rewriting: `apply_props` adds
-                    // PushTransform → ignored → no visible slide).
-                    PaintOp::PushClip { x, y, w, h } => {
-                        host::hal_draw_push_clip(*x, *y, *w, *h);
-                    }
-                    PaintOp::PopClip => {
-                        host::hal_draw_pop_clip();
-                    }
-                    PaintOp::PushTransform { dx, dy, scale } => {
-                        host::hal_draw_push_transform(*dx, *dy, *scale);
-                    }
-                    PaintOp::PopTransform => {
-                        host::hal_draw_pop_transform();
-                    }
-                }
-            }
-            host::hal_draw_present();
+        let mut hal = ExternDrawHal;
+        for op in frame.ops() {
+            dispatch_paint_op(&mut hal, op);
         }
+        // SAFETY: extern with no args, no aliasing concerns.
+        unsafe { host::hal_draw_present() }
     }
 
     /// Stone 13.4 — serialise a follower display's frame into the

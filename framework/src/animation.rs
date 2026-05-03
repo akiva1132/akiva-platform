@@ -274,7 +274,7 @@ pub fn apply_props(
                 PaintOp::StrokeRoundRect { x, y, w, h, radius, width, rgba: mul_alpha(rgba) },
             PaintOp::DrawLine { x0, y0, x1, y1, width, rgba } =>
                 PaintOp::DrawLine { x0, y0, x1, y1, width, rgba: mul_alpha(rgba) },
-            other => other,  // PushClip/PopClip/PushTransform/PopTransform/DrawImage — pass-through
+            other => other,  // PushClip/PopClip/PushTransform/PopTransform/DrawImage/DrawForeignImage — pass-through
         };
         out.push(rewritten);
     }

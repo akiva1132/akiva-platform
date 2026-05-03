@@ -561,6 +561,11 @@ pub mod opcode {
     // Stone 13.0prep C — bitmap blit by drawable_id (resolved via
     // `IO::DRAWABLE_RESOLVE`). 21 bytes total (op + drawable_id u32 + 4×f32).
     pub const DRAW_IMAGE:        u8 = 11;
+    // Foundation gap — blit by `(package_id, drawable_name)` against
+    // the foreign-drawable cache. Variable size: opcode +
+    // [pkg_len: u16 | pkg: utf8 | name_len: u16 | name: utf8] +
+    // 4 × f32. Used by the Shell to render launcher icons.
+    pub const DRAW_FOREIGN_IMAGE: u8 = 12;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -664,6 +669,25 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             out.extend_from_slice(&w.to_le_bytes());
             out.extend_from_slice(&h.to_le_bytes());
         }
+        PaintOp::DrawForeignImage { package_id, name, x, y, w, h } => {
+            out.push(opcode::DRAW_FOREIGN_IMAGE);
+            let pkg_bytes = package_id.as_bytes();
+            let name_bytes = name.as_bytes();
+            // Cap each at u16::MAX. In practice both are short
+            // (package_id <100 chars, drawable name <50) so the cap
+            // exists to keep the wire format self-consistent rather
+            // than to enforce a meaningful limit.
+            let pkg_len = pkg_bytes.len().min(u16::MAX as usize);
+            let name_len = name_bytes.len().min(u16::MAX as usize);
+            out.extend_from_slice(&(pkg_len as u16).to_le_bytes());
+            out.extend_from_slice(&pkg_bytes[..pkg_len]);
+            out.extend_from_slice(&(name_len as u16).to_le_bytes());
+            out.extend_from_slice(&name_bytes[..name_len]);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+        }
     }
 }
 
@@ -760,6 +784,27 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                 let h = read_f32(&mut bytes)?;
                 out.push(PaintOp::DrawImage { drawable_id, x, y, w, h });
             }
+            opcode::DRAW_FOREIGN_IMAGE => {
+                let pkg_len = read_u16(&mut bytes)? as usize;
+                if pkg_len > bytes.len() { return Err(DecodeError::BadLength); }
+                let (pkg_bytes, rest) = bytes.split_at(pkg_len);
+                bytes = rest;
+                let package_id = core::str::from_utf8(pkg_bytes)
+                    .map_err(|_| DecodeError::BadUtf8)?
+                    .to_string();
+                let name_len = read_u16(&mut bytes)? as usize;
+                if name_len > bytes.len() { return Err(DecodeError::BadLength); }
+                let (name_bytes, rest) = bytes.split_at(name_len);
+                bytes = rest;
+                let name = core::str::from_utf8(name_bytes)
+                    .map_err(|_| DecodeError::BadUtf8)?
+                    .to_string();
+                let x = read_f32(&mut bytes)?;
+                let y = read_f32(&mut bytes)?;
+                let w = read_f32(&mut bytes)?;
+                let h = read_f32(&mut bytes)?;
+                out.push(PaintOp::DrawForeignImage { package_id, name, x, y, w, h });
+            }
             other => return Err(DecodeError::UnknownOp(other)),
         }
     }
@@ -771,6 +816,13 @@ fn read_u32(bytes: &mut &[u8]) -> Result<u32, DecodeError> {
     let (head, tail) = bytes.split_at(4);
     *bytes = tail;
     Ok(u32::from_le_bytes([head[0], head[1], head[2], head[3]]))
+}
+
+fn read_u16(bytes: &mut &[u8]) -> Result<u16, DecodeError> {
+    if bytes.len() < 2 { return Err(DecodeError::Truncated); }
+    let (head, tail) = bytes.split_at(2);
+    *bytes = tail;
+    Ok(u16::from_le_bytes([head[0], head[1]]))
 }
 
 fn read_f32(bytes: &mut &[u8]) -> Result<f32, DecodeError> {

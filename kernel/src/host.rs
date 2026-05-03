@@ -54,6 +54,18 @@ extern "C" {
     /// Stone 13.0prep C — blit a drawable. `drawable_id == 0` is the
     /// missing-drawable sentinel; the host paints a magenta placeholder.
     pub fn hal_draw_image(drawable_id: u32, x: f32, y: f32, w: f32, h: f32);
+    /// Foundation gap — blit a drawable owned by another package. The
+    /// host's foreign-drawable cache is keyed by `(package_id, name)`
+    /// strings (string keys are needed because each package's own
+    /// drawable_ids start at 1 and would collide on a flat cache).
+    /// Missing entries paint the same magenta placeholder as
+    /// `hal_draw_image`. Used by the Shell to render foreign-package
+    /// launcher icons after reading `pkgs::PackageEntry.icon`.
+    pub fn hal_draw_foreign_image(
+        pkg_ptr: *const u8, pkg_len: usize,
+        name_ptr: *const u8, name_len: usize,
+        x: f32, y: f32, w: f32, h: f32,
+    );
     /// Stone 13.3 — transform stack. `push_transform` pairs with
     /// `pop_transform`. Used by activity push/pop slide animations
     /// (`apply_props` wraps a surface's ops with these). Backed by

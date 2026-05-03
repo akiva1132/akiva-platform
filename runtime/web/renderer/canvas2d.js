@@ -152,6 +152,15 @@ export class Canvas2DBackend {
   // reads from it. Map<u32 id, ImageBitmap | OffscreenCanvas>.
   // Missing id (0 or unregistered) paints a magenta placeholder, same
   // fallback shape as missing `@color/`/`@string/`.
+  //
+  // Note on the per-(pkg,name) parallel cache: this map is keyed by
+  // the package's OWN per-package drawable_id (1-based, sequential),
+  // so two packages can collide. The foreign cache below
+  // (`_foreignDrawables`) is the cross-package-safe path keyed by
+  // `(package_id_str, name_str)`. `_loadDrawableBitmaps` populates
+  // BOTH so a package's own draws still hit the fast `drawable_id`
+  // path while cross-package draws (Shell rendering app icons) use
+  // the `(pkg, name)` path.
   registerDrawable(id, source) {
     if (!this._drawables) this._drawables = new Map();
     this._drawables.set(id >>> 0, source);
@@ -171,6 +180,39 @@ export class Canvas2DBackend {
     }
     // Magenta placeholder for missing drawable. Matches the fallback
     // shape used by missing color / missing string lookups.
+    this.ctx.fillStyle = "#ff00ff";
+    this.ctx.fillRect(x, y, w, h);
+  }
+
+  // Foundation gap — foreign-drawable cache. Keyed by
+  // `(packageId, drawableName)` so cross-package draws (Shell
+  // rendering each installed app's launcher icon) can never collide
+  // with one another. Sparse: only packages with `manifest.app.icon`
+  // declared register entries here.
+  registerForeignDrawable(packageId, name, source) {
+    if (!this._foreignDrawables) this._foreignDrawables = new Map();
+    let pkgMap = this._foreignDrawables.get(packageId);
+    if (!pkgMap) {
+      pkgMap = new Map();
+      this._foreignDrawables.set(packageId, pkgMap);
+    }
+    pkgMap.set(name, source);
+  }
+
+  /** Drop every entry for `packageId`. Called on uninstall. */
+  forgetForeignDrawables(packageId) {
+    if (!this._foreignDrawables) return;
+    this._foreignDrawables.delete(packageId);
+  }
+
+  drawForeignImage(packageId, name, x, y, w, h) {
+    if (!this.ctx) return;
+    const source = this._foreignDrawables?.get(packageId)?.get(name);
+    if (source) {
+      this.ctx.drawImage(source, x, y, w, h);
+      return;
+    }
+    // Same magenta-placeholder fallback as `drawImage`.
     this.ctx.fillStyle = "#ff00ff";
     this.ctx.fillRect(x, y, w, h);
   }
