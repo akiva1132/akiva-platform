@@ -144,6 +144,11 @@ pub fn boot(
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
+            diagnostic_log: Vec::new(),
+            // Stone 13.3 follow-up — DISABLED until first-launch
+            // animation diagnosis lands. See Framework::animations_disabled
+            // doc-comment for rationale.
+            animations_disabled: true,
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -456,6 +461,21 @@ pub struct Framework {
     /// slide-in. Deferring to Resumed means warm and cold launches
     /// look the same. Empty in steady state.
     pending_transitions: HashMap<activity_manager::ActivityId, animation::Transition>,
+    /// Stone 13.3 diagnostic — push lines from inside the framework
+    /// that the kernel drains once per frame and forwards through
+    /// `hal_log`. The framework crate has no direct log binding
+    /// (it's wasm-target-agnostic and doesn't depend on the kernel
+    /// HAL); this is the cheapest way to surface its internal
+    /// timing on cold-launch animation issues without leaking the
+    /// log facade into every public API.
+    pub diagnostic_log: Vec<String>,
+    /// Stone 13.3 follow-up — kill switch for the visual apply_props
+    /// rewrite. The transition-tracking infrastructure (controller,
+    /// pending_transitions, state-change arming) keeps running; only
+    /// the final paint-rewrite step is gated. Lets us collect logs on
+    /// cold-launch arming without showing users a half-working
+    /// animation. Default `false` (animation visually applied).
+    pub animations_disabled: bool,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -671,16 +691,28 @@ impl Framework {
         // window starts when the activity is ready to paint, not
         // when the launch was requested.
         if let Some(fg) = foreground {
-            if self.pending_transitions.contains_key(&fg)
-                && matches!(
-                    self.activities.state_of(fg),
-                    Some(activity_manager::LifecycleState::Resumed),
-                )
+            let pending = self.pending_transitions.contains_key(&fg);
+            let state = self.activities.state_of(fg);
+            if pending {
+                self.diagnostic_log.push(format!(
+                    "[anim] arm-check: fg={} state={:?} ts={:.0} ops={}",
+                    fg, state, ts,
+                    self.compositor.surface_target(
+                        compositor::Compositor::DEFAULT_SURFACE,
+                    ).ops.len(),
+                ));
+            }
+            if pending
+                && matches!(state, Some(activity_manager::LifecycleState::Resumed))
             {
                 if let Some(transition) = self.pending_transitions.remove(&fg) {
                     self.animations.start(
                         activity_animation_key(fg), transition, ts,
                     );
+                    self.diagnostic_log.push(format!(
+                        "[anim] armed: id={} ts={:.0} kind={:?}",
+                        fg, ts, transition,
+                    ));
                 }
             }
         }
@@ -689,6 +721,11 @@ impl Framework {
         // activity, rewrite its surface ops with the resulting
         // (translate_x, alpha) props. No-op fast path when nothing is
         // animating.
+        //
+        // GATE: `animations_disabled` lets us run the controller +
+        // arming path (and emit diagnostic logs) without users seeing
+        // a half-working slide-in. Re-enabled once the cold-launch
+        // first-frame timing is properly characterised.
         if let Some(fg) = foreground {
             let surface_key = activity_animation_key(fg);
             if self.animations.is_animating(surface_key) {
@@ -696,11 +733,18 @@ impl Framework {
                     surface_key, ts, self.metrics.width_px as f32,
                 );
                 if !props.is_rest() {
-                    let target = self.compositor.surface_target(
-                        compositor::Compositor::DEFAULT_SURFACE,
-                    );
-                    let rewritten = animation::apply_props(&target.ops, props);
-                    target.ops = rewritten;
+                    self.diagnostic_log.push(format!(
+                        "[anim] props: id={} ts={:.0} dx={:.0} alpha={:.2} disabled={}",
+                        fg, ts, props.translate_x, props.alpha,
+                        self.animations_disabled,
+                    ));
+                    if !self.animations_disabled {
+                        let target = self.compositor.surface_target(
+                            compositor::Compositor::DEFAULT_SURFACE,
+                        );
+                        let rewritten = animation::apply_props(&target.ops, props);
+                        target.ops = rewritten;
+                    }
                 }
             }
         }
@@ -1780,6 +1824,11 @@ impl Framework {
                 duration_ms: PUSH_TRANSITION_MS,
             },
         );
+        self.diagnostic_log.push(format!(
+            "[anim] push: id={} pkg={}/{} ts={:.0} state={:?}",
+            outcome.id, package_id, class, ts,
+            self.activities.state_of(outcome.id),
+        ));
 
         // Drive Create first so the activity exists, then hand it any
         // saved-state blob we persisted on a previous run. Only after
@@ -2314,6 +2363,8 @@ mod tests {
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
+            diagnostic_log: Vec::new(),
+            animations_disabled: true,
         }
     }
 
@@ -3379,6 +3430,8 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
+            diagnostic_log: Vec::new(),
+            animations_disabled: true,
         };
         fw.activities.register(
             "test.pkg",
@@ -3484,6 +3537,8 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
+            diagnostic_log: Vec::new(),
+            animations_disabled: true,
         };
         fw.activities.register(
             "test.pkg",
@@ -4062,6 +4117,8 @@ optional = []
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
+            diagnostic_log: Vec::new(),
+            animations_disabled: true,
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -4180,6 +4237,8 @@ optional = []
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
+            diagnostic_log: Vec::new(),
+            animations_disabled: true,
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -4323,6 +4382,8 @@ optional = []
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
+            diagnostic_log: Vec::new(),
+            animations_disabled: true,
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),
