@@ -810,18 +810,6 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
         fw.tick_animations(timestamp_ms);
     }
 
-    // Stone 13.3 follow-up — drain framework-side diagnostic log
-    // lines and forward through hal_log so they show up in the
-    // browser console (or wherever the host routes log records).
-    // Empty in steady state once `animations_disabled` is flipped
-    // back to false and the controller's noisy push-arm-apply path
-    // settles.
-    if let Some(fw) = k.framework.as_mut() {
-        for line in fw.diagnostic_log.drain(..) {
-            log::info(&line);
-        }
-    }
-
     // Render through the framework, then flush the resulting command
     // buffer to the HAL. The split keeps HAL calls confined to the kernel
     // crate so the framework stays wasm-target-agnostic.
