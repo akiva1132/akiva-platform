@@ -47,6 +47,24 @@ pub mod fire {
     /// the result this activity wants to hand back to whoever
     /// launched it via `START_ACTIVITY_FOR_RESULT`.
     pub const SET_RESULT: u32 = 0x0005;
+
+    /// Stone 14.1 — Send a frame on an open WebSocket.
+    ///
+    /// Args: `(ws_handle: u32, kind: u8, data: bytes...)` where
+    /// `kind == 0` is a UTF-8 text frame and `kind == 1` is a
+    /// binary frame. The handle was returned by [`io::WS_OPEN`];
+    /// sending on a closed handle is silently dropped. Capability
+    /// gated by `akiva.permission.NETWORK` — but the gate already
+    /// fired at `WS_OPEN`, so an app without the grant has no way
+    /// to obtain a valid handle in the first place.
+    pub const WS_SEND: u32 = 0x0006;
+
+    /// Stone 14.1 — Close a WebSocket. Idempotent; subsequent
+    /// `WS_RECV` polls on the handle resolve immediately to
+    /// `event_kind = 2` (closed).
+    ///
+    /// Args: `(ws_handle: u32, code: u16, reason: &str)`.
+    pub const WS_CLOSE: u32 = 0x0007;
 }
 
 /// I/O operations — the app calls `akiva_host_io_start(op_kind, args…)`
@@ -131,6 +149,71 @@ pub mod io {
     /// [`crate::window_manager::dialog`] for the framework-side
     /// implementation.
     pub const SHOW_DIALOG: u32 = 0x0107;
+
+    /// Stone 14.1 — HTTP request, gated by
+    /// `akiva.permission.NETWORK`.
+    ///
+    /// Args:
+    /// ```text
+    /// [method: u8]
+    /// [url_len: u16 LE | url: utf8...]
+    /// [header_count: u16 LE]
+    /// repeat header_count:
+    ///   [name_len: u16 LE | name: utf8...]
+    ///   [val_len:  u16 LE | val:  utf8...]
+    /// [body: bytes...]   // remainder
+    /// ```
+    /// Method codes: 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=HEAD.
+    ///
+    /// Result:
+    /// ```text
+    /// [status: u16 LE]
+    /// [header_count: u16 LE]
+    /// repeat header_count: same shape
+    /// [body: bytes...]
+    /// ```
+    /// On network or CORS failure the future resolves
+    /// `STATUS::ERROR` with a UTF-8 reason. The browser's CORS
+    /// rules apply transparently — apps targeting servers that
+    /// don't expose CORS headers must proxy through their own
+    /// backend, exactly like a sandboxed mobile app on a
+    /// network without root certs would.
+    pub const HTTP_FETCH: u32 = 0x0108;
+
+    /// Stone 14.1 — Open a WebSocket. Gated by
+    /// `akiva.permission.NETWORK`.
+    ///
+    /// Args: `[url_len: u16 LE | url: utf8...
+    ///   | proto_count: u8 | (proto_len: u16 LE | proto: utf8...)*]`.
+    ///
+    /// Resolves READY with `[ws_handle: u32 LE]` once the
+    /// underlying WebSocket emits its `open` event; resolves
+    /// ERROR with a UTF-8 reason on handshake failure. The
+    /// handle is opaque, allocated by the host's `NetManager`,
+    /// and tied to the calling package — passing it from
+    /// another package's worker is rejected at the dispatcher.
+    pub const WS_OPEN: u32 = 0x0109;
+
+    /// Stone 14.1 — Pull the next event off an open WebSocket.
+    ///
+    /// Args: `[ws_handle: u32 LE]`.
+    ///
+    /// Result:
+    /// ```text
+    /// [event_kind: u8 | data: bytes...]
+    /// ```
+    /// where `event_kind`:
+    /// - `0` text message (data is utf8 of the frame),
+    /// - `1` binary message,
+    /// - `2` closed (data = `[code: u16 LE | reason: utf8...]`).
+    ///
+    /// The host buffers up to a small bounded queue per handle;
+    /// if the queue overflows the connection is force-closed
+    /// and the next `WS_RECV` surfaces a `2` event with code
+    /// `1009` ("message too big") in keeping with RFC 6455.
+    /// After a close event every further `WS_RECV` on the
+    /// handle resolves immediately as closed.
+    pub const WS_RECV: u32 = 0x010A;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds.
@@ -242,11 +325,13 @@ mod tests {
         let fire = [
             fire::LOG, fire::FINISH, fire::START_ACTIVITY,
             fire::START_ACTIVITY_FOR_RESULT, fire::SET_RESULT,
+            fire::WS_SEND, fire::WS_CLOSE,
         ];
         let io = [
             io::TEXT_WIDTH, io::QUERY_PACKAGES,
             io::STORAGE_GET, io::STORAGE_SET, io::STORAGE_DELETE,
             io::TIMER_SLEEP, io::SHOW_DIALOG,
+            io::HTTP_FETCH, io::WS_OPEN, io::WS_RECV,
         ];
         for k in fire { assert!((0x0001..=0x00FF).contains(&k), "fire op {k:#x} out of range"); }
         for k in io   { assert!((0x0101..=0x01FF).contains(&k), "io op {k:#x} out of range"); }
@@ -262,6 +347,7 @@ mod tests {
         let fire = [
             fire::LOG, fire::FINISH, fire::START_ACTIVITY,
             fire::START_ACTIVITY_FOR_RESULT, fire::SET_RESULT,
+            fire::WS_SEND, fire::WS_CLOSE,
         ];
         for (i, a) in fire.iter().enumerate() {
             for b in &fire[i + 1..] {
@@ -272,6 +358,7 @@ mod tests {
             io::TEXT_WIDTH, io::QUERY_PACKAGES,
             io::STORAGE_GET, io::STORAGE_SET, io::STORAGE_DELETE,
             io::TIMER_SLEEP, io::SHOW_DIALOG,
+            io::HTTP_FETCH, io::WS_OPEN, io::WS_RECV,
         ];
         for (i, a) in io.iter().enumerate() {
             for b in &io[i + 1..] {
@@ -294,6 +381,8 @@ mod tests {
         assert_eq!(fire::START_ACTIVITY,            sdk::fire::START_ACTIVITY);
         assert_eq!(fire::START_ACTIVITY_FOR_RESULT, sdk::fire::START_ACTIVITY_FOR_RESULT);
         assert_eq!(fire::SET_RESULT,                sdk::fire::SET_RESULT);
+        assert_eq!(fire::WS_SEND,                   sdk::fire::WS_SEND);
+        assert_eq!(fire::WS_CLOSE,                  sdk::fire::WS_CLOSE);
         assert_eq!(io::TEXT_WIDTH,                  sdk::io::TEXT_WIDTH);
         assert_eq!(io::QUERY_PACKAGES,              sdk::io::QUERY_PACKAGES);
         assert_eq!(io::STORAGE_GET,                 sdk::io::STORAGE_GET);
@@ -301,6 +390,9 @@ mod tests {
         assert_eq!(io::STORAGE_DELETE,              sdk::io::STORAGE_DELETE);
         assert_eq!(io::TIMER_SLEEP,                 sdk::io::TIMER_SLEEP);
         assert_eq!(io::SHOW_DIALOG,                 sdk::io::SHOW_DIALOG);
+        assert_eq!(io::HTTP_FETCH,                  sdk::io::HTTP_FETCH);
+        assert_eq!(io::WS_OPEN,                     sdk::io::WS_OPEN);
+        assert_eq!(io::WS_RECV,                     sdk::io::WS_RECV);
         assert_eq!(status::PENDING,                 sdk::status::PENDING);
         assert_eq!(status::READY,                   sdk::status::READY);
         assert_eq!(status::ERROR,                   sdk::status::ERROR);

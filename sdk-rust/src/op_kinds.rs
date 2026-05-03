@@ -28,6 +28,18 @@ pub mod fire {
     pub const START_ACTIVITY_FOR_RESULT: u32 = 0x0004;
     /// Args: `[handle: u32 LE | result: encoded ActivityResult...]`.
     pub const SET_RESULT: u32 = 0x0005;
+    /// Stone 14.1 — Send a frame on an open WebSocket. Args:
+    /// `[ws_handle: u32 LE | kind: u8 | data: bytes...]` where
+    /// `kind == 0` is a UTF-8 text frame and `kind == 1` is a
+    /// binary frame. The handle was returned by [`io::WS_OPEN`].
+    /// Sending on a closed handle is silently dropped (the
+    /// followup `WS_RECV` will surface the close).
+    pub const WS_SEND: u32 = 0x0006;
+    /// Stone 14.1 — Close a WebSocket. Args:
+    /// `[ws_handle: u32 LE | code: u16 LE | reason_len: u16 LE
+    ///   | reason: utf8...]`. Idempotent; subsequent ops on the
+    /// handle are no-ops.
+    pub const WS_CLOSE: u32 = 0x0007;
 }
 
 /// I/O operations. Range `0x0101..=0x01FF`.
@@ -56,6 +68,48 @@ pub mod io {
     /// dialog box. The framework owns the dialog surface and input
     /// shielding — the app worker just awaits the resolution.
     pub const SHOW_DIALOG: u32 = 0x0107;
+    /// Stone 14.1 — HTTP request, gated by
+    /// `akiva.permission.NETWORK`. The host calls `fetch()`
+    /// from the kernel worker; CORS rules apply. Args:
+    /// ```text
+    /// [method: u8]
+    /// [url_len: u16 LE | url: utf8...]
+    /// [header_count: u16 LE]
+    /// repeat header_count:
+    ///   [name_len: u16 LE | name: utf8...]
+    ///   [val_len:  u16 LE | val:  utf8...]
+    /// [body: bytes...]   // remainder of args
+    /// ```
+    /// Method codes: 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=HEAD.
+    /// Result:
+    /// ```text
+    /// [status: u16 LE]
+    /// [header_count: u16 LE]
+    /// repeat header_count: same shape as above
+    /// [body: bytes...]
+    /// ```
+    /// On network/CORS failure → STATUS::ERROR with a UTF-8 reason.
+    pub const HTTP_FETCH: u32 = 0x0108;
+    /// Stone 14.1 — Open a WebSocket. Gated by
+    /// `akiva.permission.NETWORK`. Args:
+    /// `[url_len: u16 LE | url: utf8...
+    ///   | proto_count: u8 | (proto_len: u16 LE | proto: utf8...)*]`.
+    /// Resolves READY with `[ws_handle: u32 LE]` once the WS
+    /// `open` event fires; ERROR with a UTF-8 reason if the
+    /// handshake fails. The handle is opaque, allocated by the
+    /// host, and only valid for the lifetime of this app instance.
+    pub const WS_OPEN: u32 = 0x0109;
+    /// Stone 14.1 — Receive the next event on a WebSocket.
+    /// Args: `[ws_handle: u32 LE]`. Resolves READY with:
+    /// ```text
+    /// [event_kind: u8 | data: bytes...]
+    /// ```
+    /// `event_kind == 0` text message (data is utf8);
+    /// `event_kind == 1` binary message;
+    /// `event_kind == 2` closed (`data` = `[code: u16 LE
+    ///   | reason: utf8...]`). After a close event every
+    /// further `WS_RECV` resolves immediately as closed.
+    pub const WS_RECV: u32 = 0x010A;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds. Mirror of
@@ -126,10 +180,15 @@ mod tests {
         // Failure here means the constant moved out of its declared range.
         assert!(fire::LOG <= 0x00FF);
         assert!(fire::SET_RESULT <= 0x00FF);
+        assert!(fire::WS_SEND <= 0x00FF);
+        assert!(fire::WS_CLOSE <= 0x00FF);
         assert!(io::TEXT_WIDTH >= 0x0101 && io::TEXT_WIDTH <= 0x01FF);
         assert!(io::STORAGE_SET >= 0x0101 && io::STORAGE_SET <= 0x01FF);
         assert!(io::STORAGE_DELETE >= 0x0101 && io::STORAGE_DELETE <= 0x01FF);
         assert!(io::SHOW_DIALOG >= 0x0101 && io::SHOW_DIALOG <= 0x01FF);
+        assert!(io::HTTP_FETCH >= 0x0101 && io::HTTP_FETCH <= 0x01FF);
+        assert!(io::WS_OPEN >= 0x0101 && io::WS_OPEN <= 0x01FF);
+        assert!(io::WS_RECV >= 0x0101 && io::WS_RECV <= 0x01FF);
         assert_eq!(status::PENDING, 0);
         assert_eq!(status::READY,   1);
         assert_eq!(status::ERROR,   2);

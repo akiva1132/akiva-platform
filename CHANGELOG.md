@@ -10,6 +10,47 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [0.9.0] — 2026-05 (Stone 14.1 — Net capability)
+
+**MINOR** — additive: 5 new op_kinds, no kernel export changes, no new
+HAL imports (net ops travel entirely through the existing
+`akiva_host_fire` / `akiva_host_io_start` / `akiva_host_io_poll`
+unified-ABI multiplexers, dispatched inside AppRegistry to browser
+`fetch` / `WebSocket`). Apps with `min_abi_version` ≤ 0.9.0 load
+unchanged.
+
+- **Added (Stone 14.1 — IO ops).**
+  - `IO::HTTP_FETCH = 0x0108` — gated by `akiva.permission.NETWORK`.
+    Args: `[method:u8 | url_len:u16 LE | url:utf8 | hdr_count:u16 LE
+    | (name_len:u16 | name:utf8 | val_len:u16 | val:utf8)* | body...]`.
+    Result: `[status:u16 LE | hdr_count:u16 LE | (headers as above)
+    | body...]`. CORS rules apply transparently; servers without
+    CORS headers are unreachable from the web runtime by design.
+  - `IO::WS_OPEN = 0x0109` — open a WebSocket. Args: `[url_len:u16
+    | url:utf8 | proto_count:u8 | (proto_len:u16 | proto:utf8)*]`.
+    Result: `[ws_handle:u32 LE]`. Resolves on the underlying
+    socket's `open` event; ERROR with a UTF-8 reason on handshake
+    failure.
+  - `IO::WS_RECV = 0x010A` — pull next event off a handle.
+    Args: `[ws_handle:u32 LE]`. Result: `[kind:u8 | data...]` where
+    kind 0=text, 1=binary, 2=closed (data = `[code:u16 LE | reason]`).
+- **Added (Stone 14.1 — fire ops).**
+  - `FIRE::WS_SEND = 0x0006` — send a frame. Args:
+    `[ws_handle:u32 | kind:u8 | data...]` (kind 0=text, 1=binary).
+  - `FIRE::WS_CLOSE = 0x0007` — close idempotent.
+    Args: `[ws_handle:u32 | code:u16 | reason_len:u16 | reason:utf8]`.
+- **Added (SDK).** `akiva_sdk::net` module: `Request` builder + free
+  `get`/`post` helpers + `WebSocket::connect/send_text/send_binary/
+  recv/close`, `NetError` enum (Denied/BadUrl/Network/Closed/Busy).
+  `WebSocket` impls `Drop` to send normal-closure 1000 so handles
+  never leak past activity teardown.
+- **Capability machinery.** No new wire surface — reuses the existing
+  `akiva.permission.NETWORK` declaration from Stone 10.3 (declared at
+  `ProtectionLevel::Normal`, auto-granted on install). Gating in two
+  layers: app worker shell (early reject before host_op round-trip)
+  and AppRegistry dispatcher (real enforcement). Upgrading to
+  `Dangerous` (runtime prompt) is queued as Stone 14.1.x.
+
 ## [0.8.0] — 2026-05 (Stone 13.2)
 
 **MINOR** — additive: one new io op_kind + one new kernel export +

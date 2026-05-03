@@ -225,7 +225,7 @@ pub fn dealloc(ptr: *mut u8, size: u32) {
     unsafe { std_dealloc(ptr, layout); }
 }
 
-pub const ABI_VERSION: &[u8] = b"0.8.0\0";
+pub const ABI_VERSION: &[u8] = b"0.9.0\0";
 
 /// Stone 11.6.8 #2 — per-slot backpressure cap on concurrent
 /// in-flight dispatches.

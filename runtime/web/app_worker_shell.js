@@ -694,6 +694,25 @@ function dispatchFire(opKind, args) {
       postSideEffect(opKind, args);
       return 0;
     }
+    // Stone 14.1 — WebSocket send/close. The handle is a NETWORK
+    // handle (allocated by AppRegistry on WS_OPEN), not an activity
+    // slot handle, so we forward without the activity-handle
+    // pre-check; AppRegistry validates the handle ↔ packageId
+    // binding before acting. NETWORK grant gate is here so an app
+    // without the permission can't even surface the side_effect.
+    case FIRE.WS_SEND:
+    case FIRE.WS_CLOSE: {
+      if (!grants.has("akiva.permission.NETWORK")) {
+        postLog("warn", `fire(0x${opKind.toString(16)}): denied — no NETWORK grant`);
+        return 2;
+      }
+      // WS_SEND minimum: [handle:4 | kind:1] = 5 bytes
+      // WS_CLOSE minimum: [handle:4 | code:2 | reason_len:2] = 8 bytes
+      const minLen = opKind === FIRE.WS_SEND ? 5 : 8;
+      if (args.length < minLen) return 1;
+      postSideEffect(opKind, args);
+      return 0;
+    }
     default:
       postLog("warn", `fire(0x${opKind.toString(16)}): unknown op_kind`);
       return 1;
@@ -817,6 +836,25 @@ function dispatchIoStart(opKind, args) {
       // user resolves it. Kernel side: `app_registry._handleHostOp`
       // routes into `akiva_open_dialog`, framework drains resolutions
       // each frame and posts back here.
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
+      postMessage(
+        { type: "host_op", future_id: fid, op_kind: opKind, args },
+        [args.buffer],
+      );
+      return fid;
+    }
+    // Stone 14.1 — Network ops. NETWORK grant is gated here so the
+    // app sees a clean Denied without a kernel round-trip. Each op
+    // forwards to AppRegistry via host_op; the kernel-worker calls
+    // browser fetch / WebSocket APIs and posts host_op_done back.
+    case IO.HTTP_FETCH:
+    case IO.WS_OPEN:
+    case IO.WS_RECV: {
+      if (!grants.has("akiva.permission.NETWORK")) {
+        postLog("warn", `io_start(0x${opKind.toString(16)}): denied — no NETWORK grant`);
+        return 0n;
+      }
       const fid = nextFutureId++;
       futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
       postMessage(

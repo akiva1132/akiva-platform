@@ -1523,35 +1523,55 @@ App (wasm) ─► hal_cap_* imports ─► kernel worker ─┬─[worker-native
 
 ---
 
-### Stone 14.1 — WebSocket (~1 שבוע)
+### Stone 14.1 — Net capability foundation + HTTP/WebSocket transports ✅ סגור (May 2026)
 
 **מה הדפדפן מאפשר.**
-`WebSocket` (RFC 6455) — bidirectional, message-framed, TCP/TLS. **Baseline 2015**. **זמין ב-dedicated workers** (`self.WebSocket`) — kernel worker יכול לפתוח חיבורים ישירות ב-`self`, ללא proxy לmain thread. Binary frames (`binaryType = "arraybuffer"`), UTF-8 text frames. Browser מנהל TLS + WS handshake בשקיפות. Latency: ≤ 1ms ב-local network, ~20-100ms ל-remote.
+- `fetch` — HTTP/1.1 + HTTP/2 + HTTP/3 transparent. CORS חוסם cross-origin בלי opt-in מהשרת.
+- `WebSocket` (RFC 6455) — bidirectional, message-framed, TCP/TLS. **Baseline 2015**. זמין ב-dedicated workers (`self.WebSocket`) — kernel worker פותח חיבורים ישירות, ללא proxy לmain thread. Binary frames (`binaryType = "arraybuffer"`), UTF-8 text. Browser מטפל ב-TLS + WS handshake בשקיפות.
 
-**מה אנחנו עושים.**
+**ההחלטה הארכיטקטונית.** במקום "ship WebSocket" כפי שקודם תכנן, מסגרנו את 14.1 מחדש כ-**Net Capability Foundation** — המשטח OS-shaped (manifest declaration + `INTERNET`-style permission + `connect()`-shaped SDK) קיים *ראשון*; HTTP ו-WebSocket הם הוצאות לראשונה של אותה תשתית. הסיבה: 14.2-14.6 הופכים לפלאגינים על אותה capability machinery במקום שכפול per-stone של פרק ה-grant/dispatcher.
 
-`kernel/src/host.rs` — 4 HAL imports חדשים:
-```rust
-hal_ws_open(url_ptr: u32, url_len: u32, handle_out_ptr: u32) -> i32   // 0=ok, -1=err
-hal_ws_send(handle: u32, data_ptr: u32, data_len: u32) -> i32
-hal_ws_recv(handle: u32, out_ptr: u32, out_cap: u32, out_len_ptr: u32) -> i32  // 0=empty, -1=closed
-hal_ws_close(handle: u32)
-```
+**מה נבנה (Stone 14.1 — closed)**:
 
-`runtime/web/worker.js` — `Map<u32, { ws: WebSocket, ring: Uint8Array[] }>`. פתיחה: `new WebSocket(url); ws.binaryType = "arraybuffer"`. `onmessage` → `ring.push(new Uint8Array(e.data))`. `hal_ws_recv` מוציא frame אחד מה-ring (returns `0` אם ריק; ה-app עושה yield ומנסה שוב בframe הבא).
+- **Manifest declaration** — `permissions.required = ["akiva.permission.NETWORK"]` ב-`manifest.toml` של אפליקציה. `framework::permissions::declare_mvp_permissions` כבר הצהיר על `NETWORK` ב-`ProtectionLevel::Normal` מ-Stone 10.3, אז install-time auto-grant ירש את הסמנטיקה. שדרוג ל-`Dangerous` (runtime prompt דרך 13.2's `DialogManager`) הוא 14.1.x.
+- **Capability gate** — בדיקת ה-grant פעמיים: ב-`app_worker_shell.js::dispatchFire`/`dispatchIoStart` (קצר את הקריאה לפני round-trip ל-AppRegistry) וב-`app_registry.js::_handleHostOp`/`_handleSideEffect` (אכיפה אמיתית — האפליקציה לא יכולה לרמות את ה-worker שלה כי האירוע יורד ב-AppRegistry).
+- **Wire ops** — 5 op_kinds חדשים, כולם בטווחי fire/io הקיימים:
+  - `IO::HTTP_FETCH = 0x0108` — request/response שלם, async, גומר על fetch resolution
+  - `IO::WS_OPEN = 0x0109` — handshake → handle: u32
+  - `IO::WS_RECV = 0x010A` — pull הבא event (text/binary/closed)
+  - `FIRE::WS_SEND = 0x0006` — fire-and-forget משלוח frame
+  - `FIRE::WS_CLOSE = 0x0007` — close idempotent
+- **SDK API** — `sdk-rust/src/net.rs`:
+  - `net::get(url)` / `net::post(url, body)` / `net::Request` builder עם `.header()`/`.body()`/`.send()`
+  - `net::WebSocket::connect(url) -> WsConnectFuture`; methods `send_text/send_binary/recv/close`; `Drop` שולח close 1000 כדי לא לדלוף connections
+  - `NetError` enum: `Denied | BadUrl | Network(String) | Closed | Busy`
+  - 14 unit tests (encode/decode round-trips, pre-resolved error paths, method codes)
+- **AppRegistry-side** — `_wsHandles: Map<u32, {ws, packageId, recvQueue, pendingRecv, closed}>`. אירועי `onmessage` נכנסים ל-queue (cap=64; overflow → force-close 1009). `recv()` של אפליקציה רואה את ה-queue או נרשם כ-`pendingRecv`. ניקוי ב-`evictPackage` + watchdog kill דרך `_disposeWsForPackage`.
+- **Demo app** — `apps/network/` חדש: שני כפתורים (HTTPS GET → `httpbin.org/get`, WebSocket echo → `wss://echo.websocket.events`) + status line שמראה round-trip success.
+- **ABI bump** — `RUNTIME_ABI_VERSION` 0.8.0 → 0.9.0 (additive: ops חדשים תחת fire/io ranges קיימים, אפליקציות עם `min_abi_version = "0.1.0"` עדיין נטענות).
 
-`framework/src/net.rs` — `WsHandle(u32)`. `async fn connect(url: &str) -> Result<WsHandle, WsError>` polls `hal_ws_open` future (future system מ-11.6.8). `async fn send(&self, data: &[u8])`. `async fn recv(&self) -> Result<Vec<u8>, WsError>` polls `hal_ws_recv` — מחכה עד שring לא ריק.
+**מה לא במסגרת (deferred ל-14.1.x)**:
+- **Runtime prompt UI** — `NETWORK` נשאר `Normal` (auto-grant). שדרוג ל-`Dangerous` עם dialog "Allow X to access network?" דורש את ה-`DialogManager` הקיים מ-13.2 + persistence של החלטת המשתמש. נטל קטן יחסית (~יום) אבל UI work שהמשתמש העדיף לדחות.
+- **Host allowlist בmanifest** — `permissions.network.hosts = [...]` לחסום ב-grant time. נמצא בשטח אבל מחוץ ל-foundation; כל apps כעת רואים the open internet (modulo CORS).
+- **Streaming HTTP** — `fetch` כרגע resolves על body שלם. SDK עוד אין `Response::body_stream()`. הוצאה לראשונה אם app אמיתי דורש (P1).
+- **WebSocket subprotocols** — wire byte קיים אבל ה-SDK לא חשפו, כי אין use case היום.
 
-SDK: `akiva_sdk::net::WebSocket` wrapping `framework::net::WsHandle`.
+**Exit criteria — Stone 14.1 (sealed):**
+- [x] Manifest `permissions.required = ["akiva.permission.NETWORK"]` נדרש; אפליקציה ללא ה-grant מקבלת `Err(NetError::Denied)` synchronous
+- [x] HTTPS GET ל-server עם CORS עובד (httpbin.org demo)
+- [x] WebSocket connect → send → echo round-trip עובד (echo.websocket.events demo)
+- [x] WS handle בלעדי לאפליקציה — קריאה מ-worker אחר נדחית (provenance check)
+- [x] Worker termination סוגרת WS connections (no orphan handles)
+- [x] 288 framework + 216 SDK + 81 wire + 143 vitest tests עוברים
+- [x] ABI bump 0.8.0 → 0.9.0 documented ב-`docs/abi.md`
 
-**אופי המימוש:** additive — 4 imports חדשים ל-ABI (MINOR bump). App worker שולח WebSocket requests ישירות; kernel worker אינו מעורב ב-routing.
+---
 
-**DoD:**
-- [ ] Sample app: connect → send "hello" → recv "hello" back מ-echo server
-- [ ] `hal_ws_recv` returns `0` (not panic) כשring ריק — app loops with yield
-- [ ] Server closes → next `recv()` → `Err(WsError::Closed)`
-- [ ] Connection refused (bad URL) → `Err(WsError::Failed)` תוך ≤ 5s
-- [ ] `docs/abi.md` מעודכן עם 4 imports; ABI MINOR bump
+### Stone 14.1.x — Network capability follow-ups (planned, not blocking)
+- Runtime permission prompt: NETWORK → `Dangerous`, dialog UX
+- Host-restricted grants (manifest allowlist of allowed hosts)
+- Streaming HTTP responses (`Response::body_stream()`)
+- WebSocket subprotocols exposed in SDK
 
 ---
 

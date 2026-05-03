@@ -152,6 +152,33 @@ export class AppRegistry {
      * @type {Map<number, { packageId: string, futureId: bigint }>}
      */
     this._pendingDialogs = new Map();
+
+    /**
+     * Stone 14.1 — open WebSockets, keyed by the opaque handle we
+     * hand back to apps on `IO::WS_OPEN`. Each entry pins:
+     * - `ws`         the live `WebSocket` instance
+     * - `packageId`  the app that owns the handle (rejected if any
+     *                other worker tries to act on it)
+     * - `recvQueue`  buffered events waiting for the next
+     *                `IO::WS_RECV` (text/binary/closed). Capped at
+     *                `WS_RECV_QUEUE_CAP`; overflow force-closes the
+     *                socket with code 1009 ("message too big") per
+     *                RFC 6455 §7.4.1.
+     * - `pendingRecv` the (futureId) of an in-flight `WS_RECV` the
+     *                app issued before any event arrived. At most
+     *                one — the SDK serialises recvs by construction
+     *                (each `recv()` `.await`s before issuing the
+     *                next), but if a misbehaving app double-issues
+     *                we drop the older one with ERROR.
+     * - `closed`    `true` once a Closed event has been delivered;
+     *                further sends are no-ops, further recvs return
+     *                the cached close synthetically.
+     *
+     * @type {Map<number, { ws: WebSocket, packageId: string, recvQueue: Array<Uint8Array>, pendingRecv: { futureId: bigint } | null, closed: boolean }>}
+     */
+    this._wsHandles = new Map();
+    /** Monotonic WebSocket handle allocator. Starts at 1; 0 is the "rejected" sentinel. */
+    this._nextWsHandle = 1;
     /**
      * Stone 13.2 — kernel-side bridge symbols. Looked up lazily on the
      * first dialog open after `setKernelInstance` has wired them in
@@ -620,6 +647,10 @@ export class AppRegistry {
         this._dispatches.delete(fid);
       }
     }
+    // Stone 14.1 — close any WebSocket the dead app left open so the
+    // browser doesn't hold an orphan connection. Symmetric with the
+    // watchdog kill path further down.
+    this._disposeWsForPackage(packageId);
     return 1;
   }
 
@@ -748,6 +779,7 @@ export class AppRegistry {
             this._dispatches.delete(fid);
           }
         }
+        this._disposeWsForPackage(proc.packageId);
         return;
       }
       // WARN — log once per crossing (proc.warned latches until a
@@ -1227,6 +1259,19 @@ export class AppRegistry {
   _handleSideEffect(packageId, msg) {
     const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(msg.args ?? 0);
     if (args.length < 4) return;
+
+    // Stone 14.1 — net fire ops use a separate handle namespace
+    // (WebSocket handles allocated by AppRegistry, not activity slot
+    // ids). Branch out before the activity-handle ownership check.
+    switch (msg.op_kind) {
+      case FIRE.WS_SEND:
+        this._handleWsSend(packageId, args);
+        return;
+      case FIRE.WS_CLOSE:
+        this._handleWsClose(packageId, args);
+        return;
+    }
+
     const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
     const handle = view.getUint32(0, true);
     if (!this._handleBelongsTo(handle, packageId)) {
@@ -1428,6 +1473,44 @@ export class AppRegistry {
         status = STATUS.READY;
         break;
       }
+      // Stone 14.1 — Network ops, all gated by NETWORK. Each goes
+      // async (real fetch / WebSocket events), so we don't post
+      // host_op_done from this synchronous switch — the dedicated
+      // helper resolves it once the underlying browser primitive
+      // fires its callback.
+      case IO.HTTP_FETCH: {
+        if (!this._hasGrant(packageId, "akiva.permission.NETWORK")) {
+          this._log("warn", `[${packageId}] host_op HTTP_FETCH: denied — no NETWORK grant`);
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("net: denied (no NETWORK grant)");
+          break;
+        }
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        this._handleHttpFetch(packageId, futureId, args);
+        return; // helper posts host_op_done asynchronously
+      }
+      case IO.WS_OPEN: {
+        if (!this._hasGrant(packageId, "akiva.permission.NETWORK")) {
+          this._log("warn", `[${packageId}] host_op WS_OPEN: denied — no NETWORK grant`);
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("net: denied (no NETWORK grant)");
+          break;
+        }
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        this._handleWsOpen(packageId, futureId, args);
+        return; // resolves on ws.onopen / ws.onerror
+      }
+      case IO.WS_RECV: {
+        if (!this._hasGrant(packageId, "akiva.permission.NETWORK")) {
+          this._log("warn", `[${packageId}] host_op WS_RECV: denied — no NETWORK grant`);
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("net: denied (no NETWORK grant)");
+          break;
+        }
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        this._handleWsRecv(packageId, futureId, args);
+        return; // resolves on next ws.onmessage / onclose
+      }
       default:
         this._log("warn", `[${packageId}] host_op unknown op_kind=0x${(msg.op_kind ?? 0).toString(16)}`);
         status = STATUS.ERROR;
@@ -1461,6 +1544,380 @@ export class AppRegistry {
     );
   }
 
+  // ── Stone 14.1 — Network capability ──────────────────────────────────
+  //
+  // HTTP_FETCH, WS_OPEN, WS_RECV all dispatch into browser network
+  // primitives (`fetch` / `WebSocket`) and resolve the originating
+  // `host_op` future once the primitive completes. WS_SEND / WS_CLOSE
+  // arrive as fire ops via `_handleSideEffect` and operate on an
+  // already-open handle.
+  //
+  // Each handle is bound to its allocating packageId; cross-package
+  // attempts are rejected with a logged warning and either an ERROR
+  // host_op_done (for ops that owe a reply) or a silent drop (for
+  // fire ops). The same provenance discipline as the activity-handle
+  // path in `_handleSideEffect`.
+
+  /** RFC 6455 §7.4.1 close codes the host issues. */
+  static get _WS_CLOSE_CODES() {
+    return Object.freeze({
+      NORMAL: 1000,
+      ABNORMAL: 1006,        // never sent on the wire; synthetic for
+                             // close events the browser surfaces
+                             // without a code (transport drop).
+      MESSAGE_TOO_BIG: 1009,
+    });
+  }
+
+  /** Cap on per-handle buffered receive events. Matches the SDK's
+   *  expectation that `recv()` is awaited promptly; an app that
+   *  ignores recv for too long under heavy traffic gets force-closed
+   *  rather than letting the host eat unbounded memory. 64 events
+   *  covers small bursts; sustained higher rates are an app bug. */
+  static get _WS_RECV_QUEUE_CAP() { return 64; }
+
+  /**
+   * Run an HTTP request on behalf of `packageId` and resolve its
+   * `host_op` future when the browser's `fetch` settles. Failure
+   * modes:
+   *  - parse error in the args blob → STATUS::ERROR with reason
+   *  - fetch rejected (DNS, CORS preflight refusal, TLS) → ERROR
+   *  - any thrown error reading the response body → ERROR
+   *
+   * The fetch always uses `mode: "cors"` — there is no
+   * non-CORS path from a Worker. Apps targeting non-CORS servers
+   * must proxy through their own backend.
+   */
+  _handleHttpFetch(packageId, futureId, args) {
+    let req;
+    try {
+      req = decodeHttpRequest(args, this._decoder);
+    } catch (err) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode(`http: bad request: ${err?.message ?? err}`));
+      return;
+    }
+
+    const method = HTTP_METHODS[req.method];
+    if (!method) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode(`http: unknown method code ${req.method}`));
+      return;
+    }
+
+    const proc = this._processes.get(packageId);
+
+    const init = {
+      method,
+      headers: req.headers,
+      // GET / HEAD must not have a body per the fetch spec.
+      body: (method === "GET" || method === "HEAD") ? undefined : req.body,
+      mode: "cors",
+      credentials: "omit",
+      redirect: "follow",
+    };
+
+    fetch(req.url, init).then(async (resp) => {
+      const headerPairs = [];
+      resp.headers.forEach((v, k) => headerPairs.push([k, v]));
+      const body = new Uint8Array(await resp.arrayBuffer());
+      const out = encodeHttpResponse(resp.status, headerPairs, body);
+      // Worker may have died between issue and settle.
+      if (this._processes.get(packageId) !== proc) return;
+      this._postHostOpDone(packageId, futureId, STATUS.READY, out);
+    }).catch((err) => {
+      if (this._processes.get(packageId) !== proc) return;
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode(`http: ${err?.message ?? err}`));
+    });
+  }
+
+  /**
+   * Open a WebSocket on behalf of `packageId`. Allocate a handle
+   * synchronously, store it, and resolve the open future once the
+   * `open` event fires. `error` before `open` resolves the future
+   * with STATUS::ERROR; `error` after `open` enqueues a Closed event
+   * so `recv()` surfaces it cleanly.
+   */
+  _handleWsOpen(packageId, futureId, args) {
+    if (args.length < 2) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("ws: open args truncated"));
+      return;
+    }
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const urlLen = view.getUint16(0, true);
+    if (2 + urlLen > args.length) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("ws: url length exceeds args"));
+      return;
+    }
+    const url = this._decoder.decode(args.subarray(2, 2 + urlLen));
+    // Subprotocols (1 byte count + entries) — currently always 0.
+    // Carried in the wire shape for forward compat; we ignore them.
+    const protoOff = 2 + urlLen;
+    const protocols = [];
+    if (protoOff < args.length) {
+      const count = args[protoOff];
+      let cur = protoOff + 1;
+      for (let i = 0; i < count && cur + 2 <= args.length; i++) {
+        const pl = view.getUint16(cur, true); cur += 2;
+        if (cur + pl > args.length) break;
+        protocols.push(this._decoder.decode(args.subarray(cur, cur + pl)));
+        cur += pl;
+      }
+    }
+
+    const wsHandle = this._nextWsHandle++;
+    let ws;
+    try {
+      ws = protocols.length > 0 ? new WebSocket(url, protocols) : new WebSocket(url);
+    } catch (err) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode(`ws: construct failed: ${err?.message ?? err}`));
+      return;
+    }
+    ws.binaryType = "arraybuffer";
+
+    const entry = {
+      ws,
+      packageId,
+      recvQueue: [],
+      pendingRecv: null,
+      closed: false,
+    };
+    this._wsHandles.set(wsHandle, entry);
+
+    const proc = this._processes.get(packageId);
+    let openSettled = false;
+
+    ws.addEventListener("open", () => {
+      if (openSettled) return;
+      openSettled = true;
+      if (this._processes.get(packageId) !== proc) {
+        // Worker died before connection landed. Tear down the
+        // socket so we don't keep an orphan connection alive.
+        try { ws.close(1000, ""); } catch (_) { /* ignore */ }
+        this._wsHandles.delete(wsHandle);
+        return;
+      }
+      const out = new Uint8Array(4);
+      new DataView(out.buffer).setUint32(0, wsHandle, true);
+      this._postHostOpDone(packageId, futureId, STATUS.READY, out);
+    });
+
+    ws.addEventListener("message", (ev) => this._onWsMessage(wsHandle, ev));
+    ws.addEventListener("close", (ev) => this._onWsClose(wsHandle, ev));
+    ws.addEventListener("error", () => {
+      // Browser-level error: if open hasn't happened, settle the
+      // open future with ERROR; otherwise let the close handler
+      // surface it as a Closed event (the browser fires close
+      // after error in nearly all cases).
+      if (!openSettled) {
+        openSettled = true;
+        this._wsHandles.delete(wsHandle);
+        if (this._processes.get(packageId) !== proc) return;
+        this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+          this._encoder.encode("ws: handshake failed"));
+      }
+    });
+  }
+
+  /**
+   * Pull the next event off the per-handle queue, or park the
+   * future for the next message/close to arrive.
+   */
+  _handleWsRecv(packageId, futureId, args) {
+    if (args.length < 4) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("ws: recv args truncated"));
+      return;
+    }
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const wsHandle = view.getUint32(0, true);
+    const entry = this._wsHandles.get(wsHandle);
+    if (!entry || entry.packageId !== packageId) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("ws: unknown handle"));
+      return;
+    }
+    if (entry.recvQueue.length > 0) {
+      const ev = entry.recvQueue.shift();
+      this._postHostOpDone(packageId, futureId, STATUS.READY, ev);
+      // After a Closed event we leave the entry around so further
+      // recvs return the same Closed state via the queue's pre-fill;
+      // see _onWsClose.
+      return;
+    }
+    if (entry.pendingRecv) {
+      // Two recvs in flight is a malformed app pattern (the SDK
+      // serialises). Resolve the older one with ERROR so it doesn't
+      // hang, then park this new one.
+      this._postHostOpDone(entry.packageId, entry.pendingRecv.futureId,
+        STATUS.ERROR,
+        this._encoder.encode("ws: superseded by another recv"));
+    }
+    entry.pendingRecv = { futureId };
+  }
+
+  /**
+   * App raised `FIRE::WS_SEND` — write a frame on the underlying
+   * socket. Wire: `[handle:4 | kind:1 | data...]`. Silently drops
+   * if the handle is unknown / not ours / closed; that's the
+   * fire-and-forget contract.
+   */
+  _handleWsSend(packageId, args) {
+    if (args.length < 5) return;
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const wsHandle = view.getUint32(0, true);
+    const entry = this._wsHandles.get(wsHandle);
+    if (!entry || entry.packageId !== packageId) {
+      this._log("warn", `[${packageId}] ws_send: unknown or foreign handle ${wsHandle} — dropped`);
+      return;
+    }
+    if (entry.closed) return;
+    const kind = args[4];
+    const payload = args.subarray(5);
+    try {
+      if (kind === 0) {
+        entry.ws.send(this._decoder.decode(payload));
+      } else {
+        // Slice into a fresh ArrayBuffer — `args` may be a view into
+        // a buffer the postMessage transferred to us, but `WebSocket.send`
+        // expects an ArrayBuffer / Blob / ArrayBufferView; slicing also
+        // ensures the host doesn't hold a reference to caller-owned data.
+        entry.ws.send(payload.slice().buffer);
+      }
+    } catch (err) {
+      this._log("warn", `[${packageId}] ws_send failed on handle ${wsHandle}: ${err?.message ?? err}`);
+    }
+  }
+
+  /**
+   * App raised `FIRE::WS_CLOSE`. Idempotent — second close is a no-op.
+   */
+  _handleWsClose(packageId, args) {
+    if (args.length < 8) return;
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const wsHandle = view.getUint32(0, true);
+    const entry = this._wsHandles.get(wsHandle);
+    if (!entry || entry.packageId !== packageId) {
+      this._log("warn", `[${packageId}] ws_close: unknown or foreign handle ${wsHandle} — dropped`);
+      return;
+    }
+    const code = view.getUint16(4, true);
+    const reasonLen = view.getUint16(6, true);
+    const reasonBytes = (8 + reasonLen <= args.length)
+      ? args.subarray(8, 8 + reasonLen) : new Uint8Array(0);
+    const reason = reasonBytes.length > 0 ? this._decoder.decode(reasonBytes) : "";
+    try {
+      entry.ws.close(code, reason);
+    } catch (err) {
+      this._log("warn", `[${packageId}] ws_close threw: ${err?.message ?? err}`);
+    }
+  }
+
+  /** Fired when the underlying socket emits a message frame. */
+  _onWsMessage(wsHandle, ev) {
+    const entry = this._wsHandles.get(wsHandle);
+    if (!entry || entry.closed) return;
+    let payload;
+    if (typeof ev.data === "string") {
+      const bodyBytes = this._encoder.encode(ev.data);
+      payload = new Uint8Array(1 + bodyBytes.length);
+      payload[0] = 0; // text
+      payload.set(bodyBytes, 1);
+    } else if (ev.data instanceof ArrayBuffer) {
+      const view = new Uint8Array(ev.data);
+      payload = new Uint8Array(1 + view.length);
+      payload[0] = 1; // binary
+      payload.set(view, 1);
+    } else {
+      // Blob (some browsers default to this). Drop quietly — apps
+      // that need binary should call `WebSocket.binaryType =
+      // "arraybuffer"` (we already set it) so this branch is dead
+      // in practice.
+      this._log("warn", `[${entry.packageId}] ws#${wsHandle}: unsupported message data type`);
+      return;
+    }
+    if (entry.pendingRecv) {
+      const { futureId } = entry.pendingRecv;
+      entry.pendingRecv = null;
+      this._postHostOpDone(entry.packageId, futureId, STATUS.READY, payload);
+      return;
+    }
+    if (entry.recvQueue.length >= AppRegistry._WS_RECV_QUEUE_CAP) {
+      // Force-close per RFC 6455 §7.4.1 code 1009.
+      this._log("warn", `[${entry.packageId}] ws#${wsHandle}: recv queue overflow → force-close 1009`);
+      try { entry.ws.close(AppRegistry._WS_CLOSE_CODES.MESSAGE_TOO_BIG, "queue overflow"); } catch (_) {}
+      return;
+    }
+    entry.recvQueue.push(payload);
+  }
+
+  /** Fired when the underlying socket closes (graceful or transport). */
+  _onWsClose(wsHandle, ev) {
+    const entry = this._wsHandles.get(wsHandle);
+    if (!entry) return;
+    entry.closed = true;
+    const reasonStr = typeof ev?.reason === "string" ? ev.reason : "";
+    const reasonBytes = this._encoder.encode(reasonStr);
+    const code = (typeof ev?.code === "number" && ev.code > 0)
+      ? ev.code : AppRegistry._WS_CLOSE_CODES.ABNORMAL;
+    const payload = new Uint8Array(1 + 2 + reasonBytes.length);
+    payload[0] = 2; // closed
+    new DataView(payload.buffer).setUint16(1, code, true);
+    payload.set(reasonBytes, 3);
+    if (entry.pendingRecv) {
+      const { futureId } = entry.pendingRecv;
+      entry.pendingRecv = null;
+      this._postHostOpDone(entry.packageId, futureId, STATUS.READY, payload);
+    } else {
+      // Cap-bypass: a Closed event always lands even if the queue is
+      // full, so apps that ignored recv still see the close on the
+      // next call. Replace the queue tail rather than dropping the
+      // close (the close is the most useful event in that branch).
+      if (entry.recvQueue.length >= AppRegistry._WS_RECV_QUEUE_CAP) {
+        entry.recvQueue.pop();
+      }
+      entry.recvQueue.push(payload);
+    }
+    // We deliberately don't `_wsHandles.delete` here — further
+    // `recv()` calls on the handle should still surface the cached
+    // Closed event from the queue. The entry is reaped when the
+    // owning package terminates (`_disposeWsForPackage`).
+  }
+
+  /**
+   * Force-close every WebSocket owned by `packageId`. Called from
+   * the worker-termination paths (`evictPackage`, the watchdog kill,
+   * unregister-on-uninstall) so a dead app doesn't leak browser-side
+   * connections.
+   */
+  _disposeWsForPackage(packageId) {
+    for (const [handle, entry] of this._wsHandles) {
+      if (entry.packageId !== packageId) continue;
+      try { entry.ws.close(1000, ""); } catch (_) { /* ignore */ }
+      // Resolve any in-flight recv with a synthetic Closed so the
+      // app's pending future doesn't hang past worker termination.
+      // (Not strictly necessary if the worker is gone, but avoids
+      // pinning the future entry in any zombie state map.)
+      this._wsHandles.delete(handle);
+    }
+  }
+
+  /** Post a `host_op_done` reply to `packageId`'s worker, transferring
+   *  the payload buffer for zero-copy. Stale-worker safe — silently
+   *  drops if the worker is no longer the registered process. */
+  _postHostOpDone(packageId, futureId, status, payload) {
+    const proc = this._processes.get(packageId);
+    if (!proc) return;
+    proc.worker.postMessage(
+      { type: "host_op_done", future_id: futureId, status, payload },
+      [payload.buffer],
+    );
+  }
+
   /**
    * Copy `len` bytes out of kernel memory at `ptr` into an owned
    * `Uint8Array`. Necessary before any postMessage that may detach
@@ -1473,6 +1930,89 @@ export class AppRegistry {
     copy.set(new Uint8Array(kernelBuf, ptr, len));
     return copy;
   }
+}
+
+// ── Stone 14.1 — HTTP wire format helpers ──────────────────────────────
+//
+// Mirrors `framework::wire::op_kinds::io::HTTP_FETCH` and the SDK's
+// `net::encode_http_args` / `decode_http_response`. The shape:
+//
+//   request:
+//     [method:1]
+//     [url_len:2 | url:utf8...]
+//     [hdr_count:2]
+//     hdr_count × [name_len:2 | name:utf8 | val_len:2 | val:utf8]
+//     [body: bytes...]   // remainder
+//
+//   response:
+//     [status:2]
+//     [hdr_count:2]
+//     hdr_count × same shape as request headers
+//     [body: bytes...]
+
+const HTTP_METHODS = Object.freeze({
+  0: "GET",
+  1: "POST",
+  2: "PUT",
+  3: "DELETE",
+  4: "PATCH",
+  5: "HEAD",
+});
+
+function decodeHttpRequest(args, decoder) {
+  if (args.length < 1) throw new Error("empty");
+  const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+  const method = args[0];
+  let cur = 1;
+  if (cur + 2 > args.length) throw new Error("url len truncated");
+  const urlLen = view.getUint16(cur, true); cur += 2;
+  if (cur + urlLen > args.length) throw new Error("url truncated");
+  const url = decoder.decode(args.subarray(cur, cur + urlLen)); cur += urlLen;
+  if (cur + 2 > args.length) throw new Error("header count truncated");
+  const hdrCount = view.getUint16(cur, true); cur += 2;
+  const headers = [];
+  for (let i = 0; i < hdrCount; i++) {
+    if (cur + 2 > args.length) throw new Error("header name len truncated");
+    const nl = view.getUint16(cur, true); cur += 2;
+    if (cur + nl > args.length) throw new Error("header name truncated");
+    const name = decoder.decode(args.subarray(cur, cur + nl)); cur += nl;
+    if (cur + 2 > args.length) throw new Error("header val len truncated");
+    const vl = view.getUint16(cur, true); cur += 2;
+    if (cur + vl > args.length) throw new Error("header val truncated");
+    const value = decoder.decode(args.subarray(cur, cur + vl)); cur += vl;
+    headers.push([name, value]);
+  }
+  const body = args.slice(cur);
+  return { method, url, headers, body };
+}
+
+function encodeHttpResponse(status, headerPairs, body) {
+  // Cap the header set to 256 entries — `Response.headers.forEach`
+  // on a typical server returns ~10. The cap is pure overflow
+  // protection; it doesn't drop interesting headers in practice.
+  const hdrCount = Math.min(headerPairs.length, 0xFFFF);
+  let size = 2 + 2;
+  for (let i = 0; i < hdrCount; i++) {
+    size += 2 + headerPairs[i][0].length + 2 + headerPairs[i][1].length;
+  }
+  size += body.length;
+  const out = new Uint8Array(size);
+  const view = new DataView(out.buffer);
+  view.setUint16(0, status, true);
+  view.setUint16(2, hdrCount, true);
+  let cur = 4;
+  const enc = new TextEncoder();
+  for (let i = 0; i < hdrCount; i++) {
+    const [name, value] = headerPairs[i];
+    const nb = enc.encode(name);
+    const vb = enc.encode(value);
+    view.setUint16(cur, nb.length, true); cur += 2;
+    out.set(nb, cur); cur += nb.length;
+    view.setUint16(cur, vb.length, true); cur += 2;
+    out.set(vb, cur); cur += vb.length;
+  }
+  out.set(body, cur);
+  return out;
 }
 
 // ── Worker spawn helper ─────────────────────────────────────────────────

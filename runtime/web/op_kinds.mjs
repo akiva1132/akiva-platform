@@ -22,6 +22,8 @@ export const FIRE = Object.freeze({
   START_ACTIVITY:            0x0003,
   START_ACTIVITY_FOR_RESULT: 0x0004,
   SET_RESULT:                0x0005,
+  WS_SEND:                   0x0006,  // Stone 14.1
+  WS_CLOSE:                  0x0007,  // Stone 14.1
 });
 
 export const IO = Object.freeze({
@@ -32,6 +34,9 @@ export const IO = Object.freeze({
   STORAGE_DELETE:    0x0105,
   TIMER_SLEEP:       0x0106,  // Stone 13.0prep A
   SHOW_DIALOG:       0x0107,  // Stone 13.2
+  HTTP_FETCH:        0x0108,  // Stone 14.1
+  WS_OPEN:           0x0109,  // Stone 14.1
+  WS_RECV:           0x010A,  // Stone 14.1
 });
 
 // Stone 11.4b — host→app dispatch op kinds. Mirror of

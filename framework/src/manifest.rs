@@ -19,14 +19,15 @@ use crate::activity_manager::LaunchMode;
 
 /// Current framework ABI version string, bumped in lock-step with
 /// `docs/abi.md` major+minor. MVP guests targeting 0.1.x pass the
-/// check; current is `0.8.0` after Stone 13.2 added the system dialog
-/// host op (`IO::SHOW_DIALOG = 0x0107`), the `akiva_open_dialog`
-/// kernel export, and the `hal_dialog_complete` HAL import. Stone
-/// 13.3 (animation transitions) added no ABI surface — paint
-/// transforms and alpha multipliers were already on the wire. Apps
-/// with manifest `min_abi_version = "0.1.0"` still load — bumping the
+/// check; current is `0.9.0` after Stone 14.1 added the network
+/// capability ops (`IO::HTTP_FETCH = 0x0108`, `IO::WS_OPEN = 0x0109`,
+/// `IO::WS_RECV = 0x010A`, `FIRE::WS_SEND = 0x0006`,
+/// `FIRE::WS_CLOSE = 0x0007`) gated by
+/// `akiva.permission.NETWORK`. Stone 13.3/13.4 added no ABI surface
+/// (paint ops + multi-display were existing wire shapes). Apps with
+/// manifest `min_abi_version = "0.1.0"` still load — bumping the
 /// runtime is additive and back-compat.
-pub const RUNTIME_ABI_VERSION: &str = "0.8.0";
+pub const RUNTIME_ABI_VERSION: &str = "0.9.0";
 
 // ── Typed model ──────────────────────────────────────────────────────
 

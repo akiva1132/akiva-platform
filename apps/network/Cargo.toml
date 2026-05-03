@@ -1,0 +1,21 @@
+[package]
+name = "akiva-app-network"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Akiva Team"]
+license = "MIT OR Apache-2.0"
+description = "Network capability smoke test — Stone 14.1. Exercises HTTP fetch and WebSocket round-trip end-to-end."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+akiva-sdk = { path = "../../sdk-rust" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

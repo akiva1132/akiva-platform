@@ -21,6 +21,7 @@ pub mod dialog;
 pub mod executor;
 pub mod intent;
 pub mod log;
+pub mod net;
 pub mod op_kinds;
 pub mod pkgs;
 pub mod random;
