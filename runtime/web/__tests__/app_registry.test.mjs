@@ -603,6 +603,96 @@ describe("host_op routing — kernel-served io ops", () => {
     expect(new TextDecoder().decode(reply.payload)).toMatch(/empty key/);
   });
 
+  it("STORAGE_LIST returns the package's keys, prefix-filtered + sandbox-stripped", () => {
+    const { registry, worker, storage } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+
+    // Seed the storage with a mix of this package's keys, another
+    // package's keys, and a sys/ key — all should be filtered.
+    storage.set(`pkgs/${PACKAGE_ID}/notes/today`, new Uint8Array([1]));
+    storage.set(`pkgs/${PACKAGE_ID}/notes/yesterday`, new Uint8Array([2]));
+    storage.set(`pkgs/${PACKAGE_ID}/draft`, new Uint8Array([3]));
+    storage.set(`pkgs/com.other.app/notes/secret`, new Uint8Array([4]));
+    storage.set(`sys/permissions/${PACKAGE_ID}`, new Uint8Array([5]));
+
+    // Prefix "notes/" — list only the two notes/ keys.
+    worker._inject({
+      type: "host_op", future_id: 11n, op_kind: IO.STORAGE_LIST,
+      args: new TextEncoder().encode("notes/"),
+    });
+    const reply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(reply.status).toBe(STATUS.READY);
+
+    // Decode: [count u32 LE | (klen u16 LE | key utf8...){count}]
+    const dv = new DataView(reply.payload.buffer, reply.payload.byteOffset, reply.payload.byteLength);
+    const count = dv.getUint32(0, true);
+    let off = 4;
+    const keys = [];
+    for (let i = 0; i < count; i++) {
+      const klen = dv.getUint16(off, true);
+      off += 2;
+      const k = new TextDecoder().decode(reply.payload.slice(off, off + klen));
+      off += klen;
+      keys.push(k);
+    }
+    expect(keys.sort()).toEqual(["notes/today", "notes/yesterday"]);
+  });
+
+  it("STORAGE_LIST with empty prefix lists every key the package owns", () => {
+    const { registry, worker, storage } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+
+    storage.set(`pkgs/${PACKAGE_ID}/a`, new Uint8Array([1]));
+    storage.set(`pkgs/${PACKAGE_ID}/b`, new Uint8Array([2]));
+    storage.set(`pkgs/com.other.app/c`, new Uint8Array([3]));
+
+    worker._inject({
+      type: "host_op", future_id: 12n, op_kind: IO.STORAGE_LIST,
+      args: new Uint8Array(0),
+    });
+    const reply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(reply.status).toBe(STATUS.READY);
+
+    const dv = new DataView(reply.payload.buffer, reply.payload.byteOffset, reply.payload.byteLength);
+    expect(dv.getUint32(0, true)).toBe(2);  // a, b — not c
+  });
+
+  it("STORAGE_LIST without STORAGE_SANDBOX grant is denied", () => {
+    const { registry, worker } = makeRegistry();
+    // No grant.
+    registry.register(PACKAGE_ID, CLASS_NAME);
+    worker._inject({
+      type: "host_op", future_id: 1n, op_kind: IO.STORAGE_LIST,
+      args: new Uint8Array(0),
+    });
+    expect(worker._posted.find((m) => m.type === "host_op_done").status).toBe(STATUS.ERROR);
+  });
+
+  it("STORAGE_LIST cannot escape its sandbox via prefix injection", () => {
+    // Prefix `../../sys/permissions/` would, before sandboxing, try
+    // to list keys outside the package. The dispatcher prepends
+    // `pkgs/<pkg>/` unconditionally, so the prefix lands at
+    // `pkgs/<pkg>/../../sys/permissions/` which doesn't match any
+    // real key (Storage.set rejects `..` segments via isValidKey
+    // anyway). Result: empty listing.
+    const { registry, worker, storage } = makeRegistry();
+    registry.setGrants(PACKAGE_ID, ["akiva.permission.STORAGE_SANDBOX"]);
+    registry.register(PACKAGE_ID, CLASS_NAME);
+
+    storage.set(`sys/permissions/com.other.app`, new Uint8Array([1]));
+
+    worker._inject({
+      type: "host_op", future_id: 13n, op_kind: IO.STORAGE_LIST,
+      args: new TextEncoder().encode("../../sys/permissions/"),
+    });
+    const reply = worker._posted.find((m) => m.type === "host_op_done");
+    expect(reply.status).toBe(STATUS.READY);
+    const dv = new DataView(reply.payload.buffer, reply.payload.byteOffset, reply.payload.byteLength);
+    expect(dv.getUint32(0, true)).toBe(0);  // no keys leaked
+  });
+
   it("unknown op_kind replies ERROR + warn-logs", () => {
     const { registry, worker, log } = makeRegistry();
     registry.register(PACKAGE_ID, CLASS_NAME);

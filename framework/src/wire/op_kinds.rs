@@ -349,6 +349,20 @@ pub mod io {
     /// denial, position-unavailable, or timeout. Capability
     /// gated by `akiva.permission.LOCATION`.
     pub const GEO_GET_POSITION: u32 = 0x0113;
+
+    /// Foundation gap — list keys in the per-package storage sandbox,
+    /// optionally filtered by a UTF-8 prefix. Args: `[prefix: utf8...]`
+    /// (empty bytes mean "list every key the package owns"). Result:
+    /// ```text
+    /// [count: u32 LE]
+    /// repeat count: [key_len: u16 LE | key: utf8...]
+    /// ```
+    /// The host caps the result payload at 64 KiB; oversize listings
+    /// resolve `STATUS::ERROR` with reason `"too many keys"` so apps
+    /// can paginate by prefix. Order is the host's directory iteration
+    /// order — not lexicographic; sort caller-side if you care. Same
+    /// gate as STORAGE_GET (`akiva.permission.STORAGE_SANDBOX`).
+    pub const STORAGE_LIST: u32 = 0x0114;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds.
@@ -476,6 +490,7 @@ mod tests {
             io::NOTIFY_REQUEST_PERMISSION, io::NOTIFY_POST,
             io::CLIPBOARD_READ_TEXT, io::CLIPBOARD_WRITE_TEXT,
             io::GEO_GET_POSITION,
+            io::STORAGE_LIST,
         ];
         for k in fire { assert!((0x0001..=0x00FF).contains(&k), "fire op {k:#x} out of range"); }
         for k in io   { assert!((0x0101..=0x01FF).contains(&k), "io op {k:#x} out of range"); }
@@ -512,6 +527,7 @@ mod tests {
             io::NOTIFY_REQUEST_PERMISSION, io::NOTIFY_POST,
             io::CLIPBOARD_READ_TEXT, io::CLIPBOARD_WRITE_TEXT,
             io::GEO_GET_POSITION,
+            io::STORAGE_LIST,
         ];
         for (i, a) in io.iter().enumerate() {
             for b in &io[i + 1..] {
@@ -561,6 +577,7 @@ mod tests {
         assert_eq!(io::CLIPBOARD_READ_TEXT,         sdk::io::CLIPBOARD_READ_TEXT);
         assert_eq!(io::CLIPBOARD_WRITE_TEXT,        sdk::io::CLIPBOARD_WRITE_TEXT);
         assert_eq!(io::GEO_GET_POSITION,            sdk::io::GEO_GET_POSITION);
+        assert_eq!(io::STORAGE_LIST,                sdk::io::STORAGE_LIST);
         assert_eq!(status::PENDING,                 sdk::status::PENDING);
         assert_eq!(status::READY,                   sdk::status::READY);
         assert_eq!(status::ERROR,                   sdk::status::ERROR);

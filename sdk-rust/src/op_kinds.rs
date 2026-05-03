@@ -219,6 +219,23 @@ pub mod io {
     /// position-unavailable, or timeout. Capability gated by
     /// `akiva.permission.LOCATION`.
     pub const GEO_GET_POSITION: u32 = 0x0113;
+    /// Foundation gap — list keys in the per-package storage sandbox,
+    /// optionally filtered by a prefix. Args: `[prefix: utf8...]`
+    /// (empty bytes = list every key the package owns). Result:
+    /// ```text
+    /// [count: u32 LE]
+    /// repeat count: [key_len: u16 LE | key: utf8...]
+    /// ```
+    /// Required for any app that wants to enumerate its own data
+    /// (notes, files, history, drafts) without maintaining a manual
+    /// index key. Capability: same as STORAGE_GET — gated by
+    /// `akiva.permission.STORAGE_SANDBOX`. The host caps the response
+    /// payload at 64 KiB; if the directory listing exceeds that the
+    /// host returns ERROR with reason "too many keys" (apps with that
+    /// many keys should paginate by prefix). Order is the host's
+    /// directory iteration order — apps that want a stable order sort
+    /// the result themselves.
+    pub const STORAGE_LIST: u32 = 0x0114;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds. Mirror of
@@ -313,6 +330,7 @@ mod tests {
         assert!(io::CLIPBOARD_READ_TEXT >= 0x0101 && io::CLIPBOARD_READ_TEXT <= 0x01FF);
         assert!(io::CLIPBOARD_WRITE_TEXT >= 0x0101 && io::CLIPBOARD_WRITE_TEXT <= 0x01FF);
         assert!(io::GEO_GET_POSITION >= 0x0101 && io::GEO_GET_POSITION <= 0x01FF);
+        assert!(io::STORAGE_LIST >= 0x0101 && io::STORAGE_LIST <= 0x01FF);
         assert_eq!(status::PENDING, 0);
         assert_eq!(status::READY,   1);
         assert_eq!(status::ERROR,   2);

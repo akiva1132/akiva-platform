@@ -197,6 +197,123 @@ pub fn remove(key: &str) {
     let _ = io_start(io::STORAGE_DELETE, key.as_bytes());
 }
 
+/// Future returned by [`list_keys`]. Resolves to the set of keys the
+/// package owns whose path starts with the supplied prefix. Used by
+/// apps that need to enumerate their own data — notes, files, history,
+/// drafts — without maintaining a manual index key.
+///
+/// Order is the host's directory iteration order, **not** lexicographic;
+/// apps that want a stable order sort the result themselves. The host
+/// caps the result payload at ~64 KiB; oversize listings resolve to
+/// [`StorageError::Io`] with the host's reason text consumed at the
+/// dispatcher layer (apps with that many keys should paginate by
+/// prefix).
+#[must_use = "ListKeysFuture is the only way to observe the listing"]
+pub struct ListKeysFuture {
+    future_id: u64,
+    cached: Option<Result<Vec<String>, StorageError>>,
+}
+
+impl Future for ListKeysFuture {
+    type Output = Result<Vec<String>, StorageError>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        if let Some(cached) = self.cached.take() {
+            self.cached = Some(cached.clone());
+            return Poll::Ready(cached);
+        }
+        match poll_list_inner(self.future_id) {
+            None => Poll::Pending,
+            Some(result) => {
+                self.cached = Some(result.clone());
+                Poll::Ready(result)
+            }
+        }
+    }
+}
+
+/// Begin an enumeration of the package's storage keys, optionally
+/// filtered by a UTF-8 prefix. Empty `prefix` lists every key the
+/// package owns.
+///
+/// ```ignore
+/// // List every saved note id under the `notes/` namespace.
+/// let ids = storage::list_keys("notes/").await?;
+/// for id in &ids {
+///     let bytes = storage::read(id).await?;
+///     // …
+/// }
+/// ```
+///
+/// Returns `None` only when the host rejects the call outright (no
+/// `STORAGE_SANDBOX` grant or the slot is BUSY) — same shape as
+/// [`read`]. Empty prefix is **legal** and means "list everything";
+/// it's not the rejection sentinel.
+pub fn list_keys(prefix: &str) -> Option<ListKeysFuture> {
+    let fid = io_start(io::STORAGE_LIST, prefix.as_bytes());
+    if fid == 0 { return None; }
+    Some(ListKeysFuture { future_id: fid, cached: None })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn poll_list_inner(future_id: u64) -> Option<Result<Vec<String>, StorageError>> {
+    use crate::runtime::host_io_poll;
+    // 4 KiB initial guess — enough for ~250 short keys without a
+    // retry; oversize directory listings retry once with the exact
+    // size the host reported. Heap-allocated so a 60 KiB blob doesn't
+    // blow the wasm stack.
+    let mut buf = vec![0u8; 4096];
+    let packed = host_io_poll(future_id, &mut buf);
+    let (st, len) = unpack_poll(packed);
+    let mut len = len as usize;
+    match st {
+        status::PENDING => return None,
+        status::ERROR => return Some(Err(StorageError::Io)),
+        status::BUSY => return Some(Err(StorageError::Busy)),
+        status::READY => {}
+        _ => return Some(Err(StorageError::Io)),
+    }
+    if len > buf.len() {
+        buf = vec![0u8; len];
+        let packed = host_io_poll(future_id, &mut buf);
+        let (st2, len2) = unpack_poll(packed);
+        if st2 != status::READY {
+            return Some(Err(StorageError::Io));
+        }
+        len = (len2 as usize).min(buf.len());
+    }
+    buf.truncate(len);
+    Some(decode_list_result(&buf))
+}
+
+/// Decode the [`io::STORAGE_LIST`] result blob: `[count: u32 LE]` then
+/// `count` × `[key_len: u16 LE | key: utf8...]`. Pulled out so the
+/// non-wasm test path can exercise it without a host.
+fn decode_list_result(buf: &[u8]) -> Result<Vec<String>, StorageError> {
+    if buf.len() < 4 { return Err(StorageError::Io); }
+    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut i = 4usize;
+    for _ in 0..count {
+        if i + 2 > buf.len() { return Err(StorageError::Io); }
+        let klen = u16::from_le_bytes([buf[i], buf[i + 1]]) as usize;
+        i += 2;
+        if i + klen > buf.len() { return Err(StorageError::Io); }
+        let key = match core::str::from_utf8(&buf[i..i + klen]) {
+            Ok(s) => s.to_string(),
+            Err(_) => return Err(StorageError::Io),
+        };
+        i += klen;
+        out.push(key);
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn poll_list_inner(_future_id: u64) -> Option<Result<Vec<String>, StorageError>> {
+    Some(Ok(Vec::new()))
+}
+
 // ── Wasm-only glue ─────────────────────────────────────────────────────
 
 #[cfg(target_arch = "wasm32")]
@@ -351,6 +468,78 @@ mod tests {
     #[test]
     fn remove_with_empty_key_is_a_silent_no_op() {
         remove("");
+    }
+
+    #[test]
+    fn list_keys_decodes_a_well_formed_blob() {
+        // [count u32 LE = 2]
+        // [klen u16 LE = 4]["abcd"]
+        // [klen u16 LE = 7]["foo/bar"]
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(&4u16.to_le_bytes());
+        blob.extend_from_slice(b"abcd");
+        blob.extend_from_slice(&7u16.to_le_bytes());
+        blob.extend_from_slice(b"foo/bar");
+        let out = decode_list_result(&blob).expect("should decode");
+        assert_eq!(out, vec!["abcd".to_string(), "foo/bar".to_string()]);
+    }
+
+    #[test]
+    fn list_keys_decodes_empty_listing() {
+        let blob = 0u32.to_le_bytes();
+        let out = decode_list_result(&blob).expect("should decode");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn list_keys_rejects_truncated_count_header() {
+        assert!(matches!(decode_list_result(&[0x01, 0x02]), Err(StorageError::Io)));
+    }
+
+    #[test]
+    fn list_keys_rejects_truncated_key_payload() {
+        // count=1, key_len=10, but only 3 bytes of the key follow.
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&10u16.to_le_bytes());
+        blob.extend_from_slice(b"abc");
+        assert!(matches!(decode_list_result(&blob), Err(StorageError::Io)));
+    }
+
+    #[test]
+    fn list_keys_rejects_invalid_utf8_in_key() {
+        // count=1, key_len=2, bytes 0xFF 0xFE (not valid UTF-8).
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&2u16.to_le_bytes());
+        blob.extend_from_slice(&[0xFF, 0xFE]);
+        assert!(matches!(decode_list_result(&blob), Err(StorageError::Io)));
+    }
+
+    #[test]
+    fn list_keys_handles_unicode_keys() {
+        // emoji + Hebrew + ASCII to confirm UTF-8 round-trips.
+        let keys = ["שלום", "🎉", "ascii"];
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for k in &keys {
+            blob.extend_from_slice(&(k.len() as u16).to_le_bytes());
+            blob.extend_from_slice(k.as_bytes());
+        }
+        let out = decode_list_result(&blob).expect("should decode");
+        assert_eq!(out, keys.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn list_keys_returns_empty_on_non_wasm_stub() {
+        let mut fut = ListKeysFuture { future_id: 1, cached: None };
+        let waker = noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        match Pin::new(&mut fut).poll(&mut cx) {
+            Poll::Ready(Ok(v)) if v.is_empty() => {}
+            other => panic!("expected Ready(Ok([])), got {other:?}"),
+        }
     }
 
     #[test]

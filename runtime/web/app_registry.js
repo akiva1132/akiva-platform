@@ -1510,6 +1510,51 @@ export class AppRegistry {
         this._storage.delete(this._sandboxKey(packageId, key));
         return { status: STATUS.READY, payload: new Uint8Array(0) };
       }
+      case IO.STORAGE_LIST: {
+        // Empty prefix is legal — means "list every key the package owns".
+        // Sandbox the prefix to the package's namespace so a buggy or
+        // hostile app can't enumerate `sys/` or another package's keys.
+        const userPrefix = this._decoder.decode(args);
+        const sandboxedPrefix = this._sandboxKey(packageId, userPrefix);
+        const sandboxStrip = `pkgs/${packageId}/`;
+        const allKeys = this._storage.keysWithPrefix(sandboxedPrefix);
+        // Strip the per-package prefix before handing back to the app:
+        // apps work in their own keyspace, and exposing `pkgs/<id>/`
+        // would let one package's keys be passed verbatim to another's
+        // `read` call. Order is whatever Map iteration gives — apps
+        // sort caller-side if they care.
+        const userKeys = allKeys
+          .map((k) => k.startsWith(sandboxStrip) ? k.slice(sandboxStrip.length) : null)
+          .filter((k) => k !== null && k.length > 0);
+
+        // Wire format: [count: u32 LE | (klen: u16 LE | key: utf8...){count}].
+        // Cap result at 64 KiB so a runaway directory listing can't
+        // blow the kernel↔worker postMessage buffer; apps with more
+        // keys than that should paginate by prefix.
+        const RESULT_CAP = 64 * 1024;
+        const encodedKeys = userKeys.map((k) => this._encoder.encode(k));
+        let total = 4;
+        for (const e of encodedKeys) total += 2 + e.byteLength;
+        if (total > RESULT_CAP) {
+          return {
+            status: STATUS.ERROR,
+            payload: this._encoder.encode(
+              `storage: too many keys (would emit ${total} bytes; cap is ${RESULT_CAP})`,
+            ),
+          };
+        }
+        const out = new Uint8Array(total);
+        const dv = new DataView(out.buffer);
+        dv.setUint32(0, encodedKeys.length, true);
+        let off = 4;
+        for (const e of encodedKeys) {
+          dv.setUint16(off, e.byteLength, true);
+          off += 2;
+          out.set(e, off);
+          off += e.byteLength;
+        }
+        return { status: STATUS.READY, payload: out };
+      }
       default:
         return { status: STATUS.ERROR, payload: this._encoder.encode(`storage: unknown op_kind 0x${opKind.toString(16)}`) };
     }
@@ -1545,7 +1590,8 @@ export class AppRegistry {
       }
       case IO.STORAGE_GET:
       case IO.STORAGE_SET:
-      case IO.STORAGE_DELETE: {
+      case IO.STORAGE_DELETE:
+      case IO.STORAGE_LIST: {
         if (!this._hasGrant(packageId, "akiva.permission.STORAGE_SANDBOX")) {
           this._log("warn", `[${packageId}] host_op STORAGE_*: denied — no STORAGE_SANDBOX grant`);
           status = STATUS.ERROR;

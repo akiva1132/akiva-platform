@@ -52,6 +52,7 @@ export const IO = Object.freeze({
   CLIPBOARD_READ_TEXT:       0x0111,  // Stone 14.4
   CLIPBOARD_WRITE_TEXT:      0x0112,  // Stone 14.4
   GEO_GET_POSITION:          0x0113,  // Stone 14.6
+  STORAGE_LIST:              0x0114,  // Foundation gap — directory listing for STORAGE_SANDBOX
 });
 
 // Stone 11.4b — host→app dispatch op kinds. Mirror of
