@@ -257,6 +257,23 @@ async function installOneDevApp(name, log) {
     }
   }
 
+  // Stone 13.0prep C2 — drawable PNGs. Tries a fixed set of common
+  // names because dev mode has no directory listing endpoint and
+  // discovering arbitrary asset names without a manifest declaration
+  // would mean a custom index file. The proper solution lives in C3
+  // (manifest.app.icon + per-app drawable list); for now this works
+  // for `icon` (every app's launcher pic) and a small handful of
+  // common names. 404-tolerant — apps without drawables stay silent.
+  for (const drawableName of ["icon", "launcher", "banner", "avatar"]) {
+    const resp = await fetch(`./dev-apps/${name}/res/drawable/${drawableName}.png`);
+    if (resp.ok) {
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      storage.set(`packages/${packageId}/res/drawable/${drawableName}.png`, bytes);
+    } else if (resp.status !== 404) {
+      log("warn", `dev-apps/${name}/res/drawable/${drawableName}.png: ${resp.status}`);
+    }
+  }
+
   const existing = storage.get("sys/packages/index");
   const ids = existing
     ? dec.decode(existing).split("\n").filter((s) => s.length > 0)
@@ -292,6 +309,11 @@ function attachDisplay(msg) {
   };
   backend = new Canvas2DBackend();
   backend.init(msg.surface, msg.metrics);
+  // Stone 13.0prep C2 — wire AppRegistry to the renderer so async
+  // drawable PNG decodes can register their ImageBitmaps. Any decodes
+  // that completed before this call (queued in
+  // `_pendingDrawableRegistrations`) flush here.
+  apps.setBackend(backend);
 
   if (booted && instance) startFrameLoop();
 }

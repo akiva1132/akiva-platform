@@ -213,6 +213,36 @@ fn build_one(root: &Path, name: &str, debug: bool) -> io::Result<()> {
         }
     }
 
+    // Stone 13.0prep C2 — `res/drawable/*.png`. Mirrors the values/
+    // refresh: clear the stage and copy anything currently in the
+    // source tree so deletions propagate. The dev-apps loader (in
+    // worker.js) walks a fixed list of common drawable names — apps
+    // that need others should drop them in `res/drawable/` and they
+    // ship across the stage; the JS-side fetch list is the limit
+    // until C3 wires manifest-driven discovery.
+    {
+        let src_draw = app_dir.join("res").join("drawable");
+        let dst_draw = dest_dir.join("res").join("drawable");
+        if src_draw.is_dir() {
+            // Wipe stale staged files (the source is canonical).
+            if dst_draw.is_dir() {
+                let _ = std::fs::remove_dir_all(&dst_draw);
+            }
+            std::fs::create_dir_all(&dst_draw)?;
+            for entry in std::fs::read_dir(&src_draw)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("png") {
+                    if let Some(fname) = path.file_name() {
+                        std::fs::copy(&path, dst_draw.join(fname))?;
+                    }
+                }
+            }
+        } else if dst_draw.is_dir() {
+            let _ = std::fs::remove_dir_all(&dst_draw);
+        }
+    }
+
     let staged = dest_dir.join("app.wasm");
     let size = std::fs::metadata(&staged)?.len();
     println!("[{name}] staged {} ({} bytes)", staged.display(), size);

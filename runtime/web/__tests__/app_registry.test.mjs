@@ -1423,6 +1423,58 @@ describe("@drawable/ resource index — Stone 13.0prep C", () => {
   });
 });
 
+describe("@drawable/ async PNG decode — Stone 13.0prep C2", () => {
+  // Test fake for createImageBitmap — vitest's jsdom environment doesn't
+  // ship it. We swap it for the duration of each test.
+  let originalCreateImageBitmap;
+  beforeEach(() => {
+    originalCreateImageBitmap = globalThis.createImageBitmap;
+    globalThis.createImageBitmap = (blob) =>
+      Promise.resolve({ __mock: true, size: blob.size });
+  });
+  afterEach(() => {
+    globalThis.createImageBitmap = originalCreateImageBitmap;
+  });
+
+  it("registers decoded bitmaps with the backend", async () => {
+    const { registry, storage } = makeRegistry();
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/icon.png`,
+      new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+    const registered = [];
+    registry.setBackend({ registerDrawable: (id, bm) => registered.push({ id, bm }) });
+
+    await registry._loadDrawableBitmaps(PACKAGE_ID);
+    expect(registered).toHaveLength(1);
+    expect(registered[0].id).toBe(1);  // alphabetical → icon=1
+    expect(registered[0].bm.__mock).toBe(true);
+  });
+
+  it("queues registrations when backend is wired late", async () => {
+    const { registry, storage } = makeRegistry();
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/icon.png`, new Uint8Array([0]));
+    // No setBackend call yet — load should queue.
+    await registry._loadDrawableBitmaps(PACKAGE_ID);
+    expect(registry._pendingDrawableRegistrations).toHaveLength(1);
+
+    const flushed = [];
+    registry.setBackend({ registerDrawable: (id, bm) => flushed.push({ id, bm }) });
+    expect(flushed).toHaveLength(1);
+    expect(registry._pendingDrawableRegistrations).toHaveLength(0);
+  });
+
+  it("logs a warning + skips on decode failure", async () => {
+    const { registry, storage, log } = makeRegistry();
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/bad.png`, new Uint8Array([0x42, 0x42]));
+    globalThis.createImageBitmap = () => Promise.reject(new Error("not a PNG"));
+    registry.setBackend({ registerDrawable: () => { throw new Error("should not register"); } });
+
+    await registry._loadDrawableBitmaps(PACKAGE_ID);
+    const warned = log.mock.calls.some(([lvl, msg]) =>
+      lvl === "warn" && msg.includes("@drawable/bad: decode failed"));
+    expect(warned).toBe(true);
+  });
+});
+
 describe("evictPackage — Phase 12.3 LMK eviction", () => {
   it("terminates the worker, clears the slot, and returns 1", () => {
     const { registry, worker } = makeRegistry();

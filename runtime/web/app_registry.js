@@ -44,6 +44,18 @@ export class AppRegistry {
     this._kernelMemory = kernelMemory;
     this._log = log;
     this._spawnWorker = spawnWorker ?? defaultSpawnWorker;
+    /**
+     * Stone 13.0prep C2 — renderer backend reference. AppRegistry calls
+     * `registerDrawable(id, bitmap)` after async PNG decode and
+     * `forgetDrawable(id)` on uninstall. Wired post-construction by
+     * `worker.js` once the backend's surface is live (see `setBackend`).
+     * Null-safe: drawables that resolve before the backend is wired
+     * stay queued in `_pendingDrawableRegistrations` and flush on
+     * `setBackend`.
+     */
+    this._backend = null;
+    /** @type {Array<{id: number, bitmap: ImageBitmap}>} */
+    this._pendingDrawableRegistrations = [];
 
     /** @type {Map<number, {packageId: string, class: string}>} */
     this._slots = new Map();
@@ -220,6 +232,39 @@ export class AppRegistry {
     // its wasm in parallel on its own thread, so total wall-clock
     // is dominated by the slowest single compile (~150KB).
     setTimeout(() => this._warmupWorkers(), 0);
+
+    // Stone 13.0prep C2 — async drawable PNG decode. Walk the
+    // package list and fire `_loadDrawableBitmaps` for each. Same
+    // setTimeout(0) deferral so the first paint isn't blocked.
+    // Decode is per-app independent and runs in parallel.
+    setTimeout(() => this._loadAllDrawables(), 0);
+  }
+
+  /** Stone 13.0prep C2 — fan out drawable decode across every
+   *  installed package the snapshot lists. Errors per-app are logged
+   *  inside `_loadDrawableBitmaps`; the orchestrator just races them
+   *  in parallel. */
+  _loadAllDrawables() {
+    const blob = this._packagesBlob;
+    if (blob.length < 4) return;
+    const decoder = this._decoder;
+    const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+    const count = view.getUint32(0, true);
+    let off = 4;
+    for (let i = 0; i < count; i++) {
+      if (off + 2 > blob.length) return;
+      const idLen = view.getUint16(off, true); off += 2;
+      if (off + idLen > blob.length) return;
+      const id = decoder.decode(blob.subarray(off, off + idLen));
+      off += idLen;
+      if (off + 2 > blob.length) return;
+      const classLen = view.getUint16(off, true); off += 2 + classLen;
+      if (off + 2 > blob.length) return;
+      const nameLen = view.getUint16(off, true); off += 2 + nameLen;
+      // Fire-and-forget; failures inside log + skip.
+      this._loadDrawableBitmaps(id).catch((err) =>
+        this._log("warn", `[${id}] drawable decode pass failed: ${err?.message ?? err}`));
+    }
   }
 
   /**
@@ -797,6 +842,60 @@ export class AppRegistry {
     // here is what the worker needs synchronously.
     const drawables = this._buildDrawableIndex(packageId);
     return { strings, colors, drawables };
+  }
+
+  /**
+   * Stone 13.0prep C2 — wire the renderer backend so async drawable
+   * loads can register their decoded ImageBitmaps. Called from
+   * `worker.js` after `Canvas2DBackend` is initialised. Idempotent;
+   * flushes any registrations that completed before the wire.
+   */
+  setBackend(backend) {
+    this._backend = backend;
+    if (backend && this._pendingDrawableRegistrations.length > 0) {
+      for (const { id, bitmap } of this._pendingDrawableRegistrations) {
+        try { backend.registerDrawable(id, bitmap); }
+        catch (err) { this._log("warn", `registerDrawable(${id}) failed: ${err?.message ?? err}`); }
+      }
+      this._pendingDrawableRegistrations.length = 0;
+    }
+  }
+
+  /**
+   * Stone 13.0prep C2 — async side. For every drawable PNG in storage
+   * for `packageId`, decode it to an `ImageBitmap` and register with
+   * the renderer backend. Fire-and-forget — the worker spawn does not
+   * wait for this. Until each registration lands, the renderer paints
+   * the magenta placeholder for that id.
+   *
+   * Decode failures are logged but non-fatal: the id stays valid
+   * (resolution succeeds), the renderer continues painting placeholder.
+   */
+  async _loadDrawableBitmaps(packageId) {
+    const prefix = `packages/${packageId}/res/drawable/`;
+    const keys = this._storage.keysWithPrefix?.(prefix) ?? [];
+    const index = this._buildDrawableIndex(packageId);
+    for (const key of keys) {
+      const tail = key.slice(prefix.length);
+      if (!tail.endsWith(".png")) continue;
+      const name = tail.slice(0, -".png".length);
+      const id = index[name];
+      if (!id) continue;  // not in index (shouldn't happen) — skip
+
+      const bytes = this._storage.get(key);
+      if (!bytes) continue;
+      try {
+        const blob = new Blob([bytes], { type: "image/png" });
+        const bitmap = await createImageBitmap(blob);
+        if (this._backend) {
+          this._backend.registerDrawable(id, bitmap);
+        } else {
+          this._pendingDrawableRegistrations.push({ id, bitmap });
+        }
+      } catch (err) {
+        this._log("warn", `@drawable/${name}: decode failed (${err?.message ?? err})`);
+      }
+    }
   }
 
   /**
