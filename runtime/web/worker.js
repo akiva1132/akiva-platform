@@ -753,6 +753,7 @@ const EVENT_POINTER = 1;
 const EVENT_KEY = 2;
 const EVENT_RESIZE = 3;
 const EVENT_VISIBILITY = 4;
+const EVENT_TEXT = 5;  // Foundation gap — committed typed text (single keydown char or compositionend.data).
 
 function forwardEvent(msg) {
   if (!booted || !instance) return;
@@ -782,6 +783,26 @@ function forwardEvent(msg) {
       dv.setUint8(4, msg.modifiers & 0xff);
       dv.setUint8(5, phaseId);
       postEvent(EVENT_KEY, new Uint8Array(buf));
+      break;
+    }
+    case "text": {
+      // Foundation gap — wire format: [text_len: u16 LE | text: utf8...].
+      // The kernel's `Event::TextInput` decoder caps text_len by what
+      // it actually reads, so a runaway IME chunk can't overrun the
+      // payload buffer. Cap at 64 KiB (u16 max) on the encode side too
+      // — anything larger is dropped with a warn.
+      const text = String(msg.text ?? "");
+      if (text.length === 0) break;
+      const encoded = new TextEncoder().encode(text);
+      if (encoded.byteLength > 0xffff) {
+        log("warn", `text event too large (${encoded.byteLength} bytes); dropping`);
+        break;
+      }
+      const buf = new ArrayBuffer(2 + encoded.byteLength);
+      const dv = new DataView(buf);
+      dv.setUint16(0, encoded.byteLength, true);
+      new Uint8Array(buf, 2).set(encoded);
+      postEvent(EVENT_TEXT, new Uint8Array(buf));
       break;
     }
     case "visibility": {

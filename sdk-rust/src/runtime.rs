@@ -630,6 +630,7 @@ fn install_and_poll<T: Activity + Default>(
 
             POINTER => install_pointer(slot, dispatch_id, rest)?,
             KEY     => install_key(slot, dispatch_id, rest)?,
+            TEXT_INPUT => install_text_input(slot, dispatch_id, rest)?,
             RESIZE  => install_resize(slot, dispatch_id, rest)?,
 
             RENDER => {
@@ -727,6 +728,31 @@ fn install_key(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) -> Result<(), u32
 
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_key(c, ev).await; })
+    });
+    slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
+    Ok(())
+}
+
+/// Foundation gap — decode the TEXT_INPUT payload and fire
+/// [`Activity::on_text_input`].
+///
+/// Wire format: `[text_len: u16 LE | text: utf8... | ts: f64 LE]`.
+/// Invalid UTF-8 or truncated payload returns `Err(1)` so the host
+/// flips the dispatch to ERROR — better than silently dropping bytes
+/// and leaving the user wondering why their typing disappeared.
+fn install_text_input(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) -> Result<(), u32> {
+    if rest.len() < 2 { return Err(1); }
+    let text_len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+    if rest.len() < 2 + text_len + 8 { return Err(1); }
+    let text = match core::str::from_utf8(&rest[2..2 + text_len]) {
+        Ok(s) => s.to_owned(),
+        Err(_) => return Err(1),
+    };
+    let ts = read_f64(&rest[2 + text_len..2 + text_len + 8]);
+    slot.ctx.timestamp_ms = ts;
+
+    let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
+        Box::pin(async move { a.on_text_input(c, text).await; })
     });
     slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())

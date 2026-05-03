@@ -113,6 +113,14 @@ pub trait Activity: 'static {
     fn on_key(&mut self, ctx: &mut ActivityContext<'_>, ev: KeyEvent) {
         let _ = (ctx, ev);
     }
+    /// Foundation gap — committed text input (single keydown char or
+    /// IME compositionend payload). Default is a no-op for in-kernel
+    /// activities that don't accept typed text. The kernel-side
+    /// `WasmActivity` forwards the same payload to the wasm app via
+    /// `cmd::TEXT_INPUT`. See [`crate::Framework::dispatch_text_input`].
+    fn on_text_input(&mut self, ctx: &mut ActivityContext<'_>, text: &str) {
+        let _ = (ctx, text);
+    }
     fn on_resize(&mut self, ctx: &mut ActivityContext<'_>, m: SurfaceMetrics) {
         let _ = (ctx, m);
     }

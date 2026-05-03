@@ -473,10 +473,32 @@ function installInputForwarding(canvas) {
       type: "event", kind: "key", tabId,
       code: e.keyCode | 0, modifiers: encodeModifiers(e), phase,
     });
+    // Foundation gap — also surface the typed character on `keydown`
+    // when `e.key` is a single printable character. Modifier-driven
+    // shortcuts (Ctrl-C, Cmd-V) and named keys ("Enter", "ArrowDown",
+    // "Backspace") stay on the key channel only; apps that want to
+    // accept typing override `Activity::on_text_input` and read the
+    // text from there. IME-composed text arrives via the
+    // `compositionend` listener below, not here.
+    if (phase === "down" && isSingleCharText(e)) {
+      session.send({ type: "event", kind: "text", tabId, text: e.key });
+    }
     if (!shouldPassThroughKey(e)) e.preventDefault();
   };
   canvas.addEventListener("keydown", keyEvent("down"));
   canvas.addEventListener("keyup", keyEvent("up"));
+
+  // IME / multi-codepoint paste path. `compositionend.data` carries
+  // the committed text — for Latin layouts this is what the user
+  // typed during composition (dead keys → accented char), for CJK /
+  // Hebrew niqqud / emoji it can be a multi-character string. Browsers
+  // suppress `keydown` during composition to avoid double-firing, so
+  // we listen for the commit explicitly.
+  canvas.addEventListener("compositionend", (e) => {
+    if (typeof e.data === "string" && e.data.length > 0) {
+      session.send({ type: "event", kind: "text", tabId, text: e.data });
+    }
+  });
 
   document.addEventListener("visibilitychange", () => {
     const visible = document.visibilityState === "visible";
@@ -586,4 +608,36 @@ function encodeModifiers(e) {
 }
 function shouldPassThroughKey(e) {
   return e.key === "F5" || e.key === "F12" || (e.ctrlKey && (e.key === "r" || e.key === "R"));
+}
+
+/**
+ * Foundation gap — should this `keydown` also fire a text event?
+ *
+ * The text channel exists for typed input (Notes / Search / chat).
+ * Three filters narrow `keydown` down to "user typed a character":
+ *
+ *   1. **Single-codepoint `e.key`.** Single printable character — `"a"`,
+ *      `"A"`, `"!"`. Named keys land in `e.key` as multi-letter strings:
+ *      `"Enter"`, `"Backspace"`, `"ArrowDown"`, `"F1"`. We use the
+ *      Unicode-aware iterator length so a multi-byte emoji that the
+ *      browser delivered as a single keydown ("👋", `e.key.length === 2`
+ *      under UTF-16) still counts. Native composition-end multi-char
+ *      payloads land via `compositionend` instead.
+ *   2. **No Ctrl / Meta.** Ctrl-C, Cmd-V, etc. are shortcuts, not text.
+ *      Apps that genuinely want Ctrl-letter as typed input are unusual
+ *      enough that we make them parse the existing `e.key` from the
+ *      key channel themselves.
+ *   3. **`e.isComposing` false.** Browsers fire keydown(229)
+ *      throughout an IME composition; the committed text already arrives
+ *      via `compositionend`, so swallowing the in-flight keydowns
+ *      avoids duplicates and partial-character delivery.
+ */
+function isSingleCharText(e) {
+  if (e.ctrlKey || e.metaKey) return false;
+  if (e.isComposing) return false;
+  const key = e.key;
+  if (typeof key !== "string" || key.length === 0) return false;
+  // Reject named keys — they're always more than one Unicode scalar.
+  // [...key].length collapses surrogate pairs so emoji counts as 1.
+  return [...key].length === 1;
 }

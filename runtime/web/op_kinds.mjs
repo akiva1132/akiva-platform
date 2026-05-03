@@ -82,6 +82,7 @@ export const CMD = Object.freeze({
   POINTER:         0x10,
   KEY:             0x11,
   RESIZE:          0x12,
+  TEXT_INPUT:      0x13,  // Foundation gap — typed text (single-char keydown / compositionend.data)
 
   RENDER:          0x20,
 

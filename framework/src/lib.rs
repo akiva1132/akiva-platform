@@ -628,6 +628,20 @@ impl Framework {
         self.apply_post(post, id, ts);
     }
 
+    /// Foundation gap — deliver a chunk of typed text to the foreground
+    /// activity. The host's `tab.js` produces these from `keydown` (single
+    /// printable char) and `compositionend` (committed IME text); modifier-
+    /// only keystrokes (Shift, arrows, F-keys) stay on the [`dispatch_key`]
+    /// channel and never fire here. Empty text drops on the floor —
+    /// avoids an extra dispatch round-trip when the host's filter
+    /// produced nothing.
+    pub fn dispatch_text_input(&mut self, text: &str, ts: f64) {
+        if text.is_empty() { return; }
+        let Some(id) = self.stack.last().copied() else { return; };
+        let (post, _) = self.with_ctx(id, ts, |a, ctx| a.on_text_input(ctx, text));
+        self.apply_post(post, id, ts);
+    }
+
     /// Ask the active activity to paint one frame. Returns the freshly
     /// populated FrameCommands, which the kernel flushes to the HAL.
     ///
@@ -2342,6 +2356,9 @@ mod tests {
                 *ctx.finish_requested = true;
             }
         }
+        fn on_text_input(&mut self, _: &mut ActivityContext<'_>, text: &str) {
+            self.note(&format!("text:{text}"));
+        }
         fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
     }
 
@@ -2524,6 +2541,55 @@ mod tests {
             fw.activities.state_of(shell_id),
             Some(activity_manager::LifecycleState::Resumed),
         );
+    }
+
+    #[test]
+    fn dispatch_text_input_fires_on_top_activity() {
+        // Foundation gap regression net — the text channel must reach the
+        // foreground activity verbatim. ScriptedActivity logs "text:<text>"
+        // on every on_text_input.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut fw = empty_framework();
+        let log_for_app = log.clone();
+        fw.activities.register("test.app", "Main", LaunchMode::Standard, move || {
+            Box::new(ScriptedActivity::new("app", log_for_app.clone()))
+        });
+        let id = fw.activities.launch("test.app", "Main").unwrap().id;
+        fw.stack.push(id);
+        fw.drive_to_resumed(id, 0.0);
+        log.borrow_mut().clear();
+
+        fw.dispatch_text_input("h", 1.0);
+        fw.dispatch_text_input("שלום", 2.0);
+        fw.dispatch_text_input("👋🎉", 3.0);
+
+        assert_eq!(
+            &*log.borrow(),
+            &["app:text:h", "app:text:שלום", "app:text:👋🎉"],
+        );
+    }
+
+    #[test]
+    fn dispatch_text_input_drops_empty_text_before_callback() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut fw = empty_framework();
+        let log_for_app = log.clone();
+        fw.activities.register("test.app", "Main", LaunchMode::Standard, move || {
+            Box::new(ScriptedActivity::new("app", log_for_app.clone()))
+        });
+        let id = fw.activities.launch("test.app", "Main").unwrap().id;
+        fw.stack.push(id);
+        fw.drive_to_resumed(id, 0.0);
+        log.borrow_mut().clear();
+
+        fw.dispatch_text_input("", 1.0);
+        assert!(log.borrow().is_empty(), "empty text should not wake the activity");
+    }
+
+    #[test]
+    fn dispatch_text_input_with_empty_stack_is_a_silent_noop() {
+        let mut fw = empty_framework();
+        fw.dispatch_text_input("a", 0.0);
     }
 
     #[test]

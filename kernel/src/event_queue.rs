@@ -15,6 +15,14 @@
 //!     (Stone 13.4 extended: optional trailing `display_id: u32` —
 //!     legacy 12-byte payload defaults to display 0.)
 //!   - system.visibility (kind=4): { visible: u8 }
+//!   - input.text    (kind=5): { text_len: u16, text: utf8 }
+//!     The committed printable text the user typed. Foundation gap fix
+//!     — KeyEvent's `code` was deprecated `KeyboardEvent.keyCode`, which
+//!     can't carry character data, so apps wanting typed input had no
+//!     wire path. Single-char keydown (`e.key.length == 1` with no
+//!     Ctrl/Meta) and `compositionend` (`e.data`) both produce one of
+//!     these. Modifier-only keystrokes (Shift, arrows, F-keys) stay on
+//!     the key channel and don't fire a text event.
 //!
 //! See docs/runtime-web.md §4 for the full pipeline, including where this
 //! queue sits between the worker's `akiva_on_event` and the kernel frame
@@ -47,12 +55,22 @@ pub enum Event {
     Key { code: u32, modifiers: u8, phase: KeyPhase },
     Resize { width_px: u32, height_px: u32, density: f32, display_id: u32 },
     Visibility { visible: bool },
+    /// Foundation gap — the printable text a user typed. Distinct
+    /// channel from `Key` because `Key.code` is the deprecated
+    /// `KeyboardEvent.keyCode` (numeric, layout-dependent, can't carry
+    /// a character) and apps that want text routinely also want the
+    /// composition pipeline (`compositionend.data`) collapsed into
+    /// the same callback. One event per chunk of committed text:
+    /// typing "abc" produces three events; an IME committing "שלום"
+    /// produces one event of length 4.
+    TextInput { text: String },
 }
 
 const EVENT_POINTER: u32 = 1;
 const EVENT_KEY: u32 = 2;
 const EVENT_RESIZE: u32 = 3;
 const EVENT_VISIBILITY: u32 = 4;
+const EVENT_TEXT: u32 = 5;
 
 impl Event {
     pub fn decode(kind: u32, bytes: &[u8]) -> Option<Self> {
@@ -96,6 +114,12 @@ impl Event {
             EVENT_VISIBILITY if !bytes.is_empty() => Some(Event::Visibility {
                 visible: bytes[0] != 0,
             }),
+            EVENT_TEXT if bytes.len() >= 2 => {
+                let text_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+                if 2 + text_len > bytes.len() { return None; }
+                let text = std::str::from_utf8(&bytes[2..2 + text_len]).ok()?.to_string();
+                Some(Event::TextInput { text })
+            }
             _ => None,
         }
     }
@@ -133,4 +157,75 @@ impl EventQueue {
 
     pub fn len(&self) -> usize { self.inner.len() }
     pub fn is_empty(&self) -> bool { self.inner.is_empty() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_payload(s: &str) -> Vec<u8> {
+        let bytes = s.as_bytes();
+        let mut buf = Vec::with_capacity(2 + bytes.len());
+        buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(bytes);
+        buf
+    }
+
+    #[test]
+    fn text_event_decodes_ascii() {
+        let buf = text_payload("a");
+        match Event::decode(EVENT_TEXT, &buf) {
+            Some(Event::TextInput { text }) => assert_eq!(text, "a"),
+            other => panic!("expected TextInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_event_decodes_unicode_multi_codepoint() {
+        // emoji + Hebrew (per memory: i18n is post-MVP, but the wire
+        // must carry arbitrary UTF-8 anyway because IME paste of any
+        // language is legal). Length is in BYTES of UTF-8.
+        let buf = text_payload("שלום👋");
+        match Event::decode(EVENT_TEXT, &buf) {
+            Some(Event::TextInput { text }) => assert_eq!(text, "שלום👋"),
+            other => panic!("expected TextInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_event_rejects_truncated_payload() {
+        // Header claims 10 bytes of text but only 3 follow.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&10u16.to_le_bytes());
+        buf.extend_from_slice(b"abc");
+        assert!(Event::decode(EVENT_TEXT, &buf).is_none());
+    }
+
+    #[test]
+    fn text_event_rejects_invalid_utf8() {
+        // text_len = 2, bytes 0xFF 0xFE — invalid UTF-8.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&[0xFF, 0xFE]);
+        assert!(Event::decode(EVENT_TEXT, &buf).is_none());
+    }
+
+    #[test]
+    fn text_event_decodes_empty_text() {
+        // Empty text is wire-legal even though `dispatch_text_input`
+        // drops it framework-side. The decoder doesn't second-guess
+        // the host.
+        let buf = text_payload("");
+        match Event::decode(EVENT_TEXT, &buf) {
+            Some(Event::TextInput { text }) => assert!(text.is_empty()),
+            other => panic!("expected TextInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_event_rejects_too_short_for_header() {
+        // 1 byte — not even enough for the u16 length prefix.
+        assert!(Event::decode(EVENT_TEXT, &[0x05]).is_none());
+        assert!(Event::decode(EVENT_TEXT, &[]).is_none());
+    }
 }

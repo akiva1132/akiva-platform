@@ -111,6 +111,11 @@ impl Kernel {
             Event::Visibility { visible } => {
                 log::debug(&format!("kernel: visibility={}", visible));
             }
+            Event::TextInput { text } => {
+                if let Some(fw) = self.framework.as_mut() {
+                    fw.dispatch_text_input(&text, ts);
+                }
+            }
         }
     }
 }
@@ -405,6 +410,31 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         );
         p[16..24].copy_from_slice(&ts_ms.to_le_bytes());
         self.dispatch(akiva_framework::wire::op_kinds::cmd::KEY, &p)
+    }
+
+    fn text_input(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        text: &str,
+        ts_ms: f64,
+    ) -> u64 {
+        // [handle: u32 | text_len: u16 | text: utf8... | ts: f64]
+        let bytes = text.as_bytes();
+        // Cap text at 64 KiB so a runaway IME chunk can't overflow the
+        // u16 length prefix or the cross-worker message budget.
+        if bytes.len() > u16::MAX as usize {
+            log::warn(&format!(
+                "text_input: dropping chunk over {} bytes ({} bytes)",
+                u16::MAX, bytes.len(),
+            ));
+            return 0;
+        }
+        let mut p = Vec::with_capacity(4 + 2 + bytes.len() + 8);
+        p.extend_from_slice(&handle.get().to_le_bytes());
+        p.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        p.extend_from_slice(bytes);
+        p.extend_from_slice(&ts_ms.to_le_bytes());
+        self.dispatch(akiva_framework::wire::op_kinds::cmd::TEXT_INPUT, &p)
     }
 
     fn resize(

@@ -83,6 +83,16 @@ pub trait WasmHost {
     /// but the trait shape stays the same.
     fn pointer(&self, handle: AppHandle, ev: PointerEvent, ts_ms: f64) -> u64;
     fn key(&self, handle: AppHandle, ev: KeyEvent, ts_ms: f64) -> u64;
+    /// Foundation gap — committed text input. Distinct dispatch from
+    /// [`Self::key`] because the wire payload is variable-length
+    /// (UTF-8 string) and the SDK splits the callback so apps don't
+    /// pay deprecated `keyCode` parsing for every typed character.
+    /// Default returns `0` so in-process activities (Shell, mocks)
+    /// keep ignoring the hook.
+    fn text_input(&self, handle: AppHandle, text: &str, ts_ms: f64) -> u64 {
+        let _ = (handle, text, ts_ms);
+        0
+    }
     fn resize(&self, handle: AppHandle, metrics: SurfaceMetrics) -> u64;
 
     /// Ask the app to paint one frame. Returns a `future_id` that, once
@@ -411,6 +421,10 @@ impl Activity for WasmActivity {
     }
     fn on_key(&mut self, ctx: &mut ActivityContext<'_>, ev: KeyEvent) {
         self.assert_sync("key", self.host.key(self.handle, ev, ctx.timestamp_ms));
+        self.drain_post(ctx);
+    }
+    fn on_text_input(&mut self, ctx: &mut ActivityContext<'_>, text: &str) {
+        self.assert_sync("text_input", self.host.text_input(self.handle, text, ctx.timestamp_ms));
         self.drain_post(ctx);
     }
     fn on_resize(&mut self, ctx: &mut ActivityContext<'_>, m: SurfaceMetrics) {

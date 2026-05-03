@@ -299,6 +299,20 @@ pub trait Activity: 'static {
     async fn on_key(&mut self, ctx: &mut Context<'_>, ev: KeyEvent) {
         let _ = (ctx, ev);
     }
+    /// Foundation gap — committed text input. The host fires this for
+    /// each chunk of typed text: a single printable `keydown.key`
+    /// (no Ctrl/Meta) or the committed payload of `compositionend.data`
+    /// (IME). Modifier-only keystrokes (Shift, arrow keys, F-keys,
+    /// shortcut combos) keep flowing through `on_key` and never call
+    /// this. Apps that want typed input override this method;
+    /// everyone else gets the no-op default.
+    ///
+    /// `text` is owned (`String`) because the host crosses the worker
+    /// boundary and the SDK owns the UTF-8 bytes after decode — apps
+    /// can move them straight into a buffer without an extra copy.
+    async fn on_text_input(&mut self, ctx: &mut Context<'_>, text: String) {
+        let _ = (ctx, text);
+    }
     async fn on_resize(&mut self, ctx: &mut Context<'_>, metrics: Metrics) {
         let _ = (ctx, metrics);
     }

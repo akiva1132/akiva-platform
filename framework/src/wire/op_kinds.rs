@@ -420,6 +420,13 @@ pub mod cmd {
     /// Args: `[handle: u32 LE, width_px: u32 LE, height_px: u32 LE,
     /// density: f32 LE]`. 16 bytes.
     pub const RESIZE: u32 = 0x12;
+    /// Foundation gap — the printable text the user typed. Args:
+    /// `[handle: u32 LE | text_len: u16 LE | text: utf8...
+    ///   | ts_ms: f64 LE]`. The text is the committed chunk
+    /// (single keydown char or `compositionend.data`); modifier-only
+    /// keystrokes go through `KEY` and do not fire this. Variable
+    /// payload size — minimum 14 bytes (empty text).
+    pub const TEXT_INPUT: u32 = 0x13;
 
     /// Args: `[handle: u32 LE, ts_ms: f64 LE]`. 12 bytes. Result
     /// bytes (paint stream) fetched via `akiva_app_get_result`.
@@ -591,6 +598,7 @@ mod tests {
         assert_eq!(cmd::POINTER,          sdk::cmd::POINTER);
         assert_eq!(cmd::KEY,              sdk::cmd::KEY);
         assert_eq!(cmd::RESIZE,           sdk::cmd::RESIZE);
+        assert_eq!(cmd::TEXT_INPUT,       sdk::cmd::TEXT_INPUT);
         assert_eq!(cmd::RENDER,           sdk::cmd::RENDER);
         assert_eq!(cmd::SAVE_STATE,       sdk::cmd::SAVE_STATE);
         assert_eq!(cmd::RESTORE_STATE,    sdk::cmd::RESTORE_STATE);
@@ -602,7 +610,7 @@ mod tests {
     fn cmd_kinds_are_unique() {
         let cmds = [
             cmd::CREATE, cmd::START, cmd::RESUME, cmd::PAUSE, cmd::STOP, cmd::DESTROY,
-            cmd::POINTER, cmd::KEY, cmd::RESIZE,
+            cmd::POINTER, cmd::KEY, cmd::RESIZE, cmd::TEXT_INPUT,
             cmd::RENDER,
             cmd::SAVE_STATE, cmd::RESTORE_STATE,
             cmd::NEW_INTENT, cmd::ACTIVITY_RESULT,

@@ -256,6 +256,13 @@ pub mod cmd {
     pub const POINTER: u32 = 0x10;
     pub const KEY: u32 = 0x11;
     pub const RESIZE: u32 = 0x12;
+    /// Foundation gap — typed text. Distinct from KEY because key
+    /// events carry the deprecated `KeyboardEvent.keyCode`, which
+    /// can't represent a character. Text events carry the committed
+    /// chunk (`e.key` for single-char keydown, `compositionend.data`
+    /// for IME). Apps that want typed input override
+    /// [`crate::Activity::on_text_input`].
+    pub const TEXT_INPUT: u32 = 0x13;
 
     pub const RENDER: u32 = 0x20;
 
@@ -346,7 +353,7 @@ mod tests {
         // / `fire::` qualifier — keep the ranges visibly separate.
         let cmds = [
             cmd::CREATE, cmd::START, cmd::RESUME, cmd::PAUSE, cmd::STOP, cmd::DESTROY,
-            cmd::POINTER, cmd::KEY, cmd::RESIZE,
+            cmd::POINTER, cmd::KEY, cmd::RESIZE, cmd::TEXT_INPUT,
             cmd::RENDER,
             cmd::SAVE_STATE, cmd::RESTORE_STATE,
             cmd::NEW_INTENT, cmd::ACTIVITY_RESULT,
