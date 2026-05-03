@@ -1,25 +1,43 @@
 //! Display manager.
 //!
 //! A "display" is one OffscreenCanvas owned by a tab. The leader owns the
-//! kernel; each follower tab contributes exactly one display surface. The
-//! display manager tracks per-display metrics (size, density) and flushes
-//! the framework's [`FrameCommands`] buffer to the HAL's immediate-mode
-//! draw calls each frame.
+//! kernel; each follower tab contributes its own display surface. Stone
+//! 13.4 made this multi-display: `DisplayManager` now keeps a
+//! `HashMap<DisplayId, Display>` instead of a single `primary`, and the
+//! kernel renders each display independently in the per-frame loop.
 //!
-//! Phase 2a handover: the Phase 1b pointer indicator + banner moved into
-//! the framework's Shell activity. This module now only owns:
-//!   1. Surface metrics (picked up at init from HAL getters).
-//!   2. The "apply FrameCommands" loop (rendering happens here because
-//!      the kernel owns the `extern "C"` HAL imports, not the framework).
+//! Responsibilities:
+//!   1. Track per-display surface metrics (size, density). Owners
+//!      update via `on_resize(display_id, ...)`.
+//!   2. Allocate / release displays. `alloc_display` returns a fresh
+//!      monotonically-increasing `DisplayId` the host (tab.js) uses to
+//!      claim its surface; `release_display` is called when the
+//!      claiming tab closes (or the host fires it directly).
+//!   3. The "apply FrameCommands" loop. The kernel passes the
+//!      framework's per-display frame buffer here; flush issues the
+//!      HAL draw calls for that display.
 //!
-//! Phase 2b will swap the immediate-mode HAL calls for a pluggable
-//! [`RendererBackend`] trait per ARCHITECTURE.md §10.
+//! Per-display draw routing on the JS side: `hal_draw_*` calls today
+//! go to the singleton `backend` in the worker. Stone 13.4 keeps that
+//! contract for the **leader's display** (DisplayId 0, the default
+//! transferred OffscreenCanvas) and routes follower displays via a
+//! serialised paint stream over `hal_post_to_display(displayId,
+//! bytes)` — the host BroadcastChannels the bytes to the claiming tab,
+//! which decodes and paints main-thread. The kernel switches between
+//! the two paths in `flush` based on the display id.
+
+use std::collections::HashMap;
 
 use akiva_framework::compositor::{FrameCommands, PaintOp};
 
 use crate::host;
 
 pub type DisplayId = u32;
+
+/// `DisplayId(0)` is the always-allocated leader display — the
+/// OffscreenCanvas the leader tab transferred to its worker. Followers
+/// get fresh ids starting at `1`.
+pub const PRIMARY_DISPLAY: DisplayId = 0;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SurfaceMetrics {
@@ -36,24 +54,29 @@ pub struct Display {
 }
 
 pub struct DisplayManager {
-    primary: Display,
+    displays: HashMap<DisplayId, Display>,
+    /// Monotonic id allocator. `0` is reserved for the primary; fresh
+    /// follower displays start at `1`.
+    next_id: DisplayId,
+    /// True once the primary display has been initialised by the host
+    /// (`init` after the OffscreenCanvas is transferred to the worker).
     initialised: bool,
 }
 
 impl DisplayManager {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            primary: Display {
-                id: 0,
-                metrics: SurfaceMetrics { width_px: 0, height_px: 0, density: 1.0 },
-                visible: true,
-            },
+            displays: HashMap::new(),
+            next_id: 1,
             initialised: false,
         }
     }
 
+    /// Initialise the primary display. Called by the kernel's
+    /// `akiva_boot` after the host has transferred the OffscreenCanvas
+    /// to the worker. Reads the surface metrics through the HAL
+    /// imports.
     pub fn init(&mut self) {
-        // SAFETY: metric getters are pure and always defined by the HAL.
         let m = unsafe {
             SurfaceMetrics {
                 width_px: host::hal_surface_width(),
@@ -61,19 +84,83 @@ impl DisplayManager {
                 density: host::hal_surface_density(),
             }
         };
-        self.primary.metrics = m;
+        self.displays.insert(PRIMARY_DISPLAY, Display {
+            id: PRIMARY_DISPLAY,
+            metrics: m,
+            visible: true,
+        });
         self.initialised = true;
         crate::log::info("display: primary surface ready");
     }
 
-    pub fn on_resize(&mut self, w: u32, h: u32, density: f32) {
-        self.primary.metrics = SurfaceMetrics { width_px: w, height_px: h, density };
+    /// Stone 13.4 — allocate a fresh display id and seed it with the
+    /// initial metrics the claiming tab reported. Returns the id; the
+    /// kernel hands it to the JS host (via the export the host calls)
+    /// so the host can record the displayId↔tabId mapping for paint
+    /// stream routing.
+    pub fn alloc_display(&mut self, metrics: SurfaceMetrics) -> DisplayId {
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).unwrap_or(1);
+        self.displays.insert(id, Display {
+            id,
+            metrics,
+            visible: true,
+        });
+        crate::log::info(&format!(
+            "display: allocated #{id} ({}×{} @ {:.1}x)",
+            metrics.width_px, metrics.height_px, metrics.density,
+        ));
+        id
     }
 
-    /// Walk a frame buffer and issue the corresponding HAL calls. No-op
-    /// until the display has been initialised.
-    pub fn flush(&mut self, frame: &FrameCommands) {
+    /// Stone 13.4 — release a previously-allocated display. No-op for
+    /// `PRIMARY_DISPLAY` (the leader's own canvas — releasing it would
+    /// leave the OS with no surface), and for unknown ids.
+    pub fn release_display(&mut self, id: DisplayId) -> bool {
+        if id == PRIMARY_DISPLAY {
+            crate::log::warn("display: refusing to release PRIMARY_DISPLAY");
+            return false;
+        }
+        let removed = self.displays.remove(&id).is_some();
+        if removed {
+            crate::log::info(&format!("display: released #{id}"));
+        }
+        removed
+    }
+
+    /// Stone 13.4 — every live display id, sorted ascending. The
+    /// kernel iterates this in `akiva_frame` to drive each display's
+    /// render pass.
+    pub fn ids(&self) -> Vec<DisplayId> {
+        let mut v: Vec<DisplayId> = self.displays.keys().copied().collect();
+        v.sort();
+        v
+    }
+
+    pub fn on_resize(&mut self, display_id: DisplayId, w: u32, h: u32, density: f32) {
+        if let Some(d) = self.displays.get_mut(&display_id) {
+            d.metrics = SurfaceMetrics { width_px: w, height_px: h, density };
+        } else {
+            crate::log::warn(&format!("display: resize on unknown id {display_id}"));
+        }
+    }
+
+    /// Stone 13.4 — flush a frame buffer to a specific display. The
+    /// primary display (`0`) goes through the immediate-mode HAL draw
+    /// imports unchanged; follower displays serialise their ops to a
+    /// byte stream and post via `hal_post_to_display(id, bytes)` so
+    /// the JS host can BroadcastChannel them to the claiming tab.
+    pub fn flush(&mut self, display_id: DisplayId, frame: &FrameCommands) {
         if !self.initialised { return; }
+        if !self.displays.contains_key(&display_id) { return; }
+        if display_id == PRIMARY_DISPLAY {
+            self.flush_primary(frame);
+        } else {
+            self.flush_follower(display_id, frame);
+        }
+    }
+
+    fn flush_primary(&mut self, frame: &FrameCommands) {
         // SAFETY: all HAL draw calls take primitives or pointers into
         // UTF-8 slices we own for the duration of the call.
         unsafe {
@@ -115,11 +202,40 @@ impl DisplayManager {
         }
     }
 
+    /// Stone 13.4 — serialise a follower display's frame into the
+    /// shared paint-stream wire format and post via
+    /// `hal_post_to_display`. Empty frames are still posted (they
+    /// double as a heartbeat the follower can use to detect a stalled
+    /// leader); ops-equal-to-zero is the worst case, which is one
+    /// HAL call per frame.
+    fn flush_follower(&mut self, display_id: DisplayId, frame: &FrameCommands) {
+        let mut bytes: Vec<u8> = Vec::with_capacity(frame.ops().len() * 16);
+        for op in frame.ops() {
+            akiva_framework::wasm_activity::encode_op(&mut bytes, op);
+        }
+        // SAFETY: ptr/len describe bytes we own for the duration of
+        // the call; the host copies before returning.
+        unsafe {
+            host::hal_post_to_display(display_id, bytes.as_ptr(), bytes.len());
+        }
+    }
+
     pub fn shutdown(&mut self) {
         self.initialised = false;
     }
 
-    pub fn primary(&self) -> Display { self.primary }
+    pub fn primary(&self) -> Display {
+        self.displays.get(&PRIMARY_DISPLAY).copied().unwrap_or_default()
+    }
 
-    pub fn metrics(&self) -> SurfaceMetrics { self.primary.metrics }
+    pub fn metrics(&self) -> SurfaceMetrics {
+        self.primary().metrics
+    }
+
+    /// Stone 13.4 — per-display metrics. Used by the framework's
+    /// per-display render path to pick the right `SurfaceMetrics`
+    /// when laying out the activity assigned to each display.
+    pub fn metrics_of(&self, id: DisplayId) -> Option<SurfaceMetrics> {
+        self.displays.get(&id).map(|d| d.metrics)
+    }
 }

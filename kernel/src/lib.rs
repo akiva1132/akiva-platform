@@ -43,7 +43,11 @@ use crate::scheduler::Scheduler;
 struct Kernel {
     scheduler: Scheduler,
     events: EventQueue,
-    display: DisplayManager,
+    /// Lazy-initialised in `akiva_boot` because Stone 13.4 turned the
+    /// internals into a `HashMap<DisplayId, Display>` which can't be
+    /// const-constructed; the `display()` accessor returns a mutable
+    /// reference that panics if accessed pre-boot (a bug).
+    display: Option<DisplayManager>,
     /// Lazy-initialised in `akiva_boot` because `Framework` allocates and
     /// therefore cannot be `const`-constructed.
     framework: Option<Framework>,
@@ -56,11 +60,18 @@ impl Kernel {
         Self {
             scheduler: Scheduler::new(),
             events: EventQueue::new(),
-            display: DisplayManager::new(),
+            display: None,
             framework: None,
             frame_count: 0,
             last_frame_ms: 0.0,
         }
+    }
+
+    /// Borrow the DisplayManager, panicking if `akiva_boot` hasn't
+    /// been called. Every entry point either runs after boot or
+    /// returns early before it would touch the display.
+    fn display(&mut self) -> &mut DisplayManager {
+        self.display.as_mut().expect("display accessed before akiva_boot")
     }
 
     fn handle_event(&mut self, ev: Event) {
@@ -83,7 +94,14 @@ impl Kernel {
                 }
             }
             Event::Resize { width_px, height_px, density } => {
-                self.display.on_resize(width_px, height_px, density);
+                // Stone 13.4 — resize event currently scoped to PRIMARY
+                // display. Per-display resize lands when the JS host
+                // wires the event payload to carry display_id from the
+                // tab that produced it.
+                self.display().on_resize(
+                    display_manager::PRIMARY_DISPLAY,
+                    width_px, height_px, density,
+                );
                 if let Some(fw) = self.framework.as_mut() {
                     fw.set_metrics(fw_act::SurfaceMetrics { width_px, height_px, density });
                 }
@@ -174,7 +192,11 @@ pub extern "C" fn akiva_boot() {
     log::info("kernel: boot");
     let k = kernel();
     k.scheduler.init();
-    k.display.init();
+    // Stone 13.4 — DisplayManager moved off `const fn new` (HashMap
+    // can't be const-constructed), so we lazy-init here. Subsequent
+    // boots are guarded by the BOOTED swap above.
+    k.display = Some(DisplayManager::new());
+    k.display().init();
 
     bump_boot_counter();
     let kstore: Box<dyn akiva_framework::storage::Storage> = Box::new(KernelStorage);
@@ -199,7 +221,7 @@ pub extern "C" fn akiva_boot() {
             }
         }
     }
-    let m = k.display.metrics();
+    let m = k.display().metrics();
     fw.set_metrics(fw_act::SurfaceMetrics {
         width_px: m.width_px,
         height_px: m.height_px,
@@ -752,9 +774,44 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
     // Render through the framework, then flush the resulting command
     // buffer to the HAL. The split keeps HAL calls confined to the kernel
     // crate so the framework stays wasm-target-agnostic.
-    if let Some(fw) = k.framework.as_mut() {
-        let frame = fw.render_frame(timestamp_ms);
-        k.display.flush(frame);
+    //
+    // Stone 13.4 — iterate every live display, render the task assigned
+    // to that display, and flush per display. The primary path
+    // (DisplayId 0) routes through immediate-mode HAL imports as
+    // before; follower displays serialise their ops via
+    // `hal_post_to_display` so the JS host can BroadcastChannel the
+    // bytes to the claiming tab.
+    // Stone 13.4 — disjoint borrows of `k.framework` and `k.display`
+    // through individual field references so the per-display loop
+    // doesn't trip the borrow checker (both are `Option<_>` fields on
+    // the same Kernel struct; method-style `k.display()` borrows the
+    // whole `k`).
+    if let (Some(fw), Some(disp)) = (k.framework.as_mut(), k.display.as_mut()) {
+        let display_ids = disp.ids();
+        if display_ids.len() <= 1 {
+            // Single-display fast path: render once to the primary
+            // display. Matches the pre-13.4 behaviour exactly when no
+            // follower has claimed a display.
+            let frame = fw.render_frame(timestamp_ms);
+            disp.flush(display_manager::PRIMARY_DISPLAY, frame);
+        } else {
+            for display_id in display_ids {
+                // Push per-display metrics into the framework so
+                // layout reads the right size for this pass. The
+                // primary's metrics already match (Resize events flow
+                // through `set_metrics`); follower displays carry
+                // their own.
+                if let Some(m) = disp.metrics_of(display_id) {
+                    fw.set_metrics(fw_act::SurfaceMetrics {
+                        width_px: m.width_px,
+                        height_px: m.height_px,
+                        density: m.density,
+                    });
+                }
+                let frame = fw.render_frame_for_display(timestamp_ms, display_id);
+                disp.flush(display_id, frame);
+            }
+        }
     }
 
     // Stone 13.2 — drain any dialog resolutions the user produced this
@@ -946,7 +1003,7 @@ pub extern "C" fn akiva_shutdown() {
     log::info("kernel: shutdown");
     let k = kernel();
     k.scheduler.shutdown();
-    k.display.shutdown();
+    if let Some(d) = k.display.as_mut() { d.shutdown(); }
 }
 
 /// P0 #2 — graceful-shutdown checkpoint. The HAL calls this when the
@@ -1030,6 +1087,47 @@ pub unsafe extern "C" fn akiva_dealloc(ptr: *mut u8, size: usize) {
 #[no_mangle]
 pub extern "C" fn akiva_abi_version() -> *const u8 {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr()
+}
+
+/// Stone 13.4 — allocate a fresh display for a follower tab. The JS
+/// host calls this when a tab claims a display (`request_display` →
+/// session forwards to worker → kernel calls back). Returns the
+/// freshly-minted `DisplayId`; the host records the
+/// displayId↔tabId mapping for paint stream routing via
+/// `hal_post_to_display`.
+///
+/// `density_q16` is `density * 65536` rounded to a u32 — wasm i32
+/// args don't carry float values directly without f32→i32 reinterpret
+/// boilerplate on the JS side, so we use a fixed-point encoding for
+/// the one value that needs sub-integer precision.
+#[no_mangle]
+pub extern "C" fn akiva_alloc_display(
+    width_px: u32, height_px: u32, density_q16: u32,
+) -> u32 {
+    let density = (density_q16 as f32) / 65536.0;
+    let metrics = display_manager::SurfaceMetrics { width_px, height_px, density };
+    kernel().display().alloc_display(metrics)
+}
+
+/// Stone 13.4 — release a previously-allocated display when its
+/// claiming tab closes (or gracefully relinquishes). No-op for
+/// `PRIMARY_DISPLAY` and unknown ids. Returns 1 on a successful
+/// removal, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn akiva_release_display(display_id: u32) -> u32 {
+    if kernel().display().release_display(display_id) { 1 } else { 0 }
+}
+
+/// Stone 13.4 — assign a task to a display. The kernel reads the
+/// foreground activity of the named task when rendering that
+/// display's frame each tick. `task_id == 0` is the wildcard "leave
+/// at default" sentinel.
+#[no_mangle]
+pub extern "C" fn akiva_assign_task_to_display(
+    task_id: u64, display_id: u32,
+) -> u32 {
+    let Some(fw) = kernel().framework.as_mut() else { return 0; };
+    if fw.assign_task_to_display(task_id, display_id) { 1 } else { 0 }
 }
 
 /// Stone 13.2 — open a system dialog overlay on behalf of an app

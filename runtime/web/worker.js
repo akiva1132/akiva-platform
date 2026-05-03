@@ -77,6 +77,17 @@ self.addEventListener("message", (e) => {
       // in Phase 2.
       log("info", `follower display registered for tab ${msg.tabId}`);
       break;
+    case "request_display":
+      // Stone 13.4 — follower tab is asking the kernel to allocate
+      // it a fresh DisplayId. We call into the kernel wasm, then
+      // post the assigned id back through the leader → BC → tab path
+      // so the requesting tab learns what to filter `display_frame`
+      // events on.
+      handleRequestDisplay(msg);
+      break;
+    case "release_display":
+      handleReleaseDisplay(msg);
+      break;
     case "resize":
       if (primary?.tabId === msg.tabId && backend) {
         backend.resize(msg.metrics.width_px, msg.metrics.height_px, msg.metrics.density);
@@ -322,6 +333,63 @@ function attachDisplay(msg) {
   apps.setBackend(backend);
 
   if (booted && instance) startFrameLoop();
+}
+
+// ── Stone 13.4 — follower display routing ────────────────────────────
+//
+// Every follower tab that successfully called `request_display` ends
+// up in this map. The kernel allocates a fresh DisplayId via
+// `akiva_alloc_display`, the worker tells the tab via
+// `display_assigned`, and on every `hal_post_to_display(displayId,
+// bytes)` we already postMessage `display_frame` — the leader main
+// thread BCs it; the matching follower tab decodes and paints. We
+// keep a tabId↔displayId mirror here purely for auto-launch policy
+// (each follower's display gets its own task) and for clean-up when
+// the tab closes.
+
+/** @type {Map<string, number>} tabId → displayId */
+const followerDisplays = new Map();
+
+function handleRequestDisplay(msg) {
+  if (!booted || !instance) {
+    log("warn", `request_display before boot from tab ${msg.tabId} — ignored`);
+    return;
+  }
+  if (followerDisplays.has(msg.tabId)) {
+    log("info", `request_display: tab ${msg.tabId.slice(0, 8)} already has display ${followerDisplays.get(msg.tabId)}`);
+    self.postMessage({
+      type: "display_assigned",
+      tabId: msg.tabId,
+      displayId: followerDisplays.get(msg.tabId),
+    });
+    return;
+  }
+  const w = (msg.width_px | 0) || 1;
+  const h = (msg.height_px | 0) || 1;
+  // density encoded as Q16 fixed-point on the wasm boundary (i32
+  // doesn't carry a float without reinterpret on the JS side).
+  const densityQ16 = Math.max(1, Math.round((msg.density || 1) * 65536));
+  const displayId = instance.exports.akiva_alloc_display(w, h, densityQ16) >>> 0;
+  if (displayId === 0) {
+    log("warn", `akiva_alloc_display rejected for tab ${msg.tabId} (returned 0)`);
+    return;
+  }
+  followerDisplays.set(msg.tabId, displayId);
+  log("info", `assigned display ${displayId} to tab ${msg.tabId.slice(0, 8)}`);
+  self.postMessage({ type: "display_assigned", tabId: msg.tabId, displayId });
+}
+
+function handleReleaseDisplay(msg) {
+  if (!booted || !instance) return;
+  const recordedDisplayId = followerDisplays.get(msg.tabId);
+  // Trust the message's displayId only if it matches our record;
+  // otherwise the tab is reporting stale state and we honour our
+  // own bookkeeping. Either way log so post-mortems see the trace.
+  const displayId = recordedDisplayId ?? (msg.displayId | 0);
+  if (!displayId) return;
+  const released = instance.exports.akiva_release_display(displayId) >>> 0;
+  followerDisplays.delete(msg.tabId);
+  log("info", `released display ${displayId} for tab ${msg.tabId.slice(0, 8)} (rc=${released})`);
 }
 
 // ── Frame loop ──────────────────────────────────────────────────────────

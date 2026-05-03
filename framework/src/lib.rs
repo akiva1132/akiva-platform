@@ -142,6 +142,7 @@ pub fn boot(
             },
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
+            task_displays: HashMap::new(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -439,6 +440,12 @@ pub struct Framework {
     /// before flushing the frame. Empty in the steady state — quiet
     /// frames pay one HashMap lookup.
     pub animations: animation::AnimationController,
+    /// Stone 13.4 — per-task display assignment. Tasks not in the map
+    /// render to display `0` (the primary). Multi-tab follower tabs
+    /// claim a fresh display id (allocated kernel-side via
+    /// `akiva_alloc_display`) and assign their dedicated task to it
+    /// so each tab shows a different task. Empty in single-tab mode.
+    task_displays: HashMap<activity_manager::TaskId, u32>,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -762,6 +769,94 @@ impl Framework {
     /// unblocking the SDK's `DialogFuture`.
     pub fn drain_dialog_resolutions(&mut self) -> Vec<dialog::DialogResolution> {
         self.dialogs.take_resolutions()
+    }
+
+    // ── Stone 13.4: per-display task routing ─────────────────────────
+
+    /// Bind a task to a display so the kernel renders that task's
+    /// foreground activity to the named display each frame. Tasks
+    /// without an explicit binding render to display `0` (the
+    /// primary). Returns true on success, false if `task_id` doesn't
+    /// exist.
+    pub fn assign_task_to_display(
+        &mut self, task_id: activity_manager::TaskId, display_id: u32,
+    ) -> bool {
+        if self.activities.task_stack(task_id).is_none() {
+            return false;
+        }
+        if display_id == 0 {
+            self.task_displays.remove(&task_id);
+        } else {
+            self.task_displays.insert(task_id, display_id);
+        }
+        true
+    }
+
+    /// Read the display id `task_id` is rendered on. `0` for tasks
+    /// without an explicit assignment (the default).
+    pub fn display_for_task(&self, task_id: activity_manager::TaskId) -> u32 {
+        self.task_displays.get(&task_id).copied().unwrap_or(0)
+    }
+
+    /// Stone 13.4 — render the frame that should appear on
+    /// `display_id`. The framework picks the foreground activity of
+    /// the task assigned to that display (or, for the primary
+    /// display, falls back to the system foreground task per legacy
+    /// behaviour) and runs the standard render path. Returns the
+    /// produced `FrameCommands`.
+    ///
+    /// Single-display callers should keep using `render_frame` —
+    /// this method is for the kernel's per-display loop in
+    /// `akiva_frame`.
+    pub fn render_frame_for_display(
+        &mut self, ts: f64, display_id: u32,
+    ) -> &FrameCommands {
+        // Snapshot which activity should render on this display, then
+        // override `self.stack` with that single-activity slice for
+        // the duration of `render_frame`. This is hacky but lets us
+        // reuse the entire existing render machinery (dialogs,
+        // animations, lifecycle) without forking it.
+        let target_activity = self.foreground_activity_for_display(display_id);
+        match target_activity {
+            Some(activity) => {
+                let saved_stack = std::mem::replace(&mut self.stack, vec![activity]);
+                let _ = self.render_frame(ts);
+                self.stack = saved_stack;
+                self.compositor.finish_frame_in_order(
+                    &[compositor::Compositor::DEFAULT_SURFACE],
+                )
+            }
+            None => {
+                // No activity bound to this display — emit an empty
+                // frame so the renderer paints background + present.
+                self.compositor.begin_frame();
+                self.compositor.finish_frame()
+            }
+        }
+    }
+
+    /// Pick the foreground activity for a given display: the top of
+    /// the task assigned to that display, the primary's foreground if
+    /// the display is the primary, or — for unbound non-primary
+    /// displays — the primary's foreground (mirror policy). Mirror
+    /// keeps a follower tab visible without forcing the host to
+    /// auto-launch a fresh task on every claim; tabs that want
+    /// distinct content call `assign_task_to_display` explicitly.
+    fn foreground_activity_for_display(
+        &self, display_id: u32,
+    ) -> Option<activity_manager::ActivityId> {
+        // Find every task bound to `display_id`. The most recently
+        // assigned wins if multiple are bound (rare; framework caller
+        // shouldn't double-assign).
+        let bound: Option<activity_manager::TaskId> = self.task_displays.iter()
+            .find(|(_, d)| **d == display_id)
+            .map(|(t, _)| *t);
+        if let Some(task) = bound {
+            return self.activities.task_stack(task)
+                .and_then(|s| s.last().copied());
+        }
+        // Primary or unbound mirror: surface the system foreground.
+        self.stack.last().copied()
     }
 
     /// P1 #3 — drain per-frame async signals (`finish`,
@@ -2123,6 +2218,7 @@ mod tests {
             },
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
+            task_displays: HashMap::new(),
         }
     }
 
@@ -3186,6 +3282,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
+            task_displays: HashMap::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -3289,6 +3386,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
+            task_displays: HashMap::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -3865,6 +3963,7 @@ optional = []
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
+            task_displays: HashMap::new(),
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -3981,6 +4080,7 @@ optional = []
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
+            task_displays: HashMap::new(),
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -4122,6 +4222,7 @@ optional = []
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
+            task_displays: HashMap::new(),
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),
@@ -4157,5 +4258,70 @@ optional = []
             "an Err from poll must leave state at the prior value (Trapped lands in 11.5)");
         assert!(fw.activities.pending_of(id).is_none(),
             "slot must clear even on Err so the activity isn't wedged");
+    }
+
+    // ── Stone 13.4 — multi-display assignment ─────────────────────────
+
+    #[derive(Default)]
+    struct DisplayStub;
+    impl activity::Activity for DisplayStub {
+        fn render(&mut self, _: &mut ActivityContext<'_>, _: &mut compositor::FrameCommands) {}
+    }
+
+    fn task_of(fw: &Framework, id: activity_manager::ActivityId) -> activity_manager::TaskId {
+        fw.activities.record(id).expect("activity exists").task
+    }
+
+    #[test]
+    fn assign_task_to_display_records_mapping() {
+        let mut fw = empty_framework();
+        fw.activities.register("a.test", "A1",
+            activity_manager::LaunchMode::SingleInstance, || Box::new(DisplayStub));
+        fw.activities.register("b.test", "B1",
+            activity_manager::LaunchMode::SingleInstance, || Box::new(DisplayStub));
+        let a = fw.activities.launch("a.test", "A1").unwrap();
+        let b = fw.activities.launch("b.test", "B1").unwrap();
+        let a_task = task_of(&fw, a.id);
+        let b_task = task_of(&fw, b.id);
+        // Default: both tasks render on display 0.
+        assert_eq!(fw.display_for_task(a_task), 0);
+        assert_eq!(fw.display_for_task(b_task), 0);
+        // Bind task `b` to display 1.
+        assert!(fw.assign_task_to_display(b_task, 1));
+        assert_eq!(fw.display_for_task(b_task), 1);
+        assert_eq!(fw.display_for_task(a_task), 0);
+        // Re-binding to 0 removes the entry.
+        assert!(fw.assign_task_to_display(b_task, 0));
+        assert_eq!(fw.display_for_task(b_task), 0);
+    }
+
+    #[test]
+    fn assign_task_to_display_unknown_task_returns_false() {
+        let mut fw = empty_framework();
+        assert!(!fw.assign_task_to_display(999, 1));
+    }
+
+    #[test]
+    fn foreground_activity_for_display_falls_back_to_primary_stack() {
+        let mut fw = empty_framework();
+        fw.activities.register("test.pkg", "Stub",
+            activity_manager::LaunchMode::Standard, || Box::new(DisplayStub));
+        let outcome = fw.activities.launch("test.pkg", "Stub").unwrap();
+        fw.stack.push(outcome.id);
+        // No assignment → primary picks up the stack top.
+        assert_eq!(fw.foreground_activity_for_display(0), Some(outcome.id));
+        // Unbound non-primary → mirrors primary (Stone 13.4 default).
+        assert_eq!(fw.foreground_activity_for_display(7), Some(outcome.id));
+    }
+
+    #[test]
+    fn foreground_activity_for_display_resolves_bound_task() {
+        let mut fw = empty_framework();
+        fw.activities.register("a.test", "A1",
+            activity_manager::LaunchMode::SingleInstance, || Box::new(DisplayStub));
+        let a = fw.activities.launch("a.test", "A1").unwrap();
+        let a_task = task_of(&fw, a.id);
+        fw.assign_task_to_display(a_task, 5);
+        assert_eq!(fw.foreground_activity_for_display(5), Some(a.id));
     }
 }

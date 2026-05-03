@@ -23,6 +23,8 @@
 // See docs/runtime-web.md for the full protocol.
 
 import { Session } from "./leader.js";
+import { Canvas2DBackend } from "./renderer/canvas2d.js";
+import { applyPaintStream } from "./paint_decoder.mjs";
 
 const KERNEL_URL = "./akiva-kernel.wasm";
 const WORKER_URL = new URL("./worker.js", import.meta.url);
@@ -72,6 +74,13 @@ const state = {
   ownsCanvas: true,   // true until we transferControlToOffscreen
   canvasTransferred: false,
   metrics: computeMetrics(),
+  // Stone 13.4 — follower-only fields. The leader keeps them at
+  // their defaults (canvas was transferred to the worker) and never
+  // touches the local Canvas2DBackend.
+  /** @type {number | null} The displayId the kernel assigned to us. */
+  displayId: null,
+  /** @type {Canvas2DBackend | null} */
+  followerBackend: null,
 };
 
 // Initial canvas size. Safe regardless of role; after promotion we stop
@@ -131,7 +140,19 @@ function onRoleChange({ role, promoted }) {
     }
     bootEl.classList.add("hidden");
   } else if (role === "follower") {
-    session.send({ type: "register_follower_display", tabId, metrics: state.metrics });
+    // Stone 13.4 — followers keep their canvas main-thread (the
+    // leader's worker can't transfer-control across tabs) and ask
+    // the kernel to allocate them a fresh DisplayId. The leader
+    // posts paint streams via `display_frame { displayId, bytes }`
+    // BroadcastChannel messages; we filter by displayId and decode.
+    state.followerBackend = new Canvas2DBackend();
+    state.followerBackend.init(surfaceEl, state.metrics);
+    session.send({
+      type: "request_display", tabId,
+      width_px: state.metrics.width_px,
+      height_px: state.metrics.height_px,
+      density: state.metrics.density,
+    });
     bootEl.classList.add("hidden");
   }
 }
@@ -146,6 +167,26 @@ function onKernelMessage(msg) {
       break;
     case "panic":
       onPanic(msg.text);
+      break;
+    case "display_assigned":
+      // Stone 13.4 — kernel allocated this follower a displayId.
+      // From now on we filter incoming `display_frame` messages by
+      // it. The leader auto-launches a fresh task on the assigned
+      // display; tab.js doesn't need to know which app — it just
+      // paints whatever bytes arrive.
+      if (msg.tabId === tabId) {
+        state.displayId = msg.displayId;
+        console.log(`[akiva] follower ${tabId.slice(0, 8)} got displayId=${msg.displayId}`);
+      }
+      break;
+    case "display_frame":
+      // Stone 13.4 — paint stream for one of the displays. Followers
+      // act on frames matching their own displayId; the leader
+      // ignores these (its canvas is painted by the worker directly
+      // via hal_draw_*).
+      if (state.followerBackend && state.displayId === msg.displayId && msg.bytes) {
+        applyPaintStream(msg.bytes, state.followerBackend);
+      }
       break;
   }
 }
@@ -221,6 +262,13 @@ function installInputForwarding(canvas) {
     // bfcache path is rare on apps that hold a Web Lock anyway.
     if (!e.persisted) {
       session.send({ type: "checkpoint", tabId });
+      // Stone 13.4 — release our claimed display so the kernel can
+      // free its slot. Best-effort: on hard close the BC may not
+      // flush before the page dies, but the leader's worker GCs
+      // followerDisplays on probe-timeout regardless.
+      if (state.displayId !== null) {
+        session.send({ type: "release_display", tabId, displayId: state.displayId });
+      }
     }
   });
 }
