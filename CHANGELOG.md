@@ -10,6 +10,49 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [0.7.0] — 2026-05 (Stone 13.0prep)
+
+**MINOR** — three additive bumps in flight: timer host op (A), three
+outline paint opcodes (B), and `@drawable/` resources (C). Apps with
+manifest `min_abi_version <= "0.7.0"` load against this runtime; apps
+that target older runtimes keep working since every addition is
+purely-additive.
+
+- **Added (A — Stone 13.0prep A).** `IO::TIMER_SLEEP = 0x0106` host op.
+  Args `[delay_ms: u32 LE]`, result empty. SDK exposes the new
+  `akiva_sdk::time` module: `sleep(ms)`, `timeout(fut, ms)`,
+  `interval(ms).tick()`. Required by Stone 13.3 animation transitions
+  (waker-on-tick) and useful immediately for debounce / cooldown
+  patterns. Cancel-on-drop is a known limitation: a Sleep dropped
+  before its timer fires leaves a stale futures entry until the worker
+  dies (bounded by `MAX_PENDING_FUTURES = 256`).
+- **Added (B — Stone 13.0prep B).** Three outline paint opcodes:
+  `OP_STROKE_RECT = 8` (25 bytes), `OP_STROKE_ROUND_RECT = 9` (29
+  bytes), `OP_DRAW_LINE = 10` (25 bytes). Each carries the same coords
+  as its fill counterpart plus a `width: f32` LE before the rgba u32.
+  Backed by `hal_draw_stroke_rect` / `hal_draw_stroke_round_rect` /
+  `hal_draw_line` HAL imports (kernel-side). Center-stroked per Canvas
+  2D default; `draw_line` uses round caps. SDK adds matching
+  `Canvas::stroke_rect` / `stroke_round_rect` / `draw_line` methods.
+- **Added (C — Stone 13.0prep C).** `OP_DRAW_IMAGE = 11` paint op (21
+  bytes: opcode + drawable_id u32 + 4 × f32) backed by `hal_draw_image`
+  HAL import. New `akiva_host_resource_drawable(name_ptr, name_len)
+  -> u32` host import — resolves a `@drawable/<name>` ref to a stable
+  per-package `drawable_id` (`0` is the missing sentinel; renderer
+  paints magenta). SDK exposes `Canvas::draw_image` and
+  `akiva_sdk::res::drawable(name)`. AKML inflater handles `<Image
+  src="@drawable/...">`; manifest `app.icon = "@drawable/<name>"` is
+  validated at install.
+- **Added (host — no ABI surface).** PNG decode pipeline:
+  `AppRegistry._loadDrawableBitmaps` async-decodes per-package PNGs
+  via `createImageBitmap` and registers each with the renderer
+  (`Canvas2DBackend.registerDrawable(id, bitmap)`); decodes that land
+  before the renderer is wired queue in `_pendingDrawableRegistrations`
+  and flush on `setBackend`. Dev-apps installer fetches the fixed list
+  `{icon,launcher,banner,avatar}.png` (404-tolerant); the proper
+  manifest-driven discovery lives in a follow-up. CLI build copies
+  `apps/<n>/res/drawable/*.png` to the dev-apps stage.
+
 ## [0.4.0] — 2026-05 (Stone 11.6.9)
 
 **MINOR** — additive: one new HAL paint op + one new device-config
