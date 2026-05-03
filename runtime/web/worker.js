@@ -88,12 +88,21 @@ self.addEventListener("message", (e) => {
     case "release_display":
       handleReleaseDisplay(msg);
       break;
-    case "resize":
+    case "resize": {
+      // Stone 13.4 — primary's resize re-sizes the worker's
+      // OffscreenCanvas-backed renderer; follower resizes only update
+      // the kernel's per-display metrics (the follower's main-thread
+      // Canvas2DBackend re-applies dimensions on its own side via
+      // `resize` calls in tab.js). Either path posts a resize event
+      // with the correct displayId so the kernel's
+      // `Event::Resize.display_id` routing kicks in.
+      const displayId = displayIdForTab(msg.tabId);
       if (primary?.tabId === msg.tabId && backend) {
         backend.resize(msg.metrics.width_px, msg.metrics.height_px, msg.metrics.density);
-        postEvent(3 /* resize */, encodeResize(msg.metrics));
       }
+      postEvent(3 /* resize */, encodeResize(msg.metrics, displayId));
       break;
+    }
     case "event":
       forwardEvent(msg);
       break;
@@ -376,6 +385,35 @@ function handleRequestDisplay(msg) {
   }
   followerDisplays.set(msg.tabId, displayId);
   log("info", `assigned display ${displayId} to tab ${msg.tabId.slice(0, 8)}`);
+  // Stone 13.4 — auto-launch a fresh Shell instance on this follower
+  // display so each tab gets its own independent task instead of
+  // mirroring the primary. `akiva_launch_to_display` allocates a new
+  // task, drives the activity through Created → Resumed, and binds
+  // the task to `displayId` — render_frame_for_display picks it up on
+  // the next tick. Sys.shell/ShellMain matches the manifest the
+  // dev-apps installer registers.
+  const enc = new TextEncoder();
+  const launchPkg = enc.encode("sys.shell");
+  const launchCls = enc.encode("ShellMain");
+  const pkgPtr = instance.exports.akiva_alloc(launchPkg.length);
+  const clsPtr = instance.exports.akiva_alloc(launchCls.length);
+  let taskId = 0n;
+  if (pkgPtr && clsPtr) {
+    new Uint8Array(memory.buffer, pkgPtr, launchPkg.length).set(launchPkg);
+    new Uint8Array(memory.buffer, clsPtr, launchCls.length).set(launchCls);
+    taskId = instance.exports.akiva_launch_to_display(
+      pkgPtr, launchPkg.length,
+      clsPtr, launchCls.length,
+      displayId,
+    );
+    instance.exports.akiva_dealloc(pkgPtr, launchPkg.length);
+    instance.exports.akiva_dealloc(clsPtr, launchCls.length);
+  }
+  if (taskId === 0n || taskId === 0) {
+    log("warn", `auto-launch failed for display ${displayId} — falling back to mirror policy`);
+  } else {
+    log("info", `auto-launched sys.shell/ShellMain on task ${taskId} for display ${displayId}`);
+  }
   self.postMessage({ type: "display_assigned", tabId: msg.tabId, displayId });
 }
 
@@ -671,15 +709,21 @@ const EVENT_VISIBILITY = 4;
 
 function forwardEvent(msg) {
   if (!booted || !instance) return;
+  // Stone 13.4 — every input event carries the originating display so
+  // the kernel can route it to the matching activity. Primary tab
+  // events stay at displayId 0; follower tab events use the id the
+  // kernel assigned via `request_display`.
+  const displayId = displayIdForTab(msg.tabId);
   switch (msg.kind) {
     case "pointer": {
       const phaseId = { down: 0, move: 1, up: 2, cancel: 3 }[msg.phase] ?? 3;
-      const buf = new ArrayBuffer(10);
+      const buf = new ArrayBuffer(14);
       const dv = new DataView(buf);
       dv.setFloat32(0, msg.x, true);
       dv.setFloat32(4, msg.y, true);
       dv.setUint8(8, msg.button & 0xff);
       dv.setUint8(9, phaseId);
+      dv.setUint32(10, displayId, true);
       postEvent(EVENT_POINTER, new Uint8Array(buf));
       break;
     }
@@ -701,13 +745,31 @@ function forwardEvent(msg) {
   }
 }
 
-function encodeResize(m) {
-  const buf = new ArrayBuffer(12);
+function encodeResize(m, displayId) {
+  // Stone 13.4 — 16-byte payload: [w:u32 | h:u32 | density_q8_8:u32 |
+  // display_id:u32]. Legacy 12-byte path still decodes correctly with
+  // display_id = 0 (the primary).
+  const buf = new ArrayBuffer(16);
   const dv = new DataView(buf);
   dv.setUint32(0, m.width_px >>> 0, true);
   dv.setUint32(4, m.height_px >>> 0, true);
   dv.setUint32(8, Math.round((m.density || 1) * 256) >>> 0, true);
+  dv.setUint32(12, (displayId | 0) >>> 0, true);
   return new Uint8Array(buf);
+}
+
+/**
+ * Stone 13.4 — map a tabId to the displayId the kernel assigned it.
+ * The leader (which transferred its canvas to this worker on
+ * `attach_display`) lives at displayId 0; followers carry the id
+ * returned by `akiva_alloc_display`. Unknown tabIds (e.g. event
+ * arrives during the gap between role swap and request_display
+ * landing) fall back to 0.
+ */
+function displayIdForTab(tabId) {
+  if (!tabId) return 0;
+  if (primary?.tabId === tabId) return 0;
+  return followerDisplays.get(tabId) ?? 0;
 }
 
 function postEvent(kind, bytes) {

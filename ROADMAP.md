@@ -1456,7 +1456,7 @@ impl AnimationController {
 
 ---
 
-### Stone 13.4 — Cross-display / multi-tab (~1 שבוע) ✅ סגור חלקית (May 2026)
+### Stone 13.4 — Cross-display / multi-tab (~1 שבוע) ✅ סגור (May 2026)
 
 **הבעיה.** כיום `hal_post_to_display(displayId, bytes)` קיים ב-worker.js (Stone 11.x) — אבל tab שני מקבל אותו `displayId=0` כמו הראשון ולא task נפרד. אין מנגנון שמאפשר ל-tab שני לתבוע display חדש.
 
@@ -1469,35 +1469,35 @@ impl AnimationController {
 `DisplayManager` ב-kernel: `HashMap<DisplayId, SurfaceMetrics>` (קיים ב-[`kernel/src/display_manager.rs`](kernel/src/display_manager.rs), נרחיב ל-alloc/release).
 
 **DoD:**
-- [~] שני tabs: כל אחד מקבל task נפרד (Calculator ב-tab A, Shell ב-tab B) — **partial**: ה-framework כיום תומך ב-`Framework::assign_task_to_display(task, display)` ובחיפוש per-display של ה-foreground; auto-launch של task ייעודי על follower claim עוד לא קיים. Default policy: unbound followers משקפים את ה-primary (mirror).
-- [x] resize ב-tab B → אינו משפיע על metrics ב-tab A — `DisplayManager::on_resize(display_id, ...)` עובר per-id; `metrics_of(id)` מחזיר ספציפי. JS layer עוד לא שולח resize per display id (Resize event גלובלי כיום).
-- [x] tab B נסגר → kernel מקבל `release_display` → tab.js fires `release_display` message ב-pagehide; worker קורא `akiva_release_display` שמסיר את ה-display מה-HashMap. Foreground task ב-primary לא מושפע.
+- [x] שני tabs: כל אחד מקבל task נפרד — `request_display` triggers `akiva_launch_to_display(sys.shell, ShellMain)` שמייצר instance חדש על task ייעודי. Default mirror נשמר כ-fallback אם auto-launch נכשל.
+- [x] resize ב-tab B → אינו משפיע על metrics ב-tab A — `Event::Resize` נושא `display_id`; `DisplayManager::on_resize(id, ...)` מעדכן per-display; framework's `set_metrics` נקרא רק עבור PRIMARY. tab.js follower שולח resize עם הid הנכון; ResizeObserver מחיל גם על ה-`Canvas2DBackend` המקומי.
+- [x] tab B נסגר → kernel מקבל `release_display` → tab.js fires `release_display` ב-pagehide; worker קורא `akiva_release_display` שמסיר את ה-display מה-HashMap. Foreground task ב-primary לא מושפע.
 
-**מה נבנה (Stone 13.4)**:
-- `kernel::display_manager::DisplayManager`: `HashMap<DisplayId, Display>` במקום `primary` יחיד; `alloc_display(metrics) -> DisplayId`, `release_display(id) -> bool`, `metrics_of(id)`, `ids()`, per-display `flush()`.
-- Kernel exports: `akiva_alloc_display(w, h, density_q16) -> u32`, `akiva_release_display(id) -> u32`, `akiva_assign_task_to_display(task, display) -> u32`.
-- `framework::Framework`: `task_displays: HashMap<TaskId, DisplayId>` + `assign_task_to_display`/`display_for_task`/`render_frame_for_display`/`foreground_activity_for_display`. 4 unit tests חדשים.
-- Per-display render path ב-`akiva_frame`: לולאה על `display_ids`, render→flush per id. הfast-path ה-single-display זהה ל-pre-13.4.
-- Follower paint: `runtime/web/paint_decoder.mjs` מפענח את אותו wire format ש-`framework::wasm_activity::encode_op` מפיק; tab.js follower מאתחל `Canvas2DBackend` על ה-canvas הראשי שלו ומחיל `display_frame` בא ב-BroadcastChannel.
-- JS protocol: `request_display { width, height, density }` ו-`release_display { displayId }` ב-tab.js + worker.js.
-- Mirror policy: follower ללא assignment מקבל את ה-primary's foreground activity. כל tab רואה את אותו תוכן בגדלים שונים ללא הקצאה מפורשת.
+**מה נבנה (Stone 13.4 — closed)**:
+- `kernel::display_manager::DisplayManager`: `HashMap<DisplayId, Display>`; `alloc_display`/`release_display`/`metrics_of`/`ids`/per-display `flush`.
+- Kernel exports: `akiva_alloc_display(w, h, density_q16)`, `akiva_release_display(id)`, `akiva_assign_task_to_display(task, display)`, `akiva_launch_to_display(pkg, class, display)`.
+- `ActivityManager::launch_in_new_task` — fresh-task variant של launch ש-bypasses launch_mode folding.
+- `Framework`: `task_displays`, `assign_task_to_display`, `display_for_task`, `render_frame_for_display`, `foreground_activity_for_display`, `dispatch_pointer_on_display`, `tick_animations`, `launch_to_display`.
+- `Event::Pointer` ו-`Event::Resize` הורחבו עם `display_id: u32` (legacy payloads ללא הid נקראים כ-`display_id = 0`).
+- Per-display render path ב-`akiva_frame`: animation tick once → loop over `display_ids` → set_metrics per display → render_frame_for_display → flush.
+- Follower paint: `runtime/web/paint_decoder.mjs` מפענח wire format זהה ל-`encode_op` של framework; tab.js follower מאתחל `Canvas2DBackend` ומחיל `display_frame` נכנסים מה-BroadcastChannel.
+- JS protocol: `request_display { width, height, density }` (auto-launches `sys.shell/ShellMain`), `release_display { displayId }`, resize events נושאים displayId, pointer events נושאים displayId.
+- Animation tick יוצא מ-`render_frame` ל-`tick_animations` נפרד שהקרנל קורא פעם אחת לפני loop ה-display, כדי ש-multi-display לא מאיץ transitions פי N.
+- Dialog hit-testing משתמש ב-`foreground_activity_for_display` ב-`dispatch_pointer_on_display` — dialogs נצמדים ל-activity של ה-display שלהם אוטומטית.
 
-**Follow-ups (Stone 13.4.x)**:
-- Auto-launch task per follower claim — היום צריך לקרוא `assign_task_to_display` חיצונית.
-- Per-display pointer + resize events — `Event::Resize` כיום global; לא-primary displays צריכים resize routing דרך `display_id` payload.
-- Dialogs ו-animations מתבצעות תמיד על ה-primary surface — multi-display dialog routing דחוי.
+**Tests**: 288 framework (+6 multi-display tests) + 202 SDK + 143 vitest.
 
 ---
 
 **Exit criteria — Phase 13:**
-- [x] Stone 13.0prep + 5 stones סגורים (13.0, 13.1, 13.2, 13.3, 13.4 partial).
+- [x] Stone 13.0prep + 5 stones סגורים (13.0, 13.1, 13.2, 13.3, 13.4).
 - [x] `sleep`/`timeout`/`interval` עובדים באפליקציה אמיתית; animation tick רץ על frame timestamp שמגיע מ-rAF (לא משתמש ב-timer primitive ישירות, אבל בקנה אחד עם ה-monotonic clock דרך `hal_now_ms`).
 - [x] Stroke + image opcodes מצוירים נכון; Calculator מציג icon אמיתי.
 - [x] System dialog מעל app פעיל; tap מחוץ לו סוגר אותו.
 - [x] Activity push עם animation — slide-in 250ms, לא jump-cut.
-- [~] שני tabs מציגים שתי tasks שונות — מותנה ב-host קוראת `akiva_assign_task_to_display` חיצונית; default mirror.
+- [x] שני tabs מציגים שתי tasks שונות — auto-launch על `request_display` נותן לכל tab instance עצמאי של Shell; per-display resize/pointer routing מבטיח isolation.
 
-**הערכת זמן בפועל:** Phase 13 נסגר ב-~4-5 ימי עבודה אינטנסיבית, כשהוא רוכב על השכבות שכבר עומדות מ-Phase 11 (per-app workers, async dispatch) ו-Phase 12 (LMK, suspension). ההפרש מ-6-8 השבועות שצפינו: לא נדרש לבנות capture-and-replay לחציצה outgoing ב-13.3, ולא נדרש להשלים את כל ה-policy של 13.4 כדי לפתוח את ה-foundation.
+**הערכת זמן בפועל:** Phase 13 נסגר ב-~5 ימי עבודה אינטנסיבית, כשהוא רוכב על השכבות שכבר עומדות מ-Phase 11 (per-app workers, async dispatch) ו-Phase 12 (LMK, suspension). ההפרש מ-6-8 השבועות שצפינו: לא נדרש לבנות capture-and-replay לחציצה outgoing ב-13.3 (slide-out מבוצע כ-SlideFromLeft על ה-incoming).
 
 ---
 

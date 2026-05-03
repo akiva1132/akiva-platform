@@ -8,8 +8,12 @@
 //!
 //! Wire format (little-endian, stable across kernel and HAL):
 //!   - input.pointer (kind=1): { x: f32, y: f32, button: u8, phase: u8 }
+//!     (Stone 13.4 extended: optional trailing `display_id: u32` —
+//!     legacy 10-byte payload defaults to display 0.)
 //!   - input.key     (kind=2): { code: u32, modifiers: u8, phase: u8 }
 //!   - input.resize  (kind=3): { w: u32, h: u32, density_q8_8: u32 }
+//!     (Stone 13.4 extended: optional trailing `display_id: u32` —
+//!     legacy 12-byte payload defaults to display 0.)
 //!   - system.visibility (kind=4): { visible: u8 }
 //!
 //! See docs/runtime-web.md §4 for the full pipeline, including where this
@@ -35,9 +39,13 @@ pub enum KeyPhase {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    Pointer { x: f32, y: f32, button: u8, phase: PointerPhase },
+    /// Stone 13.4 — `display_id` identifies which display the event
+    /// originated on. `0` is the primary; followers carry their
+    /// allocated id. Legacy host code that doesn't include the id
+    /// reads back as `0`.
+    Pointer { x: f32, y: f32, button: u8, phase: PointerPhase, display_id: u32 },
     Key { code: u32, modifiers: u8, phase: KeyPhase },
-    Resize { width_px: u32, height_px: u32, density: f32 },
+    Resize { width_px: u32, height_px: u32, density: f32, display_id: u32 },
     Visibility { visible: bool },
 }
 
@@ -59,6 +67,11 @@ impl Event {
                     2 => PointerPhase::Up,
                     _ => PointerPhase::Cancel,
                 },
+                display_id: if bytes.len() >= 14 {
+                    u32::from_le_bytes(bytes[10..14].try_into().ok()?)
+                } else {
+                    0
+                },
             }),
             EVENT_KEY if bytes.len() >= 6 => Some(Event::Key {
                 code: u32::from_le_bytes(bytes[0..4].try_into().ok()?),
@@ -74,6 +87,11 @@ impl Event {
                 height_px: u32::from_le_bytes(bytes[4..8].try_into().ok()?),
                 // q8.8 fixed-point — density is small and deterministic.
                 density: u32::from_le_bytes(bytes[8..12].try_into().ok()?) as f32 / 256.0,
+                display_id: if bytes.len() >= 16 {
+                    u32::from_le_bytes(bytes[12..16].try_into().ok()?)
+                } else {
+                    0
+                },
             }),
             EVENT_VISIBILITY if !bytes.is_empty() => Some(Event::Visibility {
                 visible: bytes[0] != 0,
@@ -94,10 +112,16 @@ impl EventQueue {
 
     pub fn push(&mut self, ev: Event) {
         // Coalesce pointer-moves: the latest pointer-move subsumes any prior
-        // unconsumed one. Prevents backlog when the user drags fast.
-        if let Event::Pointer { phase: PointerPhase::Move, .. } = ev {
-            if let Some(Event::Pointer { phase: PointerPhase::Move, .. }) = self.inner.back() {
-                self.inner.pop_back();
+        // unconsumed one **on the same display**. Prevents backlog when the
+        // user drags fast; per-display gating keeps a drag in tab A from
+        // eating a move in tab B.
+        if let Event::Pointer { phase: PointerPhase::Move, display_id: new_did, .. } = ev {
+            if let Some(Event::Pointer {
+                phase: PointerPhase::Move, display_id: prev_did, ..
+            }) = self.inner.back() {
+                if *prev_did == new_did {
+                    self.inner.pop_back();
+                }
             }
         }
         self.inner.push_back(ev);

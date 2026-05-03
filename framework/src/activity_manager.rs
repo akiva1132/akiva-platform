@@ -312,6 +312,45 @@ impl ActivityManager {
         Ok(LaunchOutcome { id, reused: false, popped: Vec::new() })
     }
 
+    /// Stone 13.4 — fresh-task variant of [`launch`]. Forces a brand
+    /// new task allocation regardless of the activity's declared
+    /// `LaunchMode`, so a follower-tab display claim can spawn its
+    /// own independent stack without affecting the system foreground.
+    /// Doesn't touch `foreground_task` — the caller is responsible
+    /// for assigning the resulting task to its display via
+    /// `Framework::assign_task_to_display`.
+    pub fn launch_in_new_task(
+        &mut self, package_id: &str, class: &str,
+    ) -> Result<LaunchOutcome, LaunchError> {
+        let key = (package_id.to_string(), class.to_string());
+        let (launch_mode, instance) = {
+            let (lm, factory) = self.registry.get(&key).ok_or_else(|| {
+                LaunchError::UnknownActivity {
+                    package_id: package_id.into(), class: class.into(),
+                }
+            })?;
+            (*lm, (factory)())
+        };
+        let id = self.next_activity_id;
+        self.next_activity_id += 1;
+        let task_id = self.allocate_task(
+            &format!("__display__:{}:{}", package_id, class),
+        );
+        self.tasks.get_mut(&task_id).unwrap().stack.push(id);
+        self.records.insert(id, ActivityRecord {
+            id,
+            task: task_id,
+            package_id: package_id.into(),
+            class: class.into(),
+            state: LifecycleState::Initial,
+            launch_mode,
+            pending: None,
+            trapped_at_ms: None,
+        });
+        self.instances.insert(id, instance);
+        Ok(LaunchOutcome { id, reused: false, popped: Vec::new() })
+    }
+
     fn ensure_foreground_task(&mut self, affinity: &str) -> TaskId {
         if let Some(t) = self.foreground_task {
             return t;

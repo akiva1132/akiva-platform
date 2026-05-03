@@ -488,8 +488,20 @@ impl Framework {
     /// silently swallowed (the modal stays open). The activity below
     /// receives no event in any of those cases.
     pub fn dispatch_pointer(&mut self, ev: PointerEvent, ts: f64) {
+        self.dispatch_pointer_on_display(ev, ts, 0);
+    }
+
+    /// Stone 13.4 — display-aware pointer dispatch. `display_id == 0`
+    /// preserves legacy behaviour (route to `self.stack` top); a
+    /// non-primary display routes to whatever activity is bound to
+    /// it. The dialog-shielding from Stone 13.2 still applies — but
+    /// scoped to the activity actually receiving the event, not the
+    /// system foreground.
+    pub fn dispatch_pointer_on_display(
+        &mut self, ev: PointerEvent, ts: f64, display_id: u32,
+    ) {
         self.pointer = Some(ev);
-        let Some(id) = self.stack.last().copied() else { return; };
+        let Some(id) = self.foreground_activity_for_display(display_id) else { return; };
 
         // Stone 13.2 — intercept Down events while a dialog is open on
         // any activity owned by the foreground task. Move/Up still flow
@@ -597,12 +609,12 @@ impl Framework {
     /// activity, the activity's paint ops are rewritten with
     /// `translate_x` + `alpha` props (via
     /// [`animation::apply_props`]) before the compositor flushes.
+    ///
+    /// Stone 13.4 — tick is no longer inside `render_frame`. The
+    /// kernel calls [`tick_animations`] once per frame before
+    /// iterating displays, so a multi-display loop doesn't advance
+    /// transitions N times per frame.
     pub fn render_frame(&mut self, ts: f64) -> &FrameCommands {
-        // Stone 13.3 — tick before paint so this frame reflects the
-        // current animation progress and `take_completed` lets us
-        // evict resolved transitions from the controller.
-        self.animations.tick(ts);
-        let _ = self.animations.take_completed();
         self.compositor.begin_frame();
         let foreground = self.stack.last().copied();
         if let Some(id) = foreground {
@@ -769,6 +781,48 @@ impl Framework {
     /// unblocking the SDK's `DialogFuture`.
     pub fn drain_dialog_resolutions(&mut self) -> Vec<dialog::DialogResolution> {
         self.dialogs.take_resolutions()
+    }
+
+    /// Stone 13.4 — drive every in-flight transition forward to `ts`,
+    /// once per kernel frame. Called by the kernel's `akiva_frame`
+    /// before the per-display render loop, so a multi-display tick
+    /// doesn't advance transitions multiple times.
+    pub fn tick_animations(&mut self, ts: f64) {
+        self.animations.tick(ts);
+        let _ = self.animations.take_completed();
+    }
+
+    /// Stone 13.4 — launch a fresh instance of `(package_id, class)` on
+    /// a brand-new task and bind that task to `display_id`. The system
+    /// foreground stack is unaffected; the new activity renders only
+    /// on the named display. Used by the host's `request_display`
+    /// path to give each follower tab its own independent task.
+    ///
+    /// Returns the freshly-allocated TaskId on success. The activity
+    /// is driven through Initial → Created → Started → Resumed before
+    /// returning so the next render sees a fully-set-up activity.
+    pub fn launch_to_display(
+        &mut self, package_id: &str, class: &str, display_id: u32, ts: f64,
+    ) -> Option<activity_manager::TaskId> {
+        let outcome = self.activities.launch_in_new_task(package_id, class).ok()?;
+        let task_id = self.activities.record(outcome.id)?.task;
+        // Bind first so the render path sees the activity even on the
+        // very first frame (the create dispatch itself is async; the
+        // bind has to be in place before that returns to the caller).
+        self.task_displays.insert(task_id, display_id);
+        // Drive through the lifecycle to Resumed. The advance_through_
+        // create helper handles the Created→Destroyed shortcut if the
+        // activity finishes in on_create — in that case the task ends
+        // up empty and the display will mirror the primary on the next
+        // frame.
+        if self.advance_through_create(outcome.id, ts) {
+            self.destroy_shortcut(outcome.id, ts);
+            self.task_displays.remove(&task_id);
+            return None;
+        }
+        self.try_restore_state(outcome.id, package_id, class);
+        self.drive_start_to_resumed(outcome.id, ts);
+        Some(task_id)
     }
 
     // ── Stone 13.4: per-display task routing ─────────────────────────
@@ -4323,5 +4377,44 @@ optional = []
         let a_task = task_of(&fw, a.id);
         fw.assign_task_to_display(a_task, 5);
         assert_eq!(fw.foreground_activity_for_display(5), Some(a.id));
+    }
+
+    #[test]
+    fn launch_in_new_task_allocates_independent_task() {
+        let mut fw = empty_framework();
+        fw.activities.register("a.test", "A1",
+            activity_manager::LaunchMode::Standard, || Box::new(DisplayStub));
+        // Launch via the normal (foreground-folding) path first.
+        let a = fw.activities.launch("a.test", "A1").unwrap();
+        let a_task = task_of(&fw, a.id);
+        // Now launch into a new task — should get a different task id
+        // even though the registered launch_mode is Standard.
+        let b = fw.activities.launch_in_new_task("a.test", "A1").unwrap();
+        let b_task = task_of(&fw, b.id);
+        assert_ne!(a_task, b_task,
+            "launch_in_new_task must allocate a fresh task regardless of launch_mode");
+        // Foreground task is unchanged.
+        assert_eq!(fw.activities.foreground_task(), Some(a_task));
+    }
+
+    #[test]
+    fn launch_to_display_binds_task_and_doesnt_touch_foreground() {
+        let mut fw = empty_framework();
+        fw.activities.register("primary.app", "A",
+            activity_manager::LaunchMode::Standard, || Box::new(DisplayStub));
+        // Set up the system foreground first.
+        let primary = fw.activities.launch("primary.app", "A").unwrap();
+        fw.stack.push(primary.id);
+        let primary_task = task_of(&fw, primary.id);
+        // Auto-launch a fresh "primary.app" instance on display 7.
+        let display_task = fw.launch_to_display("primary.app", "A", 7, 0.0)
+            .expect("launch_to_display should succeed");
+        assert_ne!(display_task, primary_task);
+        assert_eq!(fw.display_for_task(display_task), 7);
+        // System foreground is untouched.
+        assert_eq!(fw.activities.foreground_task(), Some(primary_task));
+        assert_eq!(fw.stack, vec![primary.id]);
+        // The display's foreground is the auto-launched activity.
+        assert_ne!(fw.foreground_activity_for_display(7), Some(primary.id));
     }
 }

@@ -298,6 +298,14 @@ function installResizeHandler(canvas) {
     const m = { width_px, height_px, density: dprNow };
     state.metrics = m;
     if (state.ownsCanvas) applyCanvasSize(canvas, m);
+    // Stone 13.4 — followers own their main-thread canvas; resize the
+    // local Canvas2DBackend so subsequent `display_frame` decodes
+    // paint into the new pixel grid. The leader path goes through
+    // `worker.js` (worker.js calls `backend.resize` against the
+    // OffscreenCanvas it owns).
+    if (state.followerBackend) {
+      state.followerBackend.resize(width_px, height_px, dprNow);
+    }
     session.send({ type: "resize", tabId, metrics: m });
   });
   ro.observe(canvas);

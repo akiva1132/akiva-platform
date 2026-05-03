@@ -77,11 +77,12 @@ impl Kernel {
     fn handle_event(&mut self, ev: Event) {
         let ts = self.last_frame_ms;
         match ev {
-            Event::Pointer { x, y, button, phase } => {
+            Event::Pointer { x, y, button, phase, display_id } => {
                 if let Some(fw) = self.framework.as_mut() {
-                    fw.dispatch_pointer(
+                    fw.dispatch_pointer_on_display(
                         fw_act::PointerEvent { x, y, button, phase: map_pointer_phase(phase) },
                         ts,
+                        display_id,
                     );
                 }
             }
@@ -93,17 +94,18 @@ impl Kernel {
                     );
                 }
             }
-            Event::Resize { width_px, height_px, density } => {
-                // Stone 13.4 — resize event currently scoped to PRIMARY
-                // display. Per-display resize lands when the JS host
-                // wires the event payload to carry display_id from the
-                // tab that produced it.
-                self.display().on_resize(
-                    display_manager::PRIMARY_DISPLAY,
-                    width_px, height_px, density,
-                );
-                if let Some(fw) = self.framework.as_mut() {
-                    fw.set_metrics(fw_act::SurfaceMetrics { width_px, height_px, density });
+            Event::Resize { width_px, height_px, density, display_id } => {
+                // Stone 13.4 — resize is per-display. The DisplayManager
+                // tracks one set of metrics per id; the framework only
+                // needs `set_metrics` for the primary (the sole render
+                // path's "global" metrics — for follower displays the
+                // per-display loop in `akiva_frame` re-pushes metrics
+                // before calling `render_frame_for_display`).
+                self.display().on_resize(display_id, width_px, height_px, density);
+                if display_id == display_manager::PRIMARY_DISPLAY {
+                    if let Some(fw) = self.framework.as_mut() {
+                        fw.set_metrics(fw_act::SurfaceMetrics { width_px, height_px, density });
+                    }
                 }
             }
             Event::Visibility { visible } => {
@@ -771,6 +773,13 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
         fw.drive_pending_signals(timestamp_ms);
     }
 
+    // Stone 13.4 — animation tick once per kernel frame, BEFORE the
+    // per-display loop. Without this guard, a multi-display
+    // configuration would advance transitions N times per frame.
+    if let Some(fw) = k.framework.as_mut() {
+        fw.tick_animations(timestamp_ms);
+    }
+
     // Render through the framework, then flush the resulting command
     // buffer to the HAL. The split keeps HAL calls confined to the kernel
     // crate so the framework stays wasm-target-agnostic.
@@ -1128,6 +1137,52 @@ pub extern "C" fn akiva_assign_task_to_display(
 ) -> u32 {
     let Some(fw) = kernel().framework.as_mut() else { return 0; };
     if fw.assign_task_to_display(task_id, display_id) { 1 } else { 0 }
+}
+
+/// Stone 13.4 — launch a fresh activity on its own task bound to the
+/// named display. The host calls this after `akiva_alloc_display` so a
+/// follower tab gets an independent `(package_id, class)` instance
+/// rather than mirroring the primary. Returns the freshly-allocated
+/// `task_id` on success, `0` on failure (unknown activity, lifecycle
+/// shortcut to Destroyed, no framework yet).
+///
+/// The system foreground stack stays untouched — the new activity
+/// renders only on `display_id` for as long as that display is
+/// alive.
+///
+/// # Safety
+/// `package_id_*` and `class_*` are valid UTF-8 byte slices the host
+/// owns for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn akiva_launch_to_display(
+    package_id_ptr: *const u8, package_id_len: usize,
+    class_ptr: *const u8, class_len: usize,
+    display_id: u32,
+) -> u64 {
+    let pkg = if package_id_ptr.is_null() || package_id_len == 0 {
+        return 0;
+    } else {
+        match core::str::from_utf8(unsafe {
+            core::slice::from_raw_parts(package_id_ptr, package_id_len)
+        }) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        }
+    };
+    let class = if class_ptr.is_null() || class_len == 0 {
+        return 0;
+    } else {
+        match core::str::from_utf8(unsafe {
+            core::slice::from_raw_parts(class_ptr, class_len)
+        }) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        }
+    };
+    let k = kernel();
+    let ts = k.last_frame_ms;
+    let Some(fw) = k.framework.as_mut() else { return 0; };
+    fw.launch_to_display(pkg, class, display_id, ts).unwrap_or(0)
 }
 
 /// Stone 13.2 — open a system dialog overlay on behalf of an app
