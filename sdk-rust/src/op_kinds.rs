@@ -59,6 +59,10 @@ pub mod fire {
     /// `[wt_handle: u32 LE | code: u32 LE | reason_len: u16 LE
     ///   | reason: utf8...]`. Idempotent.
     pub const WT_CLOSE: u32 = 0x000B;
+    /// Stone 14.3 — Close a system notification by id. Args:
+    /// `[notify_id: u32 LE]`. Idempotent. Capability gated by
+    /// `akiva.permission.NOTIFICATIONS`.
+    pub const NOTIFY_CLOSE: u32 = 0x000C;
 }
 
 /// I/O operations. Range `0x0101..=0x01FF`.
@@ -163,6 +167,28 @@ pub mod io {
     /// is empty). Subsequent recvs return fin.
     /// `event_kind == 2` error (data = utf8 reason).
     pub const WT_RECV_STREAM: u32 = 0x010E;
+    /// Stone 14.3 — Request the browser-level notification
+    /// permission. Args: `[]` (empty). Result: `[status: u8]`
+    /// where 0 = Default (user has not yet decided), 1 = Granted,
+    /// 2 = Denied. Must be triggered from a user-gesture handler;
+    /// if called outside one, browsers may treat the request as
+    /// implicit-denied. Gated by `akiva.permission.NOTIFICATIONS`
+    /// at the system layer (separate from the browser permission).
+    pub const NOTIFY_REQUEST_PERMISSION: u32 = 0x010F;
+    /// Stone 14.3 — Post a system notification. Args:
+    /// ```text
+    /// [title_len: u16 LE | title: utf8...]
+    /// [body_len:  u16 LE | body:  utf8...]
+    /// [tag_len:   u16 LE | tag:   utf8...]
+    /// ```
+    /// Result: `[notify_id: u32 LE]` once the browser accepts the
+    /// notification. ERROR with utf8 reason on
+    /// `permission != "granted"`, browser refusal, or any
+    /// `Notification` constructor throw. The `tag` collapses
+    /// duplicates: posting twice with the same tag updates the
+    /// existing notification rather than spawning a second.
+    /// Gated by `akiva.permission.NOTIFICATIONS`.
+    pub const NOTIFY_POST: u32 = 0x0110;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds. Mirror of
@@ -239,6 +265,7 @@ mod tests {
         assert!(fire::WT_SEND_STREAM <= 0x00FF);
         assert!(fire::WT_CLOSE_STREAM <= 0x00FF);
         assert!(fire::WT_CLOSE <= 0x00FF);
+        assert!(fire::NOTIFY_CLOSE <= 0x00FF);
         assert!(io::TEXT_WIDTH >= 0x0101 && io::TEXT_WIDTH <= 0x01FF);
         assert!(io::STORAGE_SET >= 0x0101 && io::STORAGE_SET <= 0x01FF);
         assert!(io::STORAGE_DELETE >= 0x0101 && io::STORAGE_DELETE <= 0x01FF);
@@ -250,6 +277,8 @@ mod tests {
         assert!(io::WT_RECV_DATAGRAM >= 0x0101 && io::WT_RECV_DATAGRAM <= 0x01FF);
         assert!(io::WT_OPEN_BIDI >= 0x0101 && io::WT_OPEN_BIDI <= 0x01FF);
         assert!(io::WT_RECV_STREAM >= 0x0101 && io::WT_RECV_STREAM <= 0x01FF);
+        assert!(io::NOTIFY_REQUEST_PERMISSION >= 0x0101 && io::NOTIFY_REQUEST_PERMISSION <= 0x01FF);
+        assert!(io::NOTIFY_POST >= 0x0101 && io::NOTIFY_POST <= 0x01FF);
         assert_eq!(status::PENDING, 0);
         assert_eq!(status::READY,   1);
         assert_eq!(status::ERROR,   2);

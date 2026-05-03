@@ -737,6 +737,18 @@ function dispatchFire(opKind, args) {
       postSideEffect(opKind, args);
       return 0;
     }
+    // Stone 14.3 — Notifications. Distinct grant
+    // (`akiva.permission.NOTIFICATIONS`); the handle is a notify_id
+    // allocated by AppRegistry, separate namespace from WS / WT.
+    case FIRE.NOTIFY_CLOSE: {
+      if (!grants.has("akiva.permission.NOTIFICATIONS")) {
+        postLog("warn", `fire(0x${opKind.toString(16)}): denied — no NOTIFICATIONS grant`);
+        return 2;
+      }
+      if (args.length < 4) return 1;  // [notify_id:4]
+      postSideEffect(opKind, args);
+      return 0;
+    }
     default:
       postLog("warn", `fire(0x${opKind.toString(16)}): unknown op_kind`);
       return 1;
@@ -882,6 +894,21 @@ function dispatchIoStart(opKind, args) {
     case IO.WT_RECV_STREAM: {
       if (!grants.has("akiva.permission.NETWORK")) {
         postLog("warn", `io_start(0x${opKind.toString(16)}): denied — no NETWORK grant`);
+        return 0n;
+      }
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
+      postMessage(
+        { type: "host_op", future_id: fid, op_kind: opKind, args },
+        [args.buffer],
+      );
+      return fid;
+    }
+    // Stone 14.3 — Notifications.
+    case IO.NOTIFY_REQUEST_PERMISSION:
+    case IO.NOTIFY_POST: {
+      if (!grants.has("akiva.permission.NOTIFICATIONS")) {
+        postLog("warn", `io_start(0x${opKind.toString(16)}): denied — no NOTIFICATIONS grant`);
         return 0n;
       }
       const fid = nextFutureId++;

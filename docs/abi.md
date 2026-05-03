@@ -311,8 +311,8 @@ extern "C" fn akiva_host_io_poll(
 
 | Range            | Transport       | קבועים                                                                                              |
 |------------------|-----------------|-----------------------------------------------------------------------------------------------------|
-| `0x0001..0x00FF` | `fire`          | `LOG=0x01`, `FINISH=0x02`, `START_ACTIVITY=0x03`, `START_ACTIVITY_FOR_RESULT=0x04`, `SET_RESULT=0x05`, `WS_SEND=0x06` (Stone 14.1), `WS_CLOSE=0x07` (Stone 14.1), `WT_SEND_DATAGRAM=0x08` (14.2), `WT_SEND_STREAM=0x09` (14.2), `WT_CLOSE_STREAM=0x0A` (14.2), `WT_CLOSE=0x0B` (14.2) |
-| `0x0101..0x01FF` | `io_start`/poll | `TEXT_WIDTH=0x101`, `QUERY_PACKAGES=0x102`, `STORAGE_GET=0x103`, `STORAGE_SET=0x104`, `STORAGE_DELETE=0x105`, `TIMER_SLEEP=0x106` (Stone 13.0prep A), `SHOW_DIALOG=0x107` (Stone 13.2), `HTTP_FETCH=0x108` (Stone 14.1), `WS_OPEN=0x109` (Stone 14.1), `WS_RECV=0x10A` (Stone 14.1), `WT_OPEN=0x10B` (14.2), `WT_RECV_DATAGRAM=0x10C` (14.2), `WT_OPEN_BIDI=0x10D` (14.2), `WT_RECV_STREAM=0x10E` (14.2) |
+| `0x0001..0x00FF` | `fire`          | `LOG=0x01`, `FINISH=0x02`, `START_ACTIVITY=0x03`, `START_ACTIVITY_FOR_RESULT=0x04`, `SET_RESULT=0x05`, `WS_SEND=0x06` (Stone 14.1), `WS_CLOSE=0x07` (Stone 14.1), `WT_SEND_DATAGRAM=0x08` (14.2), `WT_SEND_STREAM=0x09` (14.2), `WT_CLOSE_STREAM=0x0A` (14.2), `WT_CLOSE=0x0B` (14.2), `NOTIFY_CLOSE=0x0C` (14.3) |
+| `0x0101..0x01FF` | `io_start`/poll | `TEXT_WIDTH=0x101`, `QUERY_PACKAGES=0x102`, `STORAGE_GET=0x103`, `STORAGE_SET=0x104`, `STORAGE_DELETE=0x105`, `TIMER_SLEEP=0x106` (Stone 13.0prep A), `SHOW_DIALOG=0x107` (Stone 13.2), `HTTP_FETCH=0x108` (Stone 14.1), `WS_OPEN=0x109` (Stone 14.1), `WS_RECV=0x10A` (Stone 14.1), `WT_OPEN=0x10B` (14.2), `WT_RECV_DATAGRAM=0x10C` (14.2), `WT_OPEN_BIDI=0x10D` (14.2), `WT_RECV_STREAM=0x10E` (14.2), `NOTIFY_REQUEST_PERMISSION=0x10F` (14.3), `NOTIFY_POST=0x110` (14.3) |
 | `0x0200..`       | reserved        | streams / pushed events ל-Stone 11.4+                                                              |
 
 Args layout per op_kind (LE byte-stream — encoded inline ב-dispatcher):
@@ -343,6 +343,9 @@ Args layout per op_kind (LE byte-stream — encoded inline ב-dispatcher):
 | `FIRE::WT_SEND_STREAM`  (14.2) | `[stream_handle: u32 LE \| data: bytes…]` | — |
 | `FIRE::WT_CLOSE_STREAM` (14.2) | `[stream_handle: u32 LE \| code: u32 LE]`. Idempotent. | — |
 | `FIRE::WT_CLOSE`        (14.2) | `[wt_handle: u32 LE \| code: u32 LE \| reason_len: u16 LE \| reason: utf8…]`. Idempotent; closes every stream under the session. | — |
+| `IO::NOTIFY_REQUEST_PERMISSION` (14.3) | `[]`. Gated by `akiva.permission.NOTIFICATIONS`. | `[status: u8]` — 0=Default, 1=Granted, 2=Denied. Browsers auto-deny outside user-gesture handlers |
+| `IO::NOTIFY_POST` (14.3)      | `[title_len: u16 LE \| title: utf8… \| body_len: u16 LE \| body: utf8… \| tag_len: u16 LE \| tag: utf8…]`. Empty `tag` lets the browser allocate a fresh slot per call; non-empty tag collapses duplicates. | `[notify_id: u32 LE]` once the browser accepts; ERROR with utf8 reason on permission denial / browser refusal |
+| `FIRE::NOTIFY_CLOSE` (14.3)   | `[notify_id: u32 LE]`. Idempotent. | — |
 
 **Capability gating moved into the dispatcher.** עד Stone 10.3b ה-gating קרה בזמן instantiate (LinkError על import חסר). מאז Stone 11.3 ה-gating קורה per-call: ה-import עצמו תמיד מותקן, אבל ה-dispatcher בודק את ה-grants לפני שהוא מבצע op_kind שדורש capability. App ללא הרשאה → return code שגיאה (1 או 2 לפי הנתיב), warning בלוג. הצדק לבחירה: import אחד משרת ~250 op_kinds, חלקם auto חלקם gated; מסננים ב-call site, לא ב-link.
 

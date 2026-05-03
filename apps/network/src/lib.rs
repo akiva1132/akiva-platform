@@ -11,6 +11,7 @@
 //! contract.
 
 use akiva_sdk::net::{self, NetError, StreamEvent, WsEvent, WtDatagram};
+use akiva_sdk::notification::{self, NotifyError, PermissionStatus};
 use akiva_sdk::prelude::*;
 
 #[derive(Default)]
@@ -27,6 +28,7 @@ struct NetworkMain {
     http_busy: std::rc::Rc<core::cell::Cell<bool>>,
     ws_busy: std::rc::Rc<core::cell::Cell<bool>>,
     wt_busy: std::rc::Rc<core::cell::Cell<bool>>,
+    notify_busy: std::rc::Rc<core::cell::Cell<bool>>,
 }
 
 #[async_trait(?Send)]
@@ -50,7 +52,11 @@ impl Activity for NetworkMain {
         let http_btn = ui.button("http", "HTTPS GET");
         let ws_btn = ui.button("ws", "WebSocket echo");
         let wt_btn = ui.button("wt", "WebTransport echo");
-        let buttons = ui.h_stack(&[http_btn, ws_btn, wt_btn]).gap(12.0).build();
+        let notify_btn = ui.button("notify", "Send notification");
+        let buttons = ui
+            .h_stack(&[http_btn, ws_btn, wt_btn, notify_btn])
+            .gap(12.0)
+            .build();
 
         let status_text = self.status.borrow().clone();
         let status = ui.text(&status_text).size(14.0).color(0xffd0d8e8).build();
@@ -215,6 +221,57 @@ impl Activity for NetworkMain {
                 *status.borrow_mut() = format!("wt {dg_status}; {stream_status}");
                 stream.close(0);
                 wt.close(0, "done");
+                busy.set(false);
+            });
+        }
+
+        // ── System notification ────────────────────────────────────
+        //
+        // Stone 14.3. The browser exposes `Notification.permission`
+        // separately from the manifest grant — apps must request it
+        // from a user-gesture path (this click handler counts) before
+        // posts succeed. We surface every step in the status line so
+        // the demo doubles as a permission-flow walkthrough.
+        if ui.was_clicked("notify") && !self.notify_busy.get() {
+            self.notify_busy.set(true);
+            *self.status.borrow_mut() = "checking notification permission …".into();
+            let status = self.status.clone();
+            let busy = self.notify_busy.clone();
+            ctx.activity_scope().spawn(async move {
+                let perm = match notification::request_permission().await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        *status.borrow_mut() = format!("notify perm error: {e:?}");
+                        busy.set(false);
+                        return;
+                    }
+                };
+                if !perm.is_granted() {
+                    *status.borrow_mut() = match perm {
+                        PermissionStatus::Denied => "notification permission denied".into(),
+                        PermissionStatus::Default => "permission prompt dismissed".into(),
+                        PermissionStatus::Granted => unreachable!(),
+                    };
+                    busy.set(false);
+                    return;
+                }
+                match notification::post("Akiva", "Hello from the Network demo").await {
+                    Ok(handle) => {
+                        *status.borrow_mut() = format!("posted notification #{}", handle.id());
+                        // Drop the handle here; `Drop` will close the
+                        // notification, which is cosmetic (the OS
+                        // notification center keeps the entry until the
+                        // user dismisses it). To leave the notification
+                        // up indefinitely, store the handle in the
+                        // activity instead.
+                    }
+                    Err(NotifyError::PermissionNotGranted) => {
+                        *status.borrow_mut() = "post failed: browser denied permission".into();
+                    }
+                    Err(e) => {
+                        *status.borrow_mut() = format!("post failed: {e:?}");
+                    }
+                }
                 busy.set(false);
             });
         }

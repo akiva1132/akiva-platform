@@ -10,6 +10,57 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [0.11.0] — 2026-05 (Stone 14.3 — Notifications)
+
+**MINOR** — additive: 3 new op_kinds (2 io, 1 fire), no kernel
+export changes. First capability that bridges through the main
+thread (the browser `Notification` API and especially
+`Notification.requestPermission()` require a Window context). Lays
+the cap_req/cap_resp infrastructure that 14.4 Clipboard / 14.5
+Vibration / 14.6 Geolocation will reuse.
+
+- **Added (Stone 14.3 — IO ops).**
+  - `IO::NOTIFY_REQUEST_PERMISSION = 0x010F` — request browser
+    permission. Args: `[]`. Result: `[status: u8]` (0=Default,
+    1=Granted, 2=Denied). Should be called from a user-gesture
+    handler; browsers auto-deny non-gesture prompts.
+  - `IO::NOTIFY_POST = 0x0110` — post a system notification.
+    Args: `[title_len:u16 LE | title:utf8 | body_len:u16 LE | body:utf8 | tag_len:u16 LE | tag:utf8]`.
+    Result: `[notify_id:u32 LE]` once the browser accepts;
+    ERROR with reason on permission/denial. The `tag` collapses
+    duplicates per browser convention.
+- **Added (Stone 14.3 — fire ops).**
+  - `FIRE::NOTIFY_CLOSE = 0x000C` — dismiss a posted notification.
+    Args: `[notify_id:u32 LE]`. Idempotent.
+- **Added (SDK).** `akiva_sdk::notification` module:
+  - `Notification` handle with `close` + `Drop` auto-close
+  - `notification::post(title, body)` / `post_with_tag(title, body, tag)`
+  - `notification::request_permission() -> RequestPermissionFuture`
+  - `PermissionStatus { Default, Granted, Denied }`
+  - `NotifyError { Denied, PermissionNotGranted, BadTitle, Host(String), Busy }`
+  - 7 unit tests (encode round-trips, status decode, pre-resolved
+    error paths)
+- **Capability machinery.** Reuses the existing
+  `akiva.permission.NOTIFICATIONS` declaration from Stone 10.3
+  (declared at `ProtectionLevel::Normal`, install-time auto-grant).
+  Two-layer model: the system grant gates the wire op; the
+  browser's own `Notification.permission` gates the actual
+  display. Apps must obtain both — `request_permission` surfaces
+  the browser side.
+- **Main-thread bridge.** New `sendToTab` dependency on
+  AppRegistry's constructor. The kernel-worker's `worker.js`
+  passes `(msg) => self.postMessage(msg)`; tab.js routes
+  `notify_request_permission` / `notify_post` / `notify_close`
+  to the browser API, replies via the existing kernel-bound
+  `session.send` channel; worker.js forwards `notify_done` /
+  `notify_perm_done` back into AppRegistry. This pattern is the
+  first instance of the cap_req/cap_resp shape that 14.4-14.6
+  ride.
+- **Demo.** `apps/network` gains a "Send notification" button that
+  walks the full flow: `request_permission` (surfaces the
+  browser prompt on first use), then `post` with a title and
+  body. Manifest declares both NETWORK and NOTIFICATIONS grants.
+
 ## [0.10.0] — 2026-05 (Stone 14.2 — WebTransport)
 
 **MINOR** — additive: 8 new op_kinds (4 io, 4 fire), no kernel

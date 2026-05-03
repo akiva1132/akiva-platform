@@ -259,7 +259,92 @@ function onKernelMessage(msg) {
         applyPaintStream(msg.bytes, state.followerBackend);
       }
       break;
+    // Stone 14.3 — Notifications. Only the leader's kernel produces
+    // these; followers never receive them (the kernel-worker stub
+    // they run doesn't dispatch app code), so the duplicate-
+    // notification problem doesn't arise even with multiple tabs.
+    case "notify_request_permission":
+      handleNotifyRequestPermission(msg);
+      break;
+    case "notify_post":
+      handleNotifyPost(msg);
+      break;
+    case "notify_close":
+      handleNotifyCloseFromKernel(msg);
+      break;
   }
+}
+
+// ── Stone 14.3 — Notifications ───────────────────────────────────────────
+//
+// All Notification API calls live on the main thread because
+// `Notification.requestPermission()` requires a Window context (it
+// throws or auto-denies in workers on most browsers). We keep an
+// id-keyed map of live `Notification` instances so the kernel can
+// close them later.
+//
+// Reply protocol (mirror of `app_registry.js::completeNotifyPost` /
+// `completeNotifyPermission`):
+//   { type: "notify_done", notifyId, ok: bool, reason: string }
+//   { type: "notify_perm_done", notifyId, status: "default"|"granted"|"denied" }
+
+/** @type {Map<number, Notification>} */
+const liveNotifications = new Map();
+
+function handleNotifyRequestPermission({ notifyId }) {
+  if (typeof Notification === "undefined") {
+    session.send({ type: "notify_perm_done", notifyId, status: "denied" });
+    return;
+  }
+  // Promise form is supported on every browser that exposes the API
+  // since 2019. The legacy callback form would also work but the
+  // `then` chain composes more cleanly with the async reply.
+  Promise.resolve(Notification.requestPermission()).then((status) => {
+    session.send({ type: "notify_perm_done", notifyId, status });
+  }).catch(() => {
+    session.send({ type: "notify_perm_done", notifyId, status: "denied" });
+  });
+}
+
+function handleNotifyPost({ notifyId, title, body, tag }) {
+  if (typeof Notification === "undefined") {
+    session.send({ type: "notify_done", notifyId, ok: false, reason: "Notification API unavailable" });
+    return;
+  }
+  if (Notification.permission !== "granted") {
+    session.send({
+      type: "notify_done", notifyId, ok: false,
+      reason: `permission ${Notification.permission}`,
+    });
+    return;
+  }
+  let n;
+  try {
+    n = new Notification(title, {
+      body: body ?? "",
+      tag: tag || undefined,
+    });
+  } catch (err) {
+    session.send({
+      type: "notify_done", notifyId, ok: false,
+      reason: String(err?.message ?? err),
+    });
+    return;
+  }
+  liveNotifications.set(notifyId, n);
+  // Drop the entry from our map once the user dismisses the
+  // notification themselves — keeps the map tight and matches the
+  // browser's own lifecycle (the underlying object is still valid
+  // after `close`, but we don't need to track it).
+  n.addEventListener("close", () => liveNotifications.delete(notifyId));
+  session.send({ type: "notify_done", notifyId, ok: true, reason: "" });
+}
+
+function handleNotifyCloseFromKernel({ notifyId }) {
+  const n = liveNotifications.get(notifyId);
+  if (!n) return;
+  liveNotifications.delete(notifyId);
+  try { n.close(); } catch (_) { /* ignore */ }
 }
 
 function onPanic(text) {

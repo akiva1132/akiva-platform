@@ -1640,7 +1640,39 @@ SDK: `akiva_sdk::net::WebTransport` עם `send_datagram(&[u8])`, `recv_datagram(
 
 ---
 
-### Stone 14.3 — Notifications (~3 ימים)
+### Stone 14.3 — Notifications ✅ סגור (May 2026)
+
+**מה הדפדפן מאפשר.** `Notification(title, options)` — Baseline 2022. כל מודרן OS חושף את ה-tray. בדפדפן: `Notification.permission` שומר את ה-state (granted/denied/default), `Notification.requestPermission()` מציג את ה-prompt — אבל **דורש Window context** (לא zmin ב-Worker scope ברוב הדפדפנים, ובמיעוט שמאפשר זה auto-deny ללא user gesture).
+
+**מה נבנה (Stone 14.3 — closed)**:
+- 3 wire ops חדשים (additive, ABI 0.10.0 → 0.11.0):
+  - `IO::NOTIFY_REQUEST_PERMISSION = 0x010F` — `[]` → `[status:u8]`
+  - `IO::NOTIFY_POST = 0x0110` — `[title|body|tag]` → `[notify_id:u32]`
+  - `FIRE::NOTIFY_CLOSE = 0x000C` — `[notify_id:u32]`
+- SDK API (`sdk-rust/src/notification.rs`):
+  - `notification::post(title, body)` / `post_with_tag(title, body, tag)`
+  - `notification::request_permission().await -> Result<PermissionStatus, NotifyError>`
+  - `Notification` handle עם `Drop` שסוגר אוטומטית
+  - `PermissionStatus { Default, Granted, Denied }` ו-`NotifyError { Denied, PermissionNotGranted, BadTitle, Host(String), Busy }`
+- **Main-thread proxy** (חדש לתשתית) — תוסף `sendToTab` callback ל-AppRegistry. ה-pattern מבטיח ש-14.4-14.6 (Clipboard, Vibration, Geolocation) ירוצו על אותו infrastructure בלי שכפול:
+  - kernel-worker → tab: `self.postMessage({type: "notify_post", ...})`
+  - tab → kernel-worker: `session.send({type: "notify_done", ...})`
+  - tab.js שומר `liveNotifications: Map<id, Notification>` למעקב per-id
+- 7 SDK unit tests חדשים
+- Demo: כפתור "Send notification" באפליקציית `Network`. לוקח את המשתמש דרך כל ה-flow (request_permission → post). Manifest מצהיר על שני grants: NETWORK + NOTIFICATIONS.
+
+**Exit criteria — Stone 14.3 (sealed):**
+- [x] Apps עם NOTIFICATIONS grant יכולים לבקש browser permission (יוצא prompt, החזר Granted/Denied/Default)
+- [x] Apps יכולים לפרסם notification (title, body, tag) — ה-OS מציג אותה מחוץ לדפדפן
+- [x] Tag-based deduplication (אותו tag → updates במקום duplicate)
+- [x] `Notification::Drop` סוגר אוטומטית — אין דליפת handles
+- [x] Worker termination דוחק כל פתיחת notify של החבילה
+- [x] 288 framework + 231 SDK + 81 wire + 143 vitest tests עוברים
+- [x] ABI bump 0.10.0 → 0.11.0 documented
+
+---
+
+### ~~Stone 14.3 — Notifications (~3 ימים)~~ — superseded by closed entry above
 
 **מה הדפדפן מאפשר.**
 `Notification` — **Baseline 2022**. **זמין ב-dedicated workers** (`self.Notification`). `new Notification(title, { body, icon, tag, badge })` → OS-level system notification. `tag` deduplicates — אותו tag מעדכן notification קיים במקום ליצור חדש (חשוב נגד spam). `Notification.requestPermission()` → Promise<"granted"|"denied"|"default">; browser stores בין sessions.

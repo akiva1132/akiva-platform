@@ -34,6 +34,12 @@ const apps = new AppRegistry({
   storage,
   kernelMemory: () => memory,
   log: (level, text) => self.postMessage({ type: "log", level: levelCode(level), text }),
+  // Stone 14.3 — bridge to the leader's main-thread tab for caps the
+  // worker can't dispatch on its own (browser Notification API
+  // requires a Window context). Posted as ordinary worker messages;
+  // the tab's `onKernelMessage` switch routes them to the right
+  // notification handler.
+  sendToTab: (msg) => self.postMessage(msg),
 });
 // Stone 11.6.7 #3 — wire kernel→app cache invalidation. Whenever the
 // kernel writes or deletes a `pkgs/<pkg>/<userKey>` entry, the
@@ -87,6 +93,16 @@ self.addEventListener("message", (e) => {
       break;
     case "release_display":
       handleReleaseDisplay(msg);
+      break;
+    // Stone 14.3 — notification replies from the main-thread tab.
+    // The reverse message types (`notify_post`, `notify_close`,
+    // `notify_request_permission`) flow tab←kernel via `sendToTab`
+    // wired into AppRegistry's constructor.
+    case "notify_done":
+      apps.completeNotifyPost(msg.notifyId, !!msg.ok, msg.reason ?? "");
+      break;
+    case "notify_perm_done":
+      apps.completeNotifyPermission(msg.notifyId, msg.status ?? "default");
       break;
     case "resize": {
       // Stone 13.4 — primary's resize re-sizes the worker's

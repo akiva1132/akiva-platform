@@ -38,12 +38,14 @@ export class AppRegistry {
    * @param {() => WebAssembly.Memory} deps.kernelMemory  Returns the live kernel memory reference; re-read every call because wasm memory can grow and the ArrayBuffer detaches.
    * @param {(level: string, text: string) => void} deps.log  Logger (level name, not numeric code).
    * @param {(packageId: string) => Worker} [deps.spawnWorker]  Override for tests; defaults to `new Worker("./app_worker_shell.js", {type: "module"})`.
+   * @param {(msg: object) => void} [deps.sendToTab]  Stone 14.3 — bridge to the main-thread tab for capabilities that the worker can't dispatch on its own (browser Notification API requires a Window context for `requestPermission`). Default no-op so tests that don't exercise notifications can construct an AppRegistry without supplying it.
    */
-  constructor({ storage, kernelMemory, log, spawnWorker }) {
+  constructor({ storage, kernelMemory, log, spawnWorker, sendToTab }) {
     this._storage = storage;
     this._kernelMemory = kernelMemory;
     this._log = log;
     this._spawnWorker = spawnWorker ?? defaultSpawnWorker;
+    this._sendToTab = sendToTab ?? ((_msg) => {});
     /**
      * Stone 13.0prep C2 — renderer backend reference. AppRegistry calls
      * `registerDrawable(id, bitmap)` after async PNG decode and
@@ -214,6 +216,28 @@ export class AppRegistry {
      * @type {Map<number, { reader: any, writer: any, packageId: string, parentWt: number, recvQueue: Array<Uint8Array>, pendingRecv: { futureId: bigint } | null, closed: boolean }>}
      */
     this._wtStreams = new Map();
+
+    /**
+     * Stone 14.3 — pending notification ops awaiting tab reply.
+     * Keyed by the in-flight `notify_id` we allocate here; value is
+     * the (packageId, futureId) pair we route the eventual
+     * `notify_done` / `notify_perm_done` reply to.
+     *
+     * @type {Map<number, { packageId: string, futureId: bigint, kind: "post" | "perm" }>}
+     */
+    this._pendingNotifs = new Map();
+    /** Monotonic notify id allocator (host-side) shared with the tab side. */
+    this._nextNotifyId = 1;
+    /**
+     * Stone 14.3 — owners of in-flight notifications, by id. Cleared
+     * once the tab confirms `notify_post` succeeded (the id then
+     * becomes meaningful) or fails (entry removed). `_handleNotifyClose`
+     * uses this to verify the close handle belongs to the calling
+     * package before forwarding to the tab.
+     *
+     * @type {Map<number, string>}  notify_id → packageId
+     */
+    this._notifyOwners = new Map();
     /**
      * Stone 13.2 — kernel-side bridge symbols. Looked up lazily on the
      * first dialog open after `setKernelInstance` has wired them in
@@ -686,6 +710,7 @@ export class AppRegistry {
     // browser doesn't hold an orphan connection. Symmetric with the
     // watchdog kill path further down.
     this._disposeWsForPackage(packageId);
+    this._disposeNotificationsForPackage(packageId);
     return 1;
   }
 
@@ -815,6 +840,7 @@ export class AppRegistry {
           }
         }
         this._disposeWsForPackage(proc.packageId);
+        this._disposeNotificationsForPackage(proc.packageId);
         return;
       }
       // WARN — log once per crossing (proc.warned latches until a
@@ -1318,6 +1344,9 @@ export class AppRegistry {
       case FIRE.WT_CLOSE:
         this._handleWtClose(packageId, args);
         return;
+      case FIRE.NOTIFY_CLOSE:
+        this._handleNotifyClose(packageId, args);
+        return;
     }
 
     const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
@@ -1598,6 +1627,31 @@ export class AppRegistry {
         }
         const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
         this._handleWtRecvStream(packageId, futureId, args);
+        return;
+      }
+      // Stone 14.3 — Notifications. Bridged to the main-thread tab
+      // because `Notification.requestPermission` requires a Window
+      // context and many platforms route notifications through the
+      // tab's lifecycle. NOTIFICATIONS grant gate.
+      case IO.NOTIFY_REQUEST_PERMISSION: {
+        if (!this._hasGrant(packageId, "akiva.permission.NOTIFICATIONS")) {
+          this._log("warn", `[${packageId}] host_op NOTIFY_REQUEST_PERMISSION: denied — no NOTIFICATIONS grant`);
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("notify: denied (no NOTIFICATIONS grant)");
+          break;
+        }
+        this._handleNotifyRequestPermission(packageId, futureId);
+        return;
+      }
+      case IO.NOTIFY_POST: {
+        if (!this._hasGrant(packageId, "akiva.permission.NOTIFICATIONS")) {
+          this._log("warn", `[${packageId}] host_op NOTIFY_POST: denied — no NOTIFICATIONS grant`);
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("notify: denied (no NOTIFICATIONS grant)");
+          break;
+        }
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        this._handleNotifyPost(packageId, futureId, args);
         return;
       }
       default:
@@ -2360,6 +2414,118 @@ export class AppRegistry {
     sEntry.writer.close().catch(() => {});
   }
 
+  // ── Stone 14.3 — Notifications bridge ────────────────────────────────
+  //
+  // Notifications go through the main-thread tab because
+  // `Notification.requestPermission` requires a Window context (it
+  // throws or auto-denies in workers on every browser that supports
+  // worker-side `Notification` at all). The tab side does the actual
+  // browser API calls and replies via the worker's message channel
+  // (`completeNotifyPost` / `completeNotifyPermission` below).
+  //
+  // ID allocator: `_nextNotifyId` is shared across both kinds so
+  // app workers can rely on a single monotonic namespace per
+  // package.
+
+  _handleNotifyRequestPermission(packageId, futureId) {
+    const notifyId = this._nextNotifyId++;
+    this._pendingNotifs.set(notifyId, { packageId, futureId, kind: "perm" });
+    this._sendToTab({ type: "notify_request_permission", notifyId, packageId });
+  }
+
+  _handleNotifyPost(packageId, futureId, args) {
+    let parsed;
+    try {
+      parsed = decodeNotifyPostArgs(args, this._decoder);
+    } catch (err) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode(`notify: bad args: ${err?.message ?? err}`));
+      return;
+    }
+    if (!parsed.title) {
+      this._postHostOpDone(packageId, futureId, STATUS.ERROR,
+        this._encoder.encode("notify: empty title"));
+      return;
+    }
+    const notifyId = this._nextNotifyId++;
+    this._pendingNotifs.set(notifyId, { packageId, futureId, kind: "post" });
+    this._notifyOwners.set(notifyId, packageId);
+    this._sendToTab({
+      type: "notify_post",
+      notifyId,
+      packageId,
+      title: parsed.title,
+      body: parsed.body,
+      tag: parsed.tag,
+    });
+  }
+
+  _handleNotifyClose(packageId, args) {
+    if (args.length < 4) return;
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const notifyId = view.getUint32(0, true);
+    const owner = this._notifyOwners.get(notifyId);
+    if (owner !== packageId) {
+      this._log("warn", `[${packageId}] notify_close: unknown or foreign notify_id ${notifyId} — dropped`);
+      return;
+    }
+    this._notifyOwners.delete(notifyId);
+    this._sendToTab({ type: "notify_close", notifyId, packageId });
+  }
+
+  /**
+   * Called by `worker.js` when the main-thread tab replies to a
+   * `notify_post` / `notify_close`. `notifyId` keys back to the
+   * pending future; payload is the success bit + (on error) reason.
+   */
+  completeNotifyPost(notifyId, ok, reason) {
+    const pending = this._pendingNotifs.get(notifyId);
+    if (!pending) return;
+    this._pendingNotifs.delete(notifyId);
+    if (pending.kind !== "post") return;
+    if (ok) {
+      const out = new Uint8Array(4);
+      new DataView(out.buffer).setUint32(0, notifyId, true);
+      this._postHostOpDone(pending.packageId, pending.futureId, STATUS.READY, out);
+    } else {
+      this._notifyOwners.delete(notifyId);
+      this._postHostOpDone(pending.packageId, pending.futureId, STATUS.ERROR,
+        this._encoder.encode(`notify: ${reason || "host refused"}`));
+    }
+  }
+
+  /**
+   * Called by `worker.js` with the user's permission decision for a
+   * `notify_request_permission` round-trip. `status` is one of
+   * `"default"`, `"granted"`, `"denied"`.
+   */
+  completeNotifyPermission(notifyId, status) {
+    const pending = this._pendingNotifs.get(notifyId);
+    if (!pending) return;
+    this._pendingNotifs.delete(notifyId);
+    if (pending.kind !== "perm") return;
+    const code = status === "granted" ? 1 : status === "denied" ? 2 : 0;
+    this._postHostOpDone(pending.packageId, pending.futureId, STATUS.READY,
+      new Uint8Array([code]));
+  }
+
+  /** Stone 14.3 — drop every pending notification owned by a
+   *  terminated package so its replies don't leak past worker
+   *  death. Symmetric with `_disposeWsForPackage`. */
+  _disposeNotificationsForPackage(packageId) {
+    for (const [id, entry] of this._pendingNotifs) {
+      if (entry.packageId !== packageId) continue;
+      this._pendingNotifs.delete(id);
+    }
+    for (const [id, owner] of this._notifyOwners) {
+      if (owner !== packageId) continue;
+      this._notifyOwners.delete(id);
+      // Tell the tab to dismiss too — orphans on the OS notification
+      // shade are ugly.
+      this._sendToTab({ type: "notify_close", notifyId: id, packageId });
+    }
+  }
+
   _handleWtClose(packageId, args) {
     if (args.length < 10) return;
     const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
@@ -2459,6 +2625,26 @@ function decodeHttpRequest(args, decoder) {
   }
   const body = args.slice(cur);
   return { method, url, headers, body };
+}
+
+// Stone 14.3 — wire format helper for `IO::NOTIFY_POST` args. Mirror
+// of `akiva_sdk::notification::encode_post_args`.
+function decodeNotifyPostArgs(args, decoder) {
+  if (args.length < 2) throw new Error("title len truncated");
+  const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+  let cur = 0;
+  const titleLen = view.getUint16(cur, true); cur += 2;
+  if (cur + titleLen > args.length) throw new Error("title truncated");
+  const title = decoder.decode(args.subarray(cur, cur + titleLen)); cur += titleLen;
+  if (cur + 2 > args.length) throw new Error("body len truncated");
+  const bodyLen = view.getUint16(cur, true); cur += 2;
+  if (cur + bodyLen > args.length) throw new Error("body truncated");
+  const body = decoder.decode(args.subarray(cur, cur + bodyLen)); cur += bodyLen;
+  if (cur + 2 > args.length) throw new Error("tag len truncated");
+  const tagLen = view.getUint16(cur, true); cur += 2;
+  if (cur + tagLen > args.length) throw new Error("tag truncated");
+  const tag = decoder.decode(args.subarray(cur, cur + tagLen));
+  return { title, body, tag };
 }
 
 function encodeHttpResponse(status, headerPairs, body) {

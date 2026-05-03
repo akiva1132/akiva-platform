@@ -28,7 +28,7 @@ use crate::activity_manager::LaunchMode;
 /// All gated by the existing `akiva.permission.NETWORK`. Apps with
 /// manifest `min_abi_version = "0.1.0"` still load — bumping the
 /// runtime is additive and back-compat.
-pub const RUNTIME_ABI_VERSION: &str = "0.10.0";
+pub const RUNTIME_ABI_VERSION: &str = "0.11.0";
 
 // ── Typed model ──────────────────────────────────────────────────────
 

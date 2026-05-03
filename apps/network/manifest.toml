@@ -3,7 +3,7 @@ id = "com.akiva.network"
 name = "Network"
 version = "0.1.0"
 version_code = 1
-min_abi_version = "0.9.0"
+min_abi_version = "0.11.0"
 authors = ["Akiva Team"]
 description = "Smoke-test for the NETWORK capability — runs an HTTPS request and a WebSocket echo round-trip."
 category = "utilities"
@@ -28,7 +28,13 @@ categories = ["akiva.intent.category.LAUNCHER"]
 # Stone 14.1 — declared at install time; auto-granted today
 # (`ProtectionLevel::Normal`). Upgrading to `Dangerous` (runtime
 # prompt) is a follow-up stone.
-required = ["akiva.permission.NETWORK"]
+# Stone 14.3 — NOTIFICATIONS for the system-tray demo button. The
+# *system* grant is auto-granted; the *browser* permission still
+# requires a user-gesture call to `notification::request_permission`.
+required = [
+    "akiva.permission.NETWORK",
+    "akiva.permission.NOTIFICATIONS",
+]
 optional = []
 
 [display]

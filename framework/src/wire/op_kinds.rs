@@ -83,6 +83,13 @@ pub mod fire {
     /// under it. Args: `(wt_handle: u32, code: u32, reason: &str)`.
     /// Idempotent.
     pub const WT_CLOSE: u32 = 0x000B;
+
+    /// Stone 14.3 — Close a system notification by id. Args:
+    /// `(notify_id: u32)`. Idempotent. Capability gated by
+    /// `akiva.permission.NOTIFICATIONS`. The notification is
+    /// physically dismissed by the host; the app may still hold
+    /// the handle but `close` is a no-op after the first call.
+    pub const NOTIFY_CLOSE: u32 = 0x000C;
 }
 
 /// I/O operations — the app calls `akiva_host_io_start(op_kind, args…)`
@@ -280,6 +287,34 @@ pub mod io {
     /// After fin or error every further recv resolves with the
     /// same event so app loops terminate naturally.
     pub const WT_RECV_STREAM: u32 = 0x010E;
+
+    /// Stone 14.3 — Request the browser-level Notification
+    /// permission. Args: `[]`. Result: `[status: u8]` —
+    /// 0 = Default, 1 = Granted, 2 = Denied. Must be triggered
+    /// from a user-gesture path or browsers may auto-deny.
+    /// Gated by `akiva.permission.NOTIFICATIONS` at the system
+    /// layer (separate from the browser permission, which is
+    /// what this op surfaces).
+    pub const NOTIFY_REQUEST_PERMISSION: u32 = 0x010F;
+
+    /// Stone 14.3 — Post a system notification.
+    ///
+    /// Args:
+    /// ```text
+    /// [title_len: u16 LE | title: utf8...]
+    /// [body_len:  u16 LE | body:  utf8...]
+    /// [tag_len:   u16 LE | tag:   utf8...]
+    /// ```
+    /// Result: `[notify_id: u32 LE]` once the browser accepts
+    /// the notification; ERROR with a utf8 reason on
+    /// `permission != "granted"` or any browser refusal.
+    ///
+    /// The `tag` collapses duplicates per browser convention —
+    /// posting twice with the same tag updates the existing
+    /// notification rather than spawning a second. Apps that
+    /// want every event to surface separately should leave
+    /// `tag` empty.
+    pub const NOTIFY_POST: u32 = 0x0110;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds.
@@ -394,6 +429,7 @@ mod tests {
             fire::WS_SEND, fire::WS_CLOSE,
             fire::WT_SEND_DATAGRAM, fire::WT_SEND_STREAM,
             fire::WT_CLOSE_STREAM, fire::WT_CLOSE,
+            fire::NOTIFY_CLOSE,
         ];
         let io = [
             io::TEXT_WIDTH, io::QUERY_PACKAGES,
@@ -402,6 +438,7 @@ mod tests {
             io::HTTP_FETCH, io::WS_OPEN, io::WS_RECV,
             io::WT_OPEN, io::WT_RECV_DATAGRAM,
             io::WT_OPEN_BIDI, io::WT_RECV_STREAM,
+            io::NOTIFY_REQUEST_PERMISSION, io::NOTIFY_POST,
         ];
         for k in fire { assert!((0x0001..=0x00FF).contains(&k), "fire op {k:#x} out of range"); }
         for k in io   { assert!((0x0101..=0x01FF).contains(&k), "io op {k:#x} out of range"); }
@@ -420,6 +457,7 @@ mod tests {
             fire::WS_SEND, fire::WS_CLOSE,
             fire::WT_SEND_DATAGRAM, fire::WT_SEND_STREAM,
             fire::WT_CLOSE_STREAM, fire::WT_CLOSE,
+            fire::NOTIFY_CLOSE,
         ];
         for (i, a) in fire.iter().enumerate() {
             for b in &fire[i + 1..] {
@@ -433,6 +471,7 @@ mod tests {
             io::HTTP_FETCH, io::WS_OPEN, io::WS_RECV,
             io::WT_OPEN, io::WT_RECV_DATAGRAM,
             io::WT_OPEN_BIDI, io::WT_RECV_STREAM,
+            io::NOTIFY_REQUEST_PERMISSION, io::NOTIFY_POST,
         ];
         for (i, a) in io.iter().enumerate() {
             for b in &io[i + 1..] {
@@ -461,6 +500,7 @@ mod tests {
         assert_eq!(fire::WT_SEND_STREAM,            sdk::fire::WT_SEND_STREAM);
         assert_eq!(fire::WT_CLOSE_STREAM,           sdk::fire::WT_CLOSE_STREAM);
         assert_eq!(fire::WT_CLOSE,                  sdk::fire::WT_CLOSE);
+        assert_eq!(fire::NOTIFY_CLOSE,              sdk::fire::NOTIFY_CLOSE);
         assert_eq!(io::TEXT_WIDTH,                  sdk::io::TEXT_WIDTH);
         assert_eq!(io::QUERY_PACKAGES,              sdk::io::QUERY_PACKAGES);
         assert_eq!(io::STORAGE_GET,                 sdk::io::STORAGE_GET);
@@ -475,6 +515,8 @@ mod tests {
         assert_eq!(io::WT_RECV_DATAGRAM,            sdk::io::WT_RECV_DATAGRAM);
         assert_eq!(io::WT_OPEN_BIDI,                sdk::io::WT_OPEN_BIDI);
         assert_eq!(io::WT_RECV_STREAM,              sdk::io::WT_RECV_STREAM);
+        assert_eq!(io::NOTIFY_REQUEST_PERMISSION,   sdk::io::NOTIFY_REQUEST_PERMISSION);
+        assert_eq!(io::NOTIFY_POST,                 sdk::io::NOTIFY_POST);
         assert_eq!(status::PENDING,                 sdk::status::PENDING);
         assert_eq!(status::READY,                   sdk::status::READY);
         assert_eq!(status::ERROR,                   sdk::status::ERROR);
