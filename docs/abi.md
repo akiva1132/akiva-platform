@@ -312,7 +312,7 @@ extern "C" fn akiva_host_io_poll(
 | Range            | Transport       | קבועים                                                                                              |
 |------------------|-----------------|-----------------------------------------------------------------------------------------------------|
 | `0x0001..0x00FF` | `fire`          | `LOG=0x01`, `FINISH=0x02`, `START_ACTIVITY=0x03`, `START_ACTIVITY_FOR_RESULT=0x04`, `SET_RESULT=0x05` |
-| `0x0101..0x01FF` | `io_start`/poll | `TEXT_WIDTH=0x101`, `QUERY_PACKAGES=0x102`, `STORAGE_GET=0x103`, `STORAGE_SET=0x104`, `STORAGE_DELETE=0x105`, `TIMER_SLEEP=0x106` (Stone 13.0prep A) |
+| `0x0101..0x01FF` | `io_start`/poll | `TEXT_WIDTH=0x101`, `QUERY_PACKAGES=0x102`, `STORAGE_GET=0x103`, `STORAGE_SET=0x104`, `STORAGE_DELETE=0x105`, `TIMER_SLEEP=0x106` (Stone 13.0prep A), `SHOW_DIALOG=0x107` (Stone 13.2) |
 | `0x0200..`       | reserved        | streams / pushed events ל-Stone 11.4+                                                              |
 
 Args layout per op_kind (LE byte-stream — encoded inline ב-dispatcher):
@@ -328,6 +328,8 @@ Args layout per op_kind (LE byte-stream — encoded inline ב-dispatcher):
 | `IO::QUERY_PACKAGES`          | `[]`                                                       | `pkgs_wire blob` (ראה `wire/pkgs.rs`)    |
 | `IO::STORAGE_GET`             | TBD (Stone 11.6)                                           | TBD                                     |
 | `IO::STORAGE_SET`             | TBD (Stone 11.6)                                           | TBD                                     |
+| `IO::TIMER_SLEEP`             | `[delay_ms: u32 LE]`                                       | `[]` (READY after delay)                |
+| `IO::SHOW_DIALOG`             | `[handle: u32 LE \| title_len: u16 LE \| title: utf8… \| body_len: u16 LE \| body: utf8… \| btn_count: u8 \| (btn_len: u16 LE \| btn: utf8…)*]` | `[kind: u8, btn_idx: u8]` — `kind == 0` → `Button(btn_idx)`, `kind == 1` → `Dismissed` |
 
 **Capability gating moved into the dispatcher.** עד Stone 10.3b ה-gating קרה בזמן instantiate (LinkError על import חסר). מאז Stone 11.3 ה-gating קורה per-call: ה-import עצמו תמיד מותקן, אבל ה-dispatcher בודק את ה-grants לפני שהוא מבצע op_kind שדורש capability. App ללא הרשאה → return code שגיאה (1 או 2 לפי הנתיב), warning בלוג. הצדק לבחירה: import אחד משרת ~250 op_kinds, חלקם auto חלקם gated; מסננים ב-call site, לא ב-link.
 

@@ -10,6 +10,37 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [0.8.0] — 2026-05 (Stone 13.2)
+
+**MINOR** — additive: one new io op_kind + one new kernel export +
+one new HAL import. Stone 13.3 (transitions) ships entirely inside
+framework + SDK behaviour and adds no ABI surface — the spec's "no
+opcode change" constraint was held.
+
+- **Added (Stone 13.2).** `IO::SHOW_DIALOG = 0x0107` host op. Args:
+  `[handle: u32 LE | title_len: u16 LE | title: utf8... |
+   body_len: u16 LE | body: utf8... | btn_count: u8 |
+   (btn_len: u16 LE | btn: utf8...)*]`. Result: `[kind: u8,
+   btn_idx: u8]` — `kind == 0` → `Button(btn_idx)`, `kind == 1` →
+   `Dismissed`. SDK exposes `Context::show_dialog(title, body,
+   buttons) -> DialogFuture`. Framework owns the dialog surface (a
+   fresh `WindowLayer::Overlay`), input shielding (pointer events
+   intercepted while a dialog is open), and the dim layer (alpha
+   ~0.4 over the calling activity's surface).
+- **Added (Stone 13.2 — kernel surface).** `akiva_open_dialog(handle:
+  u32, future_id: u64, args_ptr: *const u8, args_len: usize) -> u32`
+  kernel export. Host (`runtime/web/app_registry.js`) decodes the
+  SHOW_DIALOG payload, copies it into kernel memory via
+  `akiva_alloc`, and calls this. Returns 0 on success, 1 on bad
+  payload, 2 on no-foreground-activity. The host is responsible for
+  pairing one `akiva_dealloc` per call.
+- **Added (Stone 13.2 — kernel imports).** `hal_dialog_complete(handle:
+  u32, future_id: u64, kind: u32, button_idx: u32)` HAL import.
+  Called by the kernel for every dialog the user resolves; the JS
+  host looks up the (handle, future_id) → (packageId,
+  workerFutureId) routing entry and posts `host_op_done` back to the
+  originating app worker.
+
 ## [0.7.0] — 2026-05 (Stone 13.0prep)
 
 **MINOR** — three additive bumps in flight: timer host op (A), three

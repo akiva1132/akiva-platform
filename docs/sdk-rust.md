@@ -206,7 +206,44 @@ impl<'a> Context<'a> {
     // Spawned tasks (Stone 11.6.5; cancellation: ראה §19.5)
     pub fn activity_scope(&self) -> TaskScope; // lives until on_destroy
     pub fn resumed_scope(&self) -> TaskScope;  // cancelled at on_pause
+
+    // Stone 13.2 — system dialog overlays. Returns immediately with a
+    // `DialogFuture`; the framework paints the dialog on a dedicated
+    // `WindowLayer::Overlay` surface and shields this activity from
+    // pointer events while the dialog is open.
+    pub fn show_dialog(
+        &mut self, title: &str, body: &str, buttons: &[&str],
+    ) -> DialogFuture;
 }
+
+pub enum DialogResult {
+    /// User tapped the button at this index in the original `buttons`
+    /// slice. Always `< buttons.len()`.
+    Button(usize),
+    /// User tapped outside the dialog box, or the framework dismissed
+    /// the dialog (e.g. activity destroyed mid-prompt).
+    Dismissed,
+}
+```
+
+**Dialog usage.** Empty `buttons` resolves immediately to `Dismissed`.
+The framework reserves the dialog box geometry per-frame from the
+current `metrics`, so the dialog re-flows on resize without an extra
+hook. Single-dialog invariant per activity: opening a second dialog
+on the same handle dismisses the first.
+
+```rust
+let scope = ctx.activity_scope();
+let fut = ctx.show_dialog(
+    "Clear?", "This will reset the calculator.", &["Cancel", "OK"],
+);
+let confirmed = self.confirmed.clone();   // Rc<Cell<bool>>
+scope.spawn(async move {
+    if matches!(fut.await, DialogResult::Button(1)) {
+        confirmed.set(true);
+    }
+});
+// On the next render: read-and-reset `confirmed`, then act.
 ```
 
 **שינויים מ-Stone 11.0 baseline.** `set_content_view`, `find_view`, `inflate`, ו-`show_toast` הוסרו — ה-`Canvas` הישיר (§8) ו-`Ui` builder (§9) החליפו את ה-AKML view-handle model. AKML עוד נתמכת (§10) אבל דרך `inflate_str_with` כל frame, לא דרך handles persistent.
