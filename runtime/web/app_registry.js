@@ -228,6 +228,23 @@ export class AppRegistry {
     this._pendingNotifs = new Map();
     /** Monotonic notify id allocator (host-side) shared with the tab side. */
     this._nextNotifyId = 1;
+
+    /**
+     * Stone 14.4 / 14.6 — pending main-thread cap requests
+     * (clipboard read/write, geo get_position). Keyed by an
+     * AppRegistry-allocated `cap_id` that the tab echoes back; value
+     * is the routing entry. Distinct from `_pendingNotifs` because
+     * notifications carry their own id namespace that the app holds
+     * after the round-trip; cap requests are one-shot — the id is
+     * internal-only.
+     *
+     * @type {Map<number, { packageId: string, futureId: bigint, kind: "clip_read" | "clip_write" | "geo_get" }>}
+     */
+    this._pendingCaps = new Map();
+    /** Monotonic cap id allocator. Disjoint from notify ids by virtue
+     *  of the separate map; the `type` field on each tab message is
+     *  what disambiguates routing. */
+    this._nextCapId = 1;
     /**
      * Stone 14.3 — owners of in-flight notifications, by id. Cleared
      * once the tab confirms `notify_post` succeeded (the id then
@@ -711,6 +728,7 @@ export class AppRegistry {
     // watchdog kill path further down.
     this._disposeWsForPackage(packageId);
     this._disposeNotificationsForPackage(packageId);
+    this._disposeCapsForPackage(packageId);
     return 1;
   }
 
@@ -841,6 +859,7 @@ export class AppRegistry {
         }
         this._disposeWsForPackage(proc.packageId);
         this._disposeNotificationsForPackage(proc.packageId);
+        this._disposeCapsForPackage(proc.packageId);
         return;
       }
       // WARN — log once per crossing (proc.warned latches until a
@@ -1347,6 +1366,9 @@ export class AppRegistry {
       case FIRE.NOTIFY_CLOSE:
         this._handleNotifyClose(packageId, args);
         return;
+      case FIRE.VIBRATE:
+        this._handleVibrate(packageId, args);
+        return;
     }
 
     const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
@@ -1652,6 +1674,36 @@ export class AppRegistry {
         }
         const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
         this._handleNotifyPost(packageId, futureId, args);
+        return;
+      }
+      // Stone 14.4 — Clipboard.
+      case IO.CLIPBOARD_READ_TEXT: {
+        if (!this._hasGrant(packageId, "akiva.permission.CLIPBOARD")) {
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("clipboard: denied (no CLIPBOARD grant)");
+          break;
+        }
+        this._handleClipboardRead(packageId, futureId);
+        return;
+      }
+      case IO.CLIPBOARD_WRITE_TEXT: {
+        if (!this._hasGrant(packageId, "akiva.permission.CLIPBOARD")) {
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("clipboard: denied (no CLIPBOARD grant)");
+          break;
+        }
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        this._handleClipboardWrite(packageId, futureId, args);
+        return;
+      }
+      // Stone 14.6 — Geolocation.
+      case IO.GEO_GET_POSITION: {
+        if (!this._hasGrant(packageId, "akiva.permission.LOCATION")) {
+          status = STATUS.ERROR;
+          payload = this._encoder.encode("geo: denied (no LOCATION grant)");
+          break;
+        }
+        this._handleGeoGetPosition(packageId, futureId);
         return;
       }
       default:
@@ -2509,6 +2561,105 @@ export class AppRegistry {
       new Uint8Array([code]));
   }
 
+  // ── Stone 14.4 — Clipboard bridge ────────────────────────────────────
+
+  _handleClipboardRead(packageId, futureId) {
+    const capId = this._nextCapId++;
+    this._pendingCaps.set(capId, { packageId, futureId, kind: "clip_read" });
+    this._sendToTab({ type: "clipboard_read_text", capId, packageId });
+  }
+
+  _handleClipboardWrite(packageId, futureId, args) {
+    const text = this._decoder.decode(args);
+    const capId = this._nextCapId++;
+    this._pendingCaps.set(capId, { packageId, futureId, kind: "clip_write" });
+    this._sendToTab({ type: "clipboard_write_text", capId, packageId, text });
+  }
+
+  /** Called by `worker.js` after the tab finishes a clipboard read.
+   *  `text` is `null` on browser refusal; `reason` (when set)
+   *  carries the host's error message. */
+  completeClipboardRead(capId, text, reason) {
+    const pending = this._pendingCaps.get(capId);
+    if (!pending) return;
+    this._pendingCaps.delete(capId);
+    if (pending.kind !== "clip_read") return;
+    if (text == null) {
+      this._postHostOpDone(pending.packageId, pending.futureId, STATUS.ERROR,
+        this._encoder.encode(reason || "clipboard read refused"));
+    } else {
+      this._postHostOpDone(pending.packageId, pending.futureId, STATUS.READY,
+        this._encoder.encode(text));
+    }
+  }
+
+  /** Called by `worker.js` after the tab finishes a clipboard write. */
+  completeClipboardWrite(capId, ok, reason) {
+    const pending = this._pendingCaps.get(capId);
+    if (!pending) return;
+    this._pendingCaps.delete(capId);
+    if (pending.kind !== "clip_write") return;
+    if (ok) {
+      this._postHostOpDone(pending.packageId, pending.futureId, STATUS.READY, new Uint8Array(0));
+    } else {
+      this._postHostOpDone(pending.packageId, pending.futureId, STATUS.ERROR,
+        this._encoder.encode(reason || "clipboard write refused"));
+    }
+  }
+
+  // ── Stone 14.5 — Vibration (fire-and-forget) ─────────────────────────
+
+  _handleVibrate(packageId, args) {
+    if (args.length < 2) return;
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const count = view.getUint16(0, true);
+    if (2 + count * 4 > args.length) {
+      this._log("warn", `[${packageId}] vibrate: pattern truncated — dropped`);
+      return;
+    }
+    const pattern = new Array(count);
+    for (let i = 0; i < count; i++) {
+      pattern[i] = view.getUint32(2 + i * 4, true);
+    }
+    // No cap_id needed — fire-and-forget; the tab dispatches
+    // synchronously.
+    this._sendToTab({ type: "vibrate", packageId, pattern });
+  }
+
+  // ── Stone 14.6 — Geolocation bridge ──────────────────────────────────
+
+  _handleGeoGetPosition(packageId, futureId) {
+    const capId = this._nextCapId++;
+    this._pendingCaps.set(capId, { packageId, futureId, kind: "geo_get" });
+    this._sendToTab({ type: "geo_get_position", capId, packageId });
+  }
+
+  /** Called by `worker.js` after the browser settles a geolocation
+   *  request. `position` is an object mirroring the wire fields, or
+   *  `null` if the read failed; `reason` is the browser's reason
+   *  text. */
+  completeGeoGetPosition(capId, position, reason) {
+    const pending = this._pendingCaps.get(capId);
+    if (!pending) return;
+    this._pendingCaps.delete(capId);
+    if (pending.kind !== "geo_get") return;
+    if (position == null) {
+      this._postHostOpDone(pending.packageId, pending.futureId, STATUS.ERROR,
+        this._encoder.encode(reason || "geolocation refused"));
+      return;
+    }
+    const out = encodeGeoPosition(position);
+    this._postHostOpDone(pending.packageId, pending.futureId, STATUS.READY, out);
+  }
+
+  /** Drop every pending cap_req owned by `packageId`. */
+  _disposeCapsForPackage(packageId) {
+    for (const [id, entry] of this._pendingCaps) {
+      if (entry.packageId !== packageId) continue;
+      this._pendingCaps.delete(id);
+    }
+  }
+
   /** Stone 14.3 — drop every pending notification owned by a
    *  terminated package so its replies don't leak past worker
    *  death. Symmetric with `_disposeWsForPackage`. */
@@ -2647,6 +2798,44 @@ function decodeNotifyPostArgs(args, decoder) {
   return { title, body, tag };
 }
 
+// Stone 14.6 — encode a `Position`-shaped JS object into the wire
+// format documented on `IO::GEO_GET_POSITION`. Mirror of
+// `akiva_sdk::geolocation::decode_position`.
+function encodeGeoPosition(p) {
+  const enc = new TextEncoder();
+  // Compute size: 3 × f64 (24) + 3 optional triplets (max 9 × f64 + 3 × u8 = 75) + ts (8).
+  // Allocate the max conservatively; we'll slice.
+  const buf = new ArrayBuffer(24 + 27 + 8);
+  const view = new DataView(buf);
+  let cur = 0;
+  view.setFloat64(cur, p.latitude, true); cur += 8;
+  view.setFloat64(cur, p.longitude, true); cur += 8;
+  view.setFloat64(cur, p.accuracy, true); cur += 8;
+  if (typeof p.altitude === "number" && Number.isFinite(p.altitude)) {
+    view.setUint8(cur, 1); cur += 1;
+    view.setFloat64(cur, p.altitude, true); cur += 8;
+  } else {
+    view.setUint8(cur, 0); cur += 1;
+  }
+  if (typeof p.speed === "number" && Number.isFinite(p.speed)) {
+    view.setUint8(cur, 1); cur += 1;
+    view.setFloat64(cur, p.speed, true); cur += 8;
+  } else {
+    view.setUint8(cur, 0); cur += 1;
+  }
+  if (typeof p.heading === "number" && Number.isFinite(p.heading)) {
+    view.setUint8(cur, 1); cur += 1;
+    view.setFloat64(cur, p.heading, true); cur += 8;
+  } else {
+    view.setUint8(cur, 0); cur += 1;
+  }
+  view.setFloat64(cur, p.timestamp ?? 0, true); cur += 8;
+  // Suppress unused warning; `enc` is here to keep parity with other
+  // encoders that might add string fields later.
+  void enc;
+  return new Uint8Array(buf, 0, cur);
+}
+
 function encodeHttpResponse(status, headerPairs, body) {
   // Cap the header set to 256 entries — `Response.headers.forEach`
   // on a typical server returns ~10. The cap is pure overflow
@@ -2717,6 +2906,9 @@ export const CAPABILITY_IMPORTS = Object.freeze({
   "akiva.permission.NOTIFICATIONS":   Object.freeze([]),
   "akiva.permission.NETWORK":         Object.freeze([]),
   "akiva.permission.CAMERA":          Object.freeze([]),
+  "akiva.permission.CLIPBOARD":       Object.freeze([]),
+  "akiva.permission.VIBRATE":         Object.freeze([]),
+  "akiva.permission.LOCATION":        Object.freeze([]),
 });
 
 // ── Tiny TOML parsers for values files ──────────────────────────────────

@@ -63,6 +63,11 @@ pub mod fire {
     /// `[notify_id: u32 LE]`. Idempotent. Capability gated by
     /// `akiva.permission.NOTIFICATIONS`.
     pub const NOTIFY_CLOSE: u32 = 0x000C;
+    /// Stone 14.5 — Trigger device haptic vibration. Args:
+    /// `[count: u16 LE | duration_ms: u32 LE; count]`. An empty
+    /// pattern (`count == 0`) cancels any in-progress vibration.
+    /// Capability gated by `akiva.permission.VIBRATE`.
+    pub const VIBRATE: u32 = 0x000D;
 }
 
 /// I/O operations. Range `0x0101..=0x01FF`.
@@ -189,6 +194,31 @@ pub mod io {
     /// existing notification rather than spawning a second.
     /// Gated by `akiva.permission.NOTIFICATIONS`.
     pub const NOTIFY_POST: u32 = 0x0110;
+    /// Stone 14.4 — Read clipboard text. Args: `[]`. Result:
+    /// `[text: utf8...]`. ERROR on permission denial or no text on
+    /// the clipboard. Capability gated by `akiva.permission.CLIPBOARD`.
+    /// The browser also enforces user-activation + page-focus;
+    /// calls outside those constraints surface as ERROR with the
+    /// browser's reason text.
+    pub const CLIPBOARD_READ_TEXT: u32 = 0x0111;
+    /// Stone 14.4 — Write clipboard text. Args: `[text: utf8...]`.
+    /// Result: empty (READY = success). Capability gated by
+    /// `akiva.permission.CLIPBOARD`. Same browser activation rules
+    /// as `CLIPBOARD_READ_TEXT`.
+    pub const CLIPBOARD_WRITE_TEXT: u32 = 0x0112;
+    /// Stone 14.6 — One-shot device geolocation read. Args: `[]`.
+    /// Result:
+    /// ```text
+    /// [lat: f64 LE | lon: f64 LE | accuracy_m: f64 LE
+    ///  | has_alt: u8 | (alt: f64 LE)?
+    ///  | has_speed: u8 | (speed: f64 LE)?
+    ///  | has_heading: u8 | (heading: f64 LE)?
+    ///  | timestamp_ms: f64 LE]
+    /// ```
+    /// ERROR with the browser's reason on permission denial,
+    /// position-unavailable, or timeout. Capability gated by
+    /// `akiva.permission.LOCATION`.
+    pub const GEO_GET_POSITION: u32 = 0x0113;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds. Mirror of
@@ -266,6 +296,7 @@ mod tests {
         assert!(fire::WT_CLOSE_STREAM <= 0x00FF);
         assert!(fire::WT_CLOSE <= 0x00FF);
         assert!(fire::NOTIFY_CLOSE <= 0x00FF);
+        assert!(fire::VIBRATE <= 0x00FF);
         assert!(io::TEXT_WIDTH >= 0x0101 && io::TEXT_WIDTH <= 0x01FF);
         assert!(io::STORAGE_SET >= 0x0101 && io::STORAGE_SET <= 0x01FF);
         assert!(io::STORAGE_DELETE >= 0x0101 && io::STORAGE_DELETE <= 0x01FF);
@@ -279,6 +310,9 @@ mod tests {
         assert!(io::WT_RECV_STREAM >= 0x0101 && io::WT_RECV_STREAM <= 0x01FF);
         assert!(io::NOTIFY_REQUEST_PERMISSION >= 0x0101 && io::NOTIFY_REQUEST_PERMISSION <= 0x01FF);
         assert!(io::NOTIFY_POST >= 0x0101 && io::NOTIFY_POST <= 0x01FF);
+        assert!(io::CLIPBOARD_READ_TEXT >= 0x0101 && io::CLIPBOARD_READ_TEXT <= 0x01FF);
+        assert!(io::CLIPBOARD_WRITE_TEXT >= 0x0101 && io::CLIPBOARD_WRITE_TEXT <= 0x01FF);
+        assert!(io::GEO_GET_POSITION >= 0x0101 && io::GEO_GET_POSITION <= 0x01FF);
         assert_eq!(status::PENDING, 0);
         assert_eq!(status::READY,   1);
         assert_eq!(status::ERROR,   2);

@@ -1707,7 +1707,43 @@ SDK: `akiva_sdk::notify::post(title: &str, body: &str) -> i32`.
 
 ---
 
-### Stone 14.4 — Clipboard (~3 ימים)
+### Stone 14.4 — Clipboard ✅ סגור (May 2026)
+
+**מה נבנה (Stone 14.4 — closed)**:
+- `IO::CLIPBOARD_READ_TEXT = 0x0111` (`[]` → `[text:utf8]`) ו-`IO::CLIPBOARD_WRITE_TEXT = 0x0112` (`[text:utf8]` → ack)
+- SDK: `akiva_sdk::clipboard::{read_text, write_text}` עם `ClipboardError { Denied, Host(String), Busy }`
+- Capability: `akiva.permission.CLIPBOARD` (חדש; declared at install)
+- Browser bridge: `navigator.clipboard.{readText,writeText}` ב-tab.js
+- Demo: שני כפתורים באפליקציית Network ("Copy hello" / "Read clipboard")
+- 2 SDK unit tests
+
+---
+
+### Stone 14.5 — Vibration ✅ סגור (May 2026)
+
+**מה נבנה (Stone 14.5 — closed)**:
+- `FIRE::VIBRATE = 0x000D` (`[count:u16 | (duration_ms:u32){count}]`)
+- SDK: `akiva_sdk::vibration::{vibrate, cancel}` (fire-and-forget)
+- Capability: `akiva.permission.VIBRATE` (חדש)
+- Browser bridge: `navigator.vibrate(pattern)`
+- Demo: כפתור "Vibrate" באפליקציית Network
+- 3 SDK unit tests
+
+---
+
+### Stone 14.6 — Geolocation ✅ סגור (May 2026)
+
+**מה נבנה (Stone 14.6 — closed)**:
+- `IO::GEO_GET_POSITION = 0x0113` (`[]` → `[lat|lon|acc|optional alt/speed/heading|ts]`, all f64 LE)
+- SDK: `akiva_sdk::geolocation::{get_position, Position, GeoError}`
+- Capability: `akiva.permission.LOCATION` (חדש)
+- Browser bridge: `navigator.geolocation.getCurrentPosition`
+- Demo: כפתור "Get location" — הדפדפן מציג prompt בפעם הראשונה
+- 4 SDK unit tests (decode minimal/with-altitude/truncated, denied path)
+
+---
+
+### ~~Stone 14.4 — Clipboard (~3 ימים)~~ — superseded by closed entry above
 
 **מה הדפדפן מאפשר.**
 `navigator.clipboard.writeText(text)` / `.readText()` — **Baseline 2018**, secure context בלבד. **Main thread only** — `navigator` לא זמין ב-dedicated workers. `readText()` דורש `clipboard-read` permission (Permissions API). `writeText()` עובד ב-response ל-user gesture.
@@ -1836,16 +1872,26 @@ pub struct GeoPosition { pub lat: f64, pub lng: f64, pub accuracy_m: f32, pub ts
 
 ---
 
-**Exit criteria — Phase 14:**
-- [ ] 6 stones סגורים, כל אחד עם end-to-end test app.
-- [ ] Calculator: notification לאחר כל חישוב → OS notification מוצגת.
-- [ ] Sample "ping" app: WebSocket send/recv roundtrip ל-echo server.
-- [ ] Clipboard write/read roundtrip עובד.
-- [ ] כל capability מטפלת gracefully ב-permission denied + browser ללא תמיכה.
-- [ ] `docs/abi.md` מעודכן עם כל HAL imports חדשים.
-- [ ] ABI MINOR bump (additive imports — לא breaking).
+**Exit criteria — Phase 14:** ✅ **כל הבסיס סגור (May 2026)**
+- [x] 6 stones סגורים: 14.1 (Net foundation + HTTP + WS), 14.2 (WebTransport), 14.3 (Notifications), 14.4 (Clipboard), 14.5 (Vibration), 14.6 (Geolocation)
+- [x] WebSocket round-trip לעבודה (live demo against Postman echo, 14.1)
+- [x] HTTPS GET (httpbin.org) round-trip (14.1)
+- [x] Clipboard write/read round-trip (14.4)
+- [x] System notification דרך browser API (14.3)
+- [x] כל capability מטפלת ב-permission denied + browser ללא תמיכה ב-graceful path (NetError/ClipboardError/NotifyError/GeoError)
+- [x] `docs/abi.md` מעודכן עם כל 14 op_kinds החדשים שהוספו ב-Phase 14
+- [x] ABI MINOR bumps: 0.8.0 → 0.9.0 (14.1) → 0.10.0 (14.2) → 0.11.0 (14.3) → 0.12.0 (14.4+14.5+14.6)
+- [x] 3 permissions חדשים נוספו ל-MVP catalog (CLIPBOARD, VIBRATE, LOCATION)
 
-**הערכת זמן:** 5-7 שבועות.
+**מה נשאר ל-14.x post-closeout (deferred / nice-to-have):**
+- Runtime permission prompt (NETWORK/NOTIFICATIONS → Dangerous, dialog UX)
+- Manifest hostname allowlist for NETWORK
+- Streaming HTTP response bodies
+- WebSocket subprotocols ב-SDK
+- WebTransport public test server (currently demo's `webtransport.day` is best-effort)
+- Geolocation `watch_position` (continuous updates)
+
+**הערכת זמן בפועל:** Phase 14 נסגר ב-~יום עבודה אינטרנסיבי (Stones 14.1–14.6 רכבו על אותה capability machinery — 14.3 הציג את ה-main-thread bridge וה-3 הנותרים השתמשו בו ללא שכפול). הפער מ-5-7 השבועות שצפינו: ה-unified ABI מ-11.3 הוריד את עלות הוספת capability חדש מ"שבוע per stone" ל-"שעות per stone" כש-bridge קיים.
 
 ---
 

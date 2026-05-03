@@ -272,7 +272,101 @@ function onKernelMessage(msg) {
     case "notify_close":
       handleNotifyCloseFromKernel(msg);
       break;
+    // Stone 14.4 — Clipboard.
+    case "clipboard_read_text":
+      handleClipboardRead(msg);
+      break;
+    case "clipboard_write_text":
+      handleClipboardWrite(msg);
+      break;
+    // Stone 14.5 — Vibration (fire-and-forget).
+    case "vibrate":
+      handleVibrate(msg);
+      break;
+    // Stone 14.6 — Geolocation.
+    case "geo_get_position":
+      handleGeoGetPosition(msg);
+      break;
   }
+}
+
+// ── Stone 14.4 — Clipboard ───────────────────────────────────────────────
+
+function handleClipboardRead({ capId }) {
+  if (!navigator.clipboard?.readText) {
+    session.send({ type: "clipboard_read_done", capId, text: null, reason: "navigator.clipboard.readText unavailable" });
+    return;
+  }
+  navigator.clipboard.readText().then((text) => {
+    session.send({ type: "clipboard_read_done", capId, text, reason: "" });
+  }).catch((err) => {
+    session.send({ type: "clipboard_read_done", capId, text: null, reason: String(err?.message ?? err) });
+  });
+}
+
+function handleClipboardWrite({ capId, text }) {
+  if (!navigator.clipboard?.writeText) {
+    session.send({ type: "clipboard_write_done", capId, ok: false, reason: "navigator.clipboard.writeText unavailable" });
+    return;
+  }
+  navigator.clipboard.writeText(text ?? "").then(() => {
+    session.send({ type: "clipboard_write_done", capId, ok: true, reason: "" });
+  }).catch((err) => {
+    session.send({ type: "clipboard_write_done", capId, ok: false, reason: String(err?.message ?? err) });
+  });
+}
+
+// ── Stone 14.5 — Vibration ───────────────────────────────────────────────
+
+function handleVibrate({ pattern }) {
+  if (typeof navigator.vibrate !== "function") return;
+  // Browsers silently no-op on devices without haptic hardware; we
+  // pass the pattern through and accept the same contract.
+  try {
+    if (Array.isArray(pattern) && pattern.length > 0) {
+      navigator.vibrate(pattern);
+    } else {
+      // Empty pattern cancels in-progress vibration.
+      navigator.vibrate(0);
+    }
+  } catch (_err) { /* ignore — fire-and-forget */ }
+}
+
+// ── Stone 14.6 — Geolocation ─────────────────────────────────────────────
+
+function handleGeoGetPosition({ capId }) {
+  if (!navigator.geolocation?.getCurrentPosition) {
+    session.send({ type: "geo_get_position_done", capId, position: null, reason: "geolocation API unavailable" });
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      const c = pos.coords ?? {};
+      session.send({
+        type: "geo_get_position_done",
+        capId,
+        position: {
+          latitude:  c.latitude  ?? 0,
+          longitude: c.longitude ?? 0,
+          accuracy:  c.accuracy  ?? 0,
+          altitude:  c.altitude  ?? null,
+          speed:     c.speed     ?? null,
+          heading:   c.heading   ?? null,
+          timestamp: pos.timestamp ?? Date.now(),
+        },
+        reason: "",
+      });
+    },
+    (err) => {
+      session.send({
+        type: "geo_get_position_done",
+        capId,
+        position: null,
+        reason: err?.message ?? `geolocation error code ${err?.code}`,
+      });
+    },
+    { enableHighAccuracy: false, timeout: 10_000, maximumAge: 30_000 },
+  );
 }
 
 // ── Stone 14.3 — Notifications ───────────────────────────────────────────

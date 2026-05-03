@@ -16,9 +16,11 @@ pub mod activity;
 pub mod akml;
 pub mod app;
 pub mod canvas;
+pub mod clipboard;
 pub mod clock;
 pub mod dialog;
 pub mod executor;
+pub mod geolocation;
 pub mod intent;
 pub mod log;
 pub mod net;
@@ -33,6 +35,7 @@ pub mod storage;
 pub mod sync;
 pub mod time;
 pub mod ui;
+pub mod vibration;
 
 pub use activity::{
     block_on_ready, Activity, ActivityContext, Context, KeyEvent, KeyPhase, Metrics,

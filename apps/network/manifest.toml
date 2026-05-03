@@ -3,7 +3,7 @@ id = "com.akiva.network"
 name = "Network"
 version = "0.1.0"
 version_code = 1
-min_abi_version = "0.11.0"
+min_abi_version = "0.12.0"
 authors = ["Akiva Team"]
 description = "Smoke-test for the NETWORK capability — runs an HTTPS request and a WebSocket echo round-trip."
 category = "utilities"
@@ -34,6 +34,9 @@ categories = ["akiva.intent.category.LAUNCHER"]
 required = [
     "akiva.permission.NETWORK",
     "akiva.permission.NOTIFICATIONS",
+    "akiva.permission.CLIPBOARD",
+    "akiva.permission.VIBRATE",
+    "akiva.permission.LOCATION",
 ]
 optional = []
 

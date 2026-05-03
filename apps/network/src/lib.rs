@@ -10,9 +10,12 @@
 //! public echo and bump nothing else; the SDK surface is the
 //! contract.
 
+use akiva_sdk::clipboard;
+use akiva_sdk::geolocation;
 use akiva_sdk::net::{self, NetError, StreamEvent, WsEvent, WtDatagram};
 use akiva_sdk::notification::{self, NotifyError, PermissionStatus};
 use akiva_sdk::prelude::*;
+use akiva_sdk::vibration;
 
 #[derive(Default)]
 struct NetworkMain {
@@ -29,6 +32,8 @@ struct NetworkMain {
     ws_busy: std::rc::Rc<core::cell::Cell<bool>>,
     wt_busy: std::rc::Rc<core::cell::Cell<bool>>,
     notify_busy: std::rc::Rc<core::cell::Cell<bool>>,
+    clip_busy: std::rc::Rc<core::cell::Cell<bool>>,
+    geo_busy: std::rc::Rc<core::cell::Cell<bool>>,
 }
 
 #[async_trait(?Send)]
@@ -53,10 +58,17 @@ impl Activity for NetworkMain {
         let ws_btn = ui.button("ws", "WebSocket echo");
         let wt_btn = ui.button("wt", "WebTransport echo");
         let notify_btn = ui.button("notify", "Send notification");
-        let buttons = ui
-            .h_stack(&[http_btn, ws_btn, wt_btn, notify_btn])
-            .gap(12.0)
-            .build();
+        let net_row = ui.h_stack(&[http_btn, ws_btn, wt_btn, notify_btn])
+            .gap(12.0).build();
+
+        let clip_w_btn = ui.button("clip_w", "Copy hello");
+        let clip_r_btn = ui.button("clip_r", "Read clipboard");
+        let vibe_btn = ui.button("vibe", "Vibrate");
+        let geo_btn = ui.button("geo", "Get location");
+        let cap_row = ui.h_stack(&[clip_w_btn, clip_r_btn, vibe_btn, geo_btn])
+            .gap(12.0).build();
+
+        let buttons = ui.v_stack(&[net_row, cap_row]).gap(8.0).build();
 
         let status_text = self.status.borrow().clone();
         let status = ui.text(&status_text).size(14.0).color(0xffd0d8e8).build();
@@ -271,6 +283,67 @@ impl Activity for NetworkMain {
                     Err(e) => {
                         *status.borrow_mut() = format!("post failed: {e:?}");
                     }
+                }
+                busy.set(false);
+            });
+        }
+
+        // ── Clipboard write ───────────────────────────────────────
+        if ui.was_clicked("clip_w") && !self.clip_busy.get() {
+            self.clip_busy.set(true);
+            *self.status.borrow_mut() = "writing clipboard …".into();
+            let status = self.status.clone();
+            let busy = self.clip_busy.clone();
+            ctx.activity_scope().spawn(async move {
+                match clipboard::write_text("hello from akiva").await {
+                    Ok(()) => *status.borrow_mut() = "clipboard: wrote \"hello from akiva\"".into(),
+                    Err(e) => *status.borrow_mut() = format!("clipboard write: {e:?}"),
+                }
+                busy.set(false);
+            });
+        }
+
+        // ── Clipboard read ────────────────────────────────────────
+        if ui.was_clicked("clip_r") && !self.clip_busy.get() {
+            self.clip_busy.set(true);
+            *self.status.borrow_mut() = "reading clipboard …".into();
+            let status = self.status.clone();
+            let busy = self.clip_busy.clone();
+            ctx.activity_scope().spawn(async move {
+                match clipboard::read_text().await {
+                    Ok(text) => {
+                        let preview: String = text.chars().take(40).collect();
+                        *status.borrow_mut() = format!("clipboard: \"{preview}\" ({} bytes)", text.len());
+                    }
+                    Err(e) => *status.borrow_mut() = format!("clipboard read: {e:?}"),
+                }
+                busy.set(false);
+            });
+        }
+
+        // ── Vibrate ───────────────────────────────────────────────
+        if ui.was_clicked("vibe") {
+            // Two short pulses with a 50ms gap between — enough to feel
+            // on devices that have haptics, no-op elsewhere.
+            vibration::vibrate(&[80, 50, 80]);
+            *self.status.borrow_mut() = "vibrate: [80, 50, 80] (silent on no-haptic devices)".into();
+        }
+
+        // ── Geolocation ───────────────────────────────────────────
+        if ui.was_clicked("geo") && !self.geo_busy.get() {
+            self.geo_busy.set(true);
+            *self.status.borrow_mut() = "getting location (browser may prompt) …".into();
+            let status = self.status.clone();
+            let busy = self.geo_busy.clone();
+            ctx.activity_scope().spawn(async move {
+                match geolocation::get_position().await {
+                    Ok(p) => {
+                        *status.borrow_mut() = format!(
+                            "location: {:.4}, {:.4} (±{:.0}m)",
+                            p.latitude, p.longitude, p.accuracy_m,
+                        );
+                    }
+                    Err(e) => *status.borrow_mut() = format!("location: {e:?}"),
                 }
                 busy.set(false);
             });

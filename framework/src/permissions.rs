@@ -96,6 +96,19 @@ pub const LAUNCH_ANY_APP:  &str = "akiva.permission.LAUNCH_ANY_APP";
 pub const NOTIFICATIONS:   &str = "akiva.permission.NOTIFICATIONS";
 pub const NETWORK:         &str = "akiva.permission.NETWORK";
 pub const CAMERA:          &str = "akiva.permission.CAMERA";
+// Stone 14.4 — read/write the system clipboard. Browser
+// `navigator.clipboard.{readText,writeText}` requires user
+// activation and the host page to be focused; the *system* grant
+// here is install-time auto-grant (Normal protection).
+pub const CLIPBOARD:       &str = "akiva.permission.CLIPBOARD";
+// Stone 14.5 — fire haptic vibration patterns via
+// `navigator.vibrate(pattern)`.
+pub const VIBRATE:         &str = "akiva.permission.VIBRATE";
+// Stone 14.6 — read device geolocation via
+// `navigator.geolocation.getCurrentPosition`. The browser still
+// shows its own permission prompt; the *system* grant gates the
+// wire op.
+pub const LOCATION:        &str = "akiva.permission.LOCATION";
 
 // ── Capability → host-import mapping (Stone 10.3) ─────────────────────
 //
@@ -147,6 +160,9 @@ pub fn imports_for_capability(name: &str) -> &'static [&'static str] {
         NOTIFICATIONS   => &[],
         NETWORK         => &[],
         CAMERA          => &[],
+        CLIPBOARD       => &[],
+        VIBRATE         => &[],
+        LOCATION        => &[],
         _ => &[],
     }
 }
@@ -185,6 +201,9 @@ pub fn declare_mvp_permissions(controller: &mut PermissionController) {
         (NOTIFICATIONS,   "Post notifications to the system tray."),
         (NETWORK,         "Make outbound network requests."),
         (CAMERA,          "Capture images from a camera device."),
+        (CLIPBOARD,       "Read and write the system clipboard."),
+        (VIBRATE,         "Trigger haptic vibration patterns."),
+        (LOCATION,        "Read device geolocation."),
     ];
     for (name, description) in set {
         controller.declare(PermissionDecl {
@@ -200,17 +219,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn declare_mvp_permissions_registers_all_six() {
+    fn declare_mvp_permissions_registers_all_nine() {
         let mut c = PermissionController::new();
         declare_mvp_permissions(&mut c);
         for name in [
             STORAGE_SANDBOX, QUERY_PACKAGES, LAUNCH_ANY_APP,
             NOTIFICATIONS, NETWORK, CAMERA,
+            CLIPBOARD, VIBRATE, LOCATION,
         ] {
             assert!(c.is_declared(name), "{name} must be declared after boot-time registration");
         }
-        assert_eq!(c.declarations().count(), 6,
-            "MVP must declare exactly six permissions; adding one requires a roadmap entry");
+        assert_eq!(c.declarations().count(), 9,
+            "MVP declares: 6 from Stones 9-13 + 3 from Phase 14 (CLIPBOARD/VIBRATE/LOCATION). Adding one requires a roadmap entry.");
     }
 
     #[test]

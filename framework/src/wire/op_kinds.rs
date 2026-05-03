@@ -90,6 +90,12 @@ pub mod fire {
     /// physically dismissed by the host; the app may still hold
     /// the handle but `close` is a no-op after the first call.
     pub const NOTIFY_CLOSE: u32 = 0x000C;
+    /// Stone 14.5 — Trigger a haptic vibration pattern.
+    /// Args: `[count: u16 LE | (duration_ms: u32 LE){count}]`.
+    /// Empty pattern (count==0) cancels any in-progress vibration
+    /// (matches `navigator.vibrate(0)` semantics). Capability
+    /// gated by `akiva.permission.VIBRATE`.
+    pub const VIBRATE: u32 = 0x000D;
 }
 
 /// I/O operations — the app calls `akiva_host_io_start(op_kind, args…)`
@@ -315,6 +321,34 @@ pub mod io {
     /// want every event to surface separately should leave
     /// `tag` empty.
     pub const NOTIFY_POST: u32 = 0x0110;
+
+    /// Stone 14.4 — Read clipboard text. Args: `[]`. Result:
+    /// `[text: utf8...]`. Capability gated by
+    /// `akiva.permission.CLIPBOARD`. ERROR on browser refusal
+    /// (no user activation, no focus, no text content).
+    pub const CLIPBOARD_READ_TEXT: u32 = 0x0111;
+
+    /// Stone 14.4 — Write clipboard text. Args: `[text: utf8...]`.
+    /// Result: empty (READY = success). Same browser activation
+    /// rules as the read.
+    pub const CLIPBOARD_WRITE_TEXT: u32 = 0x0112;
+
+    /// Stone 14.6 — One-shot geolocation read. Args: `[]`.
+    /// Result wire format:
+    /// ```text
+    /// [lat: f64 LE | lon: f64 LE | accuracy_m: f64 LE
+    ///  | has_alt: u8 | (alt: f64 LE)?
+    ///  | has_speed: u8 | (speed: f64 LE)?
+    ///  | has_heading: u8 | (heading: f64 LE)?
+    ///  | timestamp_ms: f64 LE]
+    /// ```
+    /// `has_*` is the present byte; the f64 follows only if it
+    /// equals `1`. Optional fields collapse to absent when the
+    /// browser reports `null` (e.g. browsers without GPS rarely
+    /// return altitude). ERROR with utf8 reason on permission
+    /// denial, position-unavailable, or timeout. Capability
+    /// gated by `akiva.permission.LOCATION`.
+    pub const GEO_GET_POSITION: u32 = 0x0113;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds.
@@ -430,6 +464,7 @@ mod tests {
             fire::WT_SEND_DATAGRAM, fire::WT_SEND_STREAM,
             fire::WT_CLOSE_STREAM, fire::WT_CLOSE,
             fire::NOTIFY_CLOSE,
+            fire::VIBRATE,
         ];
         let io = [
             io::TEXT_WIDTH, io::QUERY_PACKAGES,
@@ -439,6 +474,8 @@ mod tests {
             io::WT_OPEN, io::WT_RECV_DATAGRAM,
             io::WT_OPEN_BIDI, io::WT_RECV_STREAM,
             io::NOTIFY_REQUEST_PERMISSION, io::NOTIFY_POST,
+            io::CLIPBOARD_READ_TEXT, io::CLIPBOARD_WRITE_TEXT,
+            io::GEO_GET_POSITION,
         ];
         for k in fire { assert!((0x0001..=0x00FF).contains(&k), "fire op {k:#x} out of range"); }
         for k in io   { assert!((0x0101..=0x01FF).contains(&k), "io op {k:#x} out of range"); }
@@ -458,6 +495,7 @@ mod tests {
             fire::WT_SEND_DATAGRAM, fire::WT_SEND_STREAM,
             fire::WT_CLOSE_STREAM, fire::WT_CLOSE,
             fire::NOTIFY_CLOSE,
+            fire::VIBRATE,
         ];
         for (i, a) in fire.iter().enumerate() {
             for b in &fire[i + 1..] {
@@ -472,6 +510,8 @@ mod tests {
             io::WT_OPEN, io::WT_RECV_DATAGRAM,
             io::WT_OPEN_BIDI, io::WT_RECV_STREAM,
             io::NOTIFY_REQUEST_PERMISSION, io::NOTIFY_POST,
+            io::CLIPBOARD_READ_TEXT, io::CLIPBOARD_WRITE_TEXT,
+            io::GEO_GET_POSITION,
         ];
         for (i, a) in io.iter().enumerate() {
             for b in &io[i + 1..] {
@@ -501,6 +541,7 @@ mod tests {
         assert_eq!(fire::WT_CLOSE_STREAM,           sdk::fire::WT_CLOSE_STREAM);
         assert_eq!(fire::WT_CLOSE,                  sdk::fire::WT_CLOSE);
         assert_eq!(fire::NOTIFY_CLOSE,              sdk::fire::NOTIFY_CLOSE);
+        assert_eq!(fire::VIBRATE,                   sdk::fire::VIBRATE);
         assert_eq!(io::TEXT_WIDTH,                  sdk::io::TEXT_WIDTH);
         assert_eq!(io::QUERY_PACKAGES,              sdk::io::QUERY_PACKAGES);
         assert_eq!(io::STORAGE_GET,                 sdk::io::STORAGE_GET);
@@ -517,6 +558,9 @@ mod tests {
         assert_eq!(io::WT_RECV_STREAM,              sdk::io::WT_RECV_STREAM);
         assert_eq!(io::NOTIFY_REQUEST_PERMISSION,   sdk::io::NOTIFY_REQUEST_PERMISSION);
         assert_eq!(io::NOTIFY_POST,                 sdk::io::NOTIFY_POST);
+        assert_eq!(io::CLIPBOARD_READ_TEXT,         sdk::io::CLIPBOARD_READ_TEXT);
+        assert_eq!(io::CLIPBOARD_WRITE_TEXT,        sdk::io::CLIPBOARD_WRITE_TEXT);
+        assert_eq!(io::GEO_GET_POSITION,            sdk::io::GEO_GET_POSITION);
         assert_eq!(status::PENDING,                 sdk::status::PENDING);
         assert_eq!(status::READY,                   sdk::status::READY);
         assert_eq!(status::ERROR,                   sdk::status::ERROR);

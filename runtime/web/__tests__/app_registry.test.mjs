@@ -1266,6 +1266,9 @@ describe("AUTO_IMPORTS / CAPABILITY_IMPORTS — cross-side parity", () => {
       "akiva.permission.NOTIFICATIONS",
       "akiva.permission.NETWORK",
       "akiva.permission.CAMERA",
+      "akiva.permission.CLIPBOARD",
+      "akiva.permission.VIBRATE",
+      "akiva.permission.LOCATION",
     ]) {
       expect(CAPABILITY_IMPORTS[cap]).toEqual([]);
     }

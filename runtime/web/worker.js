@@ -104,6 +104,18 @@ self.addEventListener("message", (e) => {
     case "notify_perm_done":
       apps.completeNotifyPermission(msg.notifyId, msg.status ?? "default");
       break;
+    // Stone 14.4 / 14.6 — main-thread cap_resp routing. Each
+    // capability replies with `{type, capId, ...}`; AppRegistry
+    // demuxes by `capId` against its `_pendingCaps` map.
+    case "clipboard_read_done":
+      apps.completeClipboardRead(msg.capId, msg.text ?? null, msg.reason ?? "");
+      break;
+    case "clipboard_write_done":
+      apps.completeClipboardWrite(msg.capId, !!msg.ok, msg.reason ?? "");
+      break;
+    case "geo_get_position_done":
+      apps.completeGeoGetPosition(msg.capId, msg.position ?? null, msg.reason ?? "");
+      break;
     case "resize": {
       // Stone 13.4 — primary's resize re-sizes the worker's
       // OffscreenCanvas-backed renderer; follower resizes only update

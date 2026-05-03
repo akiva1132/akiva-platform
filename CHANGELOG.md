@@ -10,6 +10,50 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [0.12.0] — 2026-05 (Stones 14.4 + 14.5 + 14.6 — Phase 14 closeout)
+
+**MINOR** — additive: 6 new op_kinds (3 io, 1 fire) plus 3 new
+permission constants (`CLIPBOARD`, `VIBRATE`, `LOCATION`). All ride
+the main-thread `cap_req`/`cap_resp` bridge introduced in 14.3.
+This bump closes Phase 14 — every browser capability the
+post-MVP roadmap targeted now has a wire path, an SDK, and a
+permission gate.
+
+- **Added (Stone 14.4 — Clipboard).**
+  - `IO::CLIPBOARD_READ_TEXT = 0x0111` — `[]` → `[text:utf8]`
+  - `IO::CLIPBOARD_WRITE_TEXT = 0x0112` — `[text:utf8]` → `[]`
+  - SDK: `akiva_sdk::clipboard::{read_text, write_text}`,
+    `ClipboardError { Denied, Host(String), Busy }`
+  - Capability: `akiva.permission.CLIPBOARD`
+  - Browser layer: `navigator.clipboard.{readText,writeText}`
+- **Added (Stone 14.5 — Vibration).**
+  - `FIRE::VIBRATE = 0x000D` — `[count:u16 LE | (ms:u32 LE){count}]`.
+    Empty pattern cancels in-progress vibration.
+  - SDK: `akiva_sdk::vibration::{vibrate, cancel}` (fire-and-forget)
+  - Capability: `akiva.permission.VIBRATE`
+  - Browser layer: `navigator.vibrate(pattern)`
+- **Added (Stone 14.6 — Geolocation).**
+  - `IO::GEO_GET_POSITION = 0x0113` — `[]` → `[lat:f64 | lon:f64
+    | accuracy:f64 | optional alt/speed/heading | ts:f64]`
+  - SDK: `akiva_sdk::geolocation::{get_position, Position, GeoError}`
+  - Capability: `akiva.permission.LOCATION`
+  - Browser layer: `navigator.geolocation.getCurrentPosition`
+- **Permissions catalog.** `framework::permissions` MVP set went
+  from 6 to 9 entries. The "exactly 6" tripwire test was renamed
+  to "exactly 9" with the same intent. All three new permissions
+  ship at `ProtectionLevel::Normal` (install-time auto-grant).
+- **AppRegistry plumbing.** New `_pendingCaps` map keyed by
+  AppRegistry-allocated `cap_id` for one-shot main-thread cap
+  requests (clipboard, geolocation). `_disposeCapsForPackage`
+  hooked into the same termination paths as WS / WT / notification
+  cleanup. `completeClipboardRead` / `completeClipboardWrite` /
+  `completeGeoGetPosition` are the symmetric `host_op_done`
+  routers.
+- **Demo.** `apps/network` gains four buttons: `Copy hello`, `Read
+  clipboard`, `Vibrate`, `Get location`. Manifest now declares all
+  five Phase 14 grants (NETWORK, NOTIFICATIONS, CLIPBOARD,
+  VIBRATE, LOCATION).
+
 ## [0.11.0] — 2026-05 (Stone 14.3 — Notifications)
 
 **MINOR** — additive: 3 new op_kinds (2 io, 1 fire), no kernel

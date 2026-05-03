@@ -749,6 +749,16 @@ function dispatchFire(opKind, args) {
       postSideEffect(opKind, args);
       return 0;
     }
+    // Stone 14.5 — Vibration. Pattern can be empty (cancel).
+    case FIRE.VIBRATE: {
+      if (!grants.has("akiva.permission.VIBRATE")) {
+        postLog("warn", `fire(VIBRATE): denied — no VIBRATE grant`);
+        return 2;
+      }
+      if (args.length < 2) return 1;  // at least the count u16
+      postSideEffect(opKind, args);
+      return 0;
+    }
     default:
       postLog("warn", `fire(0x${opKind.toString(16)}): unknown op_kind`);
       return 1;
@@ -909,6 +919,38 @@ function dispatchIoStart(opKind, args) {
     case IO.NOTIFY_POST: {
       if (!grants.has("akiva.permission.NOTIFICATIONS")) {
         postLog("warn", `io_start(0x${opKind.toString(16)}): denied — no NOTIFICATIONS grant`);
+        return 0n;
+      }
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
+      postMessage(
+        { type: "host_op", future_id: fid, op_kind: opKind, args },
+        [args.buffer],
+      );
+      return fid;
+    }
+    // Stone 14.4 — Clipboard. Distinct grant; same main-thread
+    // bridge pattern as 14.3 (browser `navigator.clipboard` lives
+    // on the Window).
+    case IO.CLIPBOARD_READ_TEXT:
+    case IO.CLIPBOARD_WRITE_TEXT: {
+      if (!grants.has("akiva.permission.CLIPBOARD")) {
+        postLog("warn", `io_start(0x${opKind.toString(16)}): denied — no CLIPBOARD grant`);
+        return 0n;
+      }
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
+      postMessage(
+        { type: "host_op", future_id: fid, op_kind: opKind, args },
+        [args.buffer],
+      );
+      return fid;
+    }
+    // Stone 14.6 — Geolocation. Browser permission prompt fires
+    // automatically on first `getCurrentPosition` call.
+    case IO.GEO_GET_POSITION: {
+      if (!grants.has("akiva.permission.LOCATION")) {
+        postLog("warn", `io_start(GEO_GET_POSITION): denied — no LOCATION grant`);
         return 0n;
       }
       const fid = nextFutureId++;
