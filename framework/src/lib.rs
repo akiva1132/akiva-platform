@@ -145,10 +145,13 @@ pub fn boot(
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
             diagnostic_log: Vec::new(),
-            // Stone 13.3 follow-up — DISABLED until first-launch
-            // animation diagnosis lands. See Framework::animations_disabled
-            // doc-comment for rationale.
-            animations_disabled: true,
+            // Stone 13.3 follow-up — re-enabled after the
+            // arm-on-first-paint fix landed (gate moved from
+            // `state == Resumed` to `ops_len > 0`). See the
+            // arm-check block in `render_frame` for the full
+            // rationale; the diagnostic logs that backed this
+            // fix are 875f168.
+            animations_disabled: false,
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -684,35 +687,44 @@ impl Framework {
         // Stone 13.2 — dialog paint pass.
         self.paint_dialogs(foreground);
 
-        // Stone 13.3 fix — arm any deferred transition now that the
-        // foreground activity is actually Resumed. Cold launches
-        // arrive here ~1s after `launch_app` (wasm compile time);
-        // arming with the *current* `ts` ensures the animation
-        // window starts when the activity is ready to paint, not
-        // when the launch was requested.
+        // Stone 13.3 — arm any deferred transition the moment the
+        // foreground activity has produced its **first paint** this
+        // frame. `state == Resumed` is **insufficient** as a gate:
+        // the framework marks state=Resumed the instant `launch_app`
+        // dispatches `on_resume` to the wasm worker, but on a cold
+        // launch the worker still has ~350ms of wasm compile + init
+        // ahead of it before it can answer a render dispatch. Arming
+        // on Resumed lets the 250ms animation window run entirely
+        // through that compile gap with `ops.len() == 0` — the
+        // controller progresses to rest before the activity has
+        // produced a single visible op. (Diagnosis from the
+        // 875f168 log dump.)
+        //
+        // First-paint is a strict tightening: if ops == 0 this frame,
+        // the user wouldn't see anything anyway, so deferring one
+        // more frame is invisible. Once ops > 0, the activity is
+        // genuinely paintable and the animation window is meaningful.
         if let Some(fg) = foreground {
             let pending = self.pending_transitions.contains_key(&fg);
-            let state = self.activities.state_of(fg);
             if pending {
+                let ops_len = self.compositor.surface_target(
+                    compositor::Compositor::DEFAULT_SURFACE,
+                ).ops.len();
+                let state = self.activities.state_of(fg);
                 self.diagnostic_log.push(format!(
                     "[anim] arm-check: fg={} state={:?} ts={:.0} ops={}",
-                    fg, state, ts,
-                    self.compositor.surface_target(
-                        compositor::Compositor::DEFAULT_SURFACE,
-                    ).ops.len(),
+                    fg, state, ts, ops_len,
                 ));
-            }
-            if pending
-                && matches!(state, Some(activity_manager::LifecycleState::Resumed))
-            {
-                if let Some(transition) = self.pending_transitions.remove(&fg) {
-                    self.animations.start(
-                        activity_animation_key(fg), transition, ts,
-                    );
-                    self.diagnostic_log.push(format!(
-                        "[anim] armed: id={} ts={:.0} kind={:?}",
-                        fg, ts, transition,
-                    ));
+                if ops_len > 0 {
+                    if let Some(transition) = self.pending_transitions.remove(&fg) {
+                        self.animations.start(
+                            activity_animation_key(fg), transition, ts,
+                        );
+                        self.diagnostic_log.push(format!(
+                            "[anim] armed: id={} ts={:.0} kind={:?}",
+                            fg, ts, transition,
+                        ));
+                    }
                 }
             }
         }
