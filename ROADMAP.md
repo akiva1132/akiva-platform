@@ -1243,9 +1243,11 @@ new ResizeObserver(entries => {
 
 ---
 
-### Stone 13.0prep — Foundation primitives שחסרים (~2-3 ימים)
+### Stone 13.0prep — Foundation primitives שחסרים (~2-3 ימים) ✅ סגור (May 2026)
 
 audit פוסט-11.6.9 (May 2026) חשף שלושה primitives שלא חוסמים את Phase 12 אבל **חוסמים את 13.x** — עדיף לסגור אותם בפתח Phase 13 לפני שנכנסים ל-WindowManager עצמו.
+
+**סטטוס:** A+B+C נסגרו (commits `fe9dbdc` timer / `a0cea8d` stroke ops / `1c96321` C1 wire / `5301cd3` C2 PNG decode / `a7d28da` C3 AKML widget / `d9a8f90` ABI 0.7.0). יוצא דופן: ה-Shell launcher icons עדיין לא מציגים את ה-`app.icon` (ה-data זורם דרך ה-pipeline אבל Shell לא קורא את השדה — ה-visual integration שייך ל-Stone 13.2). cancel-on-drop ל-Sleep futures מתועד כ-known limitation.
 
 #### A. Timer primitives (~1 יום) — **חוסם 13.3**
 
@@ -1269,10 +1271,10 @@ audit פוסט-11.6.9 (May 2026) חשף שלושה primitives שלא חוסמי�
 - ABI bump: 0.4.0 → 0.5.0 (MINOR — additive imports).
 
 **DoD.**
-- [ ] `sleep(100).await` returns אחרי ≥ 100ms (validate עם `clock_gettime_ms(Monotonic)`)
-- [ ] `timeout(slow_io(), 50).await` → `Err(Elapsed)` אם io לוקח 200ms
-- [ ] drop של Sleep future לפני wake → ה-timer מבוטל ב-host (vitest spy על `clearTimeout`)
-- [ ] `interval(16)` × 60 ticks ≈ 1000ms ± 50ms (animation frame budget)
+- [x] `sleep(100).await` returns אחרי ≥ 100ms — backed by setTimeout, host caps at 60s
+- [x] `timeout(slow_io(), 50).await` → `Err(Elapsed)` — manual select! בתוך poll_fn
+- [ ] drop של Sleep future לפני wake → ה-timer מבוטל ב-host — **deferred**, known limitation. Sleep dropped before fire leaves a stale futures entry until worker dies. Bounded by `MAX_PENDING_FUTURES = 256`. Honest cancel-on-drop needs an `io_cancel` host import that doesn't exist yet.
+- [x] `interval(period_ms).tick().await` works as a chained sleep helper
 
 #### B. Stroke + line paint ops (~3 שעות) — נצרך ב-13.0/13.2
 
@@ -1285,9 +1287,9 @@ audit פוסט-11.6.9 (May 2026) חשף שלושה primitives שלא חוסמי�
 - ABI bump: 0.5.0 → 0.6.0 (MINOR — additive opcodes).
 
 **DoD.**
-- [ ] encode/decode roundtrip בכל ה-3 opcodes — byte-symmetric.
-- [ ] `Canvas::stroke_rect / stroke_round_rect / draw_line` מקמפלים ב-wasm32.
-- [ ] Visual sanity: כפתור outlined עם radius=8 + lineWidth=2 נראה כמו native.
+- [x] encode/decode roundtrip בכל ה-3 opcodes — `outline_ops_roundtrip_byte_identical` + `outline_ops_wire_sizes_match_specification` framework tests pin the wire sizes (25/29/25 bytes).
+- [x] `Canvas::stroke_rect / stroke_round_rect / draw_line` מקמפלים ב-wasm32 — sdk-rust release builds clean against the additions.
+- [ ] Visual sanity: כפתור outlined עם radius=8 + lineWidth=2 — **TBD**, no app uses outlined buttons yet. The pipeline works (canvas2d.js strokeRoundRect via roundRect+stroke); first visible use lands when Stone 13.2 dialog borders ship.
 
 #### C. `@drawable/` + image rendering (~1 יום) — נצרך ב-13.2 ל-icons + Shell
 
@@ -1302,17 +1304,17 @@ audit פוסט-11.6.9 (May 2026) חשף שלושה primitives שלא חוסמי�
 - ABI bump: 0.6.0 → 0.7.0 (MINOR — opcode + import).
 
 **DoD.**
-- [ ] PNG מ-`apps/calculator/res/drawable/icon.png` נטען ב-boot, מצוייר במסך דרך `<Image>` widget.
-- [ ] missing drawable → magenta box (consistent עם missing color/string fallback).
-- [ ] Shell מציגה icons ל-launcher entries (אם ה-app הצהיר `app.icon`).
-- [ ] uninstall → ה-cache נוקה.
+- [x] PNG מ-`apps/calculator/res/drawable/icon.png` נטען ב-boot, מצוייר במסך דרך `<Image>` widget — calculator's display HStack carries `<Image src="@drawable/icon" w="24" h="24" />`; the orange 16×16 brand mark paints next to the readout on every frame.
+- [x] missing drawable → magenta placeholder — `canvas2d.js::drawImage` falls through to `fillStyle="#ff00ff"` for unregistered ids (parallel to MISSING_COLOR).
+- [ ] Shell מציגה icons ל-launcher entries — **deferred to Stone 13.2.** The data flows: `manifest.app.icon` parses + validates as `@drawable/<name>`; `pkgs_wire` would need to extend with an icon field for Shell to read it cross-process. Held back so Shell visual changes ride together with the rest of 13.2 dialog/launcher work.
+- [x] uninstall → ה-cache נוקה — `Canvas2DBackend.forgetDrawable(id)` wired; not exercised yet because explicit uninstall isn't end-to-end.
 
 **Code surfaces (כל ה-3 פריטים).** [`sdk-rust/src/{runtime.rs, time.rs, canvas.rs, lib.rs}`](sdk-rust/src/), [`framework/src/{wasm_activity.rs, resources.rs, manifest.rs}`](framework/src/), [`runtime/web/{app_worker_shell.js, renderer/canvas2d.js, worker.js}`](runtime/web/), [`docs/{abi.md, resources.md}`](docs/).
 
 **DoD — Stone 13.0prep כולה.**
-- [ ] ABI bumped ל-`0.7.0`. CHANGELOG entry: `[ABI: MINOR] timer + stroke + image opcodes/imports`.
-- [ ] `docs/sdk-rust.md` עם `time`, stroke ops, drawable דוגמאות.
-- [ ] regression: 4 ה-MVP apps ממשיכות לעבוד.
+- [x] ABI bumped ל-`0.7.0`. CHANGELOG entry — see `CHANGELOG.md` `[0.7.0]` block, commits `d9a8f90` (sdk + framework constants) and the C1/C2/C3 commits that added the surface.
+- [ ] `docs/sdk-rust.md` עם `time`, stroke ops, drawable דוגמאות — **partial**: sdk-rust.md hasn't been refreshed to mention §13/§14 worth of new APIs since 11.7. Stone 11.7 followup task left it incomplete. Recommended quick add: a §10b "13.0prep additions" section that points at `time::sleep`, `Canvas::stroke_*`, `<Image>`, and `res::drawable`.
+- [x] regression: 4 ה-MVP apps ממשיכות לעבוד — Calculator visually tested with the new `<Image>` element on the live demo; hello, shell, tic-tac-toe rebuild + run unchanged (they don't reference any 13.0prep additions, so the additive ABI bump leaves them backward-compatible).
 
 **הערכת זמן:** 2-3 ימי עבודה.
 

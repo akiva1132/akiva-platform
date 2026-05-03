@@ -261,6 +261,13 @@ extern "C" fn akiva_host_resource_string(
 // Probes: 1 if the ref is registered, 0 otherwise.
 extern "C" fn akiva_host_resource_has_color(name_ptr: *const u8, name_len: u32) -> u32;
 extern "C" fn akiva_host_resource_has_string(name_ptr: *const u8, name_len: u32) -> u32;
+
+// Stone 13.0prep C — resolve @drawable/name to a stable per-package
+// drawable_id. The host built the index at install / boot time by
+// scanning res/drawable/*.png and decoding each PNG to an ImageBitmap;
+// this lookup is an O(1) Map fetch. Id 0 is the missing-drawable
+// sentinel (renderer paints a magenta placeholder).
+extern "C" fn akiva_host_resource_drawable(name_ptr: *const u8, name_len: u32) -> u32;
 ```
 
 #### 2.3.2 Unified ABI multiplexers (Stone 11.3)
@@ -305,7 +312,7 @@ extern "C" fn akiva_host_io_poll(
 | Range            | Transport       | קבועים                                                                                              |
 |------------------|-----------------|-----------------------------------------------------------------------------------------------------|
 | `0x0001..0x00FF` | `fire`          | `LOG=0x01`, `FINISH=0x02`, `START_ACTIVITY=0x03`, `START_ACTIVITY_FOR_RESULT=0x04`, `SET_RESULT=0x05` |
-| `0x0101..0x01FF` | `io_start`/poll | `TEXT_WIDTH=0x101`, `QUERY_PACKAGES=0x102`, `STORAGE_GET=0x103`, `STORAGE_SET=0x104`                 |
+| `0x0101..0x01FF` | `io_start`/poll | `TEXT_WIDTH=0x101`, `QUERY_PACKAGES=0x102`, `STORAGE_GET=0x103`, `STORAGE_SET=0x104`, `STORAGE_DELETE=0x105`, `TIMER_SLEEP=0x106` (Stone 13.0prep A) |
 | `0x0200..`       | reserved        | streams / pushed events ל-Stone 11.4+                                                              |
 
 Args layout per op_kind (LE byte-stream — encoded inline ב-dispatcher):
@@ -453,6 +460,10 @@ fn hal_app_drain_set_result(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
 | `0x05` | `PushTransform` | `f32 dx, f32 dy, f32 scale`                                      |
 | `0x06` | `PopTransform`  | —                                                                |
 | `0x07` | `FillRoundRect` | `f32 x, f32 y, f32 w, f32 h, f32 radius, u32 rgba` *(Stone 11.6.9 #1)* |
+| `0x08` | `StrokeRect`    | `f32 x, f32 y, f32 w, f32 h, f32 width, u32 rgba` *(Stone 13.0prep B)* |
+| `0x09` | `StrokeRoundRect` | `f32 x, f32 y, f32 w, f32 h, f32 radius, f32 width, u32 rgba` *(Stone 13.0prep B)* |
+| `0x0A` | `DrawLine`      | `f32 x0, f32 y0, f32 x1, f32 y1, f32 width, u32 rgba` *(Stone 13.0prep B)* |
+| `0x0B` | `DrawImage`     | `u32 drawable_id, f32 x, f32 y, f32 w, f32 h` *(Stone 13.0prep C)* — `drawable_id` from `akiva_host_resource_drawable`; `0` paints magenta placeholder |
 
 הקודק המלא ב-[framework/src/wasm_activity.rs](../framework/src/wasm_activity.rs) — `encode_op` / `decode_frame`. תוספות (additive) יקבלו opcodes חדשים ב-continuation של הרצף; ה-decoder דוחה opcodes לא מוכרים כ-error (אי אפשר לדעת את אורך ה-payload כדי לדלג).
 

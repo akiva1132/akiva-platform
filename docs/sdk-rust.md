@@ -228,6 +228,20 @@ impl<'a> Canvas<'a> {
         &mut self, x: f32, y: f32, size: f32, rgba: u32, text: &str,
     );
 
+    // Stone 13.0prep B — outline ops. `width` is the stroke in dp;
+    // strokes are center-aligned (Canvas 2D default).
+    pub fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, width: f32, rgba: u32);
+    pub fn stroke_round_rect(
+        &mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, width: f32, rgba: u32,
+    );
+    pub fn draw_line(
+        &mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, rgba: u32,
+    );
+
+    // Stone 13.0prep C — bitmap blit. `drawable_id` from
+    // `res::drawable("name")`; `0` paints magenta placeholder.
+    pub fn draw_image(&mut self, drawable_id: u32, x: f32, y: f32, w: f32, h: f32);
+
     // Clipping + transforms (push/pop pairs)
     pub fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32);
     pub fn pop_clip(&mut self);
@@ -297,8 +311,13 @@ use akiva_sdk::res;
 
 // Get resources manually (rare — most uses go through AKML)
 let welcome: String = res::string("@string/welcome");
-let primary: Color = res::color("@color/primary");
-let padding: Dp = res::dimen("@dimen/spacing_large");
+let primary: u32    = res::color("@color/primary");
+
+// Stone 13.0prep C — `@drawable/` resolution. `0` is the missing
+// sentinel; the renderer paints a magenta placeholder for it
+// (parallel to the magenta returned by missing `@color/`).
+let icon: u32 = res::drawable("icon");
+canvas.draw_image(icon, 16.0, 16.0, 48.0, 48.0);
 
 // Format args
 let greeting = res::string_fmt("@string/hello_name", &[("name", "Akiva")]);
@@ -331,6 +350,28 @@ fn fire_and_forget_write(&self, value: &[u8]) {
 ```
 
 `storage::remove(key)` קיים סנכרוני (אין durability ack). אין `keys()` — Stone 11.6.7 הסיר את זה (כל use case שראינו אפשר להחליף ב-cache פנימי או manifest declaration).
+
+### `time::*` (Stone 13.0prep A)
+
+```rust
+use akiva_sdk::time;
+
+// Park for ≥ ms of wall-clock; resolves with ().
+time::sleep(200).await;
+
+// Race a future against a deadline.
+match time::timeout(storage::read("k").unwrap(), 500).await {
+    Ok(Ok(Some(bytes))) => self.value = bytes,
+    Ok(Ok(None)) | Ok(Err(_)) => self.value = Vec::new(),
+    Err(time::Elapsed) => log_warn!("read timed out"),
+}
+
+// Periodic ticker. First tick fires after `period_ms`, not immediately.
+let mut tick = time::interval(16);
+loop { tick.tick().await; /* one frame */ }
+```
+
+`sleep` is best-effort — subject to JS event-loop scheduling and tab-throttling on backgrounded tabs (the host caps each delay at 60s as a safety bound). Cancel-on-drop isn't honest yet — a `Sleep` dropped before its timer fires leaves a stale futures entry until the worker dies; bounded by `MAX_PENDING_FUTURES = 256`. Documented as a known limitation.
 
 ## 13. Logging
 
