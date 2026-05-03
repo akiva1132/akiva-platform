@@ -536,6 +536,7 @@ function buildImports() {
     hal_draw_pop_transform: () => backend?.popTransform(),
     hal_draw_push_clip: (x, y, w, h) => backend?.pushClip(x, y, w, h),
     hal_draw_pop_clip: () => backend?.popClip(),
+    hal_draw_set_global_alpha: (alpha) => backend?.setGlobalAlpha(alpha),
     hal_draw_present: () => backend?.present(),
 
     hal_storage_read:   (kptr, klen, outLenPtr) => halStorageRead(kptr, klen, outLenPtr),

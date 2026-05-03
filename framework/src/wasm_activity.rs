@@ -580,6 +580,11 @@ pub mod opcode {
     // [pkg_len: u16 | pkg: utf8 | name_len: u16 | name: utf8] +
     // 4 × f32. Used by the Shell to render launcher icons.
     pub const DRAW_FOREIGN_IMAGE: u8 = 12;
+    // Sets `ctx.globalAlpha` on the renderer. Persists until restored
+    // by the next save/restore (`PushTransform` / `PopTransform` /
+    // `PushClip` / `PopClip` boundaries) or until another
+    // SetGlobalAlpha. 5 bytes total: opcode + alpha (f32 LE).
+    pub const SET_GLOBAL_ALPHA:  u8 = 13;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -702,6 +707,10 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             out.extend_from_slice(&w.to_le_bytes());
             out.extend_from_slice(&h.to_le_bytes());
         }
+        PaintOp::SetGlobalAlpha { alpha } => {
+            out.push(opcode::SET_GLOBAL_ALPHA);
+            out.extend_from_slice(&alpha.to_le_bytes());
+        }
     }
 }
 
@@ -818,6 +827,10 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                 let w = read_f32(&mut bytes)?;
                 let h = read_f32(&mut bytes)?;
                 out.push(PaintOp::DrawForeignImage { package_id, name, x, y, w, h });
+            }
+            opcode::SET_GLOBAL_ALPHA => {
+                let alpha = read_f32(&mut bytes)?;
+                out.push(PaintOp::SetGlobalAlpha { alpha });
             }
             other => return Err(DecodeError::UnknownOp(other)),
         }

@@ -78,6 +78,13 @@ extern "C" {
     /// matched pairs.
     pub fn hal_draw_push_clip(x: f32, y: f32, w: f32, h: f32);
     pub fn hal_draw_pop_clip();
+    /// Sets `ctx.globalAlpha` on the renderer. Persists until restored
+    /// by a save/restore boundary or another set. Used by the animation
+    /// pipeline to fade a surface in O(1) instead of rewriting every
+    /// op's rgba — the previous implementation cloned the activity's
+    /// full ops vec per frame and multiplied each color-bearing op's
+    /// alpha byte; this cut the per-frame cost from O(ops) to O(1).
+    pub fn hal_draw_set_global_alpha(alpha: f32);
     pub fn hal_draw_present();
 
     // ── Storage ───────────────────────────────────────────────────────────

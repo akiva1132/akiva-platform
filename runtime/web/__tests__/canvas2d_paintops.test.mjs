@@ -40,6 +40,8 @@ function makeMockContext() {
     get textBaseline() { return "top"; },
     set imageSmoothingEnabled(v) { trace.push(["set:imageSmoothingEnabled", v]); },
     get imageSmoothingEnabled() { return true; },
+    set globalAlpha(v) { trace.push(["set:globalAlpha", v]); },
+    get globalAlpha()  { return 1; },
 
     fillRect:   (...a) => trace.push(["fillRect",   ...a]),
     strokeRect: (...a) => trace.push(["strokeRect", ...a]),
@@ -226,6 +228,43 @@ describe("Canvas2DBackend — every paint op reaches the canvas", () => {
     expect(tail(trace, "---init---")).toEqual([["restore"]]);
   });
 
+  // ── Quick-win — animation routes alpha through globalAlpha ────────
+
+  it("setGlobalAlpha forwards the value to ctx.globalAlpha", () => {
+    backend.setGlobalAlpha(0.5);
+    expect(tail(trace, "---init---")).toEqual([["set:globalAlpha", 0.5]]);
+  });
+
+  it("setGlobalAlpha clamps values outside [0, 1]", () => {
+    // An animation that overshoots its window would otherwise wash
+    // out (>1) or invert (<0) on some browsers.
+    backend.setGlobalAlpha(1.5);
+    backend.setGlobalAlpha(-0.2);
+    const ops = tail(trace, "---init---");
+    expect(ops).toEqual([
+      ["set:globalAlpha", 1],
+      ["set:globalAlpha", 0],
+    ]);
+  });
+
+  it("a transition wrapper sets alpha inside a save/restore scope", () => {
+    // The animation pipeline emits PushTransform → SetGlobalAlpha →
+    // (activity ops) → PopTransform. Canvas2D's `restore()` pops the
+    // entire state including globalAlpha, so a single PopTransform
+    // both undoes the translate AND resets alpha to whatever the
+    // outer surface had.
+    backend.pushTransform(50, 0, 1);
+    backend.setGlobalAlpha(0.4);
+    backend.fillRect(0, 0, 10, 10, 0xffffffff);
+    backend.popTransform();
+    const ops = tail(trace, "---init---");
+    // Expected sequence: save, translate, set:globalAlpha, fillStyle, fillRect, restore.
+    expect(ops[0]).toEqual(["save"]);
+    expect(ops[1]).toEqual(["translate", 50, 0]);
+    expect(ops[2]).toEqual(["set:globalAlpha", 0.4]);
+    expect(ops[ops.length - 1]).toEqual(["restore"]);
+  });
+
   // ── Stone 13.0prep C — drawables ──────────────────────────────────
 
   it("drawImage with a registered drawable blits the bitmap", () => {
@@ -399,6 +438,7 @@ describe("Canvas2DBackend — every paint op reaches the canvas", () => {
     fresh.popClip();
     fresh.drawImage(0, 0, 0, 1, 1);
     fresh.drawForeignImage("com.x", "y", 0, 0, 1, 1);
+    fresh.setGlobalAlpha(0.5);
     fresh.present();
   });
 });

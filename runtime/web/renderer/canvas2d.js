@@ -147,6 +147,20 @@ export class Canvas2DBackend {
     this.ctx.restore();
   }
 
+  // Set `ctx.globalAlpha` to a value in `[0, 1]`. Animations use this
+  // to fade a surface in O(1) instead of multiplying alpha into every
+  // op's rgba: with `globalAlpha = a` the GPU multiplies during
+  // composition, and a `save() / setGlobalAlpha / restore()` scope
+  // resets it cleanly. The previous animation pipeline cloned the
+  // activity's full ops vec and rewrote every color-bearing op's
+  // alpha byte per frame; that's gone.
+  setGlobalAlpha(alpha) {
+    if (!this.ctx) return;
+    // Clamp defensively — an animation that overshoots [0, 1] would
+    // either wash out (>1) or invert (<0) on some browsers.
+    this.ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  }
+
   // Stone 13.0prep C — drawable cache. The host populates this via
   // `registerDrawable(id, bitmap)` at install/boot time; `drawImage`
   // reads from it. Map<u32 id, ImageBitmap | OffscreenCanvas>.

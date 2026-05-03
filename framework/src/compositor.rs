@@ -53,6 +53,13 @@ pub enum PaintOp {
     /// either field paints the magenta missing-drawable placeholder
     /// (consistent fallback shape).
     DrawForeignImage { package_id: String, name: String, x: f32, y: f32, w: f32, h: f32 },
+    /// Set the global alpha multiplier on the renderer. Persists until
+    /// the next `SetGlobalAlpha` or until a `PopTransform` / `PopClip`
+    /// restores the canvas state stack. Used by the animation pipeline
+    /// to fade surfaces without rewriting every paint op's rgba —
+    /// Canvas2D's `globalAlpha` is a free GPU-level multiplier, so a
+    /// transition costs O(1) per frame instead of O(ops) per frame.
+    SetGlobalAlpha { alpha: f32 },
 }
 
 impl FrameCommands {
@@ -95,6 +102,7 @@ pub trait DrawHal {
     fn pop_transform(&mut self);
     fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32);
     fn pop_clip(&mut self);
+    fn set_global_alpha(&mut self, alpha: f32);
 }
 
 /// Dispatch one paint op to a `DrawHal`. Exhaustive `match` so a new
@@ -129,6 +137,7 @@ pub fn dispatch_paint_op<H: DrawHal + ?Sized>(hal: &mut H, op: &PaintOp) {
         PaintOp::PopTransform => hal.pop_transform(),
         PaintOp::PushClip { x, y, w, h } => hal.push_clip(*x, *y, *w, *h),
         PaintOp::PopClip => hal.pop_clip(),
+        PaintOp::SetGlobalAlpha { alpha } => hal.set_global_alpha(*alpha),
     }
 }
 
@@ -400,6 +409,9 @@ mod tests {
             self.trace.push(format!("push_clip({x},{y},{w},{h})"));
         }
         fn pop_clip(&mut self) { self.trace.push("pop_clip".into()); }
+        fn set_global_alpha(&mut self, alpha: f32) {
+            self.trace.push(format!("set_global_alpha({alpha})"));
+        }
     }
 
     /// Catches the Stone 13.3 regression by construction: every PaintOp
@@ -437,6 +449,7 @@ mod tests {
             PaintOp::PopTransform,
             PaintOp::PushClip { x: 1.0, y: 2.0, w: 3.0, h: 4.0 },
             PaintOp::PopClip,
+            PaintOp::SetGlobalAlpha { alpha: 0.5 },
         ];
         let mut hal = RecordingHal::default();
         for op in &ops {
@@ -456,6 +469,7 @@ mod tests {
             "pop_transform",
             "push_clip(1,2,3,4)",
             "pop_clip",
+            "set_global_alpha(0.5)",
         ]);
     }
 

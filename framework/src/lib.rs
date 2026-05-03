@@ -738,9 +738,13 @@ impl Framework {
                 fg_surface, ts, self.metrics.width_px as f32,
             );
             if !props.is_rest() {
+                // In-place wrap: prepend `PushTransform` (+ optional
+                // `SetGlobalAlpha`), append `PopTransform`. No clone,
+                // no per-op alpha rewriting — the previous O(ops)
+                // path made 60Hz transitions stutter on activities
+                // with more than ~50 paint ops.
                 let target = self.compositor.surface_target(fg_surface);
-                let rewritten = animation::apply_props(&target.ops, props);
-                target.ops = rewritten;
+                animation::apply_props(&mut target.ops, props);
             }
         }
 

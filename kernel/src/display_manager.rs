@@ -91,6 +91,9 @@ impl DrawHal for ExternDrawHal {
     fn pop_clip(&mut self) {
         unsafe { host::hal_draw_pop_clip() }
     }
+    fn set_global_alpha(&mut self, alpha: f32) {
+        unsafe { host::hal_draw_set_global_alpha(alpha) }
+    }
 }
 
 pub type DisplayId = u32;
