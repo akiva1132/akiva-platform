@@ -143,6 +143,7 @@ pub fn boot(
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
+            pending_transitions: HashMap::new(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -446,6 +447,15 @@ pub struct Framework {
     /// `akiva_alloc_display`) and assign their dedicated task to it
     /// so each tab shows a different task. Empty in single-tab mode.
     task_displays: HashMap<activity_manager::TaskId, u32>,
+    /// Stone 13.3 fix — push/pop transitions queued at launch_app /
+    /// finish_top but **deferred** to the first render where the
+    /// activity is actually Resumed. Cold launches pay a ~1s wasm
+    /// compile delay before the activity can paint anything; if we
+    /// started the animation at push time, the entire 250ms window
+    /// would expire during the compile and the user would see no
+    /// slide-in. Deferring to Resumed means warm and cold launches
+    /// look the same. Empty in steady state.
+    pending_transitions: HashMap<activity_manager::ActivityId, animation::Transition>,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -653,6 +663,27 @@ impl Framework {
 
         // Stone 13.2 — dialog paint pass.
         self.paint_dialogs(foreground);
+
+        // Stone 13.3 fix — arm any deferred transition now that the
+        // foreground activity is actually Resumed. Cold launches
+        // arrive here ~1s after `launch_app` (wasm compile time);
+        // arming with the *current* `ts` ensures the animation
+        // window starts when the activity is ready to paint, not
+        // when the launch was requested.
+        if let Some(fg) = foreground {
+            if self.pending_transitions.contains_key(&fg)
+                && matches!(
+                    self.activities.state_of(fg),
+                    Some(activity_manager::LifecycleState::Resumed),
+                )
+            {
+                if let Some(transition) = self.pending_transitions.remove(&fg) {
+                    self.animations.start(
+                        activity_animation_key(fg), transition, ts,
+                    );
+                }
+            }
+        }
 
         // Stone 13.3 — if a transition is active on the foreground
         // activity, rewrite its surface ops with the resulting
@@ -1735,15 +1766,19 @@ impl Framework {
             self.stack.push(outcome.id);
         }
 
-        // Stone 13.3 — kick off slide-in animation for the new top.
-        // `render_frame` ticks the controller and rewrites the
-        // foreground activity's ops with the resulting translate_x.
-        self.animations.start(
-            activity_animation_key(outcome.id),
+        // Stone 13.3 — queue slide-in animation for the new top.
+        // **Deferred** until the activity actually reaches Resumed
+        // (`render_frame` arms it on the first matching frame). Cold
+        // launches pay a ~1s wasm compile delay before they can
+        // paint; arming the animation at push-time would let the
+        // 250ms window expire during the compile and the user would
+        // see no slide-in. Warm launches arm within ~16ms and look
+        // identical to before this fix.
+        self.pending_transitions.insert(
+            outcome.id,
             animation::Transition::SlideFromRight {
                 duration_ms: PUSH_TRANSITION_MS,
             },
-            ts,
         );
 
         // Drive Create first so the activity exists, then hand it any
@@ -1973,17 +2008,22 @@ impl Framework {
             // doesn't see stale state (ActivityIds are not reused in
             // practice, but defensive cleanup is cheap).
             self.animations.cancel(activity_animation_key(id));
+            self.pending_transitions.remove(&id);
             if let Some(new_top) = self.stack.last().copied() {
                 // Stone 13.3 — pop transition: reveal the previous
                 // activity from the left. Surface continuity for the
                 // outgoing surface (slide-out + fade-out concurrently)
                 // is deferred — see ROADMAP §13.3 follow-ups.
-                self.animations.start(
-                    activity_animation_key(new_top),
+                // Same deferred-arm pattern as push: the new top is
+                // typically Paused (alive in memory), so Resumed
+                // arrives within a few ms; cold-launch latency
+                // doesn't apply here, but for symmetry we use the
+                // same plumbing.
+                self.pending_transitions.insert(
+                    new_top,
                     animation::Transition::SlideFromLeft {
                         duration_ms: POP_TRANSITION_MS,
                     },
-                    ts,
                 );
                 self.drive_to_resumed(new_top, ts);
             }
@@ -1994,13 +2034,13 @@ impl Framework {
         self.destroy_with_persist(id, ts);
         self.deliver_activity_result_for(id, ts);
         self.animations.cancel(activity_animation_key(id));
+        self.pending_transitions.remove(&id);
         if let Some(new_top) = self.stack.last().copied() {
-            self.animations.start(
-                activity_animation_key(new_top),
+            self.pending_transitions.insert(
+                new_top,
                 animation::Transition::SlideFromLeft {
                     duration_ms: POP_TRANSITION_MS,
                 },
-                ts,
             );
             self.drive_to_resumed(new_top, ts);
         }
@@ -2273,6 +2313,7 @@ mod tests {
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
+            pending_transitions: HashMap::new(),
         }
     }
 
@@ -3337,6 +3378,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
+            pending_transitions: HashMap::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -3441,6 +3483,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
+            pending_transitions: HashMap::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -4018,6 +4061,7 @@ optional = []
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
+            pending_transitions: HashMap::new(),
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -4135,6 +4179,7 @@ optional = []
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
+            pending_transitions: HashMap::new(),
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -4277,6 +4322,7 @@ optional = []
             dialogs: dialog::DialogManager::new(),
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
+            pending_transitions: HashMap::new(),
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),
