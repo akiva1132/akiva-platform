@@ -81,6 +81,19 @@ const state = {
   displayId: null,
   /** @type {Canvas2DBackend | null} */
   followerBackend: null,
+  /**
+   * Stone 13.4 follower-promotion fix — a separate canvas element the
+   * follower paints into, layered over `surfaceEl` with
+   * `pointer-events: none` so clicks fall through to `surfaceEl`
+   * (where the input listeners live). Why a separate canvas: once
+   * `getContext("2d")` is called on `surfaceEl`, the browser
+   * forbids `transferControlToOffscreen()` on it. Followers that
+   * later get promoted to leader (when the leader tab closes) need
+   * `surfaceEl` pristine so the transfer can happen. Layering keeps
+   * the input pipeline (which is wired to `surfaceEl`) untouched.
+   * @type {HTMLCanvasElement | null}
+   */
+  followerCanvas: null,
 };
 
 // Initial canvas size. Safe regardless of role; after promotion we stop
@@ -116,6 +129,19 @@ function onRoleChange({ role, promoted }) {
   );
 
   if (role === "leader") {
+    // Stone 13.4 — promoted-from-follower path: tear down the
+    // follower's overlay canvas BEFORE touching `surfaceEl`. The
+    // overlay canvas had a 2D rendering context attached; the
+    // browser would throw "Cannot transfer control from a canvas
+    // that has a rendering context" if we tried to transfer
+    // surfaceEl while the overlay was still around (it isn't on
+    // surfaceEl itself any more, but discipline says: clean up the
+    // follower-mode artefacts first). The follower canvas is
+    // separate from surfaceEl precisely so this cleanup is a DOM
+    // remove rather than a "uncontextualize" no-op the browser
+    // doesn't expose.
+    teardownFollowerCanvas();
+
     if (!state.canvasTransferred) {
       // Fresh metrics at transfer time — viewport may have changed while
       // we were follower (resize during wait).
@@ -140,13 +166,12 @@ function onRoleChange({ role, promoted }) {
     }
     bootEl.classList.add("hidden");
   } else if (role === "follower") {
-    // Stone 13.4 — followers keep their canvas main-thread (the
-    // leader's worker can't transfer-control across tabs) and ask
-    // the kernel to allocate them a fresh DisplayId. The leader
-    // posts paint streams via `display_frame { displayId, bytes }`
-    // BroadcastChannel messages; we filter by displayId and decode.
-    state.followerBackend = new Canvas2DBackend();
-    state.followerBackend.init(surfaceEl, state.metrics);
+    // Stone 13.4 — followers paint into a separate overlay canvas so
+    // `surfaceEl` stays pristine in case we later get promoted to
+    // leader. The overlay sits absolutely on top of `surfaceEl` with
+    // `pointer-events: none`, so the existing input listeners
+    // (bound to `surfaceEl`) keep firing.
+    setupFollowerCanvas();
     session.send({
       type: "request_display", tabId,
       width_px: state.metrics.width_px,
@@ -155,6 +180,52 @@ function onRoleChange({ role, promoted }) {
     });
     bootEl.classList.add("hidden");
   }
+}
+
+/**
+ * Stone 13.4 follower-promotion fix — create the overlay canvas the
+ * follower paints into. Sized to match `surfaceEl`'s current pixel
+ * box. Idempotent: a second call with an existing overlay just
+ * resyncs dimensions.
+ */
+function setupFollowerCanvas() {
+  if (!state.followerCanvas) {
+    const c = document.createElement("canvas");
+    c.id = "akiva-follower-surface";
+    Object.assign(c.style, {
+      position: "fixed",
+      inset: "0",
+      width: "100vw",
+      height: "100vh",
+      display: "block",
+      // Pass clicks through to `surfaceEl` underneath, where the
+      // input listeners are installed. The follower canvas is
+      // visual-only.
+      pointerEvents: "none",
+      // Z above surfaceEl so the user sees its paint stream.
+      zIndex: "1",
+    });
+    document.body.appendChild(c);
+    state.followerCanvas = c;
+  }
+  state.followerCanvas.width  = state.metrics.width_px;
+  state.followerCanvas.height = state.metrics.height_px;
+  state.followerBackend = new Canvas2DBackend();
+  state.followerBackend.init(state.followerCanvas, state.metrics);
+}
+
+/**
+ * Stone 13.4 follower-promotion fix — drop the follower's overlay
+ * canvas + Canvas2DBackend. Called on role=leader (including
+ * promotion) so the underlying `surfaceEl` is ready for
+ * `transferControlToOffscreen`.
+ */
+function teardownFollowerCanvas() {
+  if (state.followerCanvas) {
+    state.followerCanvas.remove();
+    state.followerCanvas = null;
+  }
+  state.followerBackend = null;
 }
 
 function onKernelMessage(msg) {
@@ -298,12 +369,13 @@ function installResizeHandler(canvas) {
     const m = { width_px, height_px, density: dprNow };
     state.metrics = m;
     if (state.ownsCanvas) applyCanvasSize(canvas, m);
-    // Stone 13.4 — followers own their main-thread canvas; resize the
-    // local Canvas2DBackend so subsequent `display_frame` decodes
-    // paint into the new pixel grid. The leader path goes through
-    // `worker.js` (worker.js calls `backend.resize` against the
-    // OffscreenCanvas it owns).
-    if (state.followerBackend) {
+    // Stone 13.4 — followers paint into the overlay canvas, not
+    // `surfaceEl`. Resize the overlay's pixel grid alongside the
+    // backend so subsequent `display_frame` decodes target the
+    // right dimensions. The leader path goes through `worker.js`
+    // (worker.js calls `backend.resize` against the OffscreenCanvas
+    // it owns).
+    if (state.followerBackend && state.followerCanvas) {
       state.followerBackend.resize(width_px, height_px, dprNow);
     }
     session.send({ type: "resize", tabId, metrics: m });
