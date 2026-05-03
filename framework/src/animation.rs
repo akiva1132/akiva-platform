@@ -201,29 +201,36 @@ fn progress(entry: &ActiveTransition, now_ms: f64) -> f32 {
     ((now_ms - entry.started_at) / dur).clamp(0.0, 1.0) as f32
 }
 
+// Cubic ease-out: fast at start, decelerates to zero at end. Hides
+// 60Hz strobing on dense content (vertical edges of buttons/text
+// crossing pixel boundaries at constant velocity look stuttery) and
+// matches the "settling" feel of native iOS/Android slides.
+fn ease_out_cubic(t: f32) -> f32 {
+    let inv = 1.0 - t;
+    1.0 - inv * inv * inv
+}
+
 fn apply_transition_to_props(
     transition: Transition, t: f32, screen_width: f32, dst: &mut SurfaceProps,
 ) {
     match transition {
         Transition::SlideFromRight { .. } => {
-            // t=0: dx = +width. t=1: dx = 0.
-            dst.translate_x += screen_width * (1.0 - t);
+            let e = ease_out_cubic(t);
+            dst.translate_x += screen_width * (1.0 - e);
         }
         Transition::SlideToLeft { .. } => {
-            // t=0: dx = 0. t=1: dx = -width.
-            dst.translate_x -= screen_width * t;
+            let e = ease_out_cubic(t);
+            dst.translate_x -= screen_width * e;
         }
         Transition::SlideFromLeft { .. } => {
-            // t=0: dx = -width. t=1: dx = 0.
-            dst.translate_x -= screen_width * (1.0 - t);
+            let e = ease_out_cubic(t);
+            dst.translate_x -= screen_width * (1.0 - e);
         }
         Transition::FadeIn { .. } => {
-            // t=0: alpha 0. t=1: alpha 1.
-            dst.alpha *= t;
+            dst.alpha *= ease_out_cubic(t);
         }
         Transition::FadeOut { .. } => {
-            // t=0: alpha 1. t=1: alpha 0.
-            dst.alpha *= 1.0 - t;
+            dst.alpha *= 1.0 - ease_out_cubic(t);
         }
     }
 }
@@ -298,21 +305,21 @@ mod tests {
     }
 
     #[test]
-    fn slide_from_right_props_at_half_is_half_width() {
+    fn slide_from_right_props_at_half_is_eased() {
         let mut ctrl = AnimationController::new();
         ctrl.start(s(1), Transition::SlideFromRight { duration_ms: 200 }, 1000.0);
         let p = ctrl.props_for(s(1), 1100.0, 1080.0);
-        // t = 0.5 → translate_x = 540
-        assert!((p.translate_x - 540.0).abs() < 1.0);
+        // t = 0.5, ease_out_cubic = 0.875 → translate_x = 1080 * 0.125 = 135
+        assert!((p.translate_x - 135.0).abs() < 1.0);
     }
 
     #[test]
     fn slide_to_left_progresses_negative() {
         let mut ctrl = AnimationController::new();
         ctrl.start(s(1), Transition::SlideToLeft { duration_ms: 200 }, 1000.0);
-        // At t=0.5, translate_x = -540
+        // t = 0.5, ease_out_cubic = 0.875 → translate_x = -1080 * 0.875 = -945
         let p = ctrl.props_for(s(1), 1100.0, 1080.0);
-        assert!((p.translate_x + 540.0).abs() < 1.0);
+        assert!((p.translate_x + 945.0).abs() < 1.0);
     }
 
     #[test]
@@ -321,8 +328,10 @@ mod tests {
         ctrl.start(s(1), Transition::FadeIn { duration_ms: 200 }, 1000.0);
         // t=0 → alpha 0
         assert!((ctrl.props_for(s(1), 1000.0, 1080.0).alpha - 0.0).abs() < 0.01);
-        // t=0.5 → alpha 0.5
-        assert!((ctrl.props_for(s(1), 1100.0, 1080.0).alpha - 0.5).abs() < 0.01);
+        // t=0.5, ease_out_cubic = 0.875 → alpha 0.875
+        assert!((ctrl.props_for(s(1), 1100.0, 1080.0).alpha - 0.875).abs() < 0.01);
+        // t=1 → alpha 1
+        assert!((ctrl.props_for(s(1), 1200.0, 1080.0).alpha - 1.0).abs() < 0.01);
     }
 
     #[test]
@@ -343,14 +352,14 @@ mod tests {
     #[test]
     fn concurrent_slide_and_fade_on_same_surface_compose() {
         // Pop transition: outgoing surface slides AND fades. Both run
-        // for 200ms; at t=0.5 we should see translate_x=-540 AND
-        // alpha=0.5.
+        // for 200ms with ease-out cubic; at t=0.5, ease=0.875 →
+        // translate_x = -1080 * 0.875 = -945, alpha = 1 - 0.875 = 0.125.
         let mut ctrl = AnimationController::new();
         ctrl.start(s(7), Transition::SlideToLeft { duration_ms: 200 }, 1000.0);
         ctrl.start(s(7), Transition::FadeOut { duration_ms: 200 }, 1000.0);
         let p = ctrl.props_for(s(7), 1100.0, 1080.0);
-        assert!((p.translate_x + 540.0).abs() < 1.0);
-        assert!((p.alpha - 0.5).abs() < 0.01);
+        assert!((p.translate_x + 945.0).abs() < 1.0);
+        assert!((p.alpha - 0.125).abs() < 0.01);
     }
 
     #[test]

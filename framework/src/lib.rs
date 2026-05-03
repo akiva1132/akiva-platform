@@ -62,6 +62,7 @@ const KEY_CODE_BACK: u32 = 27;
 
 /// Stone 13.3 — default duration for the slide-in on activity push.
 const PUSH_TRANSITION_MS: u32 = 250;
+
 /// Stone 13.3 — default duration for the reveal-from-left on activity pop.
 const POP_TRANSITION_MS: u32 = 200;
 
@@ -132,12 +133,6 @@ pub fn boot(
             animations: animation::AnimationController::new(),
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
-            // Stone 13.3 follow-up — re-enabled after the
-            // arm-on-first-paint fix landed (gate moved from
-            // `state == Resumed` to `ops_len > 0`). See the
-            // arm-check block in `render_frame` for the full
-            // rationale; the diagnostic logs that backed this
-            // fix are 875f168.
             activity_surfaces: HashMap::new(),
     };
 
