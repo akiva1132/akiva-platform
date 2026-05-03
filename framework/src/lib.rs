@@ -22,6 +22,7 @@
 
 pub mod activity;
 pub mod activity_manager;
+pub mod animation;
 pub mod compositor;
 pub mod cpu_budget;
 pub mod dialog;
@@ -58,6 +59,23 @@ use wasm_activity::{WasmActivity, WasmHost};
 /// on the stack, Escape pops instead of reaching the active activity.
 /// A real key-map lives in the HAL in a later phase.
 const KEY_CODE_BACK: u32 = 27;
+
+/// Stone 13.3 — synthetic surface id used to key the
+/// [`animation::AnimationController`] off an `ActivityId`. Activities
+/// don't have a dedicated `WindowManager` surface today (Stone 13.0
+/// laid the groundwork; the wire still uses
+/// `Compositor::DEFAULT_SURFACE`), so we mint a stable u32 from the
+/// activity id and OR in the high bit to keep clear of any
+/// `WindowManager::create_surface` allocations (which start at 1 and
+/// grow upward).
+fn activity_animation_key(id: activity_manager::ActivityId) -> window_manager::SurfaceId {
+    window_manager::SurfaceId(((id as u32) & 0x7FFF_FFFF) | 0x8000_0000)
+}
+
+/// Stone 13.3 — default duration for the slide-in on activity push.
+const PUSH_TRANSITION_MS: u32 = 250;
+/// Stone 13.3 — default duration for the reveal-from-left on activity pop.
+const POP_TRANSITION_MS: u32 = 200;
 
 /// Summary the kernel prints after `boot` returns. Keeps logging out of
 /// the framework — the framework has no host log binding and we don't
@@ -123,6 +141,7 @@ pub fn boot(
                 s
             },
             dialogs: dialog::DialogManager::new(),
+            animations: animation::AnimationController::new(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -413,6 +432,13 @@ pub struct Framework {
     /// surface, and intercepts pointer events while a dialog is open.
     /// Resolutions are drained once per frame by the kernel.
     pub dialogs: dialog::DialogManager,
+    /// Stone 13.3 — push/pop transitions keyed by the synthetic
+    /// surface id we construct from `ActivityId` (truncated to
+    /// `SurfaceId(u32)`). render_frame queries this for the
+    /// foreground top's `(translate_x, alpha)` and rewrites its ops
+    /// before flushing the frame. Empty in the steady state — quiet
+    /// frames pay one HashMap lookup.
+    pub animations: animation::AnimationController,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -558,7 +584,18 @@ impl Framework {
     /// its dedicated Overlay surface. The compositor flattens
     /// `[default_app_surface, ...overlay_surfaces]` so the dialog
     /// (with dim) lands on top of the activity's paint.
+    ///
+    /// Stone 13.3 — drive any active animation transitions forward
+    /// before render. If a transition is active on the foreground
+    /// activity, the activity's paint ops are rewritten with
+    /// `translate_x` + `alpha` props (via
+    /// [`animation::apply_props`]) before the compositor flushes.
     pub fn render_frame(&mut self, ts: f64) -> &FrameCommands {
+        // Stone 13.3 — tick before paint so this frame reflects the
+        // current animation progress and `take_completed` lets us
+        // evict resolved transitions from the controller.
+        self.animations.tick(ts);
+        let _ = self.animations.take_completed();
         self.compositor.begin_frame();
         let foreground = self.stack.last().copied();
         if let Some(id) = foreground {
@@ -597,6 +634,26 @@ impl Framework {
 
         // Stone 13.2 — dialog paint pass.
         self.paint_dialogs(foreground);
+
+        // Stone 13.3 — if a transition is active on the foreground
+        // activity, rewrite its surface ops with the resulting
+        // (translate_x, alpha) props. No-op fast path when nothing is
+        // animating.
+        if let Some(fg) = foreground {
+            let surface_key = activity_animation_key(fg);
+            if self.animations.is_animating(surface_key) {
+                let props = self.animations.props_for(
+                    surface_key, ts, self.metrics.width_px as f32,
+                );
+                if !props.is_rest() {
+                    let target = self.compositor.surface_target(
+                        compositor::Compositor::DEFAULT_SURFACE,
+                    );
+                    let rewritten = animation::apply_props(&target.ops, props);
+                    target.ops = rewritten;
+                }
+            }
+        }
 
         // Compose the activity's default surface with every open dialog's
         // overlay surface, in z-order. Skip the dialog overlays in the
@@ -1529,6 +1586,17 @@ impl Framework {
             self.stack.push(outcome.id);
         }
 
+        // Stone 13.3 — kick off slide-in animation for the new top.
+        // `render_frame` ticks the controller and rewrites the
+        // foreground activity's ops with the resulting translate_x.
+        self.animations.start(
+            activity_animation_key(outcome.id),
+            animation::Transition::SlideFromRight {
+                duration_ms: PUSH_TRANSITION_MS,
+            },
+            ts,
+        );
+
         // Drive Create first so the activity exists, then hand it any
         // saved-state blob we persisted on a previous run. Only after
         // that do we let it proceed to Start → Resumed. This matches the
@@ -1751,7 +1819,23 @@ impl Framework {
             // future finish in the restored task doesn't bounce back
             // to the dead one.
             self.task_history.pop();
+            // Stone 13.3 — release the going-away activity's animation
+            // bucket so a future re-launch with the same ActivityId
+            // doesn't see stale state (ActivityIds are not reused in
+            // practice, but defensive cleanup is cheap).
+            self.animations.cancel(activity_animation_key(id));
             if let Some(new_top) = self.stack.last().copied() {
+                // Stone 13.3 — pop transition: reveal the previous
+                // activity from the left. Surface continuity for the
+                // outgoing surface (slide-out + fade-out concurrently)
+                // is deferred — see ROADMAP §13.3 follow-ups.
+                self.animations.start(
+                    activity_animation_key(new_top),
+                    animation::Transition::SlideFromLeft {
+                        duration_ms: POP_TRANSITION_MS,
+                    },
+                    ts,
+                );
                 self.drive_to_resumed(new_top, ts);
             }
             return;
@@ -1760,7 +1844,15 @@ impl Framework {
         self.stack.pop();
         self.destroy_with_persist(id, ts);
         self.deliver_activity_result_for(id, ts);
+        self.animations.cancel(activity_animation_key(id));
         if let Some(new_top) = self.stack.last().copied() {
+            self.animations.start(
+                activity_animation_key(new_top),
+                animation::Transition::SlideFromLeft {
+                    duration_ms: POP_TRANSITION_MS,
+                },
+                ts,
+            );
             self.drive_to_resumed(new_top, ts);
         }
     }
@@ -2030,6 +2122,7 @@ mod tests {
                 s
             },
             dialogs: dialog::DialogManager::new(),
+            animations: animation::AnimationController::new(),
         }
     }
 
@@ -3092,6 +3185,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
+            animations: animation::AnimationController::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -3194,6 +3288,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
+            animations: animation::AnimationController::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -3769,6 +3864,7 @@ optional = []
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
+            animations: animation::AnimationController::new(),
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -3884,6 +3980,7 @@ optional = []
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
+            animations: animation::AnimationController::new(),
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -4024,6 +4121,7 @@ optional = []
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
             dialogs: dialog::DialogManager::new(),
+            animations: animation::AnimationController::new(),
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),
