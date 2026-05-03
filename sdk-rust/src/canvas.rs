@@ -24,6 +24,10 @@ const OP_FILL_ROUND_RECT:  u8 = 7;
 const OP_STROKE_RECT:       u8 = 8;
 const OP_STROKE_ROUND_RECT: u8 = 9;
 const OP_DRAW_LINE:         u8 = 10;
+// Stone 13.0prep C — bitmap blit. drawable_id (u32) is allocated by
+// `res::drawable(name)` from the host; `0` means missing (renderer
+// paints a magenta placeholder, matching @color/@string fallback).
+const OP_DRAW_IMAGE:        u8 = 11;
 
 /// Paint surface handed to `Activity::on_render`. All coordinates are in
 /// dp (density-independent pixels); colors are **`0xAARRGGBB`** — alpha
@@ -164,5 +168,23 @@ impl<'a> Canvas<'a> {
         self.buf.extend_from_slice(&y1.to_le_bytes());
         self.buf.extend_from_slice(&width.to_le_bytes());
         self.buf.extend_from_slice(&rgba.to_le_bytes());
+    }
+
+    /// Stone 13.0prep C — blit a `@drawable/`-resolved image. Get the
+    /// `drawable_id` from [`crate::res::drawable`]; `0` is the
+    /// "missing drawable" sentinel which the renderer paints as a
+    /// magenta placeholder (parallel to the `@color/`/`@string/`
+    /// fallback). The `(x, y)` is the top-left corner; `(w, h)` is
+    /// the destination size in dp — the source image is stretched to
+    /// fit, no aspect-ratio enforcement.
+    pub fn draw_image(
+        &mut self, drawable_id: u32, x: f32, y: f32, w: f32, h: f32,
+    ) {
+        self.buf.push(OP_DRAW_IMAGE);
+        self.buf.extend_from_slice(&drawable_id.to_le_bytes());
+        self.buf.extend_from_slice(&x.to_le_bytes());
+        self.buf.extend_from_slice(&y.to_le_bytes());
+        self.buf.extend_from_slice(&w.to_le_bytes());
+        self.buf.extend_from_slice(&h.to_le_bytes());
     }
 }

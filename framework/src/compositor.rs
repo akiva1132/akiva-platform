@@ -34,6 +34,10 @@ pub enum PaintOp {
     StrokeRect { x: f32, y: f32, w: f32, h: f32, width: f32, rgba: u32 },
     StrokeRoundRect { x: f32, y: f32, w: f32, h: f32, radius: f32, width: f32, rgba: u32 },
     DrawLine { x0: f32, y0: f32, x1: f32, y1: f32, width: f32, rgba: u32 },
+    // Stone 13.0prep C — bitmap blit by drawable_id (resolved via
+    // `IO::DRAWABLE_RESOLVE`). `id == 0` is the missing-drawable
+    // sentinel; renderer paints a magenta placeholder.
+    DrawImage { drawable_id: u32, x: f32, y: f32, w: f32, h: f32 },
 }
 
 impl FrameCommands {

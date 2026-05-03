@@ -75,6 +75,13 @@ function makeRegistry({ log, fakeWorker } = {}) {
       cache.delete(key);
       return 0;
     },
+    keysWithPrefix: (prefix) => {
+      const out = [];
+      for (const k of cache.keys()) {
+        if (k != null && k.startsWith(prefix)) out.push(k);
+      }
+      return out;
+    },
   };
   const logFn = log ?? vi.fn();
   const worker = fakeWorker ?? makeFakeWorker();
@@ -1373,6 +1380,46 @@ fg = "#ff000000"`,
     registry.setNightMode(true);
     const { colors } = registry._loadResources(PACKAGE_ID);
     expect(colors.bg).toBe(0xff222222);
+  });
+});
+
+describe("@drawable/ resource index — Stone 13.0prep C", () => {
+  it("builds {name → id} index from PNG keys, deterministic across calls", () => {
+    const { registry, storage } = makeRegistry();
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/icon.png`, new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/banner.png`, new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/avatar.png`, new Uint8Array([0x89, 0x50, 0x4e, 0x47]));
+
+    const idx1 = registry._buildDrawableIndex(PACKAGE_ID);
+    const idx2 = registry._buildDrawableIndex(PACKAGE_ID);
+    expect(idx1).toEqual(idx2);
+    // Alphabetical sort → avatar=1, banner=2, icon=3
+    expect(idx1).toEqual({ avatar: 1, banner: 2, icon: 3 });
+  });
+
+  it("ignores non-PNG files in the drawable directory", () => {
+    const { registry, storage } = makeRegistry();
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/icon.png`, new Uint8Array([0]));
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/notes.txt`, new Uint8Array([0]));
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/icon.webp`, new Uint8Array([0]));
+
+    const idx = registry._buildDrawableIndex(PACKAGE_ID);
+    expect(Object.keys(idx)).toEqual(["icon"]);
+  });
+
+  it("returns empty index when no drawables present", () => {
+    const { registry } = makeRegistry();
+    expect(registry._buildDrawableIndex(PACKAGE_ID)).toEqual({});
+  });
+
+  it("loadResources packages drawables alongside strings + colors", () => {
+    const { registry, storage } = makeRegistry();
+    storage.set(`packages/${PACKAGE_ID}/res/drawable/launcher.png`, new Uint8Array([0]));
+    const r = registry._loadResources(PACKAGE_ID);
+    expect(r.drawables).toEqual({ launcher: 1 });
+    // Strings and colors come along for the ride (might be empty here).
+    expect(r.strings).toBeDefined();
+    expect(r.colors).toBeDefined();
   });
 });
 

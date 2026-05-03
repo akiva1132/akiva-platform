@@ -298,7 +298,9 @@ export class AppRegistry {
   register(packageId, className) {
     if (!packageId || !className) return 0;
 
+    const tStart = performance.now();
     let proc = this._processes.get(packageId);
+    const reused = !!proc;
     if (!proc) {
       proc = this._spawnProcess(packageId);
       if (!proc) return 0;
@@ -306,7 +308,8 @@ export class AppRegistry {
 
     const handle = this._nextHandle++;
     this._slots.set(handle, { packageId, class: className });
-    this._dbg("lifecycle", `register ${packageId}/${className} → handle ${handle}`);
+    this._log("info",
+      `[time] register(${packageId}/${className}) → handle ${handle} (${reused ? "reused" : "fresh-spawn"}, +${(performance.now() - tStart).toFixed(1)}ms)`);
     return handle;
   }
 
@@ -423,11 +426,23 @@ export class AppRegistry {
       status: STATUS.PENDING,
       bytes: null,
       packageId: slot.packageId,
+      cmdKind,
+      postedAt: performance.now(),
     });
     proc.worker.postMessage(
       { type: "dispatch", dispatch_id: dispatchId, cmd_kind: cmdKind, payload },
       [payload.buffer],
     );
+    // [time] log first dispatch per package — the gap between init_ok
+    // and first dispatch is host-side framework work (rehydrate, intent
+    // resolve, etc.); the gap between first dispatch and dispatch_done
+    // is the worker's first wasm execution.
+    if (proc.spawnStart && !proc.firstDispatchAt) {
+      proc.firstDispatchAt = performance.now();
+      const dt = (proc.firstDispatchAt - proc.spawnStart).toFixed(1);
+      this._log("info",
+        `[time] ${slot.packageId}: first dispatch (cmd=0x${cmdKind.toString(16)}) at t=${dt}ms`);
+    }
     this._dbg("dispatch",
       `${slot.packageId}[handle=${handle}] cmd=0x${cmdKind.toString(16)} → dispatch_id=${dispatchId}`);
     return dispatchId;
@@ -587,6 +602,8 @@ export class AppRegistry {
     // snapshot copy and the kernel keeps the canonical one for
     // future broadcasts.
     const wasmCopy = wasmBytes.slice();
+    const spawnStart = performance.now();
+    this._log("info", `[time] ${packageId}: spawn → init_post t=0ms (wasm ${wasmCopy.byteLength}B)`);
     worker.postMessage(
       {
         type: "init",
@@ -599,7 +616,7 @@ export class AppRegistry {
       [wasmCopy.buffer],
     );
 
-    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingTimer: null, memoryBytes: 0, cpuMs: 0, warned: false };
+    const proc = { worker, packageId, lastPongAt: 0, ready: false, pingTimer: null, memoryBytes: 0, cpuMs: 0, warned: false, spawnStart };
     this._processes.set(packageId, proc);
     // Heartbeat doesn't start until `init_ok` lands — kicking the
     // watchdog while the worker is mid-wasm-compile would mean every
@@ -772,7 +789,50 @@ export class AppRegistry {
       tryParse("values-night", "strings", parseStringsToml, strings);
       tryParse("values-night", "colors",  parseColorsToml,  colors);
     }
-    return { strings, colors };
+    // Stone 13.0prep C — enumerate `@drawable/` references. Each PNG
+    // staged at `packages/<id>/res/drawable/<name>.png` becomes a
+    // sync-allocated `drawable_id`. Actual ImageBitmap registration
+    // (PNG → bitmap → renderer.registerDrawable) is async and lives
+    // in `_loadDrawableBitmaps` below; the {name → id} map exposed
+    // here is what the worker needs synchronously.
+    const drawables = this._buildDrawableIndex(packageId);
+    return { strings, colors, drawables };
+  }
+
+  /**
+   * Stone 13.0prep C — sync side. Enumerate the package's drawable
+   * filenames in storage and assign each a stable per-package u32 id.
+   * Ids start at 1 (id 0 is the missing-drawable sentinel). Idempotent
+   * across calls because the assignment is deterministic — alphabetical
+   * sort, sequential numbering — so a re-load (night-mode flip,
+   * uninstall/reinstall) yields the same id for the same name.
+   *
+   * The actual PNG decode + ImageBitmap upload is async and happens
+   * separately in `_loadDrawableBitmaps`; until that resolves, the
+   * renderer's drawable cache is empty and the `OP_DRAW_IMAGE` path
+   * paints magenta placeholders for the assigned ids. Apps see the id
+   * resolution succeed (non-zero) but visually get the placeholder
+   * during the brief async-load window — usually invisible because
+   * boot does the loading before the first frame is composed.
+   */
+  _buildDrawableIndex(packageId) {
+    const prefix = `packages/${packageId}/res/drawable/`;
+    const keys = this._storage.keysWithPrefix?.(prefix) ?? [];
+    const names = [];
+    for (const key of keys) {
+      const tail = key.slice(prefix.length);
+      // Accept `<name>.png` only — other extensions ignored for now;
+      // adding webp/avif is a one-line change once we decide on the
+      // extension policy.
+      if (tail.endsWith(".png")) {
+        names.push(tail.slice(0, -".png".length));
+      }
+    }
+    names.sort();  // deterministic id assignment
+    const out = {};
+    let nextId = 1;  // 0 is the missing sentinel
+    for (const name of names) out[name] = nextId++;
+    return out;
   }
 
   /**
@@ -825,6 +885,10 @@ export class AppRegistry {
         if (proc && !proc.ready) {
           proc.ready = true;
           proc.lastPongAt = performance.now();
+          if (proc.spawnStart) {
+            const dt = (performance.now() - proc.spawnStart).toFixed(1);
+            this._log("info", `[time] ${packageId}: init_ok at t=${dt}ms (wasm compiled+instantiated)`);
+          }
           this._startHeartbeat(proc);
         }
         break;
@@ -838,6 +902,15 @@ export class AppRegistry {
         if (!entry) {
           this._log("warn", `${packageId}: dispatch_done for unknown id ${fid}`);
           return;
+        }
+        // [time] log first dispatch_done per package.
+        const proc = this._processes.get(packageId);
+        if (proc?.spawnStart && !proc.firstDoneAt) {
+          proc.firstDoneAt = performance.now();
+          const dt = (proc.firstDoneAt - proc.spawnStart).toFixed(1);
+          const wait = entry.postedAt ? (proc.firstDoneAt - entry.postedAt).toFixed(1) : "?";
+          this._log("info",
+            `[time] ${packageId}: first dispatch_done (cmd=0x${entry.cmdKind?.toString(16) ?? "?"}) at t=${dt}ms (wait=${wait}ms)`);
         }
         // P0 #4 — the worker shell already returns `bytes=null` for
         // ack-only dispatches and a populated `Uint8Array` for RENDER /

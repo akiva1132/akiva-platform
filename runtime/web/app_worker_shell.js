@@ -59,7 +59,7 @@ let grants = new Set();
 /** @type {Uint8Array} */
 let packagesBlob = new Uint8Array(0);
 /** @type {{ strings: Map<string, string>, colors: Map<string, number> }} */
-let resources = { strings: new Map(), colors: new Map() };
+let resources = { strings: new Map(), colors: new Map(), drawables: new Map() };
 
 /**
  * Local future registry for `akiva_host_io_start` / `akiva_host_io_poll`.
@@ -250,6 +250,7 @@ self.addEventListener("message", (e) => {
         resources = {
           strings: new Map(Object.entries(msg.resources.strings ?? {})),
           colors:  new Map(Object.entries(msg.resources.colors ?? {})),
+          drawables: new Map(Object.entries(msg.resources.drawables ?? {})),
         };
       }
       break;
@@ -301,6 +302,8 @@ function handleInit(msg) {
     resources = {
       strings: new Map(Object.entries(msg.resources.strings ?? {})),
       colors: new Map(Object.entries(msg.resources.colors ?? {})),
+      // Stone 13.0prep C — `@drawable/` index. `{name -> drawable_id}`.
+      drawables: new Map(Object.entries(msg.resources.drawables ?? {})),
     };
   }
 
@@ -572,6 +575,22 @@ function buildHostImports() {
       akiva_host_resource_has_string: (ptr, len) => {
         const name = readAppUtf8(ptr, len);
         return name !== null && resources.strings.has(name) ? 1 : 0;
+      },
+      // Stone 13.0prep C — `@drawable/` resolution. The host built the
+      // index at install / boot time (see worker.js dev-apps loader);
+      // the worker shell receives the {name -> id} Map in `init` and
+      // looks up here. `0` is the missing sentinel — the renderer
+      // paints a magenta placeholder for that id, parallel to the
+      // `@color/`/`@string/` fallbacks.
+      akiva_host_resource_drawable: (ptr, len) => {
+        const name = readAppUtf8(ptr, len);
+        if (name === null) return 0;
+        const id = resources.drawables?.get(name);
+        if (id === undefined) {
+          postLog("warn", `@drawable/${name}: undefined (using magenta placeholder)`);
+          return 0;
+        }
+        return id >>> 0;
       },
 
       // ── Primitives ──────────────────────────────────────────────

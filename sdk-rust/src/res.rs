@@ -29,6 +29,12 @@
 /// distinguish "missing" from "this exact colour" on the return.
 pub const MISSING_COLOR: u32 = 0xFFFF00FF;
 
+/// Stone 13.0prep C — sentinel the host returns for an unknown
+/// `@drawable/` ref. The renderer treats `drawable_id == 0` as the
+/// missing-drawable signal and paints a magenta placeholder, parallel
+/// to [`MISSING_COLOR`].
+pub const MISSING_DRAWABLE: u32 = 0;
+
 #[cfg(target_arch = "wasm32")]
 extern "C" {
     fn akiva_host_resource_color(name_ptr: *const u8, name_len: u32) -> u32;
@@ -40,6 +46,7 @@ extern "C" {
     ) -> u32;
     fn akiva_host_resource_has_string(name_ptr: *const u8, name_len: u32) -> u32;
     fn akiva_host_resource_has_color(name_ptr: *const u8, name_len: u32) -> u32;
+    fn akiva_host_resource_drawable(name_ptr: *const u8, name_len: u32) -> u32;
 }
 
 /// Resolve `@color/name` to its 0xAARRGGBB value. Returns
@@ -121,5 +128,34 @@ pub fn contains_string(name: &str) -> bool {
     {
         let _ = name;
         false
+    }
+}
+
+/// Stone 13.0prep C — resolve `@drawable/name` to a stable per-package
+/// `drawable_id`. The host built the index at install / boot time by
+/// scanning `res/drawable/*.png` and decoding each PNG to an
+/// `ImageBitmap`. Returns [`MISSING_DRAWABLE`] (`0`) when the name
+/// isn't registered — the renderer's `OP_DRAW_IMAGE` path paints a
+/// magenta placeholder for that id, parallel to the `@color/` and
+/// `@string/` fallbacks.
+///
+/// Resolution is cached host-side; calling repeatedly with the same
+/// name is O(1) Map lookup. Apps that want to avoid even the host call
+/// can cache the returned id once and reuse it.
+///
+/// ```ignore
+/// let icon = res::drawable("icon");  // 0 if missing
+/// canvas.draw_image(icon, 16.0, 16.0, 48.0, 48.0);
+/// ```
+#[inline]
+pub fn drawable(name: &str) -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        akiva_host_resource_drawable(name.as_ptr(), name.len() as u32)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = name;
+        MISSING_DRAWABLE
     }
 }

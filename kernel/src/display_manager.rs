@@ -100,6 +100,9 @@ impl DisplayManager {
                     PaintOp::DrawLine { x0, y0, x1, y1, width, rgba } => {
                         host::hal_draw_line(*x0, *y0, *x1, *y1, *width, *rgba);
                     }
+                    PaintOp::DrawImage { drawable_id, x, y, w, h } => {
+                        host::hal_draw_image(*drawable_id, *x, *y, *w, *h);
+                    }
                     // Clip/transform are no-ops against the immediate-mode
                     // HAL for now; Phase 2b renderer backend honours them.
                     PaintOp::PushClip { .. }

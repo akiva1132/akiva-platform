@@ -111,6 +111,34 @@ export class Canvas2DBackend {
     this.ctx.stroke();
   }
 
+  // Stone 13.0prep C — drawable cache. The host populates this via
+  // `registerDrawable(id, bitmap)` at install/boot time; `drawImage`
+  // reads from it. Map<u32 id, ImageBitmap | OffscreenCanvas>.
+  // Missing id (0 or unregistered) paints a magenta placeholder, same
+  // fallback shape as missing `@color/`/`@string/`.
+  registerDrawable(id, source) {
+    if (!this._drawables) this._drawables = new Map();
+    this._drawables.set(id >>> 0, source);
+  }
+
+  forgetDrawable(id) {
+    if (!this._drawables) return;
+    this._drawables.delete(id >>> 0);
+  }
+
+  drawImage(drawableId, x, y, w, h) {
+    if (!this.ctx) return;
+    const source = this._drawables?.get(drawableId);
+    if (source) {
+      this.ctx.drawImage(source, x, y, w, h);
+      return;
+    }
+    // Magenta placeholder for missing drawable. Matches the fallback
+    // shape used by missing color / missing string lookups.
+    this.ctx.fillStyle = "#ff00ff";
+    this.ctx.fillRect(x, y, w, h);
+  }
+
   present() {
     // Canvas2D commits implicitly at end of task. OffscreenCanvas on some
     // browsers requires explicit `commit()`, but that API is deprecated.

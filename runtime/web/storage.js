@@ -89,6 +89,18 @@ export class Storage {
     return v === undefined ? null : v;
   }
 
+  /** Stone 13.0prep C — list all keys that begin with `prefix`. Sync;
+   *  reads the in-memory mirror, no OPFS round-trip. Used by
+   *  AppRegistry to enumerate `res/drawable/*.png` per package at
+   *  resource-load time. */
+  keysWithPrefix(prefix) {
+    const out = [];
+    for (const k of this.map.keys()) {
+      if (k.startsWith(prefix)) out.push(k);
+    }
+    return out;
+  }
+
   /** Sync put. Returns SR_OK / SR_BAD_KEY. Persistence is async —
    *  the in-memory mirror updates immediately. */
   set(key, value) {

@@ -350,6 +350,11 @@ function buildImports() {
       backend?.strokeRoundRect(x, y, w, h, radius, width, rgba >>> 0),
     hal_draw_line: (x0, y0, x1, y1, width, rgba) =>
       backend?.drawLine(x0, y0, x1, y1, width, rgba >>> 0),
+    // Stone 13.0prep C — drawable_id 0 (the missing-sentinel) is
+    // handled by the backend, not here, so the magenta placeholder
+    // shape stays consistent with Canvas2D defaults.
+    hal_draw_image: (drawable_id, x, y, w, h) =>
+      backend?.drawImage(drawable_id >>> 0, x, y, w, h),
     hal_draw_present: () => backend?.present(),
 
     hal_storage_read:   (kptr, klen, outLenPtr) => halStorageRead(kptr, klen, outLenPtr),

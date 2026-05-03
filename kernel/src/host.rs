@@ -51,6 +51,9 @@ extern "C" {
         x: f32, y: f32, w: f32, h: f32, radius: f32, width: f32, rgba: u32,
     );
     pub fn hal_draw_line(x0: f32, y0: f32, x1: f32, y1: f32, width: f32, rgba: u32);
+    /// Stone 13.0prep C — blit a drawable. `drawable_id == 0` is the
+    /// missing-drawable sentinel; the host paints a magenta placeholder.
+    pub fn hal_draw_image(drawable_id: u32, x: f32, y: f32, w: f32, h: f32);
     pub fn hal_draw_present();
 
     // ── Storage ───────────────────────────────────────────────────────────

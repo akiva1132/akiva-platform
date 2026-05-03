@@ -558,6 +558,9 @@ pub mod opcode {
     pub const STROKE_RECT:       u8 = 8;
     pub const STROKE_ROUND_RECT: u8 = 9;
     pub const DRAW_LINE:         u8 = 10;
+    // Stone 13.0prep C — bitmap blit by drawable_id (resolved via
+    // `IO::DRAWABLE_RESOLVE`). 21 bytes total (op + drawable_id u32 + 4×f32).
+    pub const DRAW_IMAGE:        u8 = 11;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -653,6 +656,14 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             out.extend_from_slice(&width.to_le_bytes());
             out.extend_from_slice(&rgba.to_le_bytes());
         }
+        PaintOp::DrawImage { drawable_id, x, y, w, h } => {
+            out.push(opcode::DRAW_IMAGE);
+            out.extend_from_slice(&drawable_id.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+        }
     }
 }
 
@@ -740,6 +751,14 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                 let width = read_f32(&mut bytes)?;
                 let rgba = read_u32(&mut bytes)?;
                 out.push(PaintOp::DrawLine { x0, y0, x1, y1, width, rgba });
+            }
+            opcode::DRAW_IMAGE => {
+                let drawable_id = read_u32(&mut bytes)?;
+                let x = read_f32(&mut bytes)?;
+                let y = read_f32(&mut bytes)?;
+                let w = read_f32(&mut bytes)?;
+                let h = read_f32(&mut bytes)?;
+                out.push(PaintOp::DrawImage { drawable_id, x, y, w, h });
             }
             other => return Err(DecodeError::UnknownOp(other)),
         }
@@ -1095,6 +1114,40 @@ mod tests {
         let mut frame = FrameCommands::new();
         decode_frame(&wire, &mut frame).unwrap();
         assert_eq!(frame.ops().len(), inputs.len());
+    }
+
+    /// Stone 13.0prep C — `OP_DRAW_IMAGE` encode/decode roundtrip and
+    /// exact wire size. 21 bytes total: opcode + drawable_id u32 + 4×f32.
+    #[test]
+    fn draw_image_op_roundtrip_byte_identical() {
+        let op = PaintOp::DrawImage {
+            drawable_id: 7, x: 16.0, y: 24.0, w: 48.0, h: 48.0,
+        };
+        let mut wire1 = Vec::new();
+        encode_op(&mut wire1, &op);
+        assert_eq!(wire1.len(), 1 + 4 + 4 * 4, "DRAW_IMAGE should encode to 21 bytes");
+        assert_eq!(wire1[0], opcode::DRAW_IMAGE);
+
+        let mut frame = FrameCommands::new();
+        decode_frame(&wire1, &mut frame).unwrap();
+        let mut wire2 = Vec::new();
+        encode_op(&mut wire2, &frame.ops()[0]);
+        assert_eq!(wire1, wire2);
+    }
+
+    /// Stone 13.0prep C — `drawable_id == 0` is the missing sentinel.
+    /// Wire encoding allows it; renderer interprets it as "paint magenta".
+    #[test]
+    fn draw_image_with_missing_drawable_id_zero_is_legal_wire() {
+        let op = PaintOp::DrawImage { drawable_id: 0, x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+        let mut wire = Vec::new();
+        encode_op(&mut wire, &op);
+        let mut frame = FrameCommands::new();
+        decode_frame(&wire, &mut frame).unwrap();
+        match &frame.ops()[0] {
+            PaintOp::DrawImage { drawable_id, .. } => assert_eq!(*drawable_id, 0),
+            _ => panic!("expected DrawImage"),
+        }
     }
 
     /// Stone 13.0prep — encode/decode roundtrip for the three new

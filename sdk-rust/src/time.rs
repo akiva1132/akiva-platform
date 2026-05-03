@@ -46,9 +46,7 @@ impl Future for Sleep {
     #[cfg(target_arch = "wasm32")]
     fn poll(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<()> {
         let mut buf = [0u8; 0];
-        let packed = unsafe {
-            crate::runtime::host_io_poll(self.future_id, &mut buf)
-        };
+        let packed = crate::runtime::host_io_poll(self.future_id, &mut buf);
         let (status_code, _len) = unpack_poll(packed);
         match status_code {
             status::READY  => Poll::Ready(()),
@@ -85,7 +83,7 @@ pub fn sleep(delay_ms: u32) -> Sleep {
     {
         let mut args = [0u8; 4];
         args.copy_from_slice(&delay_ms.to_le_bytes());
-        let fid = unsafe { crate::runtime::host_io_start(io::TIMER_SLEEP, &args) };
+        let fid = crate::runtime::host_io_start(io::TIMER_SLEEP, &args);
         Sleep { future_id: fid }
     }
     #[cfg(not(target_arch = "wasm32"))]
