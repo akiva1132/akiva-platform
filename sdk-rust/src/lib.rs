@@ -17,6 +17,7 @@ pub mod akml;
 pub mod app;
 pub mod canvas;
 pub mod clock;
+pub mod dialog;
 pub mod executor;
 pub mod intent;
 pub mod log;
@@ -37,6 +38,7 @@ pub use activity::{
 };
 pub use app::{App, AppContext};
 pub use canvas::Canvas;
+pub use dialog::{DialogFuture, DialogResult};
 pub use intent::{Intent, IntentBuilder};
 pub use result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
 
@@ -47,6 +49,7 @@ pub mod prelude {
         TaskScope,
     };
     pub use crate::canvas::Canvas;
+    pub use crate::dialog::{DialogFuture, DialogResult};
     pub use crate::intent::{Intent, IntentBuilder};
     pub use crate::result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
     pub use crate::ui::{CrossAxis, MainAxis, Ui, UiState};

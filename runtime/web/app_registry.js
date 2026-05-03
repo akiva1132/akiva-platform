@@ -142,6 +142,31 @@ export class AppRegistry {
     this._encoder = new TextEncoder();
 
     /**
+     * Stone 13.2 — pending dialog futures the kernel/framework has
+     * accepted but the user hasn't resolved yet. Keyed by `handle`
+     * since the framework only tracks one open dialog per activity
+     * handle (see `framework::dialog::DialogManager`); the value is
+     * the (packageId, workerFutureId) pair we route the eventual
+     * `host_op_done` reply to once `hal_dialog_complete` fires.
+     *
+     * @type {Map<number, { packageId: string, futureId: bigint }>}
+     */
+    this._pendingDialogs = new Map();
+    /**
+     * Stone 13.2 — kernel-side bridge symbols. Looked up lazily on the
+     * first dialog open after `setKernelInstance` has wired them in
+     * from `worker.js`. Null until then; SHOW_DIALOG arriving before
+     * boot returns a synthetic Dismissed.
+     *
+     * `akiva_open_dialog` signature: `(handle: u32, future_id: u64,
+     * args_ptr: u32, args_len: u32) -> u32`. The `u64` future_id is
+     * passed as a BigInt at the JS boundary.
+     *
+     * @type {null | { exports: { akiva_alloc(n: number): number, akiva_dealloc(p: number, n: number): void, akiva_open_dialog(handle: number, futureId: bigint, ptr: number, len: number): number } }}
+     */
+    this._kernelInstance = null;
+
+    /**
      * Stone 11.4c — kernel-side cache for in-flight dispatches.
      * Populated when the kernel calls `dispatch` (status=PENDING,
      * bytes=null) and updated on each `dispatch_done` from the
@@ -862,6 +887,120 @@ export class AppRegistry {
   }
 
   /**
+   * Stone 13.2 — kernel instance reference for the dialog opening
+   * bridge. `worker.js` calls this once after `WebAssembly.instantiate`
+   * resolves; we use the exports to allocate a kernel buffer, copy the
+   * dialog payload, and call `akiva_open_dialog`.
+   *
+   * @param {WebAssembly.Instance} instance
+   */
+  setKernelInstance(instance) {
+    this._kernelInstance = instance;
+  }
+
+  /**
+   * Stone 13.2 — drive a SHOW_DIALOG host_op into the kernel. Returns
+   * `true` if the kernel accepted it (the framework will resolve the
+   * future later via `hal_dialog_complete`); `false` if it must be
+   * resolved here as Dismissed (kernel not booted, payload bad).
+   *
+   * `args` is the SDK-encoded payload: `[handle:u32 LE | title_len:u16
+   *  | title | body_len:u16 | body | btn_count:u8 | (btn_len:u16 |
+   *  btn)*]`. This method strips the handle prefix and forwards the
+   * rest to `akiva_open_dialog`, which the kernel decodes back.
+   *
+   * @param {string} packageId
+   * @param {bigint} workerFutureId
+   * @param {Uint8Array} args
+   * @returns {boolean}
+   */
+  _openDialog(packageId, workerFutureId, args) {
+    if (!this._kernelInstance) {
+      this._log("warn", `[${packageId}] SHOW_DIALOG before kernel boot — auto-dismissing`);
+      return false;
+    }
+    if (args.length < 4) {
+      this._log("warn", `[${packageId}] SHOW_DIALOG args truncated (${args.length} < 4)`);
+      return false;
+    }
+    const view = new DataView(args.buffer, args.byteOffset, args.byteLength);
+    const handle = view.getUint32(0, true);
+    if (handle === 0) {
+      this._log("warn", `[${packageId}] SHOW_DIALOG handle is 0`);
+      return false;
+    }
+    if (this._pendingDialogs.has(handle)) {
+      // The framework's open() also handles this by resolving the
+      // prior — but record-keeping on this side needs to follow suit
+      // so the future routing matches the most recent open. The prior
+      // entry's host_op_done will land via hal_dialog_complete with
+      // Dismissed kind shortly.
+      this._log("info", `[${packageId}] SHOW_DIALOG replacing in-flight dialog on handle ${handle}`);
+    }
+    const payloadBytes = args.subarray(4);
+    const exp = this._kernelInstance.exports;
+    const ptr = exp.akiva_alloc(payloadBytes.length);
+    if (!ptr) {
+      this._log("warn", `[${packageId}] SHOW_DIALOG kernel alloc(${payloadBytes.length}) failed`);
+      return false;
+    }
+    try {
+      const kernelBuf = this._kernelMemory().buffer;
+      new Uint8Array(kernelBuf, ptr, payloadBytes.length).set(payloadBytes);
+      const rc = exp.akiva_open_dialog(handle, workerFutureId, ptr, payloadBytes.length);
+      exp.akiva_dealloc(ptr, payloadBytes.length);
+      if (rc !== 0) {
+        this._log("warn", `[${packageId}] akiva_open_dialog rc=${rc}`);
+        return false;
+      }
+      this._pendingDialogs.set(handle, { packageId, futureId: workerFutureId });
+      return true;
+    } catch (err) {
+      try { exp.akiva_dealloc(ptr, payloadBytes.length); } catch {}
+      this._log("warn", `[${packageId}] akiva_open_dialog threw: ${err?.message ?? err}`);
+      return false;
+    }
+  }
+
+  /**
+   * Stone 13.2 — kernel calls back here for every dialog the user
+   * resolved (button tap or tap-outside). We look up the pending
+   * routing entry, post `host_op_done` to the originating worker,
+   * and clear the entry.
+   *
+   * `kind`: 0 = Button (`btnIdx` meaningful), 1 = Dismissed.
+   *
+   * @param {number} handle
+   * @param {bigint} _futureId  recorded for future use; we look up by handle today
+   * @param {number} kind
+   * @param {number} btnIdx
+   */
+  completeDialog(handle, _futureId, kind, btnIdx) {
+    const entry = this._pendingDialogs.get(handle);
+    if (!entry) {
+      // Stale — could happen if a watchdog tore the worker down between
+      // open and resolve. Drop on the floor.
+      this._dbg("dialog", `complete(${handle}) without pending — dropping`);
+      return;
+    }
+    this._pendingDialogs.delete(handle);
+    const proc = this._processes.get(entry.packageId);
+    if (!proc) {
+      this._dbg("dialog", `complete(${handle}) packageId=${entry.packageId} has no process`);
+      return;
+    }
+    // Wire payload: [kind: u8, btn_idx: u8]. Mirrored on the SDK side
+    // by `dialog::poll_dialog_inner` which decodes back to DialogResult.
+    const payload = new Uint8Array(2);
+    payload[0] = kind & 0xff;
+    payload[1] = btnIdx & 0xff;
+    proc.worker.postMessage(
+      { type: "host_op_done", future_id: entry.futureId, status: STATUS.READY, payload },
+      [payload.buffer],
+    );
+  }
+
+  /**
    * Stone 13.0prep C2 — async side. For every drawable PNG in storage
    * for `packageId`, decode it to an `ImageBitmap` and register with
    * the renderer backend. Fire-and-forget — the worker spawn does not
@@ -1272,6 +1411,21 @@ export class AppRegistry {
         const result = this._dispatchStorage(packageId, msg.op_kind, args);
         status = result.status;
         payload = result.payload;
+        break;
+      }
+      case IO.SHOW_DIALOG: {
+        // Stone 13.2 — fire into the kernel/framework. On success we
+        // DO NOT post host_op_done now; the framework drains
+        // resolutions later and calls back via `hal_dialog_complete`,
+        // which routes the reply through `completeDialog`. On failure
+        // we synthesize a Dismissed reply so the SDK future doesn't
+        // hang.
+        const args = msg.args instanceof Uint8Array ? msg.args : new Uint8Array(0);
+        const accepted = this._openDialog(packageId, futureId, args);
+        if (accepted) return;
+        // Auto-dismiss path: kind=1 (Dismissed), btn_idx=0
+        payload = new Uint8Array([1, 0]);
+        status = STATUS.READY;
         break;
       }
       default:

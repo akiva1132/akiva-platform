@@ -140,6 +140,12 @@ async function bootKernel(kernelUrl, _tabId) {
   instance = inst;
   memory = inst.exports.memory;
 
+  // Stone 13.2 — wire the registry's dialog bridge to the kernel
+  // exports so SHOW_DIALOG host_ops can call `akiva_open_dialog`.
+  // Must happen BEFORE `akiva_boot` so a boot-time activity that
+  // somehow triggers a dialog finds the bridge ready.
+  apps.setKernelInstance(inst);
+
   inst.exports.akiva_boot();
   booted = true;
   self.postMessage({ type: "boot_ok" });
@@ -448,6 +454,18 @@ function buildImports() {
     // side cleanup runs separately via `Framework::evict_package`.
     hal_evict_package: (pidPtr, pidLen) =>
       apps.evictPackage(readUtf8(pidPtr, pidLen)),
+
+    // Stone 13.2 — dialog resolution. The kernel drains every resolved
+    // dialog from the framework once per frame and forwards each here.
+    // We look up the (handle, future_id) → (packageId, workerFutureId)
+    // pair the registry recorded at SHOW_DIALOG time and post
+    // `host_op_done` to that worker, unblocking the SDK's DialogFuture.
+    //
+    // `kind` matches `dialog::KIND_BUTTON` (0) or `KIND_DISMISSED` (1).
+    // BigInt handling: future_id is u64 in wasm; the JS shim wraps
+    // it as a BigInt via the standard wasm i64 abi.
+    hal_dialog_complete: (handle, futureId, kind, btnIdx) =>
+      apps.completeDialog(handle, futureId, kind, btnIdx),
 
     // Stone 9.3 — read + clear the pending-finish flag for `handle`.
     // Returns 1 if the app called `akiva_host_finish` since the last

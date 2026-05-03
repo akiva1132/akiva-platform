@@ -810,6 +810,21 @@ function dispatchIoStart(opKind, args) {
       );
       return fid;
     }
+    case IO.SHOW_DIALOG: {
+      // Stone 13.2 — framework owns dialog rendering + input shielding;
+      // the worker just forwards the request to the kernel and parks
+      // the future until the kernel posts `host_op_done` after the
+      // user resolves it. Kernel side: `app_registry._handleHostOp`
+      // routes into `akiva_open_dialog`, framework drains resolutions
+      // each frame and posts back here.
+      const fid = nextFutureId++;
+      futures.set(fid, { status: STATUS.PENDING, payload: new Uint8Array(0) });
+      postMessage(
+        { type: "host_op", future_id: fid, op_kind: opKind, args },
+        [args.buffer],
+      );
+      return fid;
+    }
     case IO.TIMER_SLEEP: {
       // Stone 13.0prep — `delay_ms: u32 LE` → resolves READY after the
       // setTimeout fires. Resolved locally; no kernel round-trip. Cap

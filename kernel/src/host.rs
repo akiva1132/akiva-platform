@@ -318,6 +318,21 @@ extern "C" {
     // blob to apps. Length-prefixed (rather than LF-separated like grants)
     // because app names can contain whitespace and arbitrary unicode.
     pub fn hal_host_set_packages(bytes_ptr: *const u8, bytes_len: usize);
+
+    // ── Stone 13.2: dialog resolution ─────────────────────────────────────
+    //
+    // After `akiva_open_dialog` has been called, the framework owns the
+    // dialog's lifetime. Each frame the kernel drains
+    // `Framework::drain_dialog_resolutions` and forwards each resolution
+    // to the host with `hal_dialog_complete`. The host looks up the
+    // (`handle`, `future_id`) → `(packageId, workerFutureId)` pair it
+    // recorded at SHOW_DIALOG time and posts `host_op_done` back to that
+    // app worker, which unblocks the SDK's `DialogFuture`.
+    //
+    // `kind` matches `framework::dialog::KIND_BUTTON` (0) or
+    // `KIND_DISMISSED` (1); `button_idx` is meaningful only for
+    // `KIND_BUTTON`.
+    pub fn hal_dialog_complete(handle: u32, future_id: u64, kind: u32, button_idx: u32);
 }
 
 /// Safe wrapper for hal_log that never panics.

@@ -23,8 +23,12 @@
 //! `2 + 3 × 4` evaluates to `20`, folding left-to-right). Errors
 //! (divide-by-zero, non-finite results) latch until the user presses `C`.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use akiva_sdk::prelude::*;
 use akiva_sdk::akml::{self, Bindings};
+use akiva_sdk::dialog::DialogResult;
 use akiva_sdk::res;
 
 /// The whole UI, declared in AKML. Embedded via `include_str!` so the
@@ -240,6 +244,15 @@ fn format_number(v: f64) -> String {
 pub struct CalculatorMain {
     ui: UiState,
     calc: Calculator,
+    /// Stone 13.2 — flips to `true` when the user confirms the
+    /// "Clear?" dialog (Yes button). The next `on_render` reads-and-
+    /// resets it and runs `calc.clear()`. `Rc<Cell<…>>` rather than a
+    /// plain `bool` field because the spawned future that awaits the
+    /// dialog needs `'static` access and can't borrow `&mut self`.
+    clear_confirmed: Rc<Cell<bool>>,
+    /// True while a Clear dialog is in flight, so a second tap on C
+    /// during the dialog doesn't stack a second one.
+    clear_dialog_open: Rc<Cell<bool>>,
 }
 
 #[async_trait(?Send)]
@@ -346,7 +359,38 @@ impl Activity for CalculatorMain {
         if ui.was_triggered("apply_mul")     { self.calc.apply_op(Op::Mul); }
         if ui.was_triggered("apply_div")     { self.calc.apply_op(Op::Div); }
         if ui.was_triggered("equals")        { self.calc.equals(); log_debug!("= → {}", self.calc.display()); }
-        if ui.was_triggered("clear")         { self.calc.clear(); }
+        if ui.was_triggered("clear") {
+            // Stone 13.2 — confirmation dialog instead of an immediate
+            // wipe. Skip the dialog (and clear inline) when the
+            // calculator is already at its initial state — there's
+            // nothing to confirm. Also guard against double-tap re-arm
+            // while a dialog is in flight.
+            let already_clear = self.calc.display() == "0"
+                && !self.calc.is_error()
+                && self.calc.pending_op().is_none();
+            if already_clear || self.clear_dialog_open.get() {
+                self.calc.clear();
+            } else {
+                self.clear_dialog_open.set(true);
+                let confirmed = self.clear_confirmed.clone();
+                let in_flight = self.clear_dialog_open.clone();
+                let fut = ctx.show_dialog(
+                    "Clear?", "This will reset the calculator.",
+                    &["Cancel", "OK"],
+                );
+                ctx.activity_scope().spawn(async move {
+                    let result = fut.await;
+                    in_flight.set(false);
+                    if matches!(result, DialogResult::Button(1)) {
+                        confirmed.set(true);
+                    }
+                });
+            }
+        }
+        if self.clear_confirmed.replace(false) {
+            self.calc.clear();
+            log_debug!("clear confirmed via dialog");
+        }
         if ui.was_triggered("toggle_sign")   { self.calc.toggle_sign(); }
         if ui.was_triggered("percent")       { self.calc.percent(); }
         if ui.was_triggered("backspace")     { self.calc.backspace(); }

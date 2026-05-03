@@ -114,6 +114,23 @@ pub mod io {
     /// equivalent of one frame (16ms) for backgrounded tabs to avoid
     /// wakeup storms.
     pub const TIMER_SLEEP: u32 = 0x0106;
+
+    /// Stone 13.2 — system dialog overlay.
+    ///
+    /// Args:
+    /// `[handle: u32 LE | title_len: u16 LE | title: utf8...
+    ///   | body_len: u16 LE | body: utf8...
+    ///   | btn_count: u8 | (btn_len: u16 LE | btn: utf8...)*]`
+    ///
+    /// Result: `[kind: u8, btn_idx: u8]` — `kind == 0` →
+    /// `Button(btn_idx)`, `kind == 1` → `Dismissed` (`btn_idx`
+    /// ignored).
+    ///
+    /// The framework owns the dialog surface and input shielding; the
+    /// caller's worker just awaits the resolution. See
+    /// [`crate::window_manager::dialog`] for the framework-side
+    /// implementation.
+    pub const SHOW_DIALOG: u32 = 0x0107;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds.
@@ -229,6 +246,7 @@ mod tests {
         let io = [
             io::TEXT_WIDTH, io::QUERY_PACKAGES,
             io::STORAGE_GET, io::STORAGE_SET, io::STORAGE_DELETE,
+            io::TIMER_SLEEP, io::SHOW_DIALOG,
         ];
         for k in fire { assert!((0x0001..=0x00FF).contains(&k), "fire op {k:#x} out of range"); }
         for k in io   { assert!((0x0101..=0x01FF).contains(&k), "io op {k:#x} out of range"); }
@@ -253,6 +271,7 @@ mod tests {
         let io = [
             io::TEXT_WIDTH, io::QUERY_PACKAGES,
             io::STORAGE_GET, io::STORAGE_SET, io::STORAGE_DELETE,
+            io::TIMER_SLEEP, io::SHOW_DIALOG,
         ];
         for (i, a) in io.iter().enumerate() {
             for b in &io[i + 1..] {
@@ -280,6 +299,8 @@ mod tests {
         assert_eq!(io::STORAGE_GET,                 sdk::io::STORAGE_GET);
         assert_eq!(io::STORAGE_SET,                 sdk::io::STORAGE_SET);
         assert_eq!(io::STORAGE_DELETE,              sdk::io::STORAGE_DELETE);
+        assert_eq!(io::TIMER_SLEEP,                 sdk::io::TIMER_SLEEP);
+        assert_eq!(io::SHOW_DIALOG,                 sdk::io::SHOW_DIALOG);
         assert_eq!(status::PENDING,                 sdk::status::PENDING);
         assert_eq!(status::READY,                   sdk::status::READY);
         assert_eq!(status::ERROR,                   sdk::status::ERROR);

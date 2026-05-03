@@ -50,6 +50,12 @@ pub mod io {
     /// worker dies. Document as known limitation; revisit if practice
     /// shows leaking.
     pub const TIMER_SLEEP: u32 = 0x0106;
+    /// Stone 13.2 — system dialog overlay. Args: see
+    /// [`crate::dialog`] for the wire format. Resolves with `[kind:
+    /// u8, btn_idx: u8]` once the user taps a button or outside the
+    /// dialog box. The framework owns the dialog surface and input
+    /// shielding — the app worker just awaits the resolution.
+    pub const SHOW_DIALOG: u32 = 0x0107;
 }
 
 /// Stone 11.4b — host→app dispatch op kinds. Mirror of
@@ -123,6 +129,7 @@ mod tests {
         assert!(io::TEXT_WIDTH >= 0x0101 && io::TEXT_WIDTH <= 0x01FF);
         assert!(io::STORAGE_SET >= 0x0101 && io::STORAGE_SET <= 0x01FF);
         assert!(io::STORAGE_DELETE >= 0x0101 && io::STORAGE_DELETE <= 0x01FF);
+        assert!(io::SHOW_DIALOG >= 0x0101 && io::SHOW_DIALOG <= 0x01FF);
         assert_eq!(status::PENDING, 0);
         assert_eq!(status::READY,   1);
         assert_eq!(status::ERROR,   2);

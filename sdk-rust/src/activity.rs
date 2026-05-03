@@ -248,6 +248,32 @@ impl<'a> Context<'a> {
     pub async fn set_result(&mut self, result: &crate::result::ActivityResult) {
         crate::runtime::host_set_result(self.handle, result);
     }
+
+    /// Stone 13.2 — pop a system dialog above this activity. The
+    /// framework paints the dialog on a dedicated `WindowLayer::Overlay`
+    /// surface and shields this activity from pointer events while the
+    /// dialog is open; the calling activity continues to render but
+    /// appears dimmed.
+    ///
+    /// The returned future resolves with `Button(idx)` when the user
+    /// taps the labeled button at `idx`, or `Dismissed` when the user
+    /// taps outside the dialog bounds. Empty `buttons` is a programmer
+    /// error and resolves immediately to `Dismissed`.
+    ///
+    /// ```ignore
+    /// match ctx.show_dialog("Clear?", "This will reset", &["Yes", "No"]).await {
+    ///     DialogResult::Button(0) => self.reset(),
+    ///     _ => {}
+    /// }
+    /// ```
+    pub fn show_dialog(
+        &mut self,
+        title: &str,
+        body: &str,
+        buttons: &[&str],
+    ) -> crate::dialog::DialogFuture {
+        crate::dialog::show_dialog_inner(self.handle, title, body, buttons)
+    }
 }
 
 // ── The trait ─────────────────────────────────────────────────────────

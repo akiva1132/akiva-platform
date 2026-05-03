@@ -24,6 +24,7 @@ pub mod activity;
 pub mod activity_manager;
 pub mod compositor;
 pub mod cpu_budget;
+pub mod dialog;
 pub mod intent;
 pub mod lmk;
 pub mod manifest;
@@ -121,6 +122,7 @@ pub fn boot(
                 s.insert("sys.shell".to_string());
                 s
             },
+            dialogs: dialog::DialogManager::new(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -406,6 +408,11 @@ pub struct Framework {
     /// includes `sys.shell`; the kernel can add more (e.g. a system
     /// IME, or a recovery app) post-boot.
     lmk_protected: std::collections::HashSet<String>,
+    /// Stone 13.2 — system dialog overlays. The framework owns the
+    /// dialog surface, paints it on top of the calling activity's
+    /// surface, and intercepts pointer events while a dialog is open.
+    /// Resolutions are drained once per frame by the kernel.
+    pub dialogs: dialog::DialogManager,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -440,11 +447,83 @@ impl Framework {
     /// Dispatch a pointer event to the active activity. The framework
     /// tracks the latest pointer state so callbacks that inspect `ctx`
     /// see a consistent view.
+    ///
+    /// Stone 13.2 — when a dialog is open on the foreground activity,
+    /// pointer events are intercepted: a button hit resolves the dialog
+    /// future with `Button(idx)`; a tap outside the dialog box resolves
+    /// with `Dismissed`; a tap inside the box but on no button is
+    /// silently swallowed (the modal stays open). The activity below
+    /// receives no event in any of those cases.
     pub fn dispatch_pointer(&mut self, ev: PointerEvent, ts: f64) {
         self.pointer = Some(ev);
         let Some(id) = self.stack.last().copied() else { return; };
+
+        // Stone 13.2 — intercept Down events while a dialog is open on
+        // any activity owned by the foreground task. Move/Up still flow
+        // to the activity? No — full input shielding per the DoD.
+        // Match against the foreground activity's open dialog directly.
+        let dialog_handle = self.dialogs.open_dialogs()
+            .find(|d| d.owner == id)
+            .map(|d| d.handle);
+        if let Some(handle) = dialog_handle {
+            // Only Down events resolve buttons / outside taps; Move and
+            // Up are eaten silently so dragging across a dialog doesn't
+            // phantom-trigger anything below.
+            if matches!(ev.phase, activity::PointerPhase::Down) {
+                let hit = self.dialogs.get(handle)
+                    .map(|s| dialog::hit_test(s, ev.x, ev.y));
+                match hit {
+                    Some(dialog::HitTest::Button(idx)) => {
+                        let idx = idx.min(u8::MAX as usize) as u8;
+                        self.dialogs.resolve_button(handle, idx);
+                        // Tear down the dialog's overlay surface — it's
+                        // no longer needed and we don't want stale paint
+                        // ops on the next frame.
+                        self.tear_down_dialog_surface(handle);
+                    }
+                    Some(dialog::HitTest::Outside) => {
+                        self.dialogs.resolve_dismissed(handle);
+                        self.tear_down_dialog_surface(handle);
+                    }
+                    _ => { /* inside box, non-button → swallow silently */ }
+                }
+            }
+            // Don't forward to the activity. Even Move/Up are blocked so
+            // the activity doesn't see a phantom partial gesture.
+            return;
+        }
+
         let (post, _) = self.with_ctx(id, ts, |a, ctx| a.on_pointer(ctx, ev));
         self.apply_post(post, id, ts);
+    }
+
+    /// Stone 13.2 — drop the Overlay surface backing a (now-resolved)
+    /// dialog. Called from the pointer-resolve path so the next frame's
+    /// composition doesn't re-paint a dialog that no longer exists in
+    /// `DialogManager`.
+    fn tear_down_dialog_surface(&mut self, handle: u32) {
+        // Find the surface id from the (just-resolved) DialogResolution
+        // queue: the DialogManager already moved the dialog out, so we
+        // can't read it from `dialogs.get`. Walk all overlay surfaces
+        // owned by the foreground activity that are no longer paired
+        // with a live dialog and drop them. Single dialog per handle
+        // keeps this O(small).
+        let live_surfaces: std::collections::HashSet<window_manager::SurfaceId> =
+            self.dialogs.open_dialogs().map(|d| d.surface).collect();
+        let _ = handle;  // handle is only useful for log breadcrumbs today
+        let candidates: Vec<window_manager::SurfaceId> = self.windows
+            .surfaces_in_z_order()
+            .into_iter()
+            .filter(|sid| {
+                let Some(rec) = self.windows.surface(*sid) else { return false; };
+                rec.layer == window_manager::WindowLayer::Overlay
+                    && !live_surfaces.contains(sid)
+            })
+            .collect();
+        for sid in candidates {
+            self.windows.destroy_surface(sid);
+            self.compositor.destroy_surface(sid);
+        }
     }
 
     pub fn dispatch_key(&mut self, ev: KeyEvent, ts: f64) {
@@ -473,9 +552,16 @@ impl Framework {
 
     /// Ask the active activity to paint one frame. Returns the freshly
     /// populated FrameCommands, which the kernel flushes to the HAL.
+    ///
+    /// Stone 13.2 — after the activity paints, walk every open dialog
+    /// owned by the foreground activity and emit its paint ops onto
+    /// its dedicated Overlay surface. The compositor flattens
+    /// `[default_app_surface, ...overlay_surfaces]` so the dialog
+    /// (with dim) lands on top of the activity's paint.
     pub fn render_frame(&mut self, ts: f64) -> &FrameCommands {
         self.compositor.begin_frame();
-        if let Some(id) = self.stack.last().copied() {
+        let foreground = self.stack.last().copied();
+        if let Some(id) = foreground {
             // Stone 11.5 — Trapped activities don't paint. The empty
             // FrameCommands here means "nothing changed since last
             // frame"; the Shell's tap-to-restart UI is the user's
@@ -508,7 +594,117 @@ impl Framework {
             activities.with_instance(id, |a| a.render(&mut ctx, target));
             self.apply_post(PostCallback { finish, launch, launch_for_result, set_result }, id, ts);
         }
-        self.compositor.finish_frame()
+
+        // Stone 13.2 — dialog paint pass.
+        self.paint_dialogs(foreground);
+
+        // Compose the activity's default surface with every open dialog's
+        // overlay surface, in z-order. Skip the dialog overlays in the
+        // common "no dialog" case to keep the legacy single-surface path
+        // hot.
+        if self.dialogs.open_dialogs().next().is_none() {
+            return self.compositor.finish_frame();
+        }
+        let mut order: Vec<window_manager::SurfaceId> =
+            vec![compositor::Compositor::DEFAULT_SURFACE];
+        // Order overlays by surface id (creation order) — consistent and
+        // deterministic. Stone 13.2 has at most one open dialog per
+        // foreground activity so the ordering is trivial in practice.
+        let mut overlays: Vec<window_manager::SurfaceId> =
+            self.dialogs.open_dialogs().map(|d| d.surface).collect();
+        overlays.sort();
+        order.extend(overlays);
+        self.compositor.finish_frame_in_order(&order)
+    }
+
+    /// Stone 13.2 — paint every open dialog owned by the foreground
+    /// activity onto its Overlay surface. Each dialog clears its own
+    /// surface buffer first, so re-painting is idempotent within a
+    /// frame.
+    fn paint_dialogs(&mut self, foreground: Option<activity_manager::ActivityId>) {
+        let Some(fg) = foreground else { return; };
+        let metrics = self.metrics;
+        let screen = window_manager::Rect {
+            x: 0.0, y: 0.0,
+            w: metrics.width_px as f32,
+            h: metrics.height_px as f32,
+        };
+        // Snapshot handles to avoid double-borrowing `self.dialogs`
+        // while we mutate `self.compositor` and `self.dialogs.get_mut`
+        // back-to-back.
+        let handles: Vec<u32> = self.dialogs.open_dialogs()
+            .filter(|d| d.owner == fg)
+            .map(|d| d.handle)
+            .collect();
+        for handle in handles {
+            // Re-layout from current metrics (handles resize without
+            // requiring a separate set_metrics hook).
+            let (surface, layout) = {
+                let s = match self.dialogs.get(handle) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let lay = dialog::layout_dialog(
+                    screen, metrics.density, &s.title, &s.body, &s.buttons,
+                );
+                (s.surface, lay)
+            };
+            // Write the laid-out rects back so pointer hit-test sees
+            // the same geometry the user is looking at.
+            if let Some(s) = self.dialogs.get_mut(handle) {
+                s.box_rect = layout.box_rect;
+                s.button_rects = layout.button_rects.clone();
+            }
+            // Paint into the overlay surface.
+            self.compositor.begin_surface(surface);
+            let state = self.dialogs.get(handle).unwrap();
+            let target = self.compositor.surface_target(surface);
+            dialog::paint_dialog(target, state, screen, metrics.density, &layout);
+        }
+    }
+
+    /// Stone 13.2 — open a dialog on behalf of a calling activity. The
+    /// host (kernel) calls this from its `IO::SHOW_DIALOG` route after
+    /// decoding the wire payload.
+    ///
+    /// Returns `Ok(())` on success; `Err(...)` if there's no foreground
+    /// activity (no app to attach the dialog to). On error the host
+    /// should resolve the future immediately with `Dismissed`.
+    pub fn open_dialog(
+        &mut self,
+        handle: u32,
+        future_id: u64,
+        title: String,
+        body: String,
+        buttons: Vec<String>,
+    ) -> Result<(), &'static str> {
+        let owner = self.stack.last().copied()
+            .ok_or("open_dialog: no foreground activity")?;
+        if buttons.is_empty() {
+            return Err("open_dialog: empty buttons");
+        }
+        let surface = self.windows.create_surface(
+            owner, window_manager::WindowLayer::Overlay,
+        );
+        // Bounds will be filled in on the next render pass; mark
+        // visible up-front so the compositor walks it.
+        let metrics = self.metrics;
+        self.windows.set_bounds(surface, window_manager::Rect {
+            x: 0.0, y: 0.0,
+            w: metrics.width_px as f32, h: metrics.height_px as f32,
+        });
+        self.windows.set_visible(surface, true);
+        self.windows.focus(surface);
+        self.dialogs.open(handle, future_id, owner, surface, title, body, buttons);
+        Ok(())
+    }
+
+    /// Stone 13.2 — drain dialogs the user has resolved since the last
+    /// call. Each entry is a `(handle, future_id, kind, btn_idx)` the
+    /// host posts back to the originating app worker as `host_op_done`,
+    /// unblocking the SDK's `DialogFuture`.
+    pub fn drain_dialog_resolutions(&mut self) -> Vec<dialog::DialogResolution> {
+        self.dialogs.take_resolutions()
     }
 
     /// P1 #3 — drain per-frame async signals (`finish`,
@@ -1833,6 +2029,7 @@ mod tests {
                 s.insert("sys.shell".to_string());
                 s
             },
+            dialogs: dialog::DialogManager::new(),
         }
     }
 
@@ -2894,6 +3091,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             cpu: cpu_budget::CpuBudget::new(),
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
+            dialogs: dialog::DialogManager::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -2995,6 +3193,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             cpu: cpu_budget::CpuBudget::new(),
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
+            dialogs: dialog::DialogManager::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -3569,6 +3768,7 @@ optional = []
             cpu: cpu_budget::CpuBudget::new(),
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
+            dialogs: dialog::DialogManager::new(),
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -3683,6 +3883,7 @@ optional = []
             cpu: cpu_budget::CpuBudget::new(),
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
+            dialogs: dialog::DialogManager::new(),
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -3822,6 +4023,7 @@ optional = []
             cpu: cpu_budget::CpuBudget::new(),
             lmk_policy: lmk::LmkPolicy::default(),
             lmk_protected: std::collections::HashSet::new(),
+            dialogs: dialog::DialogManager::new(),
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),

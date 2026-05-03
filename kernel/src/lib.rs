@@ -756,6 +756,22 @@ pub extern "C" fn akiva_frame(timestamp_ms: f64) {
         let frame = fw.render_frame(timestamp_ms);
         k.display.flush(frame);
     }
+
+    // Stone 13.2 — drain any dialog resolutions the user produced this
+    // frame and hand them back to the host so it can post host_op_done
+    // to the right app worker. Empty queue is the common case.
+    if let Some(fw) = k.framework.as_mut() {
+        for r in fw.drain_dialog_resolutions() {
+            unsafe {
+                host::hal_dialog_complete(
+                    r.handle,
+                    r.future_id,
+                    r.kind as u32,
+                    r.button_idx as u32,
+                );
+            }
+        }
+    }
 }
 
 /// Phase 12.1 + 12.2 — host → framework resource sampler. Walks
@@ -1014,4 +1030,89 @@ pub unsafe extern "C" fn akiva_dealloc(ptr: *mut u8, size: usize) {
 #[no_mangle]
 pub extern "C" fn akiva_abi_version() -> *const u8 {
     concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr()
+}
+
+/// Stone 13.2 — open a system dialog overlay on behalf of an app
+/// worker that fired `IO::SHOW_DIALOG`. The host decodes the wire
+/// payload, allocates a kernel buffer via `akiva_alloc`, copies the
+/// args in, and calls this. Returns:
+/// - `0` — opened successfully; the framework will paint the dialog
+///   from the next frame on, and `hal_dialog_complete` fires when the
+///   user resolves it.
+/// - `1` — bad payload (truncated args, mismatched lengths).
+/// - `2` — no foreground activity to attach the dialog to.
+///
+/// On error the host should resolve the originating worker's future
+/// immediately with `Dismissed` so the app's `.await` doesn't hang.
+///
+/// # Safety
+/// `args_ptr..args_ptr+args_len` must be a kernel-owned byte buffer
+/// (typically from `akiva_alloc`); the host owns dealloc and must
+/// pair this call with one `akiva_dealloc(args_ptr, args_len)`.
+#[no_mangle]
+pub unsafe extern "C" fn akiva_open_dialog(
+    handle: u32,
+    future_id: u64,
+    args_ptr: *const u8,
+    args_len: usize,
+) -> u32 {
+    let bytes = if args_ptr.is_null() || args_len == 0 {
+        return 1;
+    } else {
+        unsafe { core::slice::from_raw_parts(args_ptr, args_len) }
+    };
+    let (title, body, buttons) = match decode_dialog_args(bytes) {
+        Some(t) => t,
+        None => {
+            log::warn("akiva_open_dialog: malformed args");
+            return 1;
+        }
+    };
+    let k = kernel();
+    let Some(fw) = k.framework.as_mut() else { return 2; };
+    match fw.open_dialog(handle, future_id, title, body, buttons) {
+        Ok(()) => 0,
+        Err(e) => {
+            log::warn(&format!("akiva_open_dialog: {e}"));
+            2
+        }
+    }
+}
+
+/// Decode the `IO::SHOW_DIALOG` wire format the SDK encodes in
+/// `akiva_sdk::dialog::encode_args`. The host strips the leading
+/// `handle` u32 before calling in (it's already passed as a function
+/// argument here, not embedded in the slice).
+///
+/// Layout:
+/// ```text
+/// [title_len: u16 LE | title: utf8...
+///  | body_len: u16 LE | body: utf8...
+///  | btn_count: u8 | (btn_len: u16 LE | btn: utf8...)*]
+/// ```
+fn decode_dialog_args(bytes: &[u8]) -> Option<(String, String, Vec<String>)> {
+    let mut p = 0usize;
+    let read_u16 = |p: &mut usize, b: &[u8]| -> Option<u16> {
+        if *p + 2 > b.len() { return None; }
+        let v = u16::from_le_bytes([b[*p], b[*p + 1]]);
+        *p += 2;
+        Some(v)
+    };
+    let read_str = |p: &mut usize, b: &[u8]| -> Option<String> {
+        let len = read_u16(p, b)? as usize;
+        if *p + len > b.len() { return None; }
+        let s = core::str::from_utf8(&b[*p..*p + len]).ok()?.to_string();
+        *p += len;
+        Some(s)
+    };
+    let title = read_str(&mut p, bytes)?;
+    let body = read_str(&mut p, bytes)?;
+    if p >= bytes.len() { return None; }
+    let count = bytes[p] as usize;
+    p += 1;
+    let mut buttons = Vec::with_capacity(count);
+    for _ in 0..count {
+        buttons.push(read_str(&mut p, bytes)?);
+    }
+    Some((title, body, buttons))
 }

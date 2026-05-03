@@ -31,6 +31,7 @@ export const IO = Object.freeze({
   STORAGE_SET:       0x0104,
   STORAGE_DELETE:    0x0105,
   TIMER_SLEEP:       0x0106,  // Stone 13.0prep A
+  SHOW_DIALOG:       0x0107,  // Stone 13.2
 });
 
 // Stone 11.4b — host→app dispatch op kinds. Mirror of
