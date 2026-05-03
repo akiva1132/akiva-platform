@@ -190,12 +190,23 @@ impl DisplayManager {
                     PaintOp::DrawImage { drawable_id, x, y, w, h } => {
                         host::hal_draw_image(*drawable_id, *x, *y, *w, *h);
                     }
-                    // Clip/transform are no-ops against the immediate-mode
-                    // HAL for now; Phase 2b renderer backend honours them.
-                    PaintOp::PushClip { .. }
-                    | PaintOp::PopClip
-                    | PaintOp::PushTransform { .. }
-                    | PaintOp::PopTransform => {}
+                    // Stone 13.3 — wire clip/transform to the Canvas 2D
+                    // state stack. Pre-13.3 these were dropped on the
+                    // floor (a TODO from Phase 2b that bit Stone 13.3's
+                    // animation rewriting: `apply_props` adds
+                    // PushTransform → ignored → no visible slide).
+                    PaintOp::PushClip { x, y, w, h } => {
+                        host::hal_draw_push_clip(*x, *y, *w, *h);
+                    }
+                    PaintOp::PopClip => {
+                        host::hal_draw_pop_clip();
+                    }
+                    PaintOp::PushTransform { dx, dy, scale } => {
+                        host::hal_draw_push_transform(*dx, *dy, *scale);
+                    }
+                    PaintOp::PopTransform => {
+                        host::hal_draw_pop_transform();
+                    }
                 }
             }
             host::hal_draw_present();

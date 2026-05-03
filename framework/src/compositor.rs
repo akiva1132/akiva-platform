@@ -91,18 +91,24 @@ pub struct Compositor {
 }
 
 impl Compositor {
-    /// Reserved surface id for the legacy single-surface code path.
-    /// `Framework::render_frame` paints into this when it doesn't
-    /// know about per-activity surfaces yet (pre-Stone-13.x). Picked
-    /// as `1` so it doesn't collide with `SurfaceId::NONE` (`0`),
-    /// which the WindowManager uses as the never-allocated sentinel.
-    /// **Beware:** the WindowManager's id allocator also starts at
-    /// `1`, so a real WindowManager-allocated surface could share
-    /// this id. The current architecture sidesteps that because the
-    /// legacy code path doesn't talk to the WindowManager at all —
-    /// when Stone 13.x wires per-activity surfaces into the
-    /// WindowManager, this constant goes away.
-    pub const DEFAULT_SURFACE: SurfaceId = SurfaceId(1);
+    /// Reserved surface id for the legacy single-surface code path
+    /// (`Framework::render_frame`'s `paint_target` / `finish_frame`).
+    ///
+    /// Set to `u32::MAX` so it cannot collide with any
+    /// `WindowManager::create_surface` allocation — the WindowManager
+    /// allocates from `1` upward and would have to mint 4 billion
+    /// surfaces in one process lifetime to reach this sentinel. The
+    /// pre-Stone-13.2 value of `1` did collide: Stone 13.2's dialog
+    /// path allocates an Overlay surface (the very first one would
+    /// be `SurfaceId(1)`) and `begin_surface` would then clear the
+    /// activity's paint buffer, wiping the calculator content
+    /// behind the dialog. The 0.4-alpha dim was painted on whatever
+    /// pixels survived from the previous frame, and over several
+    /// frames the dim compounded onto itself → fully opaque
+    /// background.
+    ///
+    /// `SurfaceId::NONE` (`0`) remains the never-allocated sentinel.
+    pub const DEFAULT_SURFACE: SurfaceId = SurfaceId(u32::MAX);
 
     pub fn new() -> Self {
         Self { surfaces: HashMap::new(), flat: FrameCommands::new() }

@@ -111,6 +111,42 @@ export class Canvas2DBackend {
     this.ctx.stroke();
   }
 
+  // Stone 13.3 — transform stack. Used by activity push/pop slide
+  // animations: apply_props wraps the activity's ops with
+  // `PushTransform { dx, dy, scale }` … `PopTransform` to translate
+  // (and optionally scale) every nested op without per-op rewriting.
+  // Implemented via `ctx.save()` + `ctx.translate()` / `ctx.scale()` so
+  // matrix composition follows Canvas 2D's defined semantics.
+  pushTransform(dx, dy, scale) {
+    if (!this.ctx) return;
+    this.ctx.save();
+    if (dx !== 0 || dy !== 0) this.ctx.translate(dx, dy);
+    if (scale !== 1 && scale > 0) this.ctx.scale(scale, scale);
+  }
+
+  popTransform() {
+    if (!this.ctx) return;
+    this.ctx.restore();
+  }
+
+  // Push a rectangular clip. Subsequent paint ops are masked to the
+  // intersection of all active clips. `popClip` restores the previous
+  // mask. Implemented via the canvas state stack so the Activity's
+  // push/pop discipline (the SDK enforces matched pairs in
+  // `Canvas::push_clip`/`pop_clip`) maps directly to save/restore.
+  pushClip(x, y, w, h) {
+    if (!this.ctx) return;
+    this.ctx.save();
+    this.ctx.beginPath();
+    this.ctx.rect(x, y, w, h);
+    this.ctx.clip();
+  }
+
+  popClip() {
+    if (!this.ctx) return;
+    this.ctx.restore();
+  }
+
   // Stone 13.0prep C — drawable cache. The host populates this via
   // `registerDrawable(id, bitmap)` at install/boot time; `drawImage`
   // reads from it. Map<u32 id, ImageBitmap | OffscreenCanvas>.

@@ -54,6 +54,18 @@ extern "C" {
     /// Stone 13.0prep C — blit a drawable. `drawable_id == 0` is the
     /// missing-drawable sentinel; the host paints a magenta placeholder.
     pub fn hal_draw_image(drawable_id: u32, x: f32, y: f32, w: f32, h: f32);
+    /// Stone 13.3 — transform stack. `push_transform` pairs with
+    /// `pop_transform`. Used by activity push/pop slide animations
+    /// (`apply_props` wraps a surface's ops with these). Backed by
+    /// the Canvas 2D state stack (`save` + `translate` + `scale` /
+    /// `restore`) so matrix composition follows the standard.
+    pub fn hal_draw_push_transform(dx: f32, dy: f32, scale: f32);
+    pub fn hal_draw_pop_transform();
+    /// Push a rectangular clip. `pop_clip` restores the previous
+    /// mask. The SDK's `Canvas::push_clip` / `pop_clip` enforces
+    /// matched pairs.
+    pub fn hal_draw_push_clip(x: f32, y: f32, w: f32, h: f32);
+    pub fn hal_draw_pop_clip();
     pub fn hal_draw_present();
 
     // ── Storage ───────────────────────────────────────────────────────────

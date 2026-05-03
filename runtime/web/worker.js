@@ -489,6 +489,16 @@ function buildImports() {
     // shape stays consistent with Canvas2D defaults.
     hal_draw_image: (drawable_id, x, y, w, h) =>
       backend?.drawImage(drawable_id >>> 0, x, y, w, h),
+    // Stone 13.3 — transform + clip stack. Pre-13.3 these were no-ops
+    // in the kernel display flush, so my Stone 13.3 animation
+    // rewriting (`apply_props` wrapping ops with PushTransform) had
+    // no visible effect. Wired here through Canvas 2D's save/restore
+    // stack.
+    hal_draw_push_transform: (dx, dy, scale) =>
+      backend?.pushTransform(dx, dy, scale),
+    hal_draw_pop_transform: () => backend?.popTransform(),
+    hal_draw_push_clip: (x, y, w, h) => backend?.pushClip(x, y, w, h),
+    hal_draw_pop_clip: () => backend?.popClip(),
     hal_draw_present: () => backend?.present(),
 
     hal_storage_read:   (kptr, klen, outLenPtr) => halStorageRead(kptr, klen, outLenPtr),
