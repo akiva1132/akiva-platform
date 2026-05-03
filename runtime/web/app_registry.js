@@ -423,7 +423,8 @@ export class AppRegistry {
     // pull encode/decode from `akiva-wire`; this JS reader mirrors
     // the same layout because it can't depend on a Rust crate.
     // Layout per entry:
-    //   [u16 LE id_len][id][u16 LE class_len][class][u16 LE name_len][name]
+    //   [u16 LE id_len][id][u16 LE class_len][class]
+    //   [u16 LE name_len][name][u16 LE icon_len][icon]
     const decoder = this._decoder;
     const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
     const count = view.getUint32(0, true);
@@ -434,11 +435,13 @@ export class AppRegistry {
       if (off + idLen > blob.length) return;
       const id = decoder.decode(blob.subarray(off, off + idLen));
       off += idLen;
-      // Skip class + name to advance to the next record.
+      // Skip class + name + icon to advance to the next record.
       if (off + 2 > blob.length) return;
       const classLen = view.getUint16(off, true); off += 2 + classLen;
       if (off + 2 > blob.length) return;
       const nameLen = view.getUint16(off, true); off += 2 + nameLen;
+      if (off + 2 > blob.length) return;
+      const iconLen = view.getUint16(off, true); off += 2 + iconLen;
 
       if (id === HOME_PACKAGE_ID && !this._processes.has(id)) {
         // Pre-warm the home. Fire-and-forget; failures log inside
@@ -990,9 +993,18 @@ export class AppRegistry {
   setBackend(backend) {
     this._backend = backend;
     if (backend && this._pendingDrawableRegistrations.length > 0) {
-      for (const { id, bitmap } of this._pendingDrawableRegistrations) {
+      for (const { id, bitmap, packageId, name } of this._pendingDrawableRegistrations) {
         try { backend.registerDrawable(id, bitmap); }
         catch (err) { this._log("warn", `registerDrawable(${id}) failed: ${err?.message ?? err}`); }
+        // Foundation gap — same parity as the synchronous path: every
+        // pending bitmap also gets registered against the foreign
+        // `(pkg, name)` cache so cross-package lookups resolve. Older
+        // queued entries (pre-foundation-fix) lack `packageId`/`name`
+        // — guard so we don't synthesise empty-string keys.
+        if (packageId && name) {
+          try { backend.registerForeignDrawable(packageId, name, bitmap); }
+          catch (err) { this._log("warn", `registerForeignDrawable(${packageId}/${name}) failed: ${err?.message ?? err}`); }
+        }
       }
       this._pendingDrawableRegistrations.length = 0;
     }
@@ -1140,8 +1152,13 @@ export class AppRegistry {
         const bitmap = await createImageBitmap(blob);
         if (this._backend) {
           this._backend.registerDrawable(id, bitmap);
+          // Foundation gap — also populate the foreign-drawable
+          // cache so cross-package draws (Shell painting each
+          // installed app's icon) can resolve without colliding
+          // with another package's drawable_id.
+          this._backend.registerForeignDrawable(packageId, name, bitmap);
         } else {
-          this._pendingDrawableRegistrations.push({ id, bitmap });
+          this._pendingDrawableRegistrations.push({ id, bitmap, packageId, name });
         }
       } catch (err) {
         this._log("warn", `@drawable/${name}: decode failed (${err?.message ?? err})`);

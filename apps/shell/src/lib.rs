@@ -43,6 +43,13 @@ const ROW_GAP: f32         = 8.0;
 const ROW_PAD_X: f32       = 24.0;
 const ROW_INSET_LEFT: f32  = 20.0;
 const LIST_MAX_WIDTH: f32  = 640.0;
+// Foundation gap — launcher icon. Square, vertically centred in the
+// row, 8dp inset from the row's left edge. Text content shifts right
+// to make room for the icon (whether a glyph lands or the magenta
+// placeholder).
+const ICON_INSET_LEFT: f32 = 8.0;
+const ICON_SIZE: f32       = 40.0;
+const TEXT_AFTER_ICON: f32 = ICON_INSET_LEFT + ICON_SIZE + 12.0;
 
 #[derive(Default)]
 struct ShellActivity {
@@ -205,17 +212,36 @@ impl Activity for ShellActivity {
                 button_bg
             };
             c.fill_rect(ROW_PAD_X, top, width, ROW_HEIGHT, row_bg);
+
+            // Foundation gap — launcher icon from the foreign-drawable
+            // cache. Empty `app.icon` means the package didn't declare
+            // one in its manifest; the renderer paints a magenta
+            // placeholder (consistent fallback shape with @color and
+            // @string misses). When the app declares an icon, the
+            // bitmap was loaded into the renderer when its package
+            // booted — Shell never blocks on the load.
+            c.draw_foreign_image(
+                &app.id,
+                &app.icon,
+                ROW_PAD_X + ICON_INSET_LEFT,
+                top + (ROW_HEIGHT - ICON_SIZE) * 0.5,
+                ICON_SIZE,
+                ICON_SIZE,
+            );
+
             // Text baseline sits at the y arg, so we offset from `top`
-            // into the row, not to its edge.
+            // into the row, not to its edge. Text shifts right past
+            // the icon column.
+            let text_x = ROW_PAD_X + ROW_INSET_LEFT + TEXT_AFTER_ICON;
             c.draw_text(
-                ROW_PAD_X + ROW_INSET_LEFT,
+                text_x,
                 top + 24.0,
                 16.0,
                 button_fg,
                 &app.name,
             );
             c.draw_text(
-                ROW_PAD_X + ROW_INSET_LEFT,
+                text_x,
                 top + 44.0,
                 12.0,
                 button_sub,

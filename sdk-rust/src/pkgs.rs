@@ -102,8 +102,10 @@ mod tests {
             id: "com.akiva.hello".to_string(),
             class: "MainActivity".to_string(),
             name: "Hello".to_string(),
+            icon: "launcher".to_string(),
         };
         assert_eq!(e.id, "com.akiva.hello");
         assert_eq!(e.name, "Hello");
+        assert_eq!(e.icon, "launcher");
     }
 }

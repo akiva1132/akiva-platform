@@ -243,6 +243,7 @@ pub fn boot(
             id: r.id.as_str(),
             class: r.entry_class.as_str(),
             name: r.name.as_str(),
+            icon: r.icon_drawable_name(),
         })
         .collect();
     host.set_packages(&pkgs_wire::encode(&pkg_refs));

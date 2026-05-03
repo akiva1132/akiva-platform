@@ -16,11 +16,20 @@
 //!   u16 LE  id_len      ; id bytes (UTF-8)
 //!   u16 LE  class_len   ; class bytes (UTF-8)
 //!   u16 LE  name_len    ; name bytes (UTF-8)
+//!   u16 LE  icon_len    ; icon drawable name bytes (UTF-8); 0 when
+//!                       ; the package declared no `app.icon`.
 //! ```
 //!
 //! Per-string cap is 64 KiB (u16 length). Manifests already cap
 //! id+name well below that — the ceiling exists to keep one bad
 //! upgrade from producing an unparseable blob without a crisp error.
+//!
+//! The `icon` field is the drawable NAME only (e.g. `"launcher"`),
+//! not a path or `@drawable/` ref. Apps holding the snapshot resolve
+//! it against the foreign-drawable cache via
+//! [`crate::Canvas::draw_foreign_image`] (SDK-side). Empty `icon`
+//! means the package has no launcher icon — apps should fall back to
+//! a text-only chip.
 //!
 //! ## JS mirror
 //!
@@ -38,6 +47,10 @@ pub struct PackageRef<'a> {
     pub id: &'a str,
     pub class: &'a str,
     pub name: &'a str,
+    /// Drawable name from `manifest.app.icon` (the part after
+    /// `@drawable/`). Empty `&""` for packages that declared no
+    /// `app.icon`.
+    pub icon: &'a str,
 }
 
 /// One decoded record. Owned strings — the decoder is expected to be
@@ -48,6 +61,11 @@ pub struct PackageEntry {
     pub id: String,
     pub class: String,
     pub name: String,
+    /// Drawable name registered in the foreign-drawable cache under
+    /// this package's `id`. Empty when the package has no launcher
+    /// icon. Apps render via
+    /// [`akiva_sdk::canvas::Canvas::draw_foreign_image`].
+    pub icon: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -60,12 +78,13 @@ pub enum DecodeError {
 /// `u16::MAX` bytes — over-long names degrade gracefully rather than
 /// producing an unparseable blob.
 pub fn encode(packages: &[PackageRef<'_>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + packages.len() * 32);
+    let mut out = Vec::with_capacity(4 + packages.len() * 40);
     out.extend_from_slice(&(packages.len() as u32).to_le_bytes());
     for p in packages {
         push_str(&mut out, p.id);
         push_str(&mut out, p.class);
         push_str(&mut out, p.name);
+        push_str(&mut out, p.icon);
     }
     out
 }
@@ -95,7 +114,8 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<PackageEntry>, DecodeError> {
         let id = take_str(bytes, &mut cur)?;
         let class = take_str(bytes, &mut cur)?;
         let name = take_str(bytes, &mut cur)?;
-        out.push(PackageEntry { id, class, name });
+        let icon = take_str(bytes, &mut cur)?;
+        out.push(PackageEntry { id, class, name, icon });
     }
     Ok(out)
 }
@@ -138,16 +158,19 @@ mod tests {
     #[test]
     fn three_entries_roundtrip() {
         let pkgs = vec![
-            PackageRef { id: "com.akiva.hello", class: "MainActivity", name: "Hello" },
-            PackageRef { id: "com.akiva.calc", class: "Calc", name: "Calculator" },
-            PackageRef { id: "com.akiva.ttt", class: "Game", name: "Tic-Tac-Toe" },
+            PackageRef { id: "com.akiva.hello", class: "MainActivity", name: "Hello", icon: "" },
+            PackageRef { id: "com.akiva.calc", class: "Calc", name: "Calculator", icon: "launcher" },
+            PackageRef { id: "com.akiva.ttt", class: "Game", name: "Tic-Tac-Toe", icon: "icon" },
         ];
         let bytes = encode(&pkgs);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.len(), 3);
         assert_eq!(decoded[0].id, "com.akiva.hello");
+        assert_eq!(decoded[0].icon, "");
         assert_eq!(decoded[1].name, "Calculator");
+        assert_eq!(decoded[1].icon, "launcher");
         assert_eq!(decoded[2].class, "Game");
+        assert_eq!(decoded[2].icon, "icon");
     }
 
     #[test]
@@ -156,7 +179,7 @@ mod tests {
         // (vs. LF/TAB) is what lets names safely contain separator
         // bytes inside them.
         let pkgs = vec![
-            PackageRef { id: "x.y", class: "C", name: "שלום\tworld\n!" },
+            PackageRef { id: "x.y", class: "C", name: "שלום\tworld\n!", icon: "" },
         ];
         let decoded = decode(&encode(&pkgs)).unwrap();
         assert_eq!(decoded[0].name, "שלום\tworld\n!");
@@ -178,6 +201,24 @@ mod tests {
     }
 
     #[test]
+    fn truncated_before_icon_is_an_error() {
+        // Foundation gap regression — old encoders wrote 3 strings per
+        // record. The new decoder reads 4. A record that's missing the
+        // icon trailer must be rejected so old binaries fail loudly
+        // rather than silently truncating someone else's payload.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(b"x.y");
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(b"C");
+        bytes.extend_from_slice(&5u16.to_le_bytes());
+        bytes.extend_from_slice(b"Hello");
+        // No icon trailer.
+        assert_eq!(decode(&bytes), Err(DecodeError::Truncated));
+    }
+
+    #[test]
     fn bad_utf8_is_rejected() {
         // count=1, id_len=2, two invalid UTF-8 bytes.
         let mut bytes = Vec::new();
@@ -194,7 +235,7 @@ mod tests {
         // Regression-pin: reading the encoded bytes back recovers the
         // truncated prefix, not an error.
         let big = "x".repeat(70_000);  // > u16::MAX = 65_535
-        let pkgs = vec![PackageRef { id: &big, class: "c", name: "n" }];
+        let pkgs = vec![PackageRef { id: &big, class: "c", name: "n", icon: "" }];
         let decoded = decode(&encode(&pkgs)).unwrap();
         assert_eq!(decoded[0].id.len(), u16::MAX as usize);
     }

@@ -73,6 +73,18 @@ impl PackageRecord {
             .find(|a| a.class == class)
             .map(|a| a.launch_mode)
     }
+
+    /// Drawable name from `manifest.app.icon` with the `@drawable/`
+    /// prefix stripped. Returns `""` for packages without an icon.
+    /// Used by the package-list snapshot encoder so the Shell can
+    /// render foreign-package launcher icons without re-parsing
+    /// resource refs.
+    pub fn icon_drawable_name(&self) -> &str {
+        match self.manifest.app.icon.as_deref() {
+            Some(s) if s.starts_with("@drawable/") => &s["@drawable/".len()..],
+            _ => "",
+        }
+    }
 }
 
 #[derive(Debug)]

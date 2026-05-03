@@ -25,13 +25,14 @@ mod tests {
     #[test]
     fn re_exports_compile_and_roundtrip() {
         let bytes = encode(&[PackageRef {
-            id: "x.y", class: "C", name: "n",
+            id: "x.y", class: "C", name: "n", icon: "ic",
         }]);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded, vec![PackageEntry {
             id: "x.y".to_string(),
             class: "C".to_string(),
             name: "n".to_string(),
+            icon: "ic".to_string(),
         }]);
         assert_eq!(decode(&[1, 2, 3]), Err(DecodeError::Truncated));
     }
