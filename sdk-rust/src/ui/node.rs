@@ -39,6 +39,14 @@ pub enum Node {
     Spacer {
         min: (f32, f32),
     },
+    /// Stone 13.0prep C3 — bitmap blit. `drawable_id` is whatever
+    /// `res::drawable("name")` returned at the call site (`0` ==
+    /// missing → renderer paints a magenta placeholder). Intrinsic
+    /// size is `min`; layout treats it like a `Rect`.
+    Image {
+        drawable_id: u32,
+        min: (f32, f32),
+    },
     VStack {
         children: Vec<NodeId>,
         gap: f32,
@@ -156,6 +164,33 @@ impl<'u, 's, 'c, 'b> RectBuilder<'u, 's, 'c, 'b> {
     pub fn build(self) -> NodeId {
         let id = self.ui.push(Node::Rect {
             color: self.color, min: self.min, radius: self.radius,
+        });
+        self.ui.set_grow(id, self.grow);
+        id
+    }
+}
+
+/// Stone 13.0prep C3 — `Image` builder. Set `.size(w, h)` for the
+/// destination dp; the source PNG (looked up by `drawable_id`) is
+/// stretched to fit. `drawable_id == 0` paints a magenta placeholder
+/// — same fallback as the `@color/`/`@string/` missing path.
+pub struct ImageBuilder<'u, 's, 'c, 'b> {
+    ui: &'u mut Ui<'s, 'c, 'b>,
+    drawable_id: u32,
+    min: (f32, f32),
+    grow: f32,
+}
+
+impl<'u, 's, 'c, 'b> ImageBuilder<'u, 's, 'c, 'b> {
+    pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, drawable_id: u32) -> Self {
+        Self { ui, drawable_id, min: (0.0, 0.0), grow: 0.0 }
+    }
+    pub fn size(mut self, w: f32, h: f32) -> Self { self.min = (w, h); self }
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
+    pub fn build(self) -> NodeId {
+        let id = self.ui.push(Node::Image {
+            drawable_id: self.drawable_id,
+            min: self.min,
         });
         self.ui.set_grow(id, self.grow);
         id

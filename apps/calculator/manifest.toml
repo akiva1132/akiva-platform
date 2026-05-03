@@ -6,6 +6,7 @@ version_code = 1
 min_abi_version = "0.1.0"
 authors = ["Akiva Team"]
 description = "Pocket calculator — the first app built entirely on the Akiva widget toolkit."
+icon = "@drawable/icon"
 category = "utilities"
 
 [runtime]

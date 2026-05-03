@@ -322,6 +322,15 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         node::SpacerBuilder::new(self)
     }
 
+    /// Begin an [`Image`][node::Node::Image] node — bitmap blit by
+    /// `drawable_id`. Get the id from [`crate::res::drawable`]; chain
+    /// `.size(w, h)` for the destination dimensions in dp.
+    /// `drawable_id == 0` paints a magenta placeholder (same fallback
+    /// as missing `@color/`/`@string/`).
+    pub fn image(&mut self, drawable_id: u32) -> node::ImageBuilder<'_, 's, 'c, 'b> {
+        node::ImageBuilder::new(self, drawable_id)
+    }
+
     /// Push a [`Button`][node::Node::Button] node. Returns the
     /// [`NodeId`] directly — buttons skip the builder pattern because
     /// the defaults look right and the hot path is "id + label".

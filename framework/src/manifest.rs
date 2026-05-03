@@ -263,6 +263,18 @@ fn normalize(w: WireManifest) -> Result<Manifest, ManifestError> {
     validate_semver(&w.app.version, "app.version")?;
     validate_semver(&w.app.min_abi_version, "app.min_abi_version")?;
 
+    // Stone 13.0prep C3 — `app.icon` must be a `@drawable/<name>` ref
+    // when present. Catches typos at install rather than letting the
+    // launcher quietly fall back to magenta.
+    if let Some(ref icon) = w.app.icon {
+        if !icon.starts_with("@drawable/") || icon.len() <= "@drawable/".len() {
+            return Err(ManifestError::InvalidField {
+                field: "app.icon",
+                reason: format!("must be a `@drawable/<name>` reference, got `{icon}`"),
+            });
+        }
+    }
+
     if w.runtime.wasm.is_empty() {
         return Err(ManifestError::MissingField("runtime.wasm"));
     }
@@ -494,6 +506,72 @@ orientation = "any"
         assert!(!m.activities[1].exported);
         // Task affinity defaults to package id.
         assert_eq!(m.activities[1].task_affinity, "com.akiva.calculator");
+    }
+
+    /// Stone 13.0prep C3 — `app.icon` parses + flows to AppInfo when
+    /// it's a valid `@drawable/<name>` reference.
+    #[test]
+    fn app_icon_drawable_ref_round_trips() {
+        let src = r#"
+[app]
+id = "com.akiva.x"
+name = "X"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+icon = "@drawable/launcher"
+[runtime]
+wasm = "x.wasm"
+[[activities]]
+id = "main"
+class = "Main"
+entry = true
+"#;
+        let m = parse(src).expect("valid manifest");
+        assert_eq!(m.app.icon.as_deref(), Some("@drawable/launcher"));
+    }
+
+    #[test]
+    fn app_icon_without_drawable_prefix_is_rejected() {
+        let src = r#"
+[app]
+id = "com.akiva.x"
+name = "X"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+icon = "icon.png"
+[runtime]
+wasm = "x.wasm"
+[[activities]]
+id = "main"
+class = "Main"
+entry = true
+"#;
+        match parse(src) {
+            Err(ManifestError::InvalidField { field, .. }) => assert_eq!(field, "app.icon"),
+            other => panic!("expected InvalidField(app.icon), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn app_icon_empty_drawable_name_is_rejected() {
+        let src = r#"
+[app]
+id = "com.akiva.x"
+name = "X"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.1.0"
+icon = "@drawable/"
+[runtime]
+wasm = "x.wasm"
+[[activities]]
+id = "main"
+class = "Main"
+entry = true
+"#;
+        assert!(matches!(parse(src), Err(ManifestError::InvalidField { field: "app.icon", .. })));
     }
 
     #[test]

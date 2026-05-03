@@ -26,6 +26,14 @@
     <Frame>
         <Rect color="@color/display_panel_bg" />
         <HStack gap="12" main="end" cross="center" padding="12 16">
+            <!--
+                Stone 13.0prep C3 — `@drawable/icon` is the calculator's
+                brand mark (apps/calculator/res/drawable/icon.png). The
+                renderer paints it from the host-side ImageBitmap cache;
+                missing/unregistered ids fall through to magenta so a
+                broken @drawable/ ref is loud rather than silent.
+            -->
+            <Image src="@drawable/icon" w="24" h="24" />
             <Text text="{hint}"    size="22" color="@color/hint_fg" />
             <Text text="{display}" size="48" color="{display_color}" />
         </HStack>

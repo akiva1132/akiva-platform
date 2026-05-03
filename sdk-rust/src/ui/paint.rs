@@ -49,6 +49,13 @@ fn paint_node(
             }
         }
         Node::Spacer { .. } => {}
+        Node::Image { drawable_id, .. } => {
+            // Stone 13.0prep C3 — emit the OP_DRAW_IMAGE; renderer
+            // looks up `drawable_id` in its bitmap cache and either
+            // blits the cached `ImageBitmap` or paints a magenta
+            // placeholder for `0` / unregistered ids.
+            canvas.draw_image(*drawable_id, rect.x, rect.y, rect.w, rect.h);
+        }
         Node::Button { id: btn_id, label, label_size, bg, bg_pressed, fg, pad, radius, .. } => {
             let is_pressed = clicked_ids.iter().any(|s| s == btn_id);
             let bg_color = if is_pressed { *bg_pressed } else { *bg };

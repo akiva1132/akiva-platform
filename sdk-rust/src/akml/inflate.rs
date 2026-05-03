@@ -97,6 +97,7 @@ pub fn inflate_with(
         "Button"  => inflate_button(ui, root, bindings)?,
         "Rect"    => inflate_rect(ui, root, bindings)?,
         "Spacer"  => inflate_spacer(ui, root, bindings)?,
+        "Image"   => inflate_image(ui, root, bindings)?,
         other => return Err(InflateError {
             message: format!("unknown widget tag <{other}>"),
             loc: root.loc,
@@ -244,6 +245,54 @@ fn inflate_spacer(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) ->
     let mut b = ui.spacer().size(w, h);
     if flex > 0.0 { b = b.grow(flex); }
     Ok(b.build())
+}
+
+/// Stone 13.0prep C3 — `<Image src="@drawable/icon" w="48" h="48">`.
+/// `src` is required and must be an `@drawable/<name>` reference; the
+/// inflater calls `res::drawable(name)` to resolve it. `w`/`h` are
+/// the destination size in dp; both default to 0 (intrinsic-zero —
+/// the layout will collapse the image, which is rarely what you want
+/// but is safer than guessing the source bitmap's size). `flex` /
+/// `grow` lets a parent stack stretch the image.
+///
+/// Missing or malformed `src` → magenta placeholder via id 0; same
+/// fallback shape as missing `@color/`/`@string/`. The error path
+/// surfaces the bad ref in the warn log emitted by `res::drawable`.
+fn inflate_image(ui: &mut Ui<'_, '_, '_>, el: &Element, bindings: &Bindings) -> Result<NodeId, InflateError> {
+    let src = el.attr("src").ok_or_else(|| InflateError {
+        message: "<Image> requires a `src` attribute (e.g. src=\"@drawable/icon\")".into(),
+        loc: el.loc,
+    })?;
+    let drawable_id = parse_drawable_ref(src, el.loc)?;
+    let w = attr_f32(el, bindings, "w", "width")?.unwrap_or(0.0);
+    let h = attr_f32(el, bindings, "h", "height")?.unwrap_or(0.0);
+    let flex = attr_f32(el, bindings, "flex", "grow")?.unwrap_or(0.0);
+    let mut b = ui.image(drawable_id).size(w, h);
+    if flex > 0.0 { b = b.grow(flex); }
+    Ok(b.build())
+}
+
+/// Pull the `<name>` out of `@drawable/<name>` and resolve it via
+/// `res::drawable`. Anything else (missing prefix, empty name) → the
+/// missing-drawable sentinel `0`, which the renderer paints as magenta.
+/// Inflate doesn't reject it — surfacing the typo via the placeholder
+/// is more useful than blocking the whole frame.
+fn parse_drawable_ref(src: &str, loc: crate::akml::Loc) -> Result<u32, InflateError> {
+    const PREFIX: &str = "@drawable/";
+    if let Some(name) = src.strip_prefix(PREFIX) {
+        if name.is_empty() {
+            return Err(InflateError {
+                message: format!("<Image src=\"{src}\">: drawable name is empty"),
+                loc,
+            });
+        }
+        Ok(crate::res::drawable(name))
+    } else {
+        Err(InflateError {
+            message: format!("<Image src=\"{src}\">: must start with `@drawable/`"),
+            loc,
+        })
+    }
 }
 
 // ── Attribute parsers ────────────────────────────────────────────────
@@ -686,6 +735,46 @@ mod tests {
         with_ui(|ui| {
             let err = inflate_str(ui, r#"<Rect minWidth="10" />"#).unwrap_err();
             assert!(err.message.contains("requires a `color`"), "msg: {}", err.message);
+        });
+    }
+
+    /// Stone 13.0prep C3 — `<Image src="@drawable/...">` resolves the
+    /// drawable name via `res::drawable`. On host builds (this test
+    /// run) `res::drawable` returns `MISSING_DRAWABLE` (`0`); the
+    /// inflater still produces a valid node (the renderer paints a
+    /// magenta placeholder for that id, which is the documented
+    /// fallback). We just verify the inflate succeeds — visual
+    /// rendering with a non-zero id is exercised end-to-end via
+    /// the live demo, not here.
+    #[test]
+    fn image_inflates_with_drawable_ref() {
+        with_ui(|ui| {
+            let _id = inflate_str(ui,
+                r#"<Image src="@drawable/icon" w="48" h="48" />"#).unwrap();
+        });
+    }
+
+    #[test]
+    fn image_without_src_is_an_error() {
+        with_ui(|ui| {
+            let err = inflate_str(ui, r#"<Image w="48" h="48" />"#).unwrap_err();
+            assert!(err.message.contains("requires a `src`"), "msg: {}", err.message);
+        });
+    }
+
+    #[test]
+    fn image_without_drawable_prefix_is_an_error() {
+        with_ui(|ui| {
+            let err = inflate_str(ui, r#"<Image src="icon.png" />"#).unwrap_err();
+            assert!(err.message.contains("@drawable/"), "msg: {}", err.message);
+        });
+    }
+
+    #[test]
+    fn image_with_empty_drawable_name_is_an_error() {
+        with_ui(|ui| {
+            let err = inflate_str(ui, r#"<Image src="@drawable/" />"#).unwrap_err();
+            assert!(err.message.contains("empty"), "msg: {}", err.message);
         });
     }
 

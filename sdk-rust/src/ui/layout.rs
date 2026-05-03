@@ -67,6 +67,7 @@ fn measure_node(
         }
         Node::Rect { min, .. } => *min,
         Node::Spacer { min } => *min,
+        Node::Image { min, .. } => *min,
         Node::Button { label, label_size, pad, .. } => {
             let label_w = text_width(label, *label_size);
             let label_h = *label_size * TEXT_LINE_H_RATIO;
@@ -225,6 +226,7 @@ fn place(
         Node::Text { .. }
         | Node::Rect { .. }
         | Node::Spacer { .. }
+        | Node::Image { .. }
         | Node::Button { .. } => {}
         Node::VStack { children, gap, padding, main, cross } => {
             let inner_x = rect.x + padding.3;
