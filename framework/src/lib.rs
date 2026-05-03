@@ -60,18 +60,6 @@ use wasm_activity::{WasmActivity, WasmHost};
 /// A real key-map lives in the HAL in a later phase.
 const KEY_CODE_BACK: u32 = 27;
 
-/// Stone 13.3 — synthetic surface id used to key the
-/// [`animation::AnimationController`] off an `ActivityId`. Activities
-/// don't have a dedicated `WindowManager` surface today (Stone 13.0
-/// laid the groundwork; the wire still uses
-/// `Compositor::DEFAULT_SURFACE`), so we mint a stable u32 from the
-/// activity id and OR in the high bit to keep clear of any
-/// `WindowManager::create_surface` allocations (which start at 1 and
-/// grow upward).
-fn activity_animation_key(id: activity_manager::ActivityId) -> window_manager::SurfaceId {
-    window_manager::SurfaceId(((id as u32) & 0x7FFF_FFFF) | 0x8000_0000)
-}
-
 /// Stone 13.3 — default duration for the slide-in on activity push.
 const PUSH_TRANSITION_MS: u32 = 250;
 /// Stone 13.3 — default duration for the reveal-from-left on activity pop.
@@ -152,6 +140,7 @@ pub fn boot(
             // rationale; the diagnostic logs that backed this
             // fix are 875f168.
             animations_disabled: false,
+            activity_surfaces: HashMap::new(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -327,6 +316,12 @@ pub fn boot(
                 Ok(launched) => {
                     let id = launched.id;
                     fw.stack.push(id);
+                    // Foundation gap fix — same surface allocation
+                    // as `launch_app`. Boot's home-app path didn't
+                    // go through launch_app for historical reasons
+                    // (intent resolution differs); allocate explicitly
+                    // so the home app paints into a real surface.
+                    fw.ensure_activity_surface(id);
                     fw.drive_to_resumed(id, 0.0);
                 }
                 Err(e) => {
@@ -480,6 +475,18 @@ pub struct Framework {
     /// cold-launch arming without showing users a half-working
     /// animation. Default `false` (animation visually applied).
     pub animations_disabled: bool,
+    /// Foundation gap fix — every activity owns a dedicated
+    /// [`window_manager::SurfaceId`] allocated at launch. Stone 13.0
+    /// laid the surface-model groundwork but never wired activities
+    /// into it; the renderer painted everything to
+    /// `Compositor::DEFAULT_SURFACE`, which forced the
+    /// `activity_animation_key` bit-twiddling hack to give animations
+    /// something to key off and prevented real focus / multi-window
+    /// work. With this map populated, each activity paints into its
+    /// own surface, animations and clipping target the right buffer,
+    /// and `WindowManager::surfaces_in_z_order` becomes the source of
+    /// truth for compositor ordering.
+    activity_surfaces: HashMap<activity_manager::ActivityId, window_manager::SurfaceId>,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -665,6 +672,15 @@ impl Framework {
     pub fn render_frame(&mut self, ts: f64) -> &FrameCommands {
         self.compositor.begin_frame();
         let foreground = self.stack.last().copied();
+        // Foundation gap fix — paint into the foreground activity's
+        // *real* WindowManager surface, not the legacy DEFAULT_SURFACE.
+        // The surface was allocated in `launch_app`; if it's somehow
+        // missing (test fixture that pushes onto `self.stack` without
+        // going through launch), fall back to the legacy default so
+        // those tests keep working without rewrites.
+        let fg_surface = foreground
+            .and_then(|id| self.activity_surfaces.get(&id).copied())
+            .unwrap_or(compositor::Compositor::DEFAULT_SURFACE);
         if let Some(id) = foreground {
             // Stone 11.5 — Trapped activities don't paint. The empty
             // FrameCommands here means "nothing changed since last
@@ -676,7 +692,7 @@ impl Framework {
                 self.activities.state_of(id),
                 Some(activity_manager::LifecycleState::Trapped)
             ) {
-                return self.compositor.finish_frame();
+                return self.finalize_frame(foreground);
             }
             let metrics = self.metrics;
             let pointer = self.pointer;
@@ -694,7 +710,7 @@ impl Framework {
             // Explicit split so the compiler sees `compositor` and
             // `activities` as disjoint mut borrows of self.
             let activities = &mut self.activities;
-            let target = self.compositor.paint_target();
+            let target = self.compositor.surface_target(fg_surface);
             activities.with_instance(id, |a| a.render(&mut ctx, target));
             self.apply_post(PostCallback { finish, launch, launch_for_result, set_result }, id, ts);
         }
@@ -722,9 +738,7 @@ impl Framework {
         if let Some(fg) = foreground {
             let pending = self.pending_transitions.contains_key(&fg);
             if pending {
-                let ops_len = self.compositor.surface_target(
-                    compositor::Compositor::DEFAULT_SURFACE,
-                ).ops.len();
+                let ops_len = self.compositor.surface_target(fg_surface).ops.len();
                 let state = self.activities.state_of(fg);
                 self.diagnostic_log.push(format!(
                     "[anim] arm-check: fg={} state={:?} ts={:.0} ops={}",
@@ -732,9 +746,7 @@ impl Framework {
                 ));
                 if ops_len > 0 {
                     if let Some(transition) = self.pending_transitions.remove(&fg) {
-                        self.animations.start(
-                            activity_animation_key(fg), transition, ts,
-                        );
+                        self.animations.start(fg_surface, transition, ts);
                         self.diagnostic_log.push(format!(
                             "[anim] armed: id={} ts={:.0} kind={:?}",
                             fg, ts, transition,
@@ -754,10 +766,9 @@ impl Framework {
         // a half-working slide-in. Re-enabled once the cold-launch
         // first-frame timing is properly characterised.
         if let Some(fg) = foreground {
-            let surface_key = activity_animation_key(fg);
-            if self.animations.is_animating(surface_key) {
+            if self.animations.is_animating(fg_surface) {
                 let props = self.animations.props_for(
-                    surface_key, ts, self.metrics.width_px as f32,
+                    fg_surface, ts, self.metrics.width_px as f32,
                 );
                 if !props.is_rest() {
                     self.diagnostic_log.push(format!(
@@ -766,9 +777,7 @@ impl Framework {
                         self.animations_disabled,
                     ));
                     if !self.animations_disabled {
-                        let target = self.compositor.surface_target(
-                            compositor::Compositor::DEFAULT_SURFACE,
-                        );
+                        let target = self.compositor.surface_target(fg_surface);
                         let rewritten = animation::apply_props(&target.ops, props);
                         target.ops = rewritten;
                     }
@@ -776,18 +785,69 @@ impl Framework {
             }
         }
 
-        // Compose the activity's default surface with every open dialog's
-        // overlay surface, in z-order. Skip the dialog overlays in the
-        // common "no dialog" case to keep the legacy single-surface path
-        // hot.
-        if self.dialogs.open_dialogs().next().is_none() {
-            return self.compositor.finish_frame();
+        self.finalize_frame(foreground)
+    }
+
+    /// Foundation gap fix — allocate (idempotently) a `WindowLayer::App`
+    /// surface for the activity, sized to the current display, and
+    /// store it in [`Self::activity_surfaces`]. Returns the existing
+    /// surface id on a re-entry so launch_app's reuse path doesn't
+    /// double-allocate. Called from every code path that puts an
+    /// activity on a stack — `launch_app`, `launch_app_for_result`,
+    /// boot, and the test helper `_test_push`.
+    fn ensure_activity_surface(
+        &mut self, id: activity_manager::ActivityId,
+    ) -> window_manager::SurfaceId {
+        if let Some(existing) = self.activity_surfaces.get(&id).copied() {
+            return existing;
         }
-        let mut order: Vec<window_manager::SurfaceId> =
-            vec![compositor::Compositor::DEFAULT_SURFACE];
-        // Order overlays by surface id (creation order) — consistent and
-        // deterministic. Stone 13.2 has at most one open dialog per
-        // foreground activity so the ordering is trivial in practice.
+        let surface = self.windows.create_surface(id, window_manager::WindowLayer::App);
+        let m = self.metrics;
+        self.windows.set_bounds(surface, window_manager::Rect {
+            x: 0.0, y: 0.0,
+            w: m.width_px as f32, h: m.height_px as f32,
+        });
+        self.windows.set_visible(surface, true);
+        self.activity_surfaces.insert(id, surface);
+        surface
+    }
+
+    /// Foundation gap fix — release an activity's surface allocation.
+    /// Called from every destroy path (`destroy_with_persist`,
+    /// `destroy_shortcut`, `reap_trapped`'s reaper). Idempotent: a
+    /// destroy of an activity whose surface was never allocated (test
+    /// fixtures, `_test_push` bypass) is a silent no-op.
+    fn release_activity_surface(&mut self, id: activity_manager::ActivityId) {
+        if let Some(surface) = self.activity_surfaces.remove(&id) {
+            self.compositor.destroy_surface(surface);
+            self.windows.destroy_surface(surface);
+            self.animations.cancel(surface);
+        }
+    }
+
+    /// Compose the foreground activity's surface plus every open
+    /// dialog's overlay onto the kernel's flush buffer.
+    ///
+    /// Pre-foundation-fix the order was hardcoded to
+    /// `[DEFAULT_SURFACE, ...overlays]`. Now we look up the foreground
+    /// activity's actual surface (or fall back to DEFAULT_SURFACE for
+    /// test fixtures that push onto `self.stack` without going through
+    /// `launch_app`), then append every dialog overlay sorted by
+    /// creation order — so a dialog opened later sits visually above
+    /// an older one. Future Stone-13 work can swap this for a full
+    /// `WindowManager::surfaces_in_z_order` walk; today's simpler
+    /// shape keeps the only-foreground-paints invariant from the
+    /// Trapped guard intact.
+    fn finalize_frame(
+        &mut self, foreground: Option<activity_manager::ActivityId>,
+    ) -> &FrameCommands {
+        let fg_surface = foreground
+            .and_then(|id| self.activity_surfaces.get(&id).copied())
+            .unwrap_or(compositor::Compositor::DEFAULT_SURFACE);
+        if self.dialogs.open_dialogs().next().is_none() {
+            return self.compositor.finish_frame_in_order(&[fg_surface]);
+        }
+        let mut order: Vec<window_manager::SurfaceId> = vec![fg_surface];
         let mut overlays: Vec<window_manager::SurfaceId> =
             self.dialogs.open_dialogs().map(|d| d.surface).collect();
         overlays.sort();
@@ -1403,6 +1463,11 @@ impl Framework {
             // in that case, which we count as "someone else handled
             // it" and skip silently.
             if self.activities.reap(id).is_some() {
+                // Foundation gap fix — the trapped activity's surface
+                // would otherwise leak (the worker is dead, no destroy
+                // callback runs to release it).
+                self.release_activity_surface(id);
+                self.pending_transitions.remove(&id);
                 n += 1;
             }
         }
@@ -1837,6 +1902,15 @@ impl Framework {
             self.stack.push(outcome.id);
         }
 
+        // Foundation gap fix — allocate the activity's WindowManager
+        // surface BEFORE Stone 13.3 queues its push animation, so the
+        // animation arming below can already key off the real surface
+        // id rather than a synthesised hash. Re-using the same
+        // SurfaceId for the lifetime of the ActivityId is what makes
+        // arm-on-first-paint work — the animation controller and
+        // compositor agree on the same key.
+        let _surface = self.ensure_activity_surface(outcome.id);
+
         // Stone 13.3 — queue slide-in animation for the new top.
         // **Deferred** until the activity actually reaches Resumed
         // (`render_frame` arms it on the first matching frame). Cold
@@ -1872,6 +1946,7 @@ impl Framework {
         if self.advance_through_create(outcome.id, ts) {
             self.destroy_shortcut(outcome.id, ts);
             self.stack.retain(|x| *x != outcome.id);
+            self.release_activity_surface(outcome.id);
             if switching && self.stack.is_empty() {
                 if let Some(prev) = prev_fg {
                     self.switch_foreground_stack(prev);
@@ -1947,6 +2022,8 @@ impl Framework {
             }
             self.stack.push(outcome.id);
         }
+        // Foundation gap fix — same eager allocation as launch_app.
+        let _surface = self.ensure_activity_surface(outcome.id);
         if self.advance_through_create(outcome.id, ts) {
             self.destroy_shortcut(outcome.id, ts);
             // destroy_shortcut bypasses destroy_with_persist — it fires
@@ -1954,6 +2031,7 @@ impl Framework {
             // caller still needs a result, so deliver CANCELED explicitly.
             self.deliver_activity_result_for(outcome.id, ts);
             self.stack.retain(|x| *x != outcome.id);
+            self.release_activity_surface(outcome.id);
             if switching && self.stack.is_empty() {
                 if let Some(prev) = prev_fg {
                     self.switch_foreground_stack(prev);
@@ -2079,11 +2157,11 @@ impl Framework {
             // future finish in the restored task doesn't bounce back
             // to the dead one.
             self.task_history.pop();
-            // Stone 13.3 — release the going-away activity's animation
-            // bucket so a future re-launch with the same ActivityId
-            // doesn't see stale state (ActivityIds are not reused in
-            // practice, but defensive cleanup is cheap).
-            self.animations.cancel(activity_animation_key(id));
+            // Foundation gap fix — release the activity's surface plus
+            // its animation bucket. `release_activity_surface` cancels
+            // animations and removes the entry from the WindowManager
+            // / compositor / activity_surfaces map atomically.
+            self.release_activity_surface(id);
             self.pending_transitions.remove(&id);
             if let Some(new_top) = self.stack.last().copied() {
                 // Stone 13.3 — pop transition: reveal the previous
@@ -2109,7 +2187,7 @@ impl Framework {
         self.stack.pop();
         self.destroy_with_persist(id, ts);
         self.deliver_activity_result_for(id, ts);
-        self.animations.cancel(activity_animation_key(id));
+        self.release_activity_surface(id);
         self.pending_transitions.remove(&id);
         if let Some(new_top) = self.stack.last().copied() {
             self.pending_transitions.insert(
@@ -2395,6 +2473,7 @@ mod tests {
             pending_transitions: HashMap::new(),
             diagnostic_log: Vec::new(),
             animations_disabled: true,
+            activity_surfaces: HashMap::new(),
         }
     }
 
@@ -2562,6 +2641,7 @@ mod tests {
 
         fw.dispatch_text_input("h", 1.0);
         fw.dispatch_text_input("שלום", 2.0);
+        // IME-paste of a multi-codepoint chunk in one event.
         fw.dispatch_text_input("👋🎉", 3.0);
 
         assert_eq!(
@@ -2572,6 +2652,10 @@ mod tests {
 
     #[test]
     fn dispatch_text_input_drops_empty_text_before_callback() {
+        // Empty text means the host's filter produced nothing — typically
+        // the user pressed a named key like "ArrowDown" that fell through
+        // `isSingleCharText`'s guard. No reason to wake the activity for
+        // a no-op.
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut fw = empty_framework();
         let log_for_app = log.clone();
@@ -2589,8 +2673,79 @@ mod tests {
 
     #[test]
     fn dispatch_text_input_with_empty_stack_is_a_silent_noop() {
+        // Boot edge: `tab.js` may send a text event in the gap between
+        // worker spawn and first activity launch. No top → drop on the
+        // floor (matching pointer/key semantics).
         let mut fw = empty_framework();
-        fw.dispatch_text_input("a", 0.0);
+        fw.dispatch_text_input("a", 0.0);  // no panic, no allocation
+    }
+
+    #[test]
+    fn launch_app_allocates_a_window_manager_surface_for_the_activity() {
+        // Foundation gap regression net — Stone 13.0 created the
+        // WindowManager surface model but `launch_app` never allocated.
+        // Activities painted into Compositor::DEFAULT_SURFACE and
+        // animations keyed off the synthetic `activity_animation_key`
+        // hash. This test pins the new wiring: launch → real surface,
+        // finish → real teardown, no DEFAULT_SURFACE in the picture.
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut fw = empty_framework();
+        let log_for_shell = log.clone();
+        fw.activities.register("test.shell", "Main", LaunchMode::SingleTop, move || {
+            Box::new(ScriptedActivity::new("shell", log_for_shell.clone()))
+        });
+        let log_for_app = log.clone();
+        fw.activities.register("test.app", "Main", LaunchMode::Standard, move || {
+            Box::new(ScriptedActivity::new("app", log_for_app.clone()))
+        });
+
+        // Manually launch the shell as the bottom of the stack — same
+        // shape as `boot()`'s home-app push, with the explicit
+        // `ensure_activity_surface` call.
+        let shell_id = fw.activities.launch("test.shell", "Main").unwrap().id;
+        fw.stack.push(shell_id);
+        fw.ensure_activity_surface(shell_id);
+        fw.drive_to_resumed(shell_id, 0.0);
+        let shell_surface = *fw.activity_surfaces.get(&shell_id)
+            .expect("shell surface allocated");
+        // Real WindowManager surface, not the DEFAULT_SURFACE sentinel.
+        assert_ne!(shell_surface, compositor::Compositor::DEFAULT_SURFACE);
+        assert!(fw.windows.surface(shell_surface).is_some());
+
+        // Push another activity through the regular launch_app path.
+        let app_intent = Intent::explicit("test.app", "Main");
+        fw.launch_app(&app_intent, "test.app", "Main", 1.0);
+        let app_id = *fw.stack.last().unwrap();
+        let app_surface = *fw.activity_surfaces.get(&app_id)
+            .expect("app surface allocated by launch_app");
+        // Distinct surface from the shell.
+        assert_ne!(app_surface, shell_surface);
+        assert!(fw.windows.surface(app_surface).is_some());
+        // App layer (vs Wallpaper / Overlay / System).
+        assert_eq!(
+            fw.windows.surface(app_surface).map(|s| s.layer),
+            Some(window_manager::WindowLayer::App),
+        );
+
+        // Esc back → finish_top → app surface released.
+        let esc = activity::KeyEvent {
+            code: KEY_CODE_BACK,
+            modifiers: 0,
+            phase: activity::KeyPhase::Down,
+        };
+        fw.dispatch_key(esc, 2.0);
+
+        assert!(
+            !fw.activity_surfaces.contains_key(&app_id),
+            "app surface should be released on finish",
+        );
+        assert!(
+            fw.windows.surface(app_surface).is_none(),
+            "WindowManager should have dropped the surface record",
+        );
+        // Shell surface is still around — it never finished.
+        assert!(fw.activity_surfaces.contains_key(&shell_id));
+        assert!(fw.windows.surface(shell_surface).is_some());
     }
 
     #[test]
@@ -3511,6 +3666,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             pending_transitions: HashMap::new(),
             diagnostic_log: Vec::new(),
             animations_disabled: true,
+            activity_surfaces: HashMap::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -3618,6 +3774,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             pending_transitions: HashMap::new(),
             diagnostic_log: Vec::new(),
             animations_disabled: true,
+            activity_surfaces: HashMap::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -4198,6 +4355,7 @@ optional = []
             pending_transitions: HashMap::new(),
             diagnostic_log: Vec::new(),
             animations_disabled: true,
+            activity_surfaces: HashMap::new(),
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -4318,6 +4476,7 @@ optional = []
             pending_transitions: HashMap::new(),
             diagnostic_log: Vec::new(),
             animations_disabled: true,
+            activity_surfaces: HashMap::new(),
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -4463,6 +4622,7 @@ optional = []
             pending_transitions: HashMap::new(),
             diagnostic_log: Vec::new(),
             animations_disabled: true,
+            activity_surfaces: HashMap::new(),
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),
