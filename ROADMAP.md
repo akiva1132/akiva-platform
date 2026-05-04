@@ -435,7 +435,7 @@ architecture is the load-bearing change.
             composite. Visual parity with 15.3.
       - [x] **15.4.2** Translate / scale / opacity opts on the
             WebGPU path.
-      - [ ] **15.4.3** Backdrop blur (frosted glass) — two-pass
+      - [x] **15.4.3** Backdrop blur (frosted glass) — two-pass
             Gaussian on downsampled texture.
       - [ ] **15.4.4** Drop shadow — separable blur on the
             surface's alpha channel.
