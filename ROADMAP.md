@@ -426,15 +426,29 @@ architecture is the load-bearing change.
       [`framework/src/animation.rs`](framework/src/animation.rs).
       DoD: transitions are pixel-identical to Stone 13.3 output
       but driven by compositor opts.
-- [ ] **15.4** WebGPU compositor implementation. `WebGPUCompositor`
-      against `CompositorBackend`; only the compositor pass, not
-      per-Activity backends. Real backdrop blur (two-pass
-      Gaussian on downsampled texture), drop shadows (separable
-      blur on alpha), color grading. Feature-detect at boot,
-      fall back to `Canvas2DCompositor`. DoD: a sheet over a
-      busy app shows live frosted-glass blur of the app's
-      pixels; older browsers fall back without visual loss for
-      basic shapes.
+- [ ] **15.4** WebGPU compositor implementation. Full
+      implementation plan in
+      [`docs/phase-15.4-plan.md`](docs/phase-15.4-plan.md);
+      broken into six sub-stones:
+      - [ ] **15.4.1** Architectural split (paint backend vs.
+            compositor backend) + WebGPU detection + identity
+            composite. Visual parity with 15.3.
+      - [ ] **15.4.2** Translate / scale / opacity opts on the
+            WebGPU path.
+      - [ ] **15.4.3** Backdrop blur (frosted glass) — two-pass
+            Gaussian on downsampled texture.
+      - [ ] **15.4.4** Drop shadow — separable blur on the
+            surface's alpha channel.
+      - [ ] **15.4.5** Color tint / dim — single-fragment
+            shader on `SurfaceDrawOpts.tint`.
+      - [ ] **15.4.6** `SurfaceDrawOpts` wire format
+            consolidation (61-byte CompositeSurface pinned).
+
+      Feature-detect WebGPU at boot, fall back to
+      `Canvas2DCompositor` (which silently ignores blur /
+      shadow). DoD: a sheet over a busy app shows live
+      frosted-glass blur of the app's pixels; older browsers
+      fall back without visual loss for basic shapes.
 - [ ] **15.5** (optional, opt-in) WebGPU per-Activity backend —
       the original `RendererBackend` swap from
       [`ARCHITECTURE.md §10`](ARCHITECTURE.md). Per-app manifest
