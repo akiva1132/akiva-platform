@@ -109,6 +109,7 @@ impl DrawHal for ExternDrawHal {
             host::hal_composite_surface(
                 id, x, y, w, h,
                 opts.opacity, opts.translate_x, opts.translate_y, opts.scale,
+                opts.backdrop_blur_radius,
             )
         }
     }

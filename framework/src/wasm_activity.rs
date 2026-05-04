@@ -595,12 +595,13 @@ pub mod opcode {
     pub const BEGIN_SURFACE:     u8 = 14;
     /// `EndSurface` — 1 byte (opcode only).
     pub const END_SURFACE:       u8 = 15;
-    /// `CompositeSurface { id, x, y, w, h, opts }` — 37 bytes.
-    /// Opcode + u32 + 4×f32 + 4×f32 (opts: opacity / translate_x /
-    /// translate_y / scale). Phase 15.3 — opts moved here from the
-    /// activity's own paint ops so the slide+fade transitions
-    /// translate the entire offscreen instead of clipping content
-    /// inside it.
+    /// `CompositeSurface { id, x, y, w, h, opts }` — 41 bytes (15.4.3).
+    /// Opcode + u32 + 4×f32 (bounds) + 5×f32 (opts: opacity /
+    /// translate_x / translate_y / scale / backdrop_blur_radius).
+    /// Phase 15.3 — first four opts moved here from the activity's own
+    /// paint ops so the slide+fade transitions translate the entire
+    /// offscreen instead of clipping content inside it. Phase 15.4.3
+    /// added backdrop_blur_radius for frosted-glass sheets / dialogs.
     pub const COMPOSITE_SURFACE: u8 = 16;
     /// `DestroySurface { id }` — 5 bytes.
     pub const DESTROY_SURFACE:   u8 = 17;
@@ -750,6 +751,7 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             out.extend_from_slice(&opts.translate_x.to_le_bytes());
             out.extend_from_slice(&opts.translate_y.to_le_bytes());
             out.extend_from_slice(&opts.scale.to_le_bytes());
+            out.extend_from_slice(&opts.backdrop_blur_radius.to_le_bytes());
         }
         PaintOp::DestroySurface { id } => {
             out.push(opcode::DESTROY_SURFACE);
@@ -895,10 +897,12 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                 let translate_x = read_f32(&mut bytes)?;
                 let translate_y = read_f32(&mut bytes)?;
                 let scale = read_f32(&mut bytes)?;
+                let backdrop_blur_radius = read_f32(&mut bytes)?;
                 out.push(PaintOp::CompositeSurface {
                     id, x, y, w, h,
                     opts: crate::compositor::SurfaceDrawOpts {
                         opacity, translate_x, translate_y, scale,
+                        backdrop_blur_radius,
                     },
                 });
             }
@@ -1277,13 +1281,13 @@ mod tests {
         assert_eq!(frame.ops().len(), inputs.len());
     }
 
-    /// Phase 15.1/15.3 — wire size pinning for the four surface
+    /// Phase 15.1/15.3/15.4.3 — wire size pinning for the four surface
     /// compositor opcodes. BeginSurface = 21 bytes (opcode + u32 +
-    /// 4×f32); EndSurface = 1 byte; CompositeSurface = 37 bytes
-    /// (Phase 15.3: opcode + u32 + 4×f32 bounds + 4×f32 opts);
-    /// DestroySurface = 5 bytes. A regression in encoder padding or
-    /// layout would fail these assertions before becoming a silent
-    /// decode error in the field.
+    /// 4×f32); EndSurface = 1 byte; CompositeSurface = 41 bytes
+    /// (15.3: opcode + u32 + 4×f32 bounds + 4×f32 opts; 15.4.3 added
+    /// f32 backdrop_blur_radius); DestroySurface = 5 bytes. A
+    /// regression in encoder padding or layout would fail these
+    /// assertions before becoming a silent decode error in the field.
     #[test]
     fn surface_ops_wire_sizes_are_pinned() {
         let mut buf = Vec::new();
@@ -1299,8 +1303,8 @@ mod tests {
             id: 1, x: 0.0, y: 0.0, w: 0.0, h: 0.0,
             opts: crate::compositor::SurfaceDrawOpts::IDENTITY,
         });
-        assert_eq!(buf.len(), 1 + 4 + 4 * 4 + 4 * 4,
-            "COMPOSITE_SURFACE = 37 bytes (15.3 added 16-byte opts)");
+        assert_eq!(buf.len(), 1 + 4 + 4 * 4 + 5 * 4,
+            "COMPOSITE_SURFACE = 41 bytes (15.4.3 added 4-byte backdrop_blur_radius)");
         buf.clear();
         encode_op(&mut buf, &PaintOp::DestroySurface { id: 1 });
         assert_eq!(buf.len(), 1 + 4, "DESTROY_SURFACE = 5 bytes");

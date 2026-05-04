@@ -71,8 +71,14 @@ export class Canvas2DCompositor {
    *  Identity opts (opacity=1, translate=(0,0), scale=1) take a fast
    *  path with no save/restore; anything else uses
    *  `save → translate → scale → globalAlpha → drawImage → restore`
-   *  so frame N's effects can't leak into frame N+1. */
-  compositeSurface(src, x, y, w, h, opacity, translateX, translateY, scale) {
+   *  so frame N's effects can't leak into frame N+1.
+   *
+   *  Phase 15.4.3 — `_blurRadius` is accepted to match the WebGPU
+   *  compositor signature but ignored on the Canvas2D path. CSS
+   *  `filter: blur()` on a 60Hz live-blurred sheet is too slow for an
+   *  app-grade UI; sheets / dialogs that need frosted glass must boot
+   *  on the WebGPU path. */
+  compositeSurface(src, x, y, w, h, opacity, translateX, translateY, scale, _blurRadius) {
     if (!this.screenCtx) return;
     if (!src || w <= 0 || h <= 0) return;
     const isIdentity =

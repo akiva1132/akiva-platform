@@ -819,6 +819,10 @@ impl Framework {
                 translate_x: props.translate_x,
                 translate_y: 0.0,
                 scale: 1.0,
+                // 15.4.3 — animations don't blur today; sheets/dialogs
+                // that want blur set `backdrop_blur_radius` explicitly
+                // when they emit their own CompositeSurface (15.4.3+).
+                backdrop_blur_radius: 0.0,
             }
         } else {
             compositor::SurfaceDrawOpts::IDENTITY

@@ -186,7 +186,8 @@ export function applyPaintStream(bytes, backend) {
         const x = readF32(), y = readF32(), w = readF32(), h = readF32();
         const opacity = readF32();
         const tx = readF32(), ty = readF32(), scale = readF32();
-        backend.compositeSurface?.(id, x, y, w, h, opacity, tx, ty, scale);
+        const backdropBlurRadius = readF32();
+        backend.compositeSurface?.(id, x, y, w, h, opacity, tx, ty, scale, backdropBlurRadius);
         break;
       }
       case OP_DESTROY_SURFACE: {

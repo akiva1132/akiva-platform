@@ -47,11 +47,18 @@ pub struct SurfaceDrawOpts {
     pub translate_x: f32,
     pub translate_y: f32,
     pub scale: f32,
+    /// Phase 15.4.3 — backdrop blur radius in screen pixels. `0.0` =
+    /// no blur (fast path). The WebGPU compositor downsamples the
+    /// pixels behind the surface, runs a two-pass Gaussian, and
+    /// composites the result under the surface — frosted-glass for
+    /// sheets / dialogs / nav bars. Canvas2D ignores (no live blur).
+    pub backdrop_blur_radius: f32,
 }
 
 impl SurfaceDrawOpts {
     pub const IDENTITY: SurfaceDrawOpts = SurfaceDrawOpts {
         opacity: 1.0, translate_x: 0.0, translate_y: 0.0, scale: 1.0,
+        backdrop_blur_radius: 0.0,
     };
 
     /// True when the opts are exactly identity. Renderers can
@@ -65,6 +72,7 @@ impl SurfaceDrawOpts {
             && self.translate_x == 0.0
             && self.translate_y == 0.0
             && self.scale == 1.0
+            && self.backdrop_blur_radius == 0.0
     }
 }
 
@@ -742,8 +750,9 @@ mod tests {
             &mut self, id: u32, x: f32, y: f32, w: f32, h: f32, opts: SurfaceDrawOpts,
         ) {
             self.trace.push(format!(
-                "composite_surface({id},{x},{y},{w},{h},opacity={},tx={},ty={},scale={})",
+                "composite_surface({id},{x},{y},{w},{h},opacity={},tx={},ty={},scale={},blur={})",
                 opts.opacity, opts.translate_x, opts.translate_y, opts.scale,
+                opts.backdrop_blur_radius,
             ));
         }
         fn destroy_surface(&mut self, id: u32) {
@@ -816,7 +825,7 @@ mod tests {
             "set_global_alpha(0.5)",
             "begin_surface(42,1,2,100,200)",
             "end_surface",
-            "composite_surface(42,1,2,100,200,opacity=1,tx=0,ty=0,scale=1)",
+            "composite_surface(42,1,2,100,200,opacity=1,tx=0,ty=0,scale=1,blur=0)",
             "destroy_surface(42)",
         ]);
     }

@@ -225,10 +225,10 @@ export class WebGPUCompositor {
 
   /** Composite `src` (an OffscreenCanvas allocated by the paint
    *  backend) onto the screen at `(x, y, w, h)`, transformed by the
-   *  SurfaceDrawOpts (`opacity`, `translateX`, `translateY`, `scale`).
-   *  Defaults match `SurfaceDrawOpts::IDENTITY`: opacity=1, no
-   *  translate, scale=1. */
-  compositeSurface(src, x, y, w, h, opacity = 1, translateX = 0, translateY = 0, scale = 1) {
+   *  SurfaceDrawOpts. Defaults match `SurfaceDrawOpts::IDENTITY`.
+   *  `_blurRadius` is accepted to match the trait — the actual
+   *  two-pass Gaussian backdrop-blur pipeline lands in 15.4.3b. */
+  compositeSurface(src, x, y, w, h, opacity = 1, translateX = 0, translateY = 0, scale = 1, _blurRadius = 0) {
     if (!this.device || this._lost || !src || w <= 0 || h <= 0) return;
     if (!this._frameInProgress) {
       this.beginFrame();
