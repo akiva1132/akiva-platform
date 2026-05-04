@@ -1,26 +1,47 @@
 # AKML — Akiva Markup Language
 
-## 1. מטרה
+> **Implementation status (May 2026):** parser + inflater live in
+> [`sdk-rust/src/akml/`](../sdk-rust/src/akml/). Supported widget
+> tags: **`VStack`**, **`HStack`**, **`Frame`**, **`Grid`**,
+> **`Text`**, **`Button`**, **`Rect`**, **`Spacer`**, **`Image`**.
+> `Image` resolves `@drawable/...` refs through the cross-package
+> drawable cache. `<Input>`, `<ScrollView>`, and `<List>` are
+> design targets, not yet implemented. Style references
+> (`@style/...`) and dimension references (`@dimen/...`) are
+> reserved in the syntax but the resource manager does not parse
+> them yet (see [`docs/resources.md §13`](resources.md)).
 
-AKML היא שפת תיאור דקלרטיבית לממשק משתמש באפליקציות Akiva. כמו `XML layouts` באנדרואיד — UI נכתב בקובץ חיצוני, מפורש בזמן ריצה ע"י `LayoutInflater`, והאפליקציה (קוד Rust/wasm) רק מגיבה ל-events.
+## 1. Purpose
 
-## 2. עקרונות
+AKML is the declarative language for Akiva user interfaces. Like
+XML layouts on Android, the UI is written in an external file,
+parsed at runtime by the inflater, and the app code only reacts to
+events.
 
-1. **דקלרטיבי**: מתאר "מה צריך להיות", לא "מה לעשות".
-2. **נפרד מהקוד**: UI לא נכתב ב-Rust, הוא נכתב ב-AKML.
-3. **Resource-aware**: `@string/`, `@color/`, `@dimen/` — הפניות אוטומטיות.
-4. **Qualifier-aware**: `res/layout-land/main.akml` נטען אוטומטית במצב אופקי.
-5. **Type-checked ב-inflate time**: AKML לא תקין → שגיאה לפני שהאפליקציה רצה.
+## 2. Principles
 
-## 3. תחביר
+1. **Declarative.** Describes "what should exist", not "what to
+   do".
+2. **Decoupled from code.** UI is not in Rust — it's in AKML.
+3. **Resource-aware.** `@string/`, `@color/`, `@dimen/`,
+   `@drawable/` resolve automatically.
+4. **Qualifier-aware.** `res/layout-land/main.akml` would load
+   automatically in landscape *(the qualifier flow is the planned
+   shape; today only `night` is wired in `res/values/`).*
+5. **Type-checked at inflate time.** A malformed AKML fails before
+   the app runs — the inflater rejects unknown tags, malformed
+   refs, and bad attribute types with positional errors.
 
-AKML מבוסס XML. הבחירה ב-XML:
-- הוכח במשך 20 שנה באנדרואיד
-- Tooling מסיבי (שגיאה/לינטינג/syntax highlighting)
-- Schema validation פשוט
-- מוכר למפתחי mobile
+## 3. Syntax
 
-### מבנה בסיסי
+AKML is XML-based. Why XML:
+
+- 20+ years of proof on Android.
+- Massive tooling (linting, syntax highlighting).
+- Schema validation is straightforward.
+- Familiar to mobile developers.
+
+### Basic structure
 
 ```xml
 <?akml version="1.0"?>
@@ -43,160 +64,190 @@ AKML מבוסס XML. הבחירה ב-XML:
 
 ### Elements
 
-כל element הוא widget. ה-root חייב להיות widget אחד בלבד.
+Every element is a widget. The root must be exactly one widget.
 
-**Containers:**
+**Containers** (live):
+
 - `<VStack>` — vertical stack
 - `<HStack>` — horizontal stack
-- `<Grid columns="N" rows="M">`
-- `<ScrollView>` — יכול לגלול (נוסף ב-v0.2)
-- `<Frame>` — stacking (z-order)
+- `<Grid cols="N" rows="M">` — uniform grid
+- `<Frame>` — children stack on the z axis at the same origin
 
-**Leaf widgets:**
+**Containers** (planned):
+
+- `<ScrollView>` — scrollable wrapper
+- `<List>` — virtualised list of items
+
+**Leaf widgets** (live):
+
 - `<Text>`
 - `<Button>`
-- `<Image>`
-- `<Input>` (v0.2)
-- `<Spacer>`
+- `<Rect>` — coloured rectangle (used as a primitive painter)
+- `<Spacer>` — pure layout filler
+- `<Image src="@drawable/...">` — bitmap from the cross-package
+  drawable cache
+
+**Leaf widgets** (planned):
+
+- `<Input>` — editable text field
 
 ## 4. Attributes
 
-### Universal attributes
+### Universal
 
-| Attribute | Type | דוגמה | פירוש |
-|---|---|---|---|
-| `id` | string | `@+id/name` | מזהה ייחודי ב-tree (רק אם צריך) |
-| `width` | size | `match_parent`, `wrap_content`, `100dp`, `50%` | רוחב |
-| `height` | size | כנ"ל | גובה |
-| `padding` | spacing | `16dp`, `8dp 16dp`, `8dp 16dp 8dp 16dp` | top right bottom left |
-| `margin` | spacing | כנ"ל | רווח חיצוני |
-| `background` | color | `@color/surface`, `#FF0000` | צבע רקע |
-| `flex` | float | `1.0`, `0.5` | משקל ב-stack |
-| `tag` | string | `"9"`, `"op_mul"` | מידע שמועבר ל-callback |
-| `visible` | bool | `true` \| `false` \| `gone` | הצגה (`gone` = לא תופס מקום) |
+| attribute     | type      | example                                       | meaning                                                    |
+|---------------|-----------|-----------------------------------------------|------------------------------------------------------------|
+| `id`          | string    | `@+id/name`                                   | unique id within the tree (only when needed)               |
+| `width`       | size      | `match_parent`, `wrap_content`, `100dp`, `50%`| width                                                      |
+| `height`      | size      | (same)                                        | height                                                     |
+| `padding`     | spacing   | `16dp`, `8dp 16dp`, `8dp 16dp 8dp 16dp`       | top, right, bottom, left                                   |
+| `margin`      | spacing   | (same)                                        | outer spacing                                              |
+| `background`  | color     | `@color/surface`, `#FF0000`                   | background colour                                          |
+| `flex`        | float     | `1.0`, `0.5`                                  | weight inside a stack                                      |
+| `tag`         | string    | `"9"`, `"op_mul"`                             | data passed back to the click callback                     |
+| `visible`     | bool      | `true` / `false` / `gone`                     | visibility (`gone` removes from layout)                    |
 
-### Text-specific
+### `Text`-specific
 
-| Attribute | Type | פירוש |
-|---|---|---|
-| `text` | string / ref | תוכן |
-| `textSize` | size | גודל פונט |
-| `textColor` | color | צבע טקסט |
-| `textAlign` | enum | `start`, `center`, `end`, `justify` |
-| `fontWeight` | enum | `normal`, `bold` |
-| `maxLines` | int | מספר שורות מקסימלי |
-| `ellipsize` | enum | `none`, `end` |
+| attribute     | type      | meaning                                                            |
+|---------------|-----------|--------------------------------------------------------------------|
+| `text`        | string / ref | content                                                          |
+| `textSize`    | size      | font size                                                          |
+| `textColor`   | color     | text colour                                                        |
+| `textAlign`   | enum      | `start`, `center`, `end`, `justify`                                |
+| `fontWeight`  | enum      | `normal`, `bold`                                                   |
+| `maxLines`    | int       | maximum number of rendered lines                                   |
+| `ellipsize`   | enum      | `none`, `end`                                                      |
 
-### Button-specific
+### `Button`-specific
 
-| Attribute | פירוש |
-|---|---|
-| `onClick` | שם callback ב-app |
-| `onLongClick` | שם callback |
-| `enabled` | bool |
+| attribute       | meaning                          |
+|-----------------|----------------------------------|
+| `onClick`       | name of an app-side callback     |
+| `onLongClick`   | name of an app-side callback     |
+| `enabled`       | bool                             |
 
-### Stack-specific
+### Stack-specific (`VStack`, `HStack`)
 
-| Attribute | פירוש |
-|---|---|
-| `spacing` | רווח בין ילדים |
-| `alignItems` | `start` \| `center` \| `end` \| `stretch` |
-| `justifyContent` | `start` \| `center` \| `end` \| `space_between` \| `space_around` |
+| attribute        | meaning                                                                          |
+|------------------|----------------------------------------------------------------------------------|
+| `spacing`        | gap between children                                                             |
+| `alignItems`     | `start` / `center` / `end` / `stretch`                                           |
+| `justifyContent` | `start` / `center` / `end` / `space_between` / `space_around`                    |
 
-### Grid-specific
+### `Grid`-specific
 
-| Attribute | פירוש |
-|---|---|
-| `columns` | מספר עמודות |
-| `rows` | מספר שורות (אופציונלי — auto אם לא ניתן) |
-| `spacing` | רווח אחיד |
-| `columnSpacing` / `rowSpacing` | רווחים נפרדים |
+| attribute                          | meaning                                  |
+|------------------------------------|------------------------------------------|
+| `cols`                             | number of columns (required)             |
+| `rows`                             | number of rows (required)                |
+| `spacing`                          | uniform gap                              |
+| `columnSpacing` / `rowSpacing`     | distinct horizontal / vertical gaps      |
 
-## 5. יחידות (Units)
+### `Image`-specific
 
-- `dp` — density-independent pixel. `1dp = 1/160 של אינץ'` ≈ 1 פיקסל במסך 160dpi.
-- `sp` — scale-independent pixel. כמו dp אבל מוכפל ב-user font scale.
-- `px` — פיקסל גולמי. **לא מומלץ** — לא מתאים להחלפת צפיפויות.
-- `%` — אחוז מה-parent (על `width`, `height`, `padding`).
-- `match_parent` — מילוי כל המקום הזמין.
-- `wrap_content` — רק את הגודל הנדרש לתוכן.
+| attribute   | meaning                                                                       |
+|-------------|-------------------------------------------------------------------------------|
+| `src`       | required; must start with `@drawable/`. Resolves through the package's drawable cache, or — when allowed — another package's. |
+| `width`     | size                                                                          |
+| `height`    | size                                                                          |
 
-## 6. Resource References
+## 5. Units
 
-### Types נתמכים
+- `dp` — density-independent pixel. `1 dp = 1/160 in` ≈ 1 pixel
+  on a 160 dpi screen.
+- `sp` — scale-independent pixel. Like `dp` but multiplied by the
+  user's font scale.
+- `px` — raw pixel. **Discouraged** — does not adapt to density.
+- `%` — percent of the parent (on `width`, `height`, `padding`).
+- `match_parent` — fill all available space.
+- `wrap_content` — only the size needed by the content.
 
-| Prefix | דוגמה | משמעות |
-|---|---|---|
-| `@string/` | `@string/welcome` | מ-`res/values/strings.toml` |
-| `@color/` | `@color/primary` | מ-`res/values/colors.toml` |
-| `@dimen/` | `@dimen/spacing_medium` | מ-`res/values/dimens.toml` |
-| `@drawable/` | `@drawable/icon` | מ-`res/drawable/icon.*` |
-| `@style/` | `@style/op_button` | מ-`res/values/styles.toml` |
-| `@layout/` | `@layout/list_item` | מ-`res/layout/list_item.akml` (לא ב-AKML עצמה, רק ב-API) |
-| `@+id/foo` | `@+id/display` | **יצירת** id חדש |
-| `@id/foo` | `@id/display` | **שימוש** ב-id קיים (אופציונלי) |
+## 6. Resource references
+
+### Supported types
+
+| prefix         | example                | meaning                                                      |
+|----------------|------------------------|--------------------------------------------------------------|
+| `@string/`     | `@string/welcome`      | from `res/values/strings.toml`                               |
+| `@color/`      | `@color/primary`       | from `res/values/colors.toml`                                |
+| `@dimen/`      | `@dimen/spacing_medium`| from `res/values/dimens.toml` *(reserved — not parsed today)* |
+| `@drawable/`   | `@drawable/icon`       | from `res/drawable/icon.*`                                   |
+| `@style/`      | `@style/op_button`     | from `res/values/styles.toml` *(reserved)*                   |
+| `@layout/`     | `@layout/list_item`    | from `res/layout/list_item.akml` (used in API, not in AKML) |
+| `@+id/foo`     | `@+id/display`         | **define** a new id                                          |
+| `@id/foo`      | `@id/display`          | **use** an existing id                                       |
 
 ### Literal values
 
-אם לא משתמשים ב-reference, אפשר literal:
-- צבעים: `#RRGGBB` או `#AARRGGBB` או `rgb(R,G,B)`
-- strings: טקסט רגיל בתוך attribute
-- מספרים: `"42"`, `"3.14"`
+If you don't use a reference, a literal works:
 
-**המלצה:** תמיד להשתמש ב-references, גם אם זה נראה מיותר. זה מה שנותן תמיכה ב-i18n, dark mode, וכו'.
+- Colours: `#RRGGBB`, `#AARRGGBB`, or `rgb(R, G, B)`.
+- Strings: regular text inside the attribute.
+- Numbers: `"42"`, `"3.14"`.
 
-## 7. Styles
+**Recommendation.** Prefer references even when they look
+unnecessary — they are what makes i18n, dark mode, and other
+qualifier dimensions Just Work.
 
-כמו ב-Android — סט של attributes שיכולים לעבור בירושה.
+## 7. Styles *(planned)*
 
-### הגדרה ב-`res/values/styles.toml`
+Like Android — a set of attributes shared and inheritable.
+
+### Definition in `res/values/styles.toml`
 
 ```toml
 [styles."op_button"]
 background = "@color/op_bg"
-textColor = "@color/on_op"
-padding = "16dp"
-textSize = "20sp"
+textColor  = "@color/on_op"
+padding    = "16dp"
+textSize   = "20sp"
 
 [styles."number_button"]
 background = "@color/number_bg"
-textColor = "@color/on_number"
-padding = "16dp"
-textSize = "20sp"
+textColor  = "@color/on_number"
+padding    = "16dp"
+textSize   = "20sp"
 fontWeight = "bold"
 ```
 
-### שימוש ב-AKML
+### Use in AKML
 
 ```xml
 <Button text="7" style="@style/number_button" onClick="on_digit" tag="7" />
-<Button text="+" style="@style/op_button" onClick="on_op" tag="add" />
+<Button text="+" style="@style/op_button"     onClick="on_op"    tag="add" />
 ```
 
-Attributes שמוגדרים ישירות ב-element מנצחים את ה-style.
+Attributes set directly on the element override style attributes.
+**Status:** the `style="@style/..."` attribute parses, but the
+resource manager does not yet load `styles.toml`, so references
+resolve to nothing. Use direct attributes for now.
 
 ## 8. Callbacks
 
-attribute של `onClick` (וכדומה) מכיל שם של פונקציה באפליקציה:
+A `onClick` (and friends) attribute holds the name of a function
+in the app:
 
 ```xml
 <Button text="Go" onClick="on_go_clicked" tag="primary" />
 ```
 
-ב-Rust:
+In Rust:
 
 ```rust
 #[akiva::callback]
-fn on_go_clicked(app: &mut MyApp, tag: &str) {
-    // tag = "primary"
+fn on_go_clicked(app: &mut MyApp, ctx: &CallbackContext) {
+    let tag = ctx.tag();   // "primary"
 }
 ```
 
-ה-SDK רושם את ה-callback ב-registry פנימי. בזמן inflate, ה-LayoutInflater מחבר widget → callback ID ומעביר ל-runtime.
+The SDK records the callback in an internal registry. At inflate
+time the inflater wires `widget → callback id` and hands the map
+to the runtime.
 
-## 9. דוגמה מלאה — Calculator
+## 9. Full example — Calculator
 
-### res/layout/main.akml
+### `res/layout/main.akml`
 
 ```xml
 <?akml version="1.0"?>
@@ -215,35 +266,35 @@ fn on_go_clicked(app: &mut MyApp, tag: &str) {
         background="@color/display_bg"
         flex="0" />
 
-    <Grid columns="4" spacing="8dp" flex="1">
-        <Button text="@string/clear" onClick="on_clear" tag="C" style="@style/special_button" />
-        <Button text="±" onClick="on_sign" style="@style/special_button" />
-        <Button text="%" onClick="on_percent" style="@style/special_button" />
-        <Button text="÷" onClick="on_op" tag="div" style="@style/op_button" />
+    <Grid cols="4" rows="5" spacing="8dp" flex="1">
+        <Button text="@string/clear" onClick="on_clear"   tag="C"   />
+        <Button text="±"             onClick="on_sign"               />
+        <Button text="%"             onClick="on_percent"            />
+        <Button text="÷"             onClick="on_op"      tag="div" />
 
-        <Button text="7" onClick="on_digit" tag="7" style="@style/num_button" />
-        <Button text="8" onClick="on_digit" tag="8" style="@style/num_button" />
-        <Button text="9" onClick="on_digit" tag="9" style="@style/num_button" />
-        <Button text="×" onClick="on_op" tag="mul" style="@style/op_button" />
+        <Button text="7" onClick="on_digit" tag="7" />
+        <Button text="8" onClick="on_digit" tag="8" />
+        <Button text="9" onClick="on_digit" tag="9" />
+        <Button text="×" onClick="on_op"    tag="mul" />
 
-        <Button text="4" onClick="on_digit" tag="4" style="@style/num_button" />
-        <Button text="5" onClick="on_digit" tag="5" style="@style/num_button" />
-        <Button text="6" onClick="on_digit" tag="6" style="@style/num_button" />
-        <Button text="−" onClick="on_op" tag="sub" style="@style/op_button" />
+        <Button text="4" onClick="on_digit" tag="4" />
+        <Button text="5" onClick="on_digit" tag="5" />
+        <Button text="6" onClick="on_digit" tag="6" />
+        <Button text="−" onClick="on_op"    tag="sub" />
 
-        <Button text="1" onClick="on_digit" tag="1" style="@style/num_button" />
-        <Button text="2" onClick="on_digit" tag="2" style="@style/num_button" />
-        <Button text="3" onClick="on_digit" tag="3" style="@style/num_button" />
-        <Button text="+" onClick="on_op" tag="add" style="@style/op_button" />
+        <Button text="1" onClick="on_digit" tag="1" />
+        <Button text="2" onClick="on_digit" tag="2" />
+        <Button text="3" onClick="on_digit" tag="3" />
+        <Button text="+" onClick="on_op"    tag="add" />
 
-        <Button text="0" onClick="on_digit" tag="0" style="@style/num_button" />
-        <Button text="." onClick="on_dot" style="@style/num_button" />
-        <Button text="=" onClick="on_equals" style="@style/equals_button" />
+        <Button text="0" onClick="on_digit" tag="0" />
+        <Button text="." onClick="on_dot"            />
+        <Button text="=" onClick="on_equals"         />
     </Grid>
 </VStack>
 ```
 
-ה-Rust code שמלווה:
+The Rust side that goes with it:
 
 ```rust
 use akiva_sdk::prelude::*;
@@ -255,16 +306,8 @@ struct Calculator {
     op: Option<Operation>,
 }
 
-impl App for Calculator {
-    fn new() -> Self {
-        Self {
-            display: "0".to_string(),
-            operand: 0.0,
-            op: None,
-        }
-    }
-
-    fn on_create(&mut self, ctx: &ActivityContext) {
+impl Activity for Calculator {
+    async fn on_create(&mut self, ctx: &mut Context<'_>) {
         ctx.set_content_view("@layout/main");
     }
 }
@@ -279,36 +322,36 @@ fn on_digit(app: &mut Calculator, ctx: &CallbackContext) {
     }
     ctx.update_text("@id/display", &app.display);
 }
-
-// ... שאר ה-callbacks
 ```
 
-## 10. Parser & Inflation
+## 10. Parser & inflation
 
-### שלבי ה-inflater
+### Stages
 
 ```
-1. Read akml bytes
-2. XML tokenizer → events (StartElement, EndElement, Text, Attribute)
-3. AST builder → tree of AkmlNode
+1. Read AKML bytes.
+2. XML tokenizer → events (StartElement, EndElement, Text, Attribute).
+3. AST builder → tree of AkmlNode.
 4. Validator:
-   - Check element names are known
-   - Check required attributes
-   - Check attribute types (size, color, ref)
+   - Element names known (VStack/HStack/Frame/Grid/Text/Button/Rect/Spacer/Image).
+   - Required attributes present (`Grid` needs `cols` + `rows`,
+     `Image` needs `src`, `Button` needs `label`, …).
+   - Attribute types valid (size, color, ref, …).
 5. Resolver:
-   - Resolve @string/foo, @color/bar, @dimen/baz
-   - Apply @style/* (merge attrs from style, element overrides win)
-   - Apply qualifiers if layout itself has qualifiers
+   - Resolve @string/foo, @color/bar, @drawable/baz.
+   - Apply @style/* (planned) — merge attrs from style; element overrides win.
+   - Apply qualifiers (today: `night` only) when the layout itself has them.
 6. Builder:
-   - For each node, call runtime API to create widget
-   - Register callbacks in app's callback registry
-   - Store @+id/* references in IdMap
-7. Return WidgetTreeRoot + IdMap
+   - For each node, call the runtime API to create the widget.
+   - Register callbacks in the app's callback registry.
+   - Store @+id/* references in IdMap.
+7. Return a WidgetTreeRoot + IdMap.
 ```
 
 ### Error reporting
 
-ה-parser מחזיק מיקום (שורה, עמודה) לכל token. שגיאות יש להן לוקציה:
+The parser tracks (line, column) for every token. Errors carry a
+location:
 
 ```
 Error in main.akml:15:8
@@ -316,24 +359,29 @@ Error in main.akml:15:8
   Did you mean 'fontWeight'?
 ```
 
-## 11. Schema Version
+## 11. Schema version
 
 ```xml
 <?akml version="1.0"?>
 ```
 
-מסמל את גרסת ה-schema. ה-runtime מקבל v1.0 בלבד כרגע. גרסאות עתידיות יהיו backward compatible בתוספת בלבד.
+Identifies the schema version. The runtime accepts `1.0` only.
+Future versions will be backward-compatible (additive only).
 
-## 12. מגבלות MVP
+## 12. MVP limits
 
-- אין conditional rendering (אין `<if>`, `<switch>`). האפליקציה משנה state ואז `invalidate` / `set_content_view` מחדש.
-- אין loops (אין `<for>`). רשימות תידרשנה `<List>` widget (ב-v0.2).
-- אין imports בין קבצי AKML — כל קובץ standalone.
-- אין animations declarative (ב-v0.3).
-- אין custom widgets ב-AKML (רק built-ins של ה-framework).
+- No conditional rendering (`<if>`, `<switch>`). The app updates
+  state and then `invalidate` / `set_content_view` re-runs.
+- No loops (`<for>`). Lists need a `<List>` widget *(planned)*.
+- No imports between AKML files — every file stands alone.
+- No declarative animations *(planned)*.
+- No custom widgets — only the built-in tags above.
 
-## 13. כלי פיתוח
+## 13. Tooling
 
-- **Validator**: `akiva validate res/layout/main.akml`
-- **Formatter**: `akiva fmt` — מיישר indentation
-- **VS Code extension** (עתידי): syntax highlighting, autocomplete
+- **Validator:** `akiva validate res/layout/main.akml` *(planned —
+  `akiva` CLI does not have this subcommand yet).*
+- **Formatter:** `akiva fmt` — indentation pass *(planned).*
+- **VS Code extension:** [`tools/vscode-akml/`](../tools/vscode-akml/) —
+  syntax highlighting, brackets, comments, starter snippets.
+  Validation / autocomplete are not in yet.
