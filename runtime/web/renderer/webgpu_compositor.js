@@ -1,40 +1,55 @@
 // WebGPU compositor backend.
 //
-// Phase 15.4.2 — identity composite + SurfaceDrawOpts (opacity,
-// translate, scale). Each `compositeSurface` copies the source
-// `OffscreenCanvas` into a cached per-source `GPUTexture` (path B
-// per the plan §1.5) and emits a textured quad at the destination
-// rect, transformed by the opts in the vertex shader and alpha-
-// multiplied in the fragment shader. Blur / shadow / tint are 15.4.3+.
+// Phase 15.4.3 — backdrop blur (frosted glass) on top of 15.4.1's
+// identity composite + 15.4.2's translate/scale/opacity. Each
+// `compositeSurface` copies the source `OffscreenCanvas` into a
+// cached per-source `GPUTexture` (path B per the plan §1.5) and
+// emits a textured quad at the destination rect, transformed by the
+// opts in the vertex shader and alpha-multiplied in the fragment
+// shader. When `backdrop_blur_radius > 0`, the compositor first
+// downsamples the scene texture and runs a separable Gaussian
+// (two passes), then composites the blurred result UNDER the surface
+// at the surface's bounds — sheets / dialogs see live frosted glass
+// of whatever's behind them.
 //
 // Why path B and not `importExternalTexture`: as of mid-2026, Chrome /
 // Edge / Firefox restrict `importExternalTexture` to
 // `HTMLVideoElement` and `VideoFrame` sources. `OffscreenCanvas`
 // throws "The provided value is not of type '(HTMLVideoElement or
 // VideoFrame)'". Path B (`copyExternalImageToTexture`) is universal at
-// the cost of one canvas-pixels → texture copy per surface per frame
-// (~4 surfaces × 1080p × 4 bytes × 60 fps ≈ 2 GB/s of memcpy on a
-// dGPU; well within bandwidth on every modern machine).
+// the cost of one canvas-pixels → texture copy per surface per frame.
 //
-// Frame model: `beginFrame` opens a render pass against the swapchain
-// texture; each `compositeSurface` enqueues a copy + encodes a draw;
-// `endFrame` (called via `present`) ends the pass and submits. The
-// pipeline triggers `beginFrame` lazily on the first
-// `compositeSurface` per frame, so a frame with no composites is a
-// no-op (no submit, no presented texture acquired).
+// Frame model: `beginFrame` opens a render pass against an INTERNAL
+// scene texture (full screen size). Per-surface composites encode
+// draws into that pass. When a blur is needed we pause the scene
+// pass, run downsample + blurH + blurV passes against ping-pong
+// scratch textures (1/4 res), resume the scene pass, composite the
+// blurred output back at surface bounds, then composite the surface
+// itself on top. `endFrame` ends the scene pass, encodes a final
+// scene→swapchain blit, and submits.
+//
+// Memory: one screen-sized RGBA8 scene texture (~8 MB at 1080p) plus
+// two 1/4-res scratch textures (~1 MB each). Negligible on any GPU
+// that ships in 2024+.
 
 // Embedded WGSL — keeping it in-source avoids a separate fetch path
 // and makes the shader visible alongside its bind-group layout. The
-// canonical copy lives at `runtime/web/renderer/wgsl/identity.wgsl`;
-// regenerating from there is a manual step (no build pipeline yet).
-const IDENTITY_WGSL = `
+// canonical copies live at `runtime/web/renderer/wgsl/identity.wgsl`
+// and `blur.wgsl`; regenerating from there is a manual step (no
+// build pipeline yet).
+//
+// Both shaders share the same 80-byte `Uniforms` struct so a single
+// uniform-buffer shape covers every draw. Only the pipeline (and
+// thus entry points) differs between identity and blur.
+
+const SHARED_UNIFORM_PREFIX = `
 struct Uniforms {
   dst_rect:    vec4<f32>,
-  screen_size: vec4<f32>,
-  // opts: (opacity, translate_x, translate_y, scale)
+  target_size: vec4<f32>,
   opts:        vec4<f32>,
+  src_uv:      vec4<f32>,
+  blur_dir:    vec4<f32>,
 };
-
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var s: sampler;
 @group(0) @binding(2) var t: texture_2d<f32>;
@@ -43,39 +58,94 @@ struct VsOut {
   @builtin(position) clip: vec4<f32>,
   @location(0) uv: vec2<f32>,
 };
+`;
 
+const IDENTITY_WGSL = SHARED_UNIFORM_PREFIX + `
 @vertex
 fn vs(@builtin(vertex_index) vid: u32) -> VsOut {
   let corner = vec2<f32>(f32(vid & 1u), f32((vid >> 1u) & 1u));
-  // Scale around the dst-rect centre, then translate. Order matches
-  // the Canvas2D path's save → translate → scale → drawImage so
-  // slide/fade animations look identical between backends.
   let scaled_size = u.dst_rect.zw * u.opts.w;
   let pivot       = u.dst_rect.xy + u.dst_rect.zw * 0.5;
   let pixel       = pivot
                   + (corner - vec2<f32>(0.5, 0.5)) * scaled_size
                   + u.opts.yz;
   let ndc = vec2<f32>(
-    pixel.x / u.screen_size.x * 2.0 - 1.0,
-    1.0 - pixel.y / u.screen_size.y * 2.0,
+    pixel.x / u.target_size.x * 2.0 - 1.0,
+    1.0 - pixel.y / u.target_size.y * 2.0,
   );
   var o: VsOut;
   o.clip = vec4<f32>(ndc, 0.0, 1.0);
-  o.uv   = corner;
+  o.uv   = u.src_uv.xy + corner * u.src_uv.zw;
+  return o;
+}
+
+// Surface composite: source is straight alpha (Canvas2D), output
+// is pre-multiplied (matches the swapchain's "premultiplied" alphaMode).
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+  let c = textureSample(t, s, in.uv);
+  let a = c.a * u.opts.x;
+  return vec4<f32>(c.rgb * a, a);
+}
+
+// Pre-multiplied passthrough: used for blits between intermediate
+// targets that already hold pre-multiplied pixels (scene → swapchain,
+// scene → scratch downsample, scratchA → scene as a blurred backdrop).
+// Without this, the surface-composite shader would double-multiply
+// alpha and produce a too-dark result.
+@fragment
+fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
+  return textureSample(t, s, in.uv);
+}
+`;
+
+const BLUR_WGSL = SHARED_UNIFORM_PREFIX + `
+@vertex
+fn vs(@builtin(vertex_index) vid: u32) -> VsOut {
+  let corner = vec2<f32>(f32(vid & 1u), f32((vid >> 1u) & 1u));
+  let pixel  = u.dst_rect.xy + corner * u.dst_rect.zw;
+  let ndc = vec2<f32>(
+    pixel.x / u.target_size.x * 2.0 - 1.0,
+    1.0 - pixel.y / u.target_size.y * 2.0,
+  );
+  var o: VsOut;
+  o.clip = vec4<f32>(ndc, 0.0, 1.0);
+  o.uv   = u.src_uv.xy + corner * u.src_uv.zw;
   return o;
 }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let c = textureSample(t, s, in.uv);
-  // Pre-multiply on the way out — the canvas configuration uses
-  // alphaMode "premultiplied" but our source canvases are straight
-  // alpha. Effective alpha = sampled alpha × surface opacity.
-  // (15.4.5+ effect mixing happens BEFORE this multiply.)
-  let a = c.a * u.opts.x;
-  return vec4<f32>(c.rgb * a, a);
+  let d = u.blur_dir.xy;
+  var c = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+  c = c + textureSample(t, s, in.uv - d * 4.0) * 0.016;
+  c = c + textureSample(t, s, in.uv - d * 3.0) * 0.054;
+  c = c + textureSample(t, s, in.uv - d * 2.0) * 0.121;
+  c = c + textureSample(t, s, in.uv - d * 1.0) * 0.194;
+  c = c + textureSample(t, s, in.uv          ) * 0.227;
+  c = c + textureSample(t, s, in.uv + d * 1.0) * 0.194;
+  c = c + textureSample(t, s, in.uv + d * 2.0) * 0.121;
+  c = c + textureSample(t, s, in.uv + d * 3.0) * 0.054;
+  c = c + textureSample(t, s, in.uv + d * 4.0) * 0.016;
+  return c;
 }
 `;
+
+const UNIFORM_BUFFER_SIZE = 80;          // 5 × vec4<f32>
+const SCRATCH_DOWNSAMPLE   = 4;          // 1/4-resolution blur scratch
+// Standard "over" blending — surfaces composite in z-order onto whatever
+// the prior pass deposited.
+const OVER_BLEND = {
+  color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+  alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+};
+// Replace blending — used for the blur passes (downsample / blurH /
+// blurV), where we WANT the destination to be exactly the shader's
+// output, not blended with whatever was there.
+const REPLACE_BLEND = {
+  color: { srcFactor: "one", dstFactor: "zero", operation: "add" },
+  alpha: { srcFactor: "one", dstFactor: "zero", operation: "add" },
+};
 
 export class WebGPUCompositor {
   constructor() {
@@ -88,23 +158,46 @@ export class WebGPUCompositor {
     this.device = null;
     this.format = null;
     /** @type {GPURenderPipeline|null} */
-    this.pipeline = null;
+    this.pipeline = null;          // identity-blend (over); reads identity-vs/fs
+    /** @type {GPURenderPipeline|null} */
+    this.blitPipeline = null;      // identity-replace; reads identity-vs/fs
+    /** @type {GPURenderPipeline|null} */
+    this.blurPipeline = null;      // blur-vs/fs, replace blend
     /** @type {GPUSampler|null} */
     this.sampler = null;
     /** @type {GPUBindGroupLayout|null} */
     this.bindGroupLayout = null;
     this.metrics = { width_px: 0, height_px: 0, density: 1 };
+
+    // Scene + scratch state.
+    /** @type {GPUTexture|null} */
+    this.sceneTexture = null;
+    /** @type {GPUTextureView|null} */
+    this.sceneView = null;
+    /** @type {GPUTexture|null} */
+    this.scratchA = null;
+    /** @type {GPUTextureView|null} */
+    this.scratchAView = null;
+    /** @type {GPUTexture|null} */
+    this.scratchB = null;
+    /** @type {GPUTextureView|null} */
+    this.scratchBView = null;
+    this._scratchW = 0;
+    this._scratchH = 0;
+
+    // Frame state.
     /** @type {GPUCommandEncoder|null} */
     this._encoder = null;
     /** @type {GPURenderPassEncoder|null} */
-    this._pass = null;
+    this._scenePass = null;
     this._frameInProgress = false;
     this._lost = false;
+
     /** Per-source GPUTexture cache. Keyed by the source canvas object
      *  (paint backend keeps the offscreens alive between frames, so
      *  the WeakMap keys stay valid). Each entry is
-     *  `{ texture, w, h }`; we recreate when `(w, h)` changes.
-     *  @type {WeakMap<object, {texture: GPUTexture, w: number, h: number}>} */
+     *  `{ texture, w, h, view }`; we recreate when `(w, h)` changes.
+     *  @type {WeakMap<object, {texture: GPUTexture, w: number, h: number, view: GPUTextureView}>} */
     this._textureCache = new WeakMap();
   }
 
@@ -117,9 +210,6 @@ export class WebGPUCompositor {
     this.adapter = await navigator.gpu.requestAdapter();
     if (!this.adapter) throw new Error("requestAdapter returned null");
     this.device = await this.adapter.requestDevice();
-    // Mark device as lost asynchronously — subsequent compositeSurface
-    // calls become silent no-ops. The pipeline doesn't currently
-    // hot-swap to Canvas2D on loss; that's a follow-up.
     this.device.lost.then((info) => {
       console.warn("[akiva] WebGPU device lost:", info?.message ?? info);
       this._lost = true;
@@ -127,15 +217,13 @@ export class WebGPUCompositor {
     this.format = navigator.gpu.getPreferredCanvasFormat();
     this.ctx = canvas.getContext("webgpu");
     if (!this.ctx) throw new Error("getContext('webgpu') returned null");
-    // `alphaMode: "premultiplied"` — the shader pre-multiplies on the
-    // way out so straight-alpha source canvases composite correctly
-    // against this configuration.
     this.ctx.configure({ device: this.device, format: this.format, alphaMode: "premultiplied" });
 
     this.screenCanvas = canvas;
     this.metrics = metrics;
 
-    const module = this.device.createShaderModule({ code: IDENTITY_WGSL });
+    const idModule   = this.device.createShaderModule({ code: IDENTITY_WGSL });
+    const blurModule = this.device.createShaderModule({ code: BLUR_WGSL });
 
     this.bindGroupLayout = this.device.createBindGroupLayout({
       entries: [
@@ -144,23 +232,39 @@ export class WebGPUCompositor {
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     });
+    const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] });
 
+    // Surface-composite pipeline: identity vs/fs, OVER blending so
+    // surfaces stack in z-order onto the scene.
     this.pipeline = this.device.createRenderPipeline({
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.bindGroupLayout] }),
-      vertex:   { module, entryPoint: "vs" },
-      fragment: {
-        module, entryPoint: "fs",
-        targets: [{
-          format: this.format,
-          // Standard "over" blending against the existing screen pixels.
-          // Surface ops are emitted in z-order so each composite blends
-          // on top of the prior one this frame.
-          blend: {
-            color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-          },
-        }],
-      },
+      layout: pipelineLayout,
+      vertex:   { module: idModule, entryPoint: "vs" },
+      fragment: { module: idModule, entryPoint: "fs",
+                  targets: [{ format: this.format, blend: OVER_BLEND }] },
+      primitive: { topology: "triangle-strip" },
+    });
+    // Blit / downsample pipeline: identity vs + fs_blit (pre-mult
+    // passthrough), REPLACE blending. Used for:
+    //   - scene → swapchain (final blit)
+    //   - scene → scratchA (blur downsample)
+    //   - scratchA → scene at surface bounds (blurred backdrop)
+    // All three sample pre-multiplied content; the surface-composite
+    // shader (`fs`) would double-multiply, so we use `fs_blit`.
+    this.blitPipeline = this.device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex:   { module: idModule, entryPoint: "vs" },
+      fragment: { module: idModule, entryPoint: "fs_blit",
+                  targets: [{ format: this.format, blend: REPLACE_BLEND }] },
+      primitive: { topology: "triangle-strip" },
+    });
+    // Blur pipeline: blur vs/fs, REPLACE blending. Used for both
+    // horizontal and vertical passes (the per-call uniform's
+    // `blur_dir` selects the axis).
+    this.blurPipeline = this.device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex:   { module: blurModule, entryPoint: "vs" },
+      fragment: { module: blurModule, entryPoint: "fs",
+                  targets: [{ format: this.format, blend: REPLACE_BLEND }] },
       primitive: { topology: "triangle-strip" },
     });
 
@@ -168,13 +272,49 @@ export class WebGPUCompositor {
       magFilter: "linear", minFilter: "linear",
       addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge",
     });
+
+    this._allocSceneAndScratch();
   }
 
-  /** Mirror Canvas2DCompositor's API — paint backend asks for a screen
-   *  ctx in WebGPU mode and gets `null`, since the canvas is bound to
-   *  `"webgpu"`. The legacy DEFAULT_SURFACE / zero-bounds sentinel
-   *  becomes a silent no-op in this mode (in production the framework
-   *  always emits real `BeginSurface` bounds). */
+  /** (Re)allocate the scene texture + 1/4-res blur scratches. Called
+   *  from `init` and from `resize`. Old textures are explicitly
+   *  destroyed so the driver returns the memory; the WeakMap of
+   *  source-canvas → texture is unaffected (those track per-Activity
+   *  surfaces, not the compositor's internals). */
+  _allocSceneAndScratch() {
+    const w = Math.max(1, this.metrics.width_px  | 0);
+    const h = Math.max(1, this.metrics.height_px | 0);
+    const sw = Math.max(1, (w / SCRATCH_DOWNSAMPLE) | 0);
+    const sh = Math.max(1, (h / SCRATCH_DOWNSAMPLE) | 0);
+
+    this.sceneTexture?.destroy();
+    this.sceneTexture = this.device.createTexture({
+      size:   [w, h, 1],
+      format: this.format,
+      usage:  GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.sceneView = this.sceneTexture.createView();
+
+    this.scratchA?.destroy();
+    this.scratchA = this.device.createTexture({
+      size:   [sw, sh, 1],
+      format: this.format,
+      usage:  GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.scratchAView = this.scratchA.createView();
+
+    this.scratchB?.destroy();
+    this.scratchB = this.device.createTexture({
+      size:   [sw, sh, 1],
+      format: this.format,
+      usage:  GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+    });
+    this.scratchBView = this.scratchB.createView();
+
+    this._scratchW = sw;
+    this._scratchH = sh;
+  }
+
   getScreenCtx() { return null; }
 
   resize(width_px, height_px, density) {
@@ -182,63 +322,104 @@ export class WebGPUCompositor {
     this.screenCanvas.width = width_px;
     this.screenCanvas.height = height_px;
     this.metrics = { width_px, height_px, density };
-    // The swapchain auto-resizes to match the canvas pixel dimensions on
-    // the next `getCurrentTexture()`. No explicit reconfigure needed.
+    this._allocSceneAndScratch();
   }
 
   beginFrame() {
-    if (!this.device || !this.ctx || this._lost) return;
+    if (!this.device || this._lost) return;
     if (this._frameInProgress) return;
-    let view;
-    try {
-      view = this.ctx.getCurrentTexture().createView();
-    } catch (err) {
-      // Browsers throw if the canvas hasn't been configured yet or has
-      // a degenerate size. Skip the frame; the next rAF tick re-tries.
-      console.warn("[akiva] WebGPU getCurrentTexture failed:", err);
-      return;
-    }
     this._encoder = this.device.createCommandEncoder();
-    this._pass = this._encoder.beginRenderPass({
+    this._scenePass = this._encoder.beginRenderPass({
       colorAttachments: [{
-        view,
+        view: this.sceneView,
         loadOp: "clear",
-        // Black background. The wallpaper / primary activity covers
-        // the whole screen each frame, so this is rarely visible; if
-        // it is, it's the safe choice (won't smear last-frame pixels).
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
         storeOp: "store",
       }],
     });
-    this._pass.setPipeline(this.pipeline);
+    this._scenePass.setPipeline(this.pipeline);
     this._frameInProgress = true;
   }
 
   endFrame() {
     if (!this._frameInProgress) return;
-    this._pass.end();
+    this._scenePass.end();
+    this._scenePass = null;
+
+    // Final blit: scene → swapchain. REPLACE blending so the swapchain
+    // gets the scene texture pixel-for-pixel.
+    let view;
+    try {
+      view = this.ctx.getCurrentTexture().createView();
+    } catch (err) {
+      console.warn("[akiva] WebGPU getCurrentTexture failed:", err);
+      this._encoder = null;
+      this._frameInProgress = false;
+      return;
+    }
+    const blitPass = this._encoder.beginRenderPass({
+      colorAttachments: [{
+        view,
+        loadOp: "clear",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        storeOp: "store",
+      }],
+    });
+    blitPass.setPipeline(this.blitPipeline);
+    const w = this.metrics.width_px, h = this.metrics.height_px;
+    this._encodeIdentityDraw(blitPass, this.sceneView, {
+      dstRect:    [0, 0, w, h],
+      targetSize: [w, h],
+      opts:       [1, 0, 0, 1],
+      srcUv:      [0, 0, 1, 1],
+    });
+    blitPass.end();
+
     this.device.queue.submit([this._encoder.finish()]);
-    this._pass = null;
     this._encoder = null;
     this._frameInProgress = false;
   }
 
   /** Composite `src` (an OffscreenCanvas allocated by the paint
-   *  backend) onto the screen at `(x, y, w, h)`, transformed by the
-   *  SurfaceDrawOpts. Defaults match `SurfaceDrawOpts::IDENTITY`.
-   *  `_blurRadius` is accepted to match the trait — the actual
-   *  two-pass Gaussian backdrop-blur pipeline lands in 15.4.3b. */
-  compositeSurface(src, x, y, w, h, opacity = 1, translateX = 0, translateY = 0, scale = 1, _blurRadius = 0) {
+   *  backend) onto the scene at `(x, y, w, h)`, transformed by the
+   *  SurfaceDrawOpts. When `blurRadius > 0`, first runs a backdrop-
+   *  blur pass — captures the scene region behind the surface,
+   *  downsamples + Gaussian-blurs, composites the blurred result at
+   *  surface bounds — then layers the surface itself on top. */
+  compositeSurface(src, x, y, w, h, opacity = 1, translateX = 0, translateY = 0, scale = 1, blurRadius = 0) {
     if (!this.device || this._lost || !src || w <= 0 || h <= 0) return;
     if (!this._frameInProgress) {
       this.beginFrame();
-      if (!this._frameInProgress) return;  // beginFrame failed
+      if (!this._frameInProgress) return;
     }
 
-    // Look up or allocate a GPUTexture matching the source's current
-    // pixel dimensions. Source canvases are stable across frames
-    // (paint backend reuses them), so the WeakMap keys persist; the
-    // texture is recreated only when the activity resizes its surface.
+    // Snapshot src into a per-source GPUTexture before any pass that
+    // might depend on it.
+    const srcEntry = this._uploadSourceCanvas(src);
+    if (!srcEntry) return;
+
+    if (blurRadius > 0) {
+      this._encodeBackdropBlur(x, y, w, h, blurRadius);
+    }
+
+    // Surface composite onto the scene (now possibly with blurred
+    // backdrop drawn at the same bounds, blended underneath because
+    // we just deposited it via REPLACE before resuming this pass).
+    this._encodeIdentityDraw(this._scenePass, srcEntry.view, {
+      dstRect:    [x, y, w, h],
+      targetSize: [this.metrics.width_px, this.metrics.height_px],
+      opts:       [
+        Math.max(0, Math.min(1, opacity)),
+        translateX, translateY,
+        scale > 0 ? scale : 1,
+      ],
+      srcUv:      [0, 0, 1, 1],
+    });
+  }
+
+  /** Upload (or reuse) a GPUTexture for the source canvas. Returns
+   *  `{texture, view, w, h}` or `null` on copy failure. */
+  _uploadSourceCanvas(src) {
     const srcW = Math.max(1, src.width  | 0);
     const srcH = Math.max(1, src.height | 0);
     let entry = this._textureCache.get(src);
@@ -254,10 +435,6 @@ export class WebGPUCompositor {
       entry = { texture, w: srcW, h: srcH, view: texture.createView() };
       this._textureCache.set(src, entry);
     }
-
-    // Snapshot the canvas pixels into the texture. Synchronous from
-    // the JS side; the GPU sees the copy in queue order (before the
-    // encoder we're about to submit).
     try {
       this.device.queue.copyExternalImageToTexture(
         { source: src },
@@ -266,61 +443,198 @@ export class WebGPUCompositor {
       );
     } catch (err) {
       console.warn("[akiva] copyExternalImageToTexture failed:", err);
-      return;
+      return null;
     }
+    return entry;
+  }
 
-    // Per-call uniform buffer (48 bytes = 3 × vec4<f32>). We can't
-    // reuse one buffer across multiple composites in the same
-    // submission — `writeBuffer` ordering vs. `draw` ordering isn't
-    // preserved within a single submit, so a shared buffer would
-    // deliver the LAST frame's uniforms to every draw. A small
-    // per-call allocation is correct and the GPU/driver pools small
-    // uniforms efficiently.
-    const uniforms = new Float32Array(12);
-    // dst_rect
-    uniforms[0] = x; uniforms[1] = y; uniforms[2] = w; uniforms[3] = h;
-    // screen_size
-    uniforms[4] = this.metrics.width_px;
-    uniforms[5] = this.metrics.height_px;
-    // opts (opacity, translate_x, translate_y, scale) — clamp opacity
-    // defensively to match the Canvas2D path's `setGlobalAlpha`
-    // clamping; an animation that overshoots [0,1] otherwise washes
-    // out (>1) or inverts (<0) on some GPUs.
-    uniforms[8]  = Math.max(0, Math.min(1, opacity));
-    uniforms[9]  = translateX;
-    uniforms[10] = translateY;
-    uniforms[11] = scale > 0 ? scale : 1;
-    const uniformBuffer = this.device.createBuffer({
-      size: 48,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  /** End the scene pass, run downsample + blurH + blurV, then resume
+   *  the scene pass and composite the blurred scratch back at the
+   *  surface bounds (REPLACE-blended via blitPipeline so it overwrites
+   *  whatever was at those bounds). The surface itself composites on
+   *  top in `compositeSurface` after this returns.
+   *
+   *  blurRadius is in screen pixels. The kernel covers ±4 taps;
+   *  with the 1/4 downsample we want the effective screen-space
+   *  radius to be ~radius pixels, so each tap moves ~radius / 16
+   *  scratch pixels. */
+  _encodeBackdropBlur(x, y, w, h, blurRadius) {
+    this._scenePass.end();
+    this._scenePass = null;
+
+    const sw = this._scratchW, sh = this._scratchH;
+    const screenW = this.metrics.width_px, screenH = this.metrics.height_px;
+
+    // 1) Downsample scene → scratchA at full scratch size, REPLACE.
+    const downsamplePass = this._encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.scratchAView,
+        loadOp: "clear",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        storeOp: "store",
+      }],
     });
-    this.device.queue.writeBuffer(uniformBuffer, 0, uniforms);
+    downsamplePass.setPipeline(this.blitPipeline);
+    this._encodeIdentityDraw(downsamplePass, this.sceneView, {
+      dstRect:    [0, 0, sw, sh],
+      targetSize: [sw, sh],
+      opts:       [1, 0, 0, 1],
+      srcUv:      [0, 0, 1, 1],
+    });
+    downsamplePass.end();
 
+    // Per-tap UV offsets so the effective screen-space radius lands
+    // at ~blurRadius pixels. 4 taps × SCRATCH_DOWNSAMPLE × tap_step
+    // = blurRadius → tap_step (in scratch px) = blurRadius / 16.
+    const tapPx = blurRadius / (4 * SCRATCH_DOWNSAMPLE);
+
+    // 2) Blur horizontal: scratchA → scratchB, dir = (tapPx/sw, 0).
+    const blurHPass = this._encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.scratchBView,
+        loadOp: "clear",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        storeOp: "store",
+      }],
+    });
+    blurHPass.setPipeline(this.blurPipeline);
+    this._encodeBlurDraw(blurHPass, this.scratchAView, {
+      dstRect:    [0, 0, sw, sh],
+      targetSize: [sw, sh],
+      srcUv:      [0, 0, 1, 1],
+      blurDir:    [tapPx / sw, 0],
+    });
+    blurHPass.end();
+
+    // 3) Blur vertical: scratchB → scratchA, dir = (0, tapPx/sh).
+    const blurVPass = this._encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.scratchAView,
+        loadOp: "clear",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        storeOp: "store",
+      }],
+    });
+    blurVPass.setPipeline(this.blurPipeline);
+    this._encodeBlurDraw(blurVPass, this.scratchBView, {
+      dstRect:    [0, 0, sw, sh],
+      targetSize: [sw, sh],
+      srcUv:      [0, 0, 1, 1],
+      blurDir:    [0, tapPx / sh],
+    });
+    blurVPass.end();
+
+    // 4) Resume scene pass with loadOp=load (preserve prior content).
+    this._scenePass = this._encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.sceneView,
+        loadOp: "load",
+        storeOp: "store",
+      }],
+    });
+    this._scenePass.setPipeline(this.blitPipeline);
+
+    // 5) Composite blurred scratchA back into the scene at surface
+    //    bounds. We sample only the surface-region of scratchA,
+    //    mapped back through screen-space UV (since downsample was
+    //    full screen → full scratch, the UV ratio is the same:
+    //    (x/screenW, y/screenH, w/screenW, h/screenH)). REPLACE
+    //    blending → the blurred backdrop overwrites whatever was at
+    //    those bounds (which is what frosted glass looks like).
+    this._encodeIdentityDraw(this._scenePass, this.scratchAView, {
+      dstRect:    [x, y, w, h],
+      targetSize: [screenW, screenH],
+      opts:       [1, 0, 0, 1],
+      srcUv:      [x / screenW, y / screenH, w / screenW, h / screenH],
+    });
+
+    // 6) Switch back to OVER-blend pipeline so the surface itself
+    //    composites with proper alpha.
+    this._scenePass.setPipeline(this.pipeline);
+  }
+
+  /** Encode one identity textured-quad draw into `pass`. The pipeline
+   *  must already be set on the pass (caller's choice of OVER vs
+   *  REPLACE blend). */
+  _encodeIdentityDraw(pass, srcView, args) {
+    const buf = this._uploadUniforms({
+      dstRect:    args.dstRect,
+      targetSize: args.targetSize,
+      opts:       args.opts,
+      srcUv:      args.srcUv,
+      blurDir:    [0, 0],  // unused
+    });
     const bindGroup = this.device.createBindGroup({
       layout: this.bindGroupLayout,
       entries: [
-        { binding: 0, resource: { buffer: uniformBuffer } },
+        { binding: 0, resource: { buffer: buf } },
         { binding: 1, resource: this.sampler },
-        { binding: 2, resource: entry.view },
+        { binding: 2, resource: srcView },
       ],
     });
-    this._pass.setBindGroup(0, bindGroup);
-    this._pass.draw(4);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(4);
+  }
+
+  /** Encode one blur draw into `pass`. The blur pipeline must already
+   *  be set on the pass. */
+  _encodeBlurDraw(pass, srcView, args) {
+    const buf = this._uploadUniforms({
+      dstRect:    args.dstRect,
+      targetSize: args.targetSize,
+      opts:       [0, 0, 0, 1],   // unused by blur shader
+      srcUv:      args.srcUv,
+      blurDir:    args.blurDir,
+    });
+    const bindGroup = this.device.createBindGroup({
+      layout: this.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: buf } },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: srcView },
+      ],
+    });
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(4);
+  }
+
+  /** Allocate a fresh per-call uniform buffer and upload the packed
+   *  args. Per-call allocation is mandatory: `writeBuffer` ordering
+   *  vs `draw` ordering isn't preserved within a single submission,
+   *  so a shared buffer would deliver the LAST frame's uniforms to
+   *  every draw. The driver pools small uniforms efficiently. */
+  _uploadUniforms({ dstRect, targetSize, opts, srcUv, blurDir }) {
+    const u = new Float32Array(20);  // 80 bytes / 4
+    u[0]  = dstRect[0];    u[1]  = dstRect[1];    u[2]  = dstRect[2];    u[3]  = dstRect[3];
+    u[4]  = targetSize[0]; u[5]  = targetSize[1]; u[6]  = 0;             u[7]  = 0;
+    u[8]  = opts[0];       u[9]  = opts[1];       u[10] = opts[2];       u[11] = opts[3];
+    u[12] = srcUv[0];      u[13] = srcUv[1];      u[14] = srcUv[2];      u[15] = srcUv[3];
+    u[16] = blurDir[0];    u[17] = blurDir[1];    u[18] = 0;             u[19] = 0;
+    const buf = this.device.createBuffer({
+      size: UNIFORM_BUFFER_SIZE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(buf, 0, u);
+    return buf;
   }
 
   present() { this.endFrame(); }
 
   destroy() {
     if (this._frameInProgress) this.endFrame();
+    this.sceneTexture?.destroy();
+    this.scratchA?.destroy();
+    this.scratchB?.destroy();
+    this.sceneTexture = this.scratchA = this.scratchB = null;
+    this.sceneView = this.scratchAView = this.scratchBView = null;
     this.pipeline = null;
+    this.blitPipeline = null;
+    this.blurPipeline = null;
     this.sampler = null;
     this.bindGroupLayout = null;
     this.ctx = null;
     this.device = null;
     this.adapter = null;
     this.screenCanvas = null;
-    // _textureCache is a WeakMap; entries get GC'd when their source
-    // canvases do. We don't `destroy()` each texture explicitly —
-    // device teardown reclaims them.
   }
 }
