@@ -1,16 +1,24 @@
-# ארכיטקטורה טכנית — Akiva Platform
+# Technical Architecture — Akiva Platform
 
-## 1. עיקרון מנחה
+## 1. Guiding principle
 
-עקיבא היא **מערכת הפעלה אמיתית**, לא game engine ולא web framework. היא כוללת את כל תתי-המערכות שמצופות מ-OS אפליקטיבית מודרנית: process model, activity lifecycle, resource system עם qualifiers, declarative layout language, intent-based IPC, package manager, window manager. כל אחת מהן **חובה** להיות קיימת, אפילו אם רזה.
+Akiva is a **real applicative operating system** — not a game
+engine, not a web framework. It includes every subsystem expected
+of a modern OS: a process model, activity lifecycle, a resource
+system with qualifiers, a declarative layout language, intent-based
+IPC, a package manager, a window manager. Each one **must** exist,
+even if thin.
 
-"שלד רזה" לא אומר "שלד חסר" — אומר "כל עצם קיים, אבל כל עצם עושה מינימום". אפשר להרחיב בעתיד, אי אפשר "להוסיף" תת-מערכת בסיסית בדיעבד בלי לשכתב הכל.
+"Thin skeleton" does not mean "missing skeleton" — it means "every
+bone is present, every bone does the minimum". You can extend
+later; you cannot retroactively add a foundational subsystem
+without rewriting everything.
 
-## 2. מפת תתי-המערכות
+## 2. Subsystem map
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│                     Akiva User Space                          │
+│                     Akiva user space                          │
 │   ┌──────────┐  ┌──────────┐  ┌──────────┐                    │
 │   │ App: Calc│  │ App: Note│  │ App: Shell│  (apps = wasm,    │
 │   └─────┬────┘  └─────┬────┘  └────┬─────┘   each linking the │
@@ -22,7 +30,7 @@
 │         │             │            │                           │
 ├─────────┼─────────────┼────────────┼──────────────────────────┤
 │         ▼             ▼            ▼                           │
-│                  Akiva Framework                               │
+│                  Akiva framework                               │
 │  ┌─────────────────────────────────────────────────────────┐  │
 │  │  ActivityManager   │  PackageManager   │  IntentRouter  │  │
 │  │  lifecycle + stack │  app registry     │  routing       │  │
@@ -34,7 +42,7 @@
 │  │  activity each frame and flushes the buffer to the HAL. │  │
 │  └─────────────────────────────────────────────────────────┘  │
 ├───────────────────────────────────────────────────────────────┤
-│                    Akiva Kernel (runtime core)                │
+│                    Akiva kernel (runtime core)                │
 │  ┌─────────────────────────────────────────────────────────┐  │
 │  │  WasmLoader    │  MemoryManager    │  Scheduler          │  │
 │  │  app instances │  per-app memory   │  frame loop + ticks │  │
@@ -50,114 +58,159 @@
 └───────────────────────────────────────────────────────────────┘
 ```
 
-### הסבר קצר של כל תת-מערכת
+### Per-subsystem summary
 
-**Akiva Kernel** (הגרעין):
-- **WasmLoader** — טוען wasm modules של אפליקציות, מאתחל instances
-- **MemoryManager** — עוקב אחרי צריכת זיכרון של כל app, אוכף quotas
-- **Scheduler** — מריץ את לולאת ה-frame, מחליט מי מקבל CPU time
-- **EventQueue** — מקבל events מה-HAL, מנתב לפי focus
-- **StorageManager** — key-value sandboxed per-app, מעל OPFS
-- **IPCBus** — מעביר מסרים (intents) בין app instances
+**Akiva kernel** (the core):
 
-**Akiva Framework** (מעל הגרעין, נותן abstractions לאפליקציות):
-- **ActivityManager** — מנהל stack של Activities, lifecycle callbacks, task affinities
-- **PackageManager** — רישום אפליקציות מותקנות, resolve של intents
-- **IntentRouter** — מבצע implicit intent resolution דרך PackageManager
-- **WindowManager** — איזה Activity מוצג מתי, animations של מעברים
-- **ResourceManager** — טעינת resources עם qualifier matching
-- **PermissionMgr** — בודק אם app הכריז על permission ואישור המשתמש
-- **Compositor** — מחזיק את buffer ה-`FrameCommands` (paint ops) של ה-frame הנוכחי, מקבל אותם מה-activity הפעילה ומעביר ל-HAL
+- **WasmLoader** — loads app wasm modules, instantiates them.
+- **MemoryManager** — tracks per-app memory consumption, enforces
+  quotas.
+- **Scheduler** — runs the frame loop, decides who gets CPU time.
+- **EventQueue** — receives events from the HAL, routes by focus.
+- **StorageManager** — sandboxed key-value store per app, over OPFS.
+- **IPCBus** — relays messages (intents) between app instances.
 
-**Akiva SDK** (linked into each app — קוד שרץ *בתוך* wasm האפליקציה, לא בקרנל):
-- **Widget toolkit** (`sdk-rust/src/ui`) — `VStack`/`HStack`/`Frame`/`Text`/`Button`/`Rect`/`Spacer`, alignment, grow, click detection
-- **Layout engine** (`sdk-rust/src/ui/layout.rs`) — measure pass + place pass, בדיוק הפונקציונליות שה-ROADMAP המקורי ייעד ל-framework
-- **AKML inflater** (`sdk-rust/src/akml`) — parser + inflater + bindings (`{name}` substitution); ה-AKML הופך ל-widget tree בתוך ה-app, לא בקרנל
+**Akiva framework** (above the kernel; gives apps abstractions):
 
-ראה סעיף 2.1 להסבר למה widgets/layout/AKML חיים ב-SDK ולא ב-framework.
+- **ActivityManager** — manages the Activity stack, lifecycle
+  callbacks, task affinities.
+- **PackageManager** — registry of installed apps, manifest /
+  resource bookkeeping.
+- **IntentRouter** — implicit-intent resolution.
+- **WindowManager** — which Activity is shown when, transition
+  animations.
+- **ResourceManager** — loads resources with qualifier matching.
+- **PermissionMgr** — checks that an app declared a permission
+  and that the user approved it.
+- **Compositor** — holds the buffer of `PaintOp`s for the current
+  frame, accepts them from the active activity, and flushes to
+  the HAL.
 
-**JS HAL** (רק זה לא-Rust):
-- דקיק. ~500 שורות סך הכל. שום לוגיקה של OS.
-- ה-HAL מפוצל פיזית לשניים:
-  - **Tab HAL** (`tab.js`, בכל tab): canvas + input events + leader election client. שולח/מקבל מ-Worker דרך MessagePort.
-  - **Worker HAL** (`worker.js`, רק ב-leader tab): storage (OPFS), wasm loading, מנהל את ה-runtime ואת ה-renderer.
-  - ראה סעיף 9 לפרטי ארכיטקטורת ה-Single-Instance.
+**Akiva SDK** (linked into each app — code that runs *inside* the
+app's wasm, not in the kernel):
 
-## 2.1 ABI boundary — למה widgets ו-AKML חיים ב-SDK ולא ב-framework
+- **Widget toolkit** (`sdk-rust/src/ui`) —
+  `VStack`/`HStack`/`Frame`/`Text`/`Button`/`Rect`/`Spacer`,
+  alignment, growth, click detection.
+- **Layout engine** (`sdk-rust/src/ui/layout.rs`) — measure pass +
+  place pass; the functionality the original ROADMAP earmarked
+  for the framework.
+- **AKML inflater** (`sdk-rust/src/akml`) — parser + inflater +
+  bindings (`{name}` substitution); AKML becomes a widget tree
+  inside the app, not in the kernel.
 
-ה-ROADMAP המקורי ייעד את ה-LayoutInflater, LayoutEngine, והwidget tree ל-framework. בפועל (Phase 3a + 3b) הם הועברו ל-SDK. ההחלטה היא אדריכלית, לא שרירותית:
+See [§2.1](#21-abi-boundary--why-widgets-and-akml-live-in-the-sdk-not-the-framework)
+for why widgets / layout / AKML live in the SDK and not the
+framework.
 
-**מה עובר את ה-ABI בפועל:** `PaintOp` בלבד — `FillRect`, `DrawText`, `PushClip`, וכו'. פורמט binary פשוט ויציב, מוגדר ב-[docs/abi.md §2](docs/abi.md).
+**JS HAL** (the only non-Rust part):
 
-**אם ה-widgets היו ב-framework:** ה-ABI היה צריך לשאת widget declarations (hierarchy + attributes), ולהחזיר events חזרה ל-app עם widget ids כ-handles. פרוטוקול דו-כיווני מורכב, ששינוי widget אחד בו הוא breaking change לכל האפליקציות.
+- Thin. ~500 lines total. No OS logic.
+- Physically split:
+  - **Tab HAL** (`tab.js`, in every tab): canvas + input events
+    + leader-election client. Sends to / receives from the
+    Worker through a MessagePort.
+  - **Kernel-Worker HAL** (`worker.js`, only on the leader tab):
+    storage (OPFS), wasm loading, runs the runtime and the
+    renderer.
+  - **Per-app workers** (Stone 11.4c, `app_worker_shell.js`):
+    one worker per package — see [§9](#9-single-instance-architecture-tabs--displays-not-devices).
 
-**מה ה-SDK-side נותן:**
-- ABI צר ויציב — paint ops בלבד. שינוי widget toolkit לא נוגע ב-framework.
-- אפליקציות מתפתחות כל אחת בקצב שלה; `cargo update` על SDK שומר תאימות binary מלאה.
-- ה-framework הוא בפועל "decoder של paint ops" — פשוט, נבדל, קל לבדוק.
-- Layout logic חי יחד עם ה-widgets שמשתמשים בה — אין split של measure/place בין שני crates.
+## 2.1 ABI boundary — why widgets and AKML live in the SDK, not the framework
 
-**המחיר:** כל app נושאת את ה-widget code בתוך ה-wasm שלה (~50KB compressed). ב-post-MVP, אם זה יהפוך לצוואר בקבוק או אם נרצה enforcement של a11y/RTL מרכזי, אפשר יהיה לשקול widget ABI — אבל זה לא מחויב היום.
+The original ROADMAP put `LayoutInflater`, `LayoutEngine`, and
+the widget tree in the framework. In practice (Phases 3a + 3b)
+they were moved into the SDK. The decision is architectural, not
+arbitrary.
 
-ראה פירוט מלא של מה ש-`akiva_app_*` ו-`akiva_host_*` exports/imports מחליפים ב-[docs/abi.md](docs/abi.md).
+**What actually crosses the ABI:** `PaintOp` only —
+`FillRect`, `DrawText`, `PushClip`, etc. A simple, stable binary
+format defined in [`docs/abi.md §2`](docs/abi.md).
 
-## 3. Process Model
+**If widgets had stayed in the framework:** the ABI would have
+had to carry widget declarations (hierarchy + attributes) and
+return events back to the app with widget ids as handles. A
+complex bidirectional protocol where any widget change is a
+breaking change for every app.
 
-### המודל המושגי
+**What the SDK-side approach gives:**
 
-כל אפליקציה רצה ב-**wasm instance נפרד**. זה הצורה שלנו ל-"process":
-- memory מבודד
-- ערך מסוים של quota
-- יכול להיהרג (instance destroyed) ולהישחזר (new instance)
-- מזוהה ב-`ProcessId` ייחודי
+- A narrow, stable ABI — paint ops only. Changing the widget
+  toolkit doesn't touch the framework.
+- Apps evolve at their own pace; `cargo update` on the SDK
+  preserves binary compatibility.
+- The framework becomes a "paint-op decoder" — small, isolated,
+  easy to test.
+- Layout logic lives next to the widgets that use it — no
+  measure/place split between two crates.
 
-### App States
+**The cost:** every app carries the widget code in its own wasm
+(~50 KB compressed). If that ever becomes a bottleneck, or if
+we want centralised a11y / RTL enforcement, a widget ABI can be
+introduced — but it is not required today.
 
-אותם States שיש באנדרואיד:
+See [`docs/abi.md`](docs/abi.md) for what `akiva_app_*` and
+`akiva_host_*` exports/imports actually carry.
+
+## 3. Process model
+
+### Conceptual model
+
+Each app runs in a **separate wasm instance** — our shape of a
+"process":
+
+- isolated memory;
+- a defined quota;
+- killable (instance destroyed) and recoverable (new instance);
+- identified by a unique `ProcessId`.
+
+### App states
+
+The same shape as Android:
 
 ```
 ┌──────────┐
 │ NotExists│ ─────────┐
 └──────────┘          │
-     │                │ (low memory killer)
+     │                │ (low-memory killer)
      │ launch         │
      ▼                │
 ┌──────────┐          │
 │ Created  │          │
 └─────┬────┘          │
-      │ onStart       │
+      │ on_start      │
       ▼               │
 ┌──────────┐          │
 │ Started  │          │
 └─────┬────┘          │
-      │ onResume      │
+      │ on_resume     │
       ▼               │
 ┌──────────┐          │
 │ Resumed  │ ◄────────┼─── (user focuses)
 └─────┬────┘          │
-      │ onPause       │
+      │ on_pause      │
       ▼               │
 ┌──────────┐          │
 │ Paused   │          │
 └─────┬────┘          │
-      │ onStop        │
+      │ on_stop       │
       ▼               │
 ┌──────────┐          │
 │ Stopped  │          │
 └─────┬────┘          │
-      │ onDestroy     │
+      │ on_destroy    │
       ▼               │
 ┌──────────┐          │
 │ Destroyed│ ─────────┘
 └──────────┘
 ```
 
-### Task Stack
+### Task stack
 
-Stack גלובלי של Activity instances (כמו ב-Android):
+A global stack of activity instances (Android-style):
 
 ```
-Stack top (user sees this)
+Stack top (what the user sees)
 ┌──────────────────────────┐
 │  Notes.EditScreen        │  ← Resumed
 ├──────────────────────────┤
@@ -170,13 +223,15 @@ Stack bottom
 
 Back button → pop stack top → previous activity resumes.
 
-Launch modes: `standard`, `singleTop`, `singleTask`, `singleInstance` — כמו באנדרואיד.
+Launch modes: `standard`, `singleTop`, `singleTask`,
+`singleInstance` — same as Android. See
+[`docs/activity-model.md §4`](docs/activity-model.md).
 
-## 4. Resource System
+## 4. Resource system
 
-### מבנה resources
+### Resources directory
 
-כל אפליקציה כוללת תיקיית `res/`:
+Every app contains a `res/` directory:
 
 ```
 apps/calculator/
@@ -185,51 +240,67 @@ apps/calculator/
 └── res/
     ├── layout/
     │   └── main.akml
-    ├── layout-land/
+    ├── layout-land/        ← planned
     │   └── main.akml
     ├── values/
     │   ├── strings.toml
     │   ├── colors.toml
     │   └── dimens.toml
-    ├── values-he/
+    ├── values-he/          ← planned
     │   └── strings.toml
-    ├── values-night/
+    ├── values-night/       ← live
     │   └── colors.toml
     └── drawable/
-        └── icon.svg
+        └── icon.png
 ```
 
-### Qualifiers (תחילית במינימום ב-MVP)
+### Qualifiers (target list)
 
-- `-he`, `-en` — שפה (ISO 639-1)
-- `-ldrtl`, `-ldltr` — כיוון טקסט
-- `-land`, `-port` — orientation
-- `-night` — dark mode
-- `-sw600dp` — עתידי, screen width
+- `-he`, `-en` — language (ISO 639-1) — *planned*
+- `-ldrtl`, `-ldltr` — text direction — *planned*
+- `-land`, `-port` — orientation — *planned*
+- `-night` — dark mode — **live (Stone 11.6.9 #3)**
+- `-sw600dp` — future, screen width
 
 ### Resolution
 
-ה-ResourceManager ב-boot זמן:
-1. קורא את device config: `{ locale: "he-IL", orientation: "portrait", night: false }`
-2. לכל resource reference (`@string/welcome`) מוצא את ה-match הכי טוב
-3. Fallback: תמיד `values/` ללא qualifier
+The ResourceManager at boot:
 
-### יחידות
+1. reads the device config — e.g.
+   `{ locale: "he-IL", orientation: "portrait", night: false }`;
+2. for every resource reference (`@string/welcome`) finds the
+   best match;
+3. fallback: always `values/` with no qualifier.
 
-- `dp` (density-independent pixels): מוכפל ב-device density factor
-- `sp` (scale-independent pixels): כמו dp + font size multiplier
-- `px`: פיקסלים גולמיים (לא מומלץ)
-- `%`: אחוז מה-parent
+### Units
 
-פורמט רישום: `"16dp"`, `"1.5sp"`, `"50%"`.
+- `dp` (density-independent pixels): multiplied by the device
+  density factor.
+- `sp` (scale-independent pixels): like `dp` plus the user's font
+  scale.
+- `px`: raw pixels (discouraged).
+- `%`: percent of the parent.
 
-## 5. AKML — שפת התיאור הדקלרטיבית
+Notation: `"16dp"`, `"1.5sp"`, `"50%"`.
 
-AKML = **Akiva Markup Language**. XML-based. נפרד מהאפליקציה.
+## 5. AKML — the declarative description language
 
-> **מיקום פיזי ב-MVP (Phase 3b):** ה-parser + inflater חיים ב-SDK (`sdk-rust/src/akml`), לא ב-framework. כל app שקוראת `akml::inflate_str(&mut ui, LAYOUT)` מריצה את הפארסר בתוך ה-wasm שלה, מייצרת widget tree ב-SDK, ומפיקה paint ops ש-framework מאסף. ה-`set_content_view` + callback-auto-wiring שמופיעים בדוגמה למטה הם ה-API ה-**ארוך-טווח**; ה-MVP מוחלף ב-builder API (`akml::inflate_str_with(&mut ui, LAYOUT, &bindings)`) + dispatch pull-based (`ui.was_triggered("action")`). ראה [docs/akml.md](docs/akml.md) + [sdk-rust/src/akml/mod.rs](sdk-rust/src/akml/mod.rs) למה שעובד בפועל כיום.
+AKML = **Akiva Markup Language**. XML-based, separate from the
+app.
 
-### דוגמה
+> **Physical location (Phase 3b).** The parser + inflater live
+> in the SDK (`sdk-rust/src/akml`), not in the framework. Every
+> app that calls `akml::inflate_str(&mut ui, LAYOUT)` runs the
+> parser inside its own wasm, produces a widget tree in the SDK,
+> and emits paint ops the framework collects. The
+> `set_content_view` + auto-callback API shown in the example
+> below is the **long-term** API; the MVP today uses a builder
+> API (`akml::inflate_str_with(&mut ui, LAYOUT, &bindings)`)
+> with pull-based dispatch (`ui.was_triggered("action")`). See
+> [`docs/akml.md`](docs/akml.md) and
+> [`sdk-rust/src/akml/mod.rs`](sdk-rust/src/akml/mod.rs).
+
+### Example
 
 ```xml
 <!-- res/layout/main.akml -->
@@ -247,150 +318,168 @@ AKML = **Akiva Markup Language**. XML-based. נפרד מהאפליקציה.
         textAlign="end"
         padding="12dp" />
 
-    <Grid columns="4" rows="5" spacing="8dp" flex="1">
-        <Button text="@string/clear" onClick="on_clear" style="@style/op_button" />
-        <Button text="/" onClick="on_op" tag="div" style="@style/op_button" />
-        <Button text="×" onClick="on_op" tag="mul" style="@style/op_button" />
-        <!-- וכו' -->
+    <Grid cols="4" rows="5" spacing="8dp" flex="1">
+        <Button text="@string/clear" onClick="on_clear"  />
+        <Button text="/"             onClick="on_op" tag="div" />
+        <Button text="×"             onClick="on_op" tag="mul" />
+        <!-- … -->
     </Grid>
 </VStack>
 ```
 
-### מה ה-app מקבל
+### What the app receives
 
-האפליקציה (wasm) בזמן `onCreate`:
+The app (wasm) at `on_create`:
 
 ```rust
-fn on_create(&mut self, ctx: &ActivityContext) {
+async fn on_create(&mut self, ctx: &mut Context<'_>) {
     ctx.set_content_view("@layout/main");
-    // handlers מופעלים אוטומטית כי AKML הצהיר עליהם
+    // Handlers fire automatically because AKML declared them.
 }
 
-fn on_clear(&mut self) {
-    self.display = "0".to_string();
-    self.invalidate("@+id/display");  // runtime יעדכן את ה-Text widget
+#[akiva::callback]
+fn on_clear(app: &mut Calculator, ctx: &CallbackContext) {
+    app.display = "0".to_string();
+    ctx.invalidate("@+id/display");  // runtime updates the Text widget
 }
 ```
 
-ה-runtime מפרסר את ה-AKML, יוצר widgets, קושר callbacks — הכל דרך attribute binding.
-
-### Inflation flow — ארוך-טווח (עם ResourceManager + callback registry)
+### Inflation flow — long-term (with ResourceManager + callback registry)
 
 ```
-1. App:      ctx.set_content_view("@layout/main")
-2. Framework: ResourceManager.get_layout("main") → main.akml (אחרי qualifier matching)
-3. Framework: LayoutInflater.inflate(akml_bytes)
-4. Framework: מפרסר XML → יוצר widget tree פנימי
-5. Framework: כל attribute מתורגם לקריאת runtime API (set_text, set_padding, וכו')
-6. Framework: @string/@color/@dimen refs נפתרים דרך ResourceManager
-7. Framework: onClick="on_clear" נרשם דרך callback registry של האפליקציה
+1. App:        ctx.set_content_view("@layout/main")
+2. Framework:  ResourceManager.get_layout("main") → main.akml (after qualifier matching)
+3. Framework:  LayoutInflater.inflate(akml_bytes)
+4. Framework:  XML parsed → internal widget tree
+5. Framework:  every attribute is translated into a runtime API call (set_text, set_padding, …)
+6. Framework:  @string / @color / @dimen refs resolved through ResourceManager
+7. Framework:  onClick="on_clear" registered through the app's callback registry
 8. LayoutEngine: measure pass → layout pass
 9. Compositor: draw commands → canvas
 ```
 
-### Inflation flow — MVP (Phase 3b; ללא ResourceManager, ללא callback registry)
+### Inflation flow — MVP (Phase 3b; no ResourceManager, no callback registry)
 
 ```
-1. App:     Bindings::new().text("display", ...).color("display_color", ...)
-2. SDK:     akml::inflate_str_with(&mut ui, LAYOUT, &bindings)
-3. SDK:     parser → AST → Ui node ids (כולל רישום id + onClick action)
-4. SDK:     measure pass → place pass (bottom-up / top-down)
-5. SDK:     paint pass emits PaintOps דרך Canvas
-6. Framework: מצטרף ל-FrameCommands, מעביר ל-HAL
-7. Frame הבא: App שואל `ui.was_triggered("equals")` ומנתב לעצמו
+1. App:    Bindings::new().text("display", …).color("display_color", …)
+2. SDK:    akml::inflate_str_with(&mut ui, LAYOUT, &bindings)
+3. SDK:    parser → AST → Ui node ids (id + onClick action registered)
+4. SDK:    measure pass → place pass (bottom-up / top-down)
+5. SDK:    paint pass emits PaintOps via the Canvas
+6. Framework: collected into FrameCommands, sent to the HAL
+7. Next frame: app calls `ui.was_triggered("equals")` and routes to itself
 
-השלבים שחסרים לעומת ה-long-term: resource lookup (ה-AKML נצרך
-literals בלבד), qualifier matching (אין layout-land/), callback
-auto-wire (ה-app קוראת was_triggered ידנית), set_content_view
-(ה-app מחזיקה את ה-layout בתור &'static str).
+What's missing relative to the long-term plan: resource lookup
+(AKML literals only), qualifier matching (no layout-land/),
+callback auto-wiring (the app calls was_triggered manually),
+set_content_view (the app holds the layout as a &'static str).
 ```
 
-## 6. Intent System
+## 6. Intent system
 
-### מבנה Intent
+### Intent shape
 
 ```rust
 pub struct Intent {
-    pub action: String,           // "akiva.intent.action.VIEW"
-    pub data_uri: Option<String>, // "content://..."
+    pub action:    String,            // "akiva.intent.action.VIEW"
+    pub data_uri:  Option<String>,    // "content://..."
     pub mime_type: Option<String>,
-    pub extras: HashMap<String, Value>,
-    pub target: IntentTarget,     // Explicit | Implicit
+    pub extras:    HashMap<String, Value>,
+    pub target:    IntentTarget,      // Explicit | Implicit
 }
 ```
 
-### Intent filters (במניפסט)
+### Intent filters (in the manifest)
 
 ```toml
 [[activities]]
 id = "main"
 [[activities.intent_filters]]
-actions = ["akiva.intent.action.MAIN"]
+actions    = ["akiva.intent.action.MAIN"]
 categories = ["akiva.intent.category.LAUNCHER"]
 ```
 
 ### Resolution
 
-1. App שולחת intent → `IntentRouter.dispatch(intent)`
-2. Implicit: `PackageManager.query_intent(intent)` מחזיר רשימת matches
-3. אם יותר מאחד — chooser UI
-4. ActivityManager מריץ את ה-activity המתאים, דוחף ל-stack
-5. Target activity מקבל את ה-intent ב-`onCreate` / `onNewIntent`
+1. App sends an intent → `IntentRouter::resolve(intent)`.
+2. Implicit: scans every registered filter for a match.
+3. If multiple matches → chooser UI *(planned)*.
+4. ActivityManager launches the chosen activity, pushes onto the
+   stack.
+5. Target activity sees the intent in `on_create` /
+   `on_new_intent`.
 
-### דוגמה
+### Example
 
 ```rust
-// Calculator רוצה לפתוח Settings
+// Calculator wants to open Settings
 let intent = Intent::new("akiva.intent.action.VIEW")
     .with_data("akiva://settings/theme");
-ctx.start_activity(intent);
+ctx.start_activity(&intent).await;
 ```
 
 ## 7. Window Manager
 
-### תפקיד
+### Role
 
-מחליט **מה מוצג על המסך** בכל רגע.
+Decides **what is shown on screen** at any given moment.
 
-### קומפוזיציה בסיסית (MVP)
+### Basic composition (today)
 
-- Activity אחד ברגע נתון (fullscreen)
-- Transition animations בין activities
-- Overlay layer לסיסטם UI (status bar, navigation bar)
+- One activity at a time (fullscreen).
+- Push / pop transition animations (slide + fade with ease-out
+  cubic — Stone 13.3).
+- `Overlay` z-band reserved for system UI (status bar, navigation
+  bar, toasts) — the layer exists but no widget renders into it
+  yet.
 
-### מורכבות עתידית
+### Future complexity
 
-- Multi-window (split screen)
-- Floating windows
-- Picture-in-picture
-- Drag & drop בין windows
+- Multi-window (split-screen).
+- Floating windows.
+- Picture-in-picture.
+- Drag and drop between windows.
 
 ### Shell
 
-**ה-Shell הוא אפליקציית Akiva רגילה** עם permission מיוחד:
-- מופעלת אוטומטית ב-boot
-- מטפלת ב-intent `akiva.intent.category.HOME`
-- מציגה רשימת אפליקציות מותקנות דרך `PackageManager`
-- מציגה task switcher (רשימת activities פתוחות)
+**Shell is a regular Akiva app** with extra privileges:
 
-**Back button**: WindowManager שולט בזה. לחיצה → ActivityManager.pop().
+- Launches automatically at boot.
+- Handles the `akiva.intent.category.HOME` intent.
+- Renders the list of installed apps via PackageManager.
+- Hosts a task switcher *(planned).*
 
-> **מיקום פיזי ב-MVP (Phase 2b.5):** ה-Shell עדיין לא apps/shell נפרד — הוא built-in ב-[framework/src/shell.rs](framework/src/shell.rs), נרשם ע"י `framework::boot` עם `package_id = "sys.shell"`, launch mode SingleTop, ומודגר תמיד בתחתית ה-task stack. ההוצאה ל-`apps/shell/` כ-wasm package רגיל דוחה ל-post-MVP, אחרי ש-IntentRouter מחובר בפועל (הקוד של IntentRouter קיים ב-[framework/src/intent.rs](framework/src/intent.rs) אבל אף אחד לא קורא לו). עד אז, launch עובד דרך `ActivityManager::launch(package_id, class)` ישירות, ללא intent resolution.
+**Back button:** WindowManager owns it. A press →
+`ActivityManager::pop()`.
 
-## 8. Permission Model (Capability-via-Imports)
+## 8. Permission model (Capability-via-Imports)
 
-> **סטטוס מימוש (אפריל 2026):** [framework/src/permissions.rs](framework/src/permissions.rs) מכיל את הסוגים (`ProtectionLevel`, `PermissionDecl`, `grant`/`revoke`/`check`) אבל **לא אוכף כלום** — `manifest.permissions.required` לא נקרא ב-install, ה-wasm loader לא בונה import map לפי grants. כל המנגנון המתואר למטה מיושם ב-**Phase 10 של v0.2**. ראה [docs/v0.2-design.md §4 (עמוד 3)](docs/v0.2-design.md).
+> **Implementation status (May 2026):** the model is **fully
+> live**. `framework/src/permissions.rs` declares the catalog at
+> boot via `permissions::declare_mvp_permissions`;
+> `package_manager::install` rejects any required permission not
+> declared (Stone 10.2); the wasm loader builds the import map
+> per app from grants; an app calling an ungranted import fails
+> at instantiation. Phase 14 added five capability gates
+> (NETWORK, NOTIFICATIONS, CLIPBOARD, VIBRATE, LOCATION).
 
-**עיקרון:** אפליקציה יכולה לקרוא רק לפונקציות ש-ה-runtime ייבאה ל-wasm instance שלה. Permission denied = import חסר. אין runtime check. זה ה-model הטבעי של wasm/WASI ו-ה-Component Model.
+**Principle.** An app can only call functions the runtime
+imported into its wasm instance. Permission denied = import
+absent. No runtime check. This is the natural wasm / WASI /
+Component-Model model.
 
-### סוגי permissions
+### Permission tiers
 
-- `auto` — ניתנים תמיד (דוגמה: storage sandbox של ה-app עצמה, log, system config).
-- `install-time` — משתמש מאשר בזמן התקנה; אחר כך מחוברים לכל lifetime של ה-app (דוגמה: network, cross-app storage).
-- `runtime` — משתמש מאשר בזמן ריצה; ה-app מקבלת imports זמניים דרך re-link (MVP: דחוי — נתחיל עם install-time בלבד).
-- `signature` — רק apps חתומות ע"י אותו publisher (post-MVP).
+- `auto` — always granted (e.g. the app's own storage sandbox,
+  log, system config).
+- `install-time` — user approves at install time; bound for the
+  app's lifetime (e.g. network, cross-app storage).
+- `runtime` — user approves at runtime; the app receives
+  temporary imports through re-link *(deferred).*
+- `signature` — only apps signed by the same publisher
+  *(post-MVP).*
 
-### אכיפה ב-instantiation time
+### Enforcement at instantiation time
 
 ```
 PackageManager.install(app)
@@ -399,29 +488,30 @@ PackageManager.install(app)
 Validate manifest.permissions.required
   │
   ▼
-User confirms (MVP: auto-approve כי אין app store)
+User confirms (today: auto-approve since there is no app store)
   │
   ▼
-Store granted capability set in registry
+Store the granted capability set in the registry
   │
   ▼
 ActivityManager.launch(app)
   │
   ▼
-WasmLoader builds import map per-capability:
+WasmLoader builds the import map per capability:
   │
-  ├─ "akiva.permission.STORAGE_SANDBOX" → include `storage` interface
-  ├─ "akiva.permission.NETWORK"         → include `network` interface (post-MVP)
-  ├─ "akiva.permission.QUERY_PACKAGES"  → include extra methods on `activity-api`
+  ├─ "akiva.permission.STORAGE_SANDBOX" → include the storage interface
+  ├─ "akiva.permission.NETWORK"         → include the network interface
+  ├─ "akiva.permission.QUERY_PACKAGES"  → include extra methods on activity-api
   │
   ▼
-Instantiate component with computed imports
+Instantiate the component with the computed imports
   │
-  └─ App tries to call an import it doesn't have → link error at instantiate,
-     NOT a runtime error. App can't even reach that code path.
+  └─ The app tries to call an absent import → link error at
+     instantiate, NOT a runtime error. The code path can't be
+     reached.
 ```
 
-### הצהרה במניפסט
+### Manifest declaration
 
 ```toml
 [permissions]
@@ -429,62 +519,84 @@ required = ["akiva.permission.NETWORK"]
 optional = ["akiva.permission.CAMERA"]
 ```
 
-בזמן build, `akiva build` מפיק warning אם ה-code ייבא interfaces שלא מופיעים ב-permissions (אי אפשר בכלל לקמפל בהצלחה).
+At build time, `akiva build` warns if the code imports
+interfaces not listed in `permissions` (the build can't even
+succeed in the first place).
 
-### יתרונות הגישה
+### Why it works
 
-| יתרון | איך |
-|---|---|
-| **מהיר** | אין branch על כל API call |
-| **unforgeable** | אין שום דרך לאפליקציה להגיע ל-function שלא יובאה — confused deputy בלתי אפשרי |
-| **auditable** | `akiva build` מדפיס את ה-capability set; קובץ WIT מתעד את ה-exact surface |
-| **Component Model-native** | בדיוק איך ש-WASI עובד |
+| advantage              | how                                                                        |
+|------------------------|----------------------------------------------------------------------------|
+| **Fast**               | No branch on every API call.                                               |
+| **Unforgeable**        | An app cannot reach a function that wasn't imported — confused-deputy is impossible. |
+| **Auditable**          | `akiva build` prints the capability set; the WIT file documents the exact surface. |
+| **Component-Model native** | Exactly how WASI works.                                                  |
 
-### Mapping מלא (MVP)
+### Full mapping (today)
 
-| Capability                          | Interfaces / methods מיובאים                        |
-|-------------------------------------|-----------------------------------------------------|
-| (אוטומטית)                          | `log`, `system.monotonic-nanos`, `system.wall-millis`, `system.current-config`, `system.random-bytes`, `widget.*`, `resources.*`, `activity-api`, `intent` |
-| `akiva.permission.STORAGE_SANDBOX`  | `storage.*` (per-app sandbox, auto-granted)        |
-| `akiva.permission.QUERY_PACKAGES`   | `activity-api.query-packages` (Shell only)          |
-| `akiva.permission.LAUNCH_ANY_APP`   | `activity-api.start-activity` לכל package (Shell only) |
-| `akiva.permission.NOTIFICATIONS`    | `notifications.*` (post-MVP)                        |
-| `akiva.permission.NETWORK`          | `network.*` (post-MVP)                              |
-| `akiva.permission.CAMERA`           | `camera.*` (post-MVP)                               |
+| capability                              | imports                                                                                                                |
+|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| (automatic)                             | `log`, monotonic / wall clocks, random bytes, widget / resource / activity / intent core APIs                          |
+| `akiva.permission.STORAGE_SANDBOX`      | `storage::*` (per-app sandbox)                                                                                          |
+| `akiva.permission.QUERY_PACKAGES`       | `query_packages` (Shell-only)                                                                                           |
+| `akiva.permission.LAUNCH_ANY_APP`       | `start_activity` for any package (Shell-only)                                                                          |
+| `akiva.permission.NETWORK`              | `net::*` — WebSocket / WebTransport / fetch (Phase 14.1, 14.2)                                                          |
+| `akiva.permission.NOTIFICATIONS`        | `notify_*` (Stone 14.3)                                                                                                |
+| `akiva.permission.CLIPBOARD`            | `clipboard::*` (Stone 14.4)                                                                                            |
+| `akiva.permission.VIBRATE`              | `vibrate` (Stone 14.5)                                                                                                  |
+| `akiva.permission.LOCATION`             | `geolocation::get_position` (Stone 14.6)                                                                               |
 
 ## 9. Single-Instance Architecture (Tabs = Displays, not Devices)
 
-**עיקרון:** יש **OS instance אחת** לכל משתמש ב-origin נתון. שני tabs של Akiva באותו דפדפן — שניהם רואים את אותה מערכת הפעלה, אותן אפליקציות רצות, אותו state. בדיוק כמו שאנדרואיד אחת רצה גם אם מחברים אליה שני מסכים חיצוניים.
+**Principle.** There is **one OS instance** per user per origin.
+Two tabs of Akiva in the same browser — both see the same OS,
+same running apps, same state. Just like one Android instance can
+serve two external displays.
 
-**המודל הקונספטואלי:**
-- **Akiva OS** רץ ב-**worker יחיד** שמוחזק ע"י ה-tab ה"מוביל" (leader) — מקום אחד, מרכזי, שמחזיק את כל ה-state
-- כל **tab = client תצוגה + קלט** — לא מריץ OS, רק מציג canvas ומעביר events
-- פתיחת tab חדש = "חיבור עוד מסך" לאותה Akiva
-- סגירת ה-tab המוביל → tab אחר נבחר אוטומטית ומעביר את ה-worker אליו
-- סגירת כל ה-tabs → ה-OS נכבה (state נשמר ב-OPFS)
+**Conceptual model:**
 
-### החלטה ארכיטקטונית: Web Locks Leader Election (Primary)
+- **Akiva OS** runs in a **single Worker** held by the "leader"
+  tab — one central place that holds all the state.
+- Each **tab = a display + input client** — does not run the OS,
+  only paints a canvas and forwards events.
+- Opening a new tab = "plug in another display" to the same Akiva.
+- Closing the leader → another tab is selected automatically and
+  takes over the worker.
+- Closing every tab → the OS shuts down (state persisted to OPFS).
 
-**הגישה שנבחרה:** שימוש ב-[Web Locks API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API) לבחירת tab מוביל, והרצת ה-OS ב-**Dedicated Worker** שה-leader מחזיק.
+### Architectural decision: Web Locks leader election (primary)
 
-**למה לא SharedWorker כ-primary:**
-- Safari תמיכה בסיסית בלבד; כיסוי mobile דליל
-- דפדפנים הורגים SharedWorker idle גם בזמן שיש tabs פתוחים
-- OPFS `SyncAccessHandle` exclusive לקונטקסט יחיד — SharedWorker מתנגש עם tabs על access
-- Dedicated Worker יציב יותר, נהרג רק עם ה-tab המחזיק
+**Chosen approach:** use the
+[Web Locks API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API)
+for leader election, run the OS inside a **Dedicated Worker**
+the leader holds.
 
-**מה Web Locks נותנים:**
-- lock יחיד בשם `akiva.os.leader` — רק tab אחד מחזיק אותו בכל רגע
-- `navigator.locks.request(name)` מוחזק על lifetime של ה-tab; ברגע שה-tab נסגר, הדפדפן משחרר אוטומטית
-- tab אחר שממתין על ה-lock מקבל אותו מיד — transition transparent למשתמש
-- עובד בכל הדפדפנים (Chrome/Firefox/Safari/Edge) מ-2022
+**Why not SharedWorker as primary:**
 
-### מימוש טכני
+- Safari support is partial; mobile coverage is sparse.
+- Browsers kill idle SharedWorkers even with open tabs.
+- OPFS `SyncAccessHandle` is exclusive to a single context —
+  SharedWorker conflicts with tabs over access.
+- Dedicated Worker is more reliable, dies only with its owning
+  tab.
+
+**What Web Locks provide:**
+
+- A single named lock `akiva.os.leader` — only one tab holds it
+  at a time.
+- `navigator.locks.request(name)` is held for the tab's
+  lifetime; the browser releases automatically on tab close.
+- Another waiting tab gets the lock immediately — the transition
+  is transparent to the user.
+- Available in every modern browser (Chrome / Firefox / Safari /
+  Edge) since 2022.
+
+### Technical implementation
 
 ```
 ┌────────────────┐  ┌────────────────┐  ┌────────────────┐
-│   Leader Tab   │  │   Follower Tab │  │   Follower Tab │
-│  HAL + Canvas  │  │  HAL + Canvas  │  │  HAL + Canvas  │
+│   Leader tab   │  │   Follower tab │  │   Follower tab │
+│  HAL + canvas  │  │  HAL + canvas  │  │  HAL + canvas  │
 │  (display #1)  │  │  (display #2)  │  │  (display #3)  │
 │                │  │                │  │                │
 │  holds         │  │                │  │                │
@@ -509,10 +621,9 @@ optional = ["akiva.permission.CAMERA"]
 └───────────────────────────────────────────────────────────┘
 ```
 
-**זרימת bootstrap של tab (tab.js בכל tab):**
+**Tab bootstrap (`tab.js` in every tab):**
 
 ```js
-// pseudo-code
 async function boot() {
   const channel = new BroadcastChannel("akiva.os");
 
@@ -525,105 +636,149 @@ async function boot() {
 
   // No leader answered — race for the lock.
   navigator.locks.request("akiva.os.leader", async (lock) => {
-    // We won. Start the Worker and serve others until we're closed.
+    // We won. Start the Worker and serve others until we close.
     const worker = new Worker("worker.js", { type: "module" });
     registerAsLeader(channel, worker);
-    connectAsFollower(worker.port);         // the leader tab is also display #1
-    await new Promise(() => {});            // hold lock until tab closes
+    connectAsFollower(worker.port);          // the leader is also display #1
+    await new Promise(() => {});             // hold lock until tab closes
   });
 }
 ```
 
-**הסבר:**
-- Tab חדש מפרסם `"who-is-leader?"` ב-BroadcastChannel. אם מישהו עונה תוך 150ms — נעשים follower.
-- אחרת מתחרים על ה-lock. ה-winner מרים Worker, מרים את ה-OS, וכשה-BroadcastChannel קיבל `"who-is-leader?"` הוא פותח MessagePort חדש ושולח אותו לשואל.
-- הכל זרוק דרך BroadcastChannel כדי לתאם. הטרנספורט בפועל של draw commands / events הוא MessagePort per-tab (point-to-point, מהיר יותר).
+**How it works:**
 
-### חלוקת האחריות
+- A new tab posts `"who-is-leader?"` on the BroadcastChannel.
+  If someone answers within 150 ms — it joins as a follower.
+- Otherwise it races for the lock. The winner spins up a Worker,
+  boots the OS, and when its BroadcastChannel sees a
+  `"who-is-leader?"` it opens a fresh MessagePort and sends it
+  to the asker.
+- All coordination flows through BroadcastChannel. The actual
+  draw-commands / events transport per tab is a MessagePort
+  (point-to-point, faster).
 
-**HAL בכל tab** (`tab.js`, lightweight, ~200 שורות):
-- יוצר canvas + OffscreenCanvas transfer ל-Worker (ראה סעיף 10)
-- פותח BroadcastChannel + MessagePort
-- ממיר pointer/keyboard events ל-messages
-- **אין לוגיקה של OS ב-tab**
+### Division of responsibility
 
-**Dedicated Worker ב-Leader** (`worker.js`, ~300 שורות):
-- מחזיק את instance ה-wasm של הרנטיים
-- מריץ את כל האפליקציות
-- מחזיק OPFS `SyncAccessHandle` ל-storage sandbox
-- מנהל רשימת displays — לכל follower MessagePort משלו
-- שולח draw commands ל-display שבו ה-activity "חי"
-- מקבל input events מ-displays
+**HAL in every tab** (`tab.js`, lightweight, ~200 lines):
 
-**Service Worker** (אופציונלי, post-MVP):
-- Cache ל-wasm של runtime + apps מותקנות
-- Offline boot
-- **לא** מריץ OS (lifetime קצר מדי)
+- Builds the canvas + transfers `OffscreenCanvas` to the Worker
+  (see [§10](#10-renderer-backend-abstract)).
+- Opens the BroadcastChannel + MessagePort.
+- Translates pointer / keyboard / IME events into messages.
+- **No OS logic in the tab.**
 
-### Leader Failover
+**Dedicated Worker on the leader** (`worker.js`, ~300 lines):
 
-כשה-leader נסגר:
-1. הדפדפן משחרר אוטומטית את `akiva.os.leader`.
-2. ה-follower הבא שקרא `navigator.locks.request` מקבל אותו.
-3. ה-winner מרים Worker חדש. ה-wasm runtime עולה, קורא state מ-OPFS (ActivityManager task stack + saved states), ממשיך משם.
-4. Tabs אחרים (followers) פותחים MessagePort חדש ל-leader החדש.
-5. המשתמש רואה flash קצר (תלוי כמה זמן לוקח לטעון את ה-wasm — בפועל ~100-300ms מ-Service Worker cache).
+- Holds the wasm runtime instance.
+- Runs every app worker via `AppRegistry`.
+- Holds the OPFS `SyncAccessHandle` for the storage sandbox.
+- Manages the displays list — one MessagePort per follower.
+- Sends draw commands to the display where the activity "lives".
+- Receives input events from displays.
 
-**תוצאה:** single OS instance logical שמחזיקה ברציפות את ה-state ללא תלות באיזה tab "לוקח את ההגה".
+**Service Worker** (optional, post-MVP):
+
+- Cache for the runtime wasm + installed apps.
+- Offline boot.
+- **Does not** run the OS — its lifetime is too short.
+
+### Leader failover
+
+When the leader closes:
+
+1. The browser releases `akiva.os.leader` automatically.
+2. The next follower waiting on
+   `navigator.locks.request` receives it.
+3. The winner spins up a fresh Worker. The wasm runtime boots,
+   reads state from OPFS (ActivityManager task stack + saved
+   states), and continues from there.
+4. Other tabs (followers) open a new MessagePort to the new
+   leader.
+5. The user sees a brief flash (depending on how long the wasm
+   takes to load — typically ~100–300 ms from a Service Worker
+   cache).
+
+**Result:** a logical single OS instance that retains state
+continuously, regardless of which tab "is at the wheel".
 
 ### Multi-tab scenarios
 
-**משתמש פותח tab ראשון:**
-1. Tab מתחרה על lock — מנצח (אין אחרים).
-2. מרים Worker, ה-runtime מבצע boot.
-3. Tab נרשם כ-display #1 (בתוך ה-Worker).
-4. Shell activity מופיעה.
+**User opens the first tab:**
 
-**משתמש פותח tab שני:**
-1. Tab מפרסם `"who-is-leader?"` → tab הראשון עונה עם MessagePort.
-2. Tab מתחבר כ-display #2.
-3. ActivityManager מקצה מה להציג ב-display #2 (MVP: Shell).
+1. The tab races for the lock — wins (no others).
+2. Spins up a Worker; the runtime boots.
+3. The tab registers as display #1 inside the Worker.
+4. Shell appears.
 
-**משתמש סוגר את ה-tab המוביל אבל יש tabs אחרים:**
-1. Leader נסגר → lock משוחרר → follower מקבל.
-2. Worker חדש עולה אצל ה-follower החדש.
-3. State נטען מ-OPFS.
-4. Tabs אחרים מתחברים ל-leader החדש.
+**User opens a second tab:**
 
-**משתמש סוגר את כל ה-tabs:**
-- כל ה-Workers נהרגים.
-- State השתמר ב-OPFS דרך `on_save_state` של activities ו-ActivityManager persistence.
-- פתיחת tab חדש יעלה הכל שוב.
+1. The tab posts `"who-is-leader?"` → tab one replies with a
+   MessagePort.
+2. The tab connects as display #2.
+3. ActivityManager decides what to show on display #2 (today:
+   Shell).
 
-### מגבלות מוכרות
+**User closes the leader while other tabs remain:**
 
-- **Cross-origin:** לא משתף. akiva.app עם akiva.app עובד; לא עם domain שונה.
-- **Incognito:** אין persistence (מקובל, צפוי).
-- **iOS Safari:** יש תמיכה ב-Web Locks ו-BroadcastChannel מ-16.4+. לגרסאות ישנות יותר — לא נתמכות (נציג הודעת "Akiva requires a modern browser").
-- **Tab freeze (mobile):** דפדפני mobile עלולים להקפיא tab ברקע. ה-leader freeze לא משפיע על ה-Worker באופן מיידי, אבל ה-throttle יכול להוריד ל-60s tick. ב-mobile נתעדף tab פעיל כ-leader אם אפשר.
+1. Leader closes → lock released → follower receives.
+2. A fresh Worker boots in the new leader.
+3. State is loaded from OPFS.
+4. Other tabs reconnect to the new leader.
 
-### Fallback לגרסאות ישנות
+**User closes every tab:**
 
-אם ה-Web Locks API לא זמין (שלא יקרה בדפדפנים נתמכים):
-- Fallback ל-`localStorage` leader election (mutex ע"י timestamp + random nonce). פחות אמין, אבל עובד. תיעוד בלבד — לא נממש ב-MVP.
+- Every Worker dies.
+- State is preserved in OPFS via activity `save_state` and
+  ActivityManager persistence.
+- Opening a new tab brings everything back.
 
-**החלטה ל-MVP:** Web Locks + Dedicated Worker הם ה-primary. SharedWorker לא נמצא ב-MVP — אולי נחזיר אותו בעתיד כ-optimization path אם נזהה תרחיש שמצדיק.
+### Known limits
 
-## 10. Renderer Backend (Abstract)
+- **Cross-origin:** not shared. `akiva.app` with `akiva.app`
+  works; not with a different domain.
+- **Incognito:** no persistence (acceptable, expected).
+- **iOS Safari:** Web Locks + BroadcastChannel are supported
+  from 16.4+. Older versions are not supported (we display a
+  "Akiva requires a modern browser" notice).
+- **Tab freeze (mobile):** mobile browsers may freeze
+  background tabs. A frozen leader doesn't immediately impact
+  the Worker, but the throttle can drop to a 60 s tick. On
+  mobile we'll prefer the active tab as leader where possible.
 
-**עיקרון:** ה-Compositor מפיק שכבת draw commands מופשטת. מאחוריה יושב `RendererBackend` — trait שלו יש implementations שונות. בחירת backend היא החלטה של ה-host בזמן boot, לא קשורה לקוד ה-framework.
+### Fallback for older versions
 
-**למה abstract מההתחלה:** Canvas 2D נפגע בביצועים ב-~2500 אובייקטים. ברגע שמתחילים לצייר shell עם grid של apps + toolbars + overlays + dialogs, יוצאים מזה. אנחנו לא רוצים לגלות את זה באפליקציה החמישית.
+If the Web Locks API is missing (shouldn't happen in supported
+browsers):
+
+- Fallback to `localStorage` leader election (mutex via
+  timestamp + random nonce). Less reliable, but works.
+  Documented only — we don't ship it.
+
+**Decision (today):** Web Locks + Dedicated Worker is the
+primary. SharedWorker is not on the roadmap — we may revisit
+it in the future as an optimisation if a scenario justifies it.
+
+## 10. Renderer Backend (abstract)
+
+**Principle.** The Compositor produces an abstract layer of
+draw commands. Behind it sits the `RendererBackend` trait —
+with multiple implementations. Choosing a backend is a host-time
+decision, not framework-level.
+
+**Why abstract from the start.** Canvas 2D's performance
+degrades around ~2 500 objects. The moment we draw a Shell with
+an app grid + toolbars + overlays + dialogs, we leave that
+budget. We don't want to discover that on the fifth app.
 
 ### Trait
 
 ```rust
 pub trait RendererBackend: Send {
-    /// Initialize with an OffscreenCanvas handle + device metrics.
+    /// Initialise with an OffscreenCanvas + device metrics.
     fn init(&mut self, canvas: RenderSurface, metrics: SurfaceMetrics) -> Result<()>;
 
     /// Apply one frame's draw commands. Commands reference glyph/image handles
-    /// that the backend caches internally.
+    /// the backend caches internally.
     fn submit(&mut self, frame: &FrameCommands) -> Result<()>;
 
     /// Resize the target surface.
@@ -637,27 +792,28 @@ pub trait RendererBackend: Send {
 }
 
 pub enum FrameCommand {
-    FillRect  { rect: Rect, rgba: u32 },
-    StrokeRect{ rect: Rect, rgba: u32, width_px: f32 },
+    FillRect        { rect: Rect, rgba: u32 },
+    StrokeRect      { rect: Rect, rgba: u32, width_px: f32 },
     FillRoundedRect { rect: Rect, rgba: u32, radius_px: f32 },
-    FillText  { origin: Point, text: GlyphRun, rgba: u32 },
-    DrawImage { dst: Rect, image: ImageId, src: Option<Rect> },
-    PushClip  { rect: Rect },
+    FillText        { origin: Point, text: GlyphRun, rgba: u32 },
+    DrawImage       { dst: Rect, image: ImageId, src: Option<Rect> },
+    PushClip        { rect: Rect },
     PopClip,
-    PushOpacity { alpha: f32 },
+    PushOpacity     { alpha: f32 },
     PopOpacity,
 }
 ```
 
 ### Implementations
 
-| Backend          | When used                                  | Notes                                         |
-|------------------|--------------------------------------------|-----------------------------------------------|
-| `Canvas2DBackend`| MVP default; compatibility floor           | OffscreenCanvas.getContext("2d") from Worker  |
-| `WebGPUBackend`  | Primary post-MVP for perf                  | requires `navigator.gpu` — detect at boot     |
-| `WebGL2Backend`  | Optional fallback for older browsers       | only if someone ships without WebGPU          |
+| backend            | when used                                         | notes                                              |
+|--------------------|---------------------------------------------------|----------------------------------------------------|
+| `Canvas2DBackend`  | MVP default; compatibility floor                   | `OffscreenCanvas.getContext("2d")` from the Worker |
+| `WebGPUBackend`    | Primary post-MVP for performance                   | requires `navigator.gpu` — detect at boot          |
+| `WebGL2Backend`    | Optional fallback for older browsers               | only if a target ships without WebGPU              |
 
-**בחירה ב-boot (ב-Worker):**
+**Boot-time selection (in the Worker):**
+
 ```rust
 let backend: Box<dyn RendererBackend> = if gpu_available() {
     Box::new(WebGPUBackend::new())
@@ -666,149 +822,200 @@ let backend: Box<dyn RendererBackend> = if gpu_available() {
 };
 ```
 
-**מה ב-MVP:** רק `Canvas2DBackend`. אבל ה-trait קיים וה-Compositor כותב מולו — החלפת הבקאנד היא תוספת implementation בלבד.
+**What ships today:** `Canvas2DBackend` only. The trait exists
+and the Compositor writes against it — replacing the backend is
+a pure implementation addition.
 
 ### OffscreenCanvas mandatory
 
-כל הרינדור קורה ב-**Worker** דרך `OffscreenCanvas` שה-tab העביר עם `transferControlToOffscreen`. ה-main thread של ה-tab מציג רק, לא מצייר. זה מבטל risk של UI jank כשה-OS עסוק.
+All rendering happens in the **Worker** through an
+`OffscreenCanvas` the tab transferred via
+`transferControlToOffscreen`. The tab's main thread only
+displays — it never paints. This eliminates UI jank when the OS
+is busy.
 
 ---
 
-## 11. Graphics Primitives (coordinate system + color + density)
+## 11. Graphics primitives (coordinate system + colour + density)
 
-בלי שהסעיף הזה קבוע, כל widget יכתב ספק ומימוש שונה. אלו ה-ground rules:
+Without this section pinned, every widget would invent its own
+spec. These are the ground rules:
 
 ### Coordinate system
-- **Origin**: top-left של כל surface (canvas, widget, frame).
-- **Axes**: X הולך ימינה, Y הולך **למטה**. זהה לכל ה-browser APIs.
-- **יחידות פנים**: ה-Compositor מקבל dp מ-ה-Layout, ממיר ל-physical pixels (`px = dp * density`) לפני submit ל-backend.
-- **Sub-pixel**: קואורדינטות הן `f32`. ה-backend אחראי לעיגול אם צריך.
+
+- **Origin:** top-left of every surface (canvas, widget, frame).
+- **Axes:** X right, Y **down**. Same as every browser API.
+- **Internal units:** the Compositor receives `dp` from layout,
+  converts to physical pixels (`px = dp × density`) before
+  submitting to the backend.
+- **Sub-pixel:** coordinates are `f32`. The backend rounds if
+  necessary.
 
 ### Density
-- **Baseline**: 160 dpi = density `1.0` (mdpi).
-- **Density buckets** (לצורך בחירת drawable variant):
-  - `mdpi`   — density ≤ 1.25  (≤200 dpi)
-  - `hdpi`   — 1.25 < density ≤ 1.75  (≤280 dpi)
-  - `xhdpi`  — 1.75 < density ≤ 2.5   (≤400 dpi)
-  - `xxhdpi` — 2.5  < density ≤ 3.5   (≤560 dpi)
-  - `xxxhdpi`— density > 3.5          (>560 dpi)
-- **מקור**: `window.devicePixelRatio` בתוך ה-tab, משודר ל-Worker ב-display registration.
 
-### Color space
-- **MVP**: sRGB בלבד. כל ה-API של צבעים (`0xRRGGBBAA`, TOML `#RRGGBB[AA]`) ב-sRGB.
-- **Gamut assumption**: אין תמיכה ב-display-P3 או HDR ב-v0.1. נוסיף ב-v0.3+ דרך color profile ב-manifest.
-- **Blending**: "source-over" default. אלפא pre-multiplied בתוך ה-renderer (אבל ה-API מציג straight alpha).
+- **Baseline:** 160 dpi = density `1.0` (`mdpi`).
+- **Density buckets** (for picking a drawable variant):
+  - `mdpi`    — density ≤ 1.25 (≤ 200 dpi)
+  - `hdpi`    — 1.25 < density ≤ 1.75 (≤ 280 dpi)
+  - `xhdpi`   — 1.75 < density ≤ 2.5  (≤ 400 dpi)
+  - `xxhdpi`  — 2.5  < density ≤ 3.5  (≤ 560 dpi)
+  - `xxxhdpi` — density > 3.5         (>  560 dpi)
+- **Source:** `window.devicePixelRatio` inside the tab,
+  forwarded to the Worker on display registration.
+
+### Colour space
+
+- **MVP:** sRGB only. Every colour API (`0xRRGGBBAA`, TOML
+  `#RRGGBB[AA]`) is sRGB.
+- **Gamut assumption:** no display-P3 or HDR support in v0.1.
+  Add via a colour profile in the manifest in v0.3+.
+- **Blending:** "source-over" default. Alpha is pre-multiplied
+  inside the renderer (the API exposes straight alpha).
 
 ### Font metrics
-- **Baseline font stack (MVP)**: system-ui, sans-serif.
-- **sp → px**: `px = sp * density * font_scale` כאשר `font_scale` = 1.0 ב-MVP (עתיד: user preference).
-- **Text rendering**: Canvas `fillText` ב-MVP (latin + basic unicode). Proper shaping (HarfBuzz) + BiDi post-MVP.
+
+- **Baseline font stack (MVP):** system-ui, sans-serif.
+- **`sp → px`:** `px = sp × density × font_scale`, where
+  `font_scale = 1.0` in MVP (future: user preference).
+- **Text rendering:** Canvas `fillText` in MVP (Latin + basic
+  unicode). Proper shaping (HarfBuzz) + BiDi post-MVP.
 
 ### Clocks
-- `system.monotonic-nanos`: `performance.now() * 1_000_000` בתוך ה-Worker.
+
+- `system.monotonic-nanos`: `performance.now() * 1_000_000`
+  inside the Worker.
 - `system.wall-millis`: `Date.now()`.
 
 ### RNG
-- `system.random-bytes(n)` מנותב ל-`crypto.getRandomValues` של ה-Worker. תמיד secure, ללא אפשרות fallback.
+
+- `system.random-bytes(n)` is mapped to the Worker's
+  `crypto.getRandomValues`. Always secure; no fallback.
 
 ---
 
-## 12. Crash Recovery
+## 12. Crash recovery
 
-### ברמת App
+### App level
 
-- App crash → ActivityManager מציין state = CRASHED
-- Task stack שומר snapshot של saved state של ה-activity
-- משתמש יכול לבחור relaunch או kill
-- Relaunch: instance חדש נוצר, onCreate נקרא עם savedInstanceState
+- App crash → ActivityManager flips the state to `Trapped`.
+- The task stack keeps a snapshot of the activity's saved state.
+- The user can choose to relaunch or kill.
+- Relaunch: a new instance is created, `on_create` runs with the
+  saved state.
+- A 30 s grace window applies before the trapped record is
+  reaped — see [`docs/risks.md §7.4`](docs/risks.md).
 
-### ברמת Runtime
+### Runtime level
 
-- Runtime crash → browser page reload
-- StorageManager שומר ב-OPFS, מחזיק state גם אחרי reload
-- ActivityManager משחזר task stack (רק ה-top activity reloads)
+- Runtime crash → browser reload of the page.
+- StorageManager keeps everything in OPFS, state survives
+  reload.
+- ActivityManager rehydrates the task stack (only the top
+  activity reloads).
 
-## 13. זרימת boot מלאה
+## 13. Full boot flow
 
 ```
-1. Browser טוען index.html (בתוך tab)
-2. index.html טוען akiva-tab.js (Tab HAL)
-3. Tab HAL יוצר <canvas>, רושם event listeners
-4. Tab HAL פותח/מתחבר ל-Shared Worker (akiva-worker.js)
-5. אם Worker חדש: Worker HAL טוען akiva-runtime.wasm
-6. Worker HAL: WebAssembly.instantiate(runtime, imports)
-7. Tab נרשם אצל Worker כ-display #N
-8. Runtime.boot() (פעם אחת, ב-Worker בלבד):
-   a. MemoryManager.init()
-   b. StorageManager.init(OPFS)
-   c. PackageManager.scan_installed()   → מוצא אפליקציות
-   d. PermissionManager.load_grants()
-   e. ActivityManager.init()
-   f. ResourceManager.load_device_config()
-   g. IntentRouter.init()
-   h. DisplayManager.init()  ← ניהול tabs כ-displays
-9. Framework שולחת intent: action=MAIN, category=HOME
-10. PackageManager מחזיר: com.akiva.shell
-11. ActivityManager.launch("com.akiva.shell/.HomeActivity", display=1)
-    a. WasmLoader.load(shell.wasm) → new instance
-    b. קורא akiva_on_create
-    c. ה-app קוראת `akml::inflate_str_with(&mut ui, LAYOUT, &bindings)` (SDK-side)
-    d. SDK: parser → AST → measure → place → paint ops על `Canvas`
-    e. Canvas כותב את ה-ops אל buffer שה-framework מעביר כ-`FrameCommands`
-    f. Compositor שולח draw commands ל-display #1 דרך MessagePort
-    g. Tab HAL מצייר על canvas
-12. משתמש לוחץ על icon של calculator
-    a. Tab HAL מעביר pointer event ל-Worker
-    b. EventQueue מנתב ל-Shell
-13. Shell שולח intent: action=MAIN, target=com.akiva.calculator
-14. ActivityManager.launch(calculator) — push ל-stack
-15. WindowManager: transition animation, draw commands → אותו display
+1.  Browser loads index.html (in a tab).
+2.  index.html loads tab.js (Tab HAL).
+3.  Tab HAL creates <canvas>, registers event listeners.
+4.  Tab HAL connects to / spawns the kernel Worker (worker.js).
+5.  If the worker is fresh: worker loads akiva-kernel.wasm.
+6.  Worker: WebAssembly.instantiate(kernel, imports).
+7.  Tab registers with the worker as display #N.
+8.  Runtime boot (once, in the Worker only):
+    a. MemoryManager.init()
+    b. StorageManager.init(OPFS)
+    c. PackageManager.scan_installed()  → finds apps
+    d. PermissionController.load_grants()
+    e. ActivityManager.init()
+    f. ResourceManager.load_device_config()
+    g. IntentRouter.init()
+    h. DisplayManager.init() — manages tabs as displays
+9.  Framework dispatches an intent: action=MAIN, category=HOME.
+10. PackageManager returns: com.akiva.shell.
+11. ActivityManager.launch("com.akiva.shell/.HomeActivity", display=1):
+    a. WasmLoader loads shell.wasm → new instance.
+    b. Calls akiva_app_create.
+    c. The app calls `akml::inflate_str_with(&mut ui, LAYOUT, &bindings)` (SDK-side).
+    d. SDK: parser → AST → measure → place → paint ops on the Canvas.
+    e. Canvas writes the ops into a buffer the framework collects as `FrameCommands`.
+    f. Compositor sends draw commands to display #1 via MessagePort.
+    g. Tab HAL paints to the canvas.
+12. User taps the Calculator icon:
+    a. Tab HAL forwards a pointer event to the Worker.
+    b. EventQueue routes to Shell.
+13. Shell sends an intent: action=MAIN, target=com.akiva.calculator.
+14. ActivityManager.launch(calculator) — push onto the stack.
+15. WindowManager: transition animation; draw commands flow to
+    the same display.
 ```
 
-## 14. מה שומרים מ-AOSP כ-inspiration
+## 14. What we keep from AOSP as inspiration
 
-| AOSP | Akiva מחקה את הרעיון של |
-|---|---|
-| `ActivityManagerService` | ActivityManager |
-| `PackageManagerService` | PackageManager |
-| `WindowManagerService` | WindowManager |
-| `Resources` / `AssetManager` | ResourceManager |
-| `LayoutInflater` | AKML inflater (ב-SDK, לא ב-framework — ראה §2.1) |
-| `Intent` + `IntentFilter` | Intent + IntentRouter |
-| XML layouts | AKML |
-| XML themes/styles | AKML styles |
-| `android:id="@+id/..."` | `id="@+id/..."` (זהה) |
-| dp/sp units | dp/sp (זהה) |
-| `onCreate` / `onPause` lifecycle | זהה |
-| `onSaveInstanceState` | `onSaveState` |
+| AOSP                                | Akiva mirrors the idea of                              |
+|-------------------------------------|--------------------------------------------------------|
+| `ActivityManagerService`            | ActivityManager                                        |
+| `PackageManagerService`             | PackageManager                                         |
+| `WindowManagerService`              | WindowManager                                          |
+| `Resources` / `AssetManager`        | ResourceManager                                        |
+| `LayoutInflater`                    | AKML inflater (in the SDK, not the framework — see §2.1) |
+| `Intent` + `IntentFilter`           | Intent + IntentRouter                                  |
+| XML layouts                         | AKML                                                   |
+| XML themes / styles                 | AKML styles                                            |
+| `android:id="@+id/..."`             | `id="@+id/..."` (identical)                            |
+| dp / sp units                       | dp / sp (identical)                                    |
+| `onCreate` / `onPause` lifecycle    | identical                                              |
+| `onSaveInstanceState`               | `save_state`                                           |
 
-**אנחנו לא מעתיקים קוד. אנחנו לוקחים רעיונות שעברו 20 שנה של הוכחה בפרודקשן ומיישמים אותם ב-Rust עם התאמות ל-wasm/browser.**
+**We are not copying code. We are taking ideas that were proven
+across 20 years in production and reimplementing them in Rust
+with adaptations for wasm/browser.**
 
-## 15. מה **לא** לוקחים מ-AOSP
+## 15. What we do **not** take from AOSP
 
-- Java/Kotlin (אנחנו Rust)
-- Binder IPC (יש לנו ipc in-process דרך runtime)
-- ART (VM — אנחנו wasm)
-- SELinux (אנחנו wasm sandbox)
-- Hardware services (ה-browser מטפל)
-- SystemServer כ-process נפרד (אצלנו framework ב-runtime instance)
+- Java / Kotlin (we are Rust).
+- Binder IPC (we have in-process IPC through the runtime).
+- ART (a VM — we are wasm).
+- SELinux (we have the wasm sandbox).
+- Hardware services (the browser handles them).
+- SystemServer as a separate process (the framework lives in
+  the runtime instance with us).
 
-## 16. Introspection Surface
+## 16. Introspection surface
 
-**עיקרון:** כשה-runtime לא DOM, כלי ה-debug הרגילים של הדפדפן (Elements, Inspect) מאבדים גישה למבנה ה-UI. המערכת חייבת לספק **שכבת introspection נפרדת** כ-first-class concern, לא כ-afterthought — אחרת פיתוח non-DOM הופך מהר ל"עיוור".
+**Principle.** When the runtime is not the DOM, the browser's
+regular debug tools (Elements, Inspect) lose access to the UI
+structure. The system has to provide a **separate introspection
+layer** as a first-class concern, not as an afterthought —
+otherwise non-DOM development quickly becomes "blind".
 
-### הבחנה בין שתי שכבות
+### Two layers
 
-- **Runtime UI** — ה-renderer האמיתי (Canvas2D/WebGPU; §10), widget tree, frame commands. זה מה שהמשתמש רואה.
-- **Introspection** — overlays שמציגים מצב פנימי: widget-tree inspector, event trace, activity-stack view, resource-resolution log, frame timing. נפרד מה-renderer ומנותק מה-widget tree של האפליקציה.
+- **Runtime UI** — the actual renderer (Canvas2D / WebGPU; §10),
+  the widget tree, the frame commands. What the user sees.
+- **Introspection** — overlays showing internal state: a
+  widget-tree inspector, an event trace, an activity-stack view,
+  a resource-resolution log, frame timing. Separate from the
+  renderer and detached from the app's widget tree.
 
-### עקרונות מימוש
+### Implementation principles
 
-- יושב ב-**framework**, לא ב-kernel. קורא מצב דרך APIs פנימיים קיימים של ActivityManager / ResourceManager / Compositor — בלי להרחיב את ה-ABI של האפליקציה.
-- מופעל רק במצב dev (flag ברמת ה-session, לא per-app).
-- רץ כ-overlay נפרד על גבי ה-`FrameCommands` של ה-Compositor, לא מתערבב בתוכו.
-- חשיפה אל מחוץ ל-worker דרך `postMessage` אל ה-tab, כדי שבעתיד תיכתב DevTools extension שתציג את ה-trace באופן אינטראקטיבי.
+- Lives in the **framework**, not the kernel. Reads state via
+  existing internal APIs of ActivityManager / ResourceManager /
+  Compositor — without extending the app's ABI.
+- Active only in dev mode (a session-level flag, not per-app).
+- Runs as a separate overlay on top of the Compositor's
+  `FrameCommands`, not mixed into them.
+- Surfaces out of the worker via `postMessage` to the tab so a
+  future DevTools extension can render the trace
+  interactively.
 
-### MVP vs עתיד
+### MVP vs. future
 
-ב-MVP אנחנו **לא** מממשים introspection. הסעיף הזה עוגן ארכיטקטוני שמונע מצב שבו נוסיף debug APIs ad-hoc שמזהמים את ה-ABI. המימוש בפועל יבוא כשה-shell יתחיל להכיל יותר מ-"kernel: boot" — כנראה סביב Phase 3 (window manager + task switcher), כשה-widget tree יהיה מורכב מספיק כדי להצדיק inspector.
+Today we **do not** implement introspection. This section is an
+architectural anchor that prevents us from adding ad-hoc debug
+APIs that pollute the ABI. The actual implementation will land
+when the Shell starts hosting more than "kernel: boot" — likely
+around the introspection-overlay phase, when the widget tree is
+complex enough to justify an inspector.
