@@ -1,98 +1,132 @@
 # `.akv` Archive Format (AKPK v1)
 
-> **סטטוס מימוש:** Phase 8.1 — פורמט + encode/decode + unit tests פעילים ב-[cli/src/archive.rs](../cli/src/archive.rs). `akiva package` + `akiva install` (Phase 8.2–8.3) יושבים על גבי זה.
+> **Implementation status (May 2026):** Phase 8.1 — format,
+> encode/decode, and unit tests are all live in
+> [`cli/src/archive.rs`](../cli/src/archive.rs). `akiva package` and
+> `akiva install` (Phases 8.2–8.3) ride on top. The runtime still
+> sources dev apps from `runtime/web/dev-apps/` rather than from
+> installed `.akv` archives, so the on-disk format is real but the
+> production ingestion path stays gated until the loader closes that
+> loop.
 
-## 1. למה פורמט מותאם, לא ZIP
+## 1. Why a custom format and not ZIP
 
-ה-CLI של Akiva הוא stdlib-only בכוונה — ה-devserver הוא שרת HTTP שכתבנו בעצמנו, ה-manifest parser ב-`build.rs` סורק שורה-שורה בלי TOML parser. להביא crate כמו `zip` רק כדי לארוז שלושה קבצים בחבילה מפרה את העיקרון הזה.
+The Akiva CLI is intentionally stdlib-only — the dev-server is a
+hand-written HTTP server, the manifest parser in `build.rs` reads
+TOML line-by-line without a parser dependency. Pulling in a `zip`
+crate just to bundle three files in a package would break that
+discipline.
 
-חסרונות של ZIP לטובת המקרה שלנו:
-- הוא גדול — ZIP parser מלא טומן טיפול ב-EOCD record, central directory, multi-disk, data descriptors, encryption, 0x05054b50 ו-ZIP64.
-- יתרונותיו (random access, tools מוכרים) לא קריטיים: Akiva תמיד טוענת את כל ה-archive ל-RAM ב-install; ה-`.akv` לא נועד לעריכה ידנית.
+ZIP's drawbacks for our case:
 
-AKPK הוא ~200 שורות Rust כולל tests, ו-0 תלויות. אם יום אחד נרצה compression או random access נעבור ל-ZIP דרך bump של version byte — הפורמט תומך בזה.
+- It is large — a complete ZIP parser handles EOCD records, the
+  central directory, multi-disk volumes, data descriptors,
+  encryption, the `0x05054b50` marker, and ZIP64.
+- Its strengths (random access, ubiquitous tooling) do not buy us
+  much: Akiva always loads the whole archive into RAM at install
+  time; `.akv` is not meant to be hand-edited.
 
-## 2. מבנה ה-wire (little-endian)
+AKPK is ~200 lines of Rust including tests, with zero dependencies.
+If we ever want compression or random access we bump the version
+byte and switch — the format leaves room.
+
+## 2. Wire layout (little-endian)
 
 ```
 offset  size       field       description
 ──────  ────────   ─────────   ──────────────────────────────────────
 0       4          magic       "AKPK" (0x4B50_4B41 LE bytes 'A','K','P','K')
 4       1          version     1
-5       4          count       u32 — מספר entries
-9       *          entries     רצף של entries ברצף
+5       4          count       u32 — number of entries
+9       *          entries     entries laid out back-to-back
 
 Entry:
-0       2          path_len    u16 — אורך ה-path בבתים (UTF-8)
-2       path_len   path        UTF-8 bytes, separator תמיד '/'
-        4          data_len    u32 — אורך התוכן בבתים
+0       2          path_len    u16 — length of the path in bytes (UTF-8)
+2       path_len   path        UTF-8 bytes; separator is always '/'
+        4          data_len    u32 — length of the payload in bytes
         data_len   data        raw bytes
 ```
 
-הפורמט **לא מתיר bytes נוספים אחרי ה-entry האחרון**. קובץ ארוך יותר מהצפוי → `TrailingBytes`. זה מאפשר לאתר שחיתות מיידית.
+The format **forbids any trailing bytes after the last entry**. A
+file longer than expected → `TrailingBytes`. This makes corruption
+detectable immediately.
 
-## 3. תוכן נדרש
+## 3. Required content
 
-ב-v1 חובה שיכילו שני entries:
+In v1, every archive must contain at least these two entries:
 
-- `manifest.toml` — תוכן ה-[`manifest.toml`](manifest.md) של האפליקציה
-- `app.wasm` — ה-wasm module הקומפלציוני של האפליקציה
+- `manifest.toml` — the [`manifest.toml`](manifest.md) of the app.
+- `app.wasm` — the compiled wasm module.
 
-ה-decode דוחה archive שאין בו את שניהם עם `MissingRequired("…")`.
+`decode()` rejects an archive missing either of them with
+`MissingRequired("…")`.
 
-## 4. Entries אופציונליים מוכרים
+## 4. Reserved optional entries
 
-הפורמט עצמו agnostic — כל מה שעומד בכללי ה-path חוקי. לפי convention, הנתיבים הבאים שמורים ומוזנים ע"י ה-PackageManager בזמן install:
+The format itself is content-agnostic — anything that obeys the path
+rules below is accepted. By convention these paths are reserved and
+consumed by the `PackageManager` at install time:
 
 - `res/values/strings.toml`
 - `res/values/colors.toml`
-- `res/layout/*.akml` (עתידי, v0.3 qualifiers)
-- `res/drawable/*` (עתידי, v0.3+)
+- `res/layout/*.akml` (planned for v0.3 with qualifier directories)
+- `res/drawable/*` (planned for v0.3+)
 
-## 5. כללי path
+## 5. Path rules
 
-כל path חייב:
+Every path must:
 
-- להיות UTF-8 תקין
-- לא ריק
-- לא להתחיל ב-`/`
-- לא להסתיים ב-`/`
-- לא להכיל רכיב ריק (`foo//bar` → פסול)
-- לא להכיל רכיב `.` או `..` (שום traversal)
-- להשתמש ב-`/` בלבד כמפריד (לא `\`)
-- לא להכיל NUL (`\0`)
+- be valid UTF-8
+- be non-empty
+- not start with `/`
+- not end with `/`
+- contain no empty segment (`foo//bar` → invalid)
+- contain no `.` or `..` segment (no traversal)
+- use `/` exclusively as a separator (no `\`)
+- not contain a NUL byte (`\0`)
 
-Path `foo/bar.txt` חוקי. `foo/` / `/foo` / `foo//bar` / `foo/../x` / `..` — כולם פסולים.
+`foo/bar.txt` is valid. `foo/`, `/foo`, `foo//bar`, `foo/../x`, `..`
+— all invalid.
 
-**Uniqueness:** שני entries עם אותו path בדיוק → `DuplicatePath` ב-encode. לא נקראים "override" — מי שבונה את ה-archive חייב לדעת מה הוא מכניס.
+**Uniqueness:** two entries with the same path → `DuplicatePath` at
+encode time. There is no "override" semantics — the encoder must
+know what it is putting in.
 
-## 6. הגבלות גודל
+## 6. Size limits
 
-- `path_len` — עד 65 535 בתים UTF-8 (u16)
-- `data_len` — עד 4 GB (u32). קובץ wasm גדול מ-4 GB הוא סימן שמשהו הרבה יותר יסודי לא בסדר.
-- `count` — עד 4 294 967 295 entries. זניח בפועל; MVP אפליקציה טיפוסית תכיל 3-10 entries.
-- סך ה-archive לא חסום — limit בא מהזיכרון הזמין של המתקין.
+- `path_len` — up to 65 535 UTF-8 bytes (`u16`).
+- `data_len` — up to 4 GB (`u32`). A wasm file larger than 4 GB is
+  a sign that something far more fundamental has gone wrong.
+- `count` — up to 4 294 967 295 entries. Negligible in practice; an
+  MVP-typical app has 3–10 entries.
+- The total archive size is unbounded; the limit comes from the
+  installer's available memory.
 
 ## 7. Versioning
 
-ה-byte בעמדה 4 הוא `version = 1`. כל שינוי **לא-תואם** (פריסה שונה, compression, סדר שדות) דורש בump. Decoder שרואה version לא מוכר מחזיר `UnsupportedVersion(n)` ולא מנחש.
+Byte at offset 4 is `version = 1`. Any **incompatible** change
+(layout shuffle, compression, field-order change) requires a bump.
+A decoder seeing an unknown version returns `UnsupportedVersion(n)`
+rather than guessing.
 
-תואמות-תואם (למשל, הוספת entries אופציונליים) לא דורשת bump — ה-decoder רק מתעלם מ-entries שלא מוכרים לו.
+Compatible changes (e.g. adding optional reserved entries) do not
+require a bump — the decoder simply ignores entries it does not
+recognise.
 
-## 8. מה **לא** ב-v1
+## 8. What v1 deliberately does not include
 
-| תכונה | למה לא | מתי |
-|---|---|---|
-| Compression | ה-wasm כבר עבר optimize (`opt-level="z"`, `strip=true`), רווח deflate עליו שולי. קבצי TOML זניחים. | אם אפליקציות יגיעו לגדלים שבהם חבילה מעל כמה MB — v2. |
-| Signatures (`signature.sig`) | [`docs/manifest.md §9`](manifest.md) מציין post-MVP | v0.3+ (code signing) |
-| Checksums פנימיים (CRC32 פר-entry) | התחייבות TCP ו-OPFS כבר מספקת טעינה נקייה; שחיתות ב-flight → `Truncated` / `BadMagic` מזהים | אם יתגלו שחיתות שקטות — v2 |
-| Random access | כל ה-archive נטען ל-RAM בכל אופן | לא מתוכנן |
-| Directory entries | ה-PackageManager יוצר נתיבים לפי ה-entries — אין צורך לייצג תיקייה ריקה | לא מתוכנן |
-| Symlinks, mode bits | לא רלוונטי ל-wasm packages | לא מתוכנן |
+| feature                         | why not                                                                                                                      | when                                          |
+|---------------------------------|------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------|
+| Compression                     | wasm is already optimised (`opt-level="z"`, `strip=true`); deflate margin is small. TOML files are tiny.                      | v2, if app sizes start crossing several MB.   |
+| Signatures (`signature.sig`)    | [`docs/manifest.md §9`](manifest.md) flags this as post-MVP.                                                                  | v0.3+ (code signing).                         |
+| Per-entry CRC32                 | TCP and OPFS already deliver clean reads; in-flight corruption surfaces as `Truncated` / `BadMagic`.                          | v2, if silent corruption ever shows up.       |
+| Random access                   | The whole archive is loaded into RAM anyway.                                                                                  | not planned.                                  |
+| Directory entries               | The PackageManager creates paths from entries; no need to represent an empty directory.                                       | not planned.                                  |
+| Symlinks, mode bits             | irrelevant for wasm packages.                                                                                                  | not planned.                                  |
 
-## 9. דוגמה: archive של calculator
+## 9. Example: calculator archive
 
-מבנה לוגי:
+Logical contents:
 
 ```
 manifest.toml             742 bytes
@@ -100,7 +134,7 @@ app.wasm               169,279 bytes
 res/values/colors.toml    378 bytes
 ```
 
-Binary layout (schematically):
+Binary layout (schematic):
 
 ```
 "AKPK"                               # magic
@@ -123,44 +157,61 @@ Binary layout (schematically):
 <colors.toml bytes, 378>
 ```
 
-סה"כ: `4 + 1 + 4 + (2 + 13 + 4 + 742) + (2 + 8 + 4 + 169279) + (2 + 22 + 4 + 378) = ~170 KB`.
+Total: `4 + 1 + 4 + (2 + 13 + 4 + 742) + (2 + 8 + 4 + 169279) +
+(2 + 22 + 4 + 378) ≈ 170 KB`.
 
-## 10. שגיאות decode
+## 10. Decode errors
 
-ה-API מחזיר `ArchiveError`. כל variant מציין בדיוק מה לא בסדר — הקוד קורא ב-`PackageManager::install` ועונה הודעה בהירה למשתמש:
+The decoder returns `ArchiveError`. Each variant says exactly what
+is wrong; `PackageManager::install` reads it and produces a clear
+message for the user:
 
-| Variant | משמעות |
-|---|---|
-| `BadMagic` | ארבעת הבתים הראשונים לא `AKPK` — הקובץ אינו `.akv` |
-| `UnsupportedVersion(n)` | Version byte לא 1 — archive חדש מדי או פגום |
-| `Truncated` | ה-header מציין עוד נתונים אבל הגענו לסוף הבאפר |
-| `TrailingBytes` | בתים אחרי ה-entry האחרון — פגום |
-| `NonUtf8Path` | ה-path של entry מסוים אינו UTF-8 |
-| `InvalidPath(String)` | ה-path מפר את כללי §5 |
-| `DuplicatePath(String)` | שני entries עם אותו path |
-| `MissingRequired(&'static str)` | `manifest.toml` או `app.wasm` חסרים |
-| `PathTooLong(String)` | path עולה על 65 535 בתים |
-| `FileTooLarge(String)` | entry עולה על 4 GB |
+| variant                          | meaning                                                                |
+|----------------------------------|------------------------------------------------------------------------|
+| `BadMagic`                       | First four bytes are not `AKPK` — the file is not an `.akv`.          |
+| `UnsupportedVersion(n)`          | Version byte is not 1 — the archive is too new or corrupt.            |
+| `Truncated`                      | A header promises more data but the buffer ends.                       |
+| `TrailingBytes`                  | Bytes appear after the last entry — corrupt or padded.                |
+| `NonUtf8Path`                    | An entry's path is not valid UTF-8.                                    |
+| `InvalidPath(String)`            | A path violates the §5 rules.                                          |
+| `DuplicatePath(String)`          | Two entries share a path.                                              |
+| `MissingRequired(&'static str)`  | `manifest.toml` or `app.wasm` is missing.                              |
+| `PathTooLong(String)`            | Path exceeds 65 535 bytes.                                             |
+| `FileTooLarge(String)`           | Entry exceeds 4 GB.                                                    |
 
-## 11. Magic bytes במערכות שזיהוי קבצים
+## 11. Magic bytes vs known formats
 
-`AKPK` במיקום 0 לא מתנגש עם חתימות מוכרות:
+`AKPK` at offset 0 does not collide with any well-known signature:
 
-- ZIP: `PK\x03\x04` (50 4B 03 04)
-- tar: "ustar" ב-offset 257
+- ZIP: `PK\x03\x04` (`50 4B 03 04`)
+- tar: `"ustar"` at offset 257
 - gzip: `1F 8B`
-- wasm: `\0asm` (00 61 73 6D)
-- אנדרואיד APK: ZIP magic
+- wasm: `\0asm` (`00 61 73 6D`)
+- Android APK: ZIP magic
 
-כלי `file(1)` עם ה-database המוגדרת לא יזהה את הפורמט כיום — ב-v0.3 נוסיף entry ל-`/etc/magic.d/` מקומי אם נצטרך.
+The standard `file(1)` magic database does not currently identify
+the format; an entry can be added to a local `/etc/magic.d/` if it
+ever becomes useful.
 
-## 12. Extraction safety (קריאה חובה ל-extractors)
+## 12. Extraction safety (mandatory reading for extractors)
 
-Zip Slip הוא מחלקת-חולשות בפורמטי archive שבה entry מזיק עם path כגון `../../etc/passwd` מפתה את ה-extractor לכתוב מחוץ לספריית היעד. CVEs רבים נמצאו ב-tar, jar, war, cpio, apk, 7z. ב-Akiva יש שתי שכבות הגנה — וחובה ליישם את שתיהן.
+Zip Slip is a class of vulnerability where a malicious archive entry
+with a path like `../../etc/passwd` tricks the extractor into
+writing outside the target directory. CVEs have been filed against
+tar, jar, war, cpio, apk, and 7z extractors. Akiva applies two
+layers of defence — both must be implemented.
 
-**שכבה 1: הפורמט עצמו דוחה paths מזיקים.** §5 מגדיר את כל הכללים שה-decoder אוכף: אין absolute paths, אין `..` כרכיב, אין backslash, אין NUL, אין רכיבים ריקים. `archive::decode` מחזיר `InvalidPath(…)` לפני שה-extractor בכלל רואה את ה-entries.
+**Layer 1: the format itself rejects malicious paths.** §5 lists
+every rule the decoder enforces: no absolute paths, no `..`
+component, no backslash, no NUL, no empty components.
+`archive::decode()` returns `InvalidPath(...)` before the extractor
+ever sees the entries.
 
-**שכבה 2: ה-extractor חייב לעשות canonicalization + containment check.** גם עם שכבה 1 מוצלחת, extractor שמסתמך רק על הפורמט עובר ללא הגנה אם (א) גרסה עתידית של AKPK תקל על כללי §5, או (ב) באג במימוש הפורמט. הפרקטיקה הסטנדרטית:
+**Layer 2: the extractor must canonicalize and enforce
+containment.** Even with layer 1 sound, an extractor that relies
+solely on the format becomes unsafe if (a) a future version of AKPK
+relaxes the §5 rules, or (b) an implementation bug slips. The
+standard pattern:
 
 ```rust
 fn extract_entry(target_dir: &Path, entry: &Entry) -> io::Result<PathBuf> {
@@ -183,16 +234,37 @@ fn extract_entry(target_dir: &Path, entry: &Entry) -> io::Result<PathBuf> {
 }
 ```
 
-ב-Akiva ה-extractor היחיד היום הוא `PackageManager::install` (Phase 8.2+), שלא כותב ל-filesystem בכלל — כותב לכ-KV store של ה-kernel תחת `packages/{id}/…`. גם שם אותו כלל חל: path של entry חייב להיות validated *פעם נוספת* לפני שמשתלב ל-storage key, כי האוכל של ה-kernel storage הוא namespace משותף.
+In Akiva today the only extractor is `PackageManager::install`
+(Phase 8.2+), which does not write to the filesystem at all — it
+writes to the kernel's KV store under `packages/{id}/…`. The same
+rule applies there: an entry's path must be validated *again* before
+it is concatenated into a storage key, because the kernel storage
+namespace is shared.
 
-## 13. עתיד: Component Model ו-Bindle
+## 13. Forward-looking: Component Model and Bindle
 
-WebAssembly Component Model נמצא באימוץ מואץ ב-2026 ([WASI 0.3](https://eunomia.dev/blog/2025/02/16/wasi-and-the-webassembly-component-model-current-status/), [Bytecode Alliance `wkg`](https://component-model.bytecodealliance.org/)). [Bindle](https://github.com/deislabs/bindle) הוא פורמט manifest המיועד ספציפית ל-distribution של components + dependencies.
+The WebAssembly Component Model is moving fast in 2026
+([WASI 0.3](https://eunomia.dev/blog/2025/02/16/wasi-and-the-webassembly-component-model-current-status/),
+[Bytecode Alliance `wkg`](https://component-model.bytecodealliance.org/)).
+[Bindle](https://github.com/deislabs/bindle) is a manifest format
+designed specifically for distributing components plus their
+dependencies.
 
-Akiva דוחה אימוץ Component Model ל-Phase 4 של v0.3+ (ראה [`ROADMAP.md`](../ROADMAP.md) "Phase 4 (ABI)"). עד אז, האפליקציות שלנו הן core wasm modules (`wasm32-unknown-unknown`) ולא components, ו-AKPK מתאים להן בדיוק: שלושה-חמישה קבצים פר-package, התקנה מ-disk, אין dependencies בין חבילות.
+Akiva defers Component Model adoption to v0.3+ (see
+[`docs/research-component-model.md`](research-component-model.md)).
+Until then our apps are core wasm modules
+(`wasm32-unknown-unknown`) rather than components, and AKPK matches
+that shape exactly: 3–5 files per package, install-from-disk, no
+inter-package dependencies.
 
-כשנעבור ל-Component Model, שתי אפשרויות פתוחות:
-1. **AKPK v2** — להרחיב את הפורמט (בamp של version byte) לתמיכה ב-components + manifest של dependencies. משמר את הקריאה הפשוטה "archive אחד מתקין אפליקציה".
-2. **Bindle adoption** — לאמץ את הפורמט הסטנדרטי של הקהילה, לקבל תואמות עם registries עתידיים.
+When we do migrate, two doors are open:
 
-ההחלטה לא עכשיו. שתי האפשרויות נתמכות כי version byte = 1 משאיר את כל המרחב ל-future versions, ו-`min_abi_version` במניפסט מטפל בהחלטות תאימות ברמת האפליקציה.
+1. **AKPK v2** — extend the format (bump the version byte) for
+   components plus a manifest of dependencies. Preserves the
+   "one archive installs one app" mental model.
+2. **Bindle adoption** — adopt the community-standard format for
+   future registry compatibility.
+
+The decision is not now. Both are reachable because the version
+byte = 1 today and `min_abi_version` in the manifest already handles
+app-level compatibility decisions.
