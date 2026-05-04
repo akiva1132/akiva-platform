@@ -28,6 +28,13 @@ const OP_STROKE_RECT        = 8;
 const OP_STROKE_ROUND_RECT  = 9;
 const OP_DRAW_LINE          = 10;
 const OP_DRAW_IMAGE         = 11;
+const OP_DRAW_FOREIGN_IMAGE = 12;
+const OP_SET_GLOBAL_ALPHA   = 13;
+// Phase 15.1 — per-Activity surface compositor markers.
+const OP_BEGIN_SURFACE      = 14;
+const OP_END_SURFACE        = 15;
+const OP_COMPOSITE_SURFACE  = 16;
+const OP_DESTROY_SURFACE    = 17;
 
 const decoder = new TextDecoder("utf-8");
 
@@ -146,6 +153,43 @@ export function applyPaintStream(bytes, backend) {
         const id = readU32();
         const x = readF32(), y = readF32(), w = readF32(), h = readF32();
         backend.drawImage?.(id, x, y, w, h);
+        break;
+      }
+      case OP_DRAW_FOREIGN_IMAGE: {
+        const pkgLen = view.getUint16(p, true); p += 2;
+        const pkg = decoder.decode(bytes.subarray(p, p + pkgLen));
+        p += pkgLen;
+        const nameLen = view.getUint16(p, true); p += 2;
+        const name = decoder.decode(bytes.subarray(p, p + nameLen));
+        p += nameLen;
+        const x = readF32(), y = readF32(), w = readF32(), h = readF32();
+        backend.drawForeignImage?.(pkg, name, x, y, w, h);
+        break;
+      }
+      case OP_SET_GLOBAL_ALPHA: {
+        const alpha = readF32();
+        backend.setGlobalAlpha?.(alpha);
+        break;
+      }
+      case OP_BEGIN_SURFACE: {
+        const id = readU32();
+        const x = readF32(), y = readF32(), w = readF32(), h = readF32();
+        backend.beginSurface?.(id, x, y, w, h);
+        break;
+      }
+      case OP_END_SURFACE: {
+        backend.endSurface?.();
+        break;
+      }
+      case OP_COMPOSITE_SURFACE: {
+        const id = readU32();
+        const x = readF32(), y = readF32(), w = readF32(), h = readF32();
+        backend.compositeSurface?.(id, x, y, w, h);
+        break;
+      }
+      case OP_DESTROY_SURFACE: {
+        const id = readU32();
+        backend.destroySurfaceCanvas?.(id);
         break;
       }
       default:

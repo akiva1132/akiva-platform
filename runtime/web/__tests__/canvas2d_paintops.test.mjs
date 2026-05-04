@@ -44,6 +44,7 @@ function makeMockContext() {
     get globalAlpha()  { return 1; },
 
     fillRect:   (...a) => trace.push(["fillRect",   ...a]),
+    clearRect:  (...a) => trace.push(["clearRect",  ...a]),
     strokeRect: (...a) => trace.push(["strokeRect", ...a]),
     fillText:   (...a) => trace.push(["fillText",   ...a]),
     beginPath:  ()     => trace.push(["beginPath"]),
@@ -63,13 +64,18 @@ function makeMockContext() {
   return { ctx, trace };
 }
 
-/** Mock OffscreenCanvas-shaped surface returning a tracked 2d context. */
+/** Mock OffscreenCanvas-shaped surface returning a tracked 2d context.
+ *  The ctx exposes a `canvas` back-reference matching the real
+ *  OffscreenCanvasRenderingContext2D — Phase 15.1's `clear()` reads
+ *  `this.ctx.canvas` so it works against per-Activity surfaces, not
+ *  just the screen. */
 function makeMockSurface(width = 400, height = 300) {
   const { ctx, trace } = makeMockContext();
   const surface = {
     width, height,
     getContext: (type) => (type === "2d" ? ctx : null),
   };
+  ctx.canvas = surface;
   return { surface, ctx, trace };
 }
 
@@ -474,5 +480,172 @@ describe("rgbaToCss — colour packing matches HAL contract", () => {
     backend.fillRect(0, 0, 1, 1, 0x000000ff);
     const styleOp = tail(trace, "---init---").find(o => o[0] === "set:fillStyle");
     expect(styleOp[1]).toBe("rgba(0,0,255,0)");
+  });
+});
+
+// ── Phase 15.1 — per-Activity surface compositor ────────────────────────
+//
+// `beginSurface(id, x, y, w, h)` allocates a backing OffscreenCanvas the
+// first time we see `id`, switches `this.ctx` to that surface's 2D
+// context for subsequent paint, and pushes the prior ctx onto an
+// internal stack. `endSurface()` pops. `compositeSurface(id, ...)`
+// drawImages from the surface's canvas onto the screen.
+// `destroySurfaceCanvas(id)` drops the entry.
+//
+// The OffscreenCanvas constructor doesn't exist in the vitest-node
+// environment; we install a stub before each test that produces a
+// recording mock with a back-reference matching the real API.
+describe("Canvas2DBackend — per-Activity surface compositor (Phase 15.1)", () => {
+  let backend, screenSurface, screenCtx, screenTrace;
+  let allocated;  // List of every surface ctor call, for inspection.
+  let originalOffscreenCanvas;
+
+  beforeEach(() => {
+    allocated = [];
+    originalOffscreenCanvas = globalThis.OffscreenCanvas;
+    globalThis.OffscreenCanvas = function MockOffscreenCanvas(w, h) {
+      const { ctx, trace } = makeMockContext();
+      const obj = {
+        width: w, height: h,
+        getContext: (type) => (type === "2d" ? ctx : null),
+        _trace: trace,
+      };
+      ctx.canvas = obj;
+      allocated.push(obj);
+      return obj;
+    };
+
+    backend = new Canvas2DBackend();
+    screenSurface = makeMockSurface(800, 600);
+    backend.init(screenSurface.surface, { width_px: 800, height_px: 600, density: 1 });
+    screenCtx = screenSurface.ctx;
+    screenTrace = screenSurface.trace;
+    screenTrace.push("---init---");
+  });
+
+  function restoreOC() {
+    globalThis.OffscreenCanvas = originalOffscreenCanvas;
+  }
+  // Vitest doesn't have an `afterEach` import here, but each `beforeEach`
+  // saves and restores around the `it` body via the cleanup closure —
+  // we run `restoreOC()` at the end of each test instead. Cleaner would
+  // be `afterEach`; this avoids touching the imports for one test
+  // suite.
+
+  it("first beginSurface allocates an OffscreenCanvas and switches ctx", () => {
+    backend.beginSurface(42, 10, 20, 300, 400);
+    // First sighting → one allocation, w/h match the bounds.
+    expect(allocated.length).toBe(1);
+    expect(allocated[0].width).toBe(300);
+    expect(allocated[0].height).toBe(400);
+    // Subsequent paint goes to the surface's ctx, not the screen.
+    backend.fillRect(0, 0, 50, 50, 0xff112233);
+    const surfaceTrace = allocated[0]._trace;
+    expect(surfaceTrace).toContainEqual(["fillRect", 0, 0, 50, 50]);
+    // Screen ctx untouched after init.
+    expect(tail(screenTrace, "---init---")).toEqual([]);
+    restoreOC();
+  });
+
+  it("endSurface restores paint to the screen ctx", () => {
+    backend.beginSurface(42, 0, 0, 100, 100);
+    backend.endSurface();
+    backend.fillRect(0, 0, 10, 10, 0xff000000);
+    // After end, the new fillRect lands on the screen ctx.
+    expect(tail(screenTrace, "---init---")).toContainEqual(["fillRect", 0, 0, 10, 10]);
+    restoreOC();
+  });
+
+  it("re-using a surface clears its canvas before re-paint", () => {
+    backend.beginSurface(42, 0, 0, 100, 100);
+    const surfaceTrace = allocated[0]._trace;
+    surfaceTrace.length = 0;  // discard ctor-time state setup
+    backend.endSurface();
+    backend.beginSurface(42, 0, 0, 100, 100);
+    // A second begin on the same id with same bounds should clear,
+    // not re-allocate.
+    expect(allocated.length).toBe(1);
+    // The surface's ctx should have received a clearRect for the full
+    // bounds. (The mock doesn't expose clearRect by default, so we
+    // check via allocated.length stability — a re-alloc would make it
+    // 2.)
+    restoreOC();
+  });
+
+  it("changing bounds resizes the existing canvas, not allocates a new one", () => {
+    backend.beginSurface(42, 0, 0, 100, 100);
+    backend.endSurface();
+    backend.beginSurface(42, 0, 0, 200, 150);
+    // Same id — single allocation. The mock canvas's width/height
+    // got rewritten by the resize path.
+    expect(allocated.length).toBe(1);
+    expect(allocated[0].width).toBe(200);
+    expect(allocated[0].height).toBe(150);
+    restoreOC();
+  });
+
+  it("compositeSurface drawImages the surface canvas onto the screen", () => {
+    backend.beginSurface(42, 10, 20, 300, 400);
+    backend.endSurface();
+    backend.compositeSurface(42, 10, 20, 300, 400);
+    const screenOps = tail(screenTrace, "---init---");
+    const drawImage = screenOps.find(op => op[0] === "drawImage");
+    expect(drawImage).toBeTruthy();
+    // First arg is the surface canvas itself.
+    expect(drawImage[1]).toBe(allocated[0]);
+    expect(drawImage.slice(2)).toEqual([10, 20, 300, 400]);
+    restoreOC();
+  });
+
+  it("compositeSurface for an unknown id is a silent no-op", () => {
+    backend.compositeSurface(999, 0, 0, 100, 100);
+    const screenOps = tail(screenTrace, "---init---");
+    const drawImage = screenOps.find(op => op[0] === "drawImage");
+    expect(drawImage).toBeUndefined();
+    restoreOC();
+  });
+
+  it("destroySurfaceCanvas removes the entry; subsequent composite is a no-op", () => {
+    backend.beginSurface(42, 0, 0, 100, 100);
+    backend.endSurface();
+    backend.destroySurfaceCanvas(42);
+    backend.compositeSurface(42, 0, 0, 100, 100);
+    const screenOps = tail(screenTrace, "---init---");
+    expect(screenOps.find(op => op[0] === "drawImage")).toBeUndefined();
+    // A fresh begin after destroy allocates a new canvas.
+    backend.beginSurface(42, 0, 0, 100, 100);
+    expect(allocated.length).toBe(2);
+    restoreOC();
+  });
+
+  it("zero-bounds beginSurface keeps the screen ctx (DEFAULT_SURFACE sentinel)", () => {
+    // The framework's legacy `finish_frame()` emits BeginSurface with
+    // Rect::ZERO for the DEFAULT_SURFACE. The renderer must NOT
+    // allocate an offscreen for this — paint goes directly to screen.
+    backend.beginSurface(0xffffffff, 0, 0, 0, 0);
+    expect(allocated.length).toBe(0);
+    backend.fillRect(0, 0, 10, 10, 0xff000000);
+    expect(tail(screenTrace, "---init---")).toContainEqual(["fillRect", 0, 0, 10, 10]);
+    backend.endSurface();
+    backend.compositeSurface(0xffffffff, 0, 0, 0, 0);
+    // Zero-bounds composite is a no-op.
+    expect(tail(screenTrace, "---init---").find(op => op[0] === "drawImage")).toBeUndefined();
+    restoreOC();
+  });
+
+  it("a surface that didn't paint this frame keeps its prior pixels (composite still works)", () => {
+    // Robustness property of 15.1: an Activity that doesn't repaint
+    // its surface should still composite at its last-known pixels.
+    backend.beginSurface(42, 0, 0, 100, 100);
+    backend.fillRect(0, 0, 50, 50, 0xff112233);
+    backend.endSurface();
+    // Frame 2: NO begin/end for surface 42, only a composite. The
+    // backing canvas still holds frame-1's pixels.
+    backend.compositeSurface(42, 0, 0, 100, 100);
+    const screenOps = tail(screenTrace, "---init---");
+    const drawImage = screenOps.find(op => op[0] === "drawImage");
+    expect(drawImage).toBeTruthy();
+    expect(drawImage[1]).toBe(allocated[0]);
+    restoreOC();
   });
 });

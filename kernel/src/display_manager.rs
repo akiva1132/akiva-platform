@@ -94,6 +94,18 @@ impl DrawHal for ExternDrawHal {
     fn set_global_alpha(&mut self, alpha: f32) {
         unsafe { host::hal_draw_set_global_alpha(alpha) }
     }
+    fn begin_surface(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {
+        unsafe { host::hal_begin_surface(id, x, y, w, h) }
+    }
+    fn end_surface(&mut self) {
+        unsafe { host::hal_end_surface() }
+    }
+    fn composite_surface(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {
+        unsafe { host::hal_composite_surface(id, x, y, w, h) }
+    }
+    fn destroy_surface(&mut self, id: u32) {
+        unsafe { host::hal_destroy_surface(id) }
+    }
 }
 
 pub type DisplayId = u32;

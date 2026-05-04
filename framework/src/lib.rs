@@ -802,14 +802,27 @@ impl Framework {
         let fg_surface = foreground
             .and_then(|id| self.activity_surfaces.get(&id).copied())
             .unwrap_or(compositor::Compositor::DEFAULT_SURFACE);
+        // Phase 15.1 — every surface id needs its bounds for the new
+        // wire format (BeginSurface + CompositeSurface carry bounds).
+        // Bounds come from the WindowManager; the legacy DEFAULT_SURFACE
+        // (test fallback) has no record there, so it gets `Rect::ZERO` —
+        // the renderer's "screen-bound default" sentinel.
+        let bounds_of = |windows: &window_manager::WindowManager,
+                         id: window_manager::SurfaceId| -> window_manager::Rect {
+            windows.surface(id).map(|s| s.bounds).unwrap_or(window_manager::Rect::ZERO)
+        };
         if self.dialogs.open_dialogs().next().is_none() {
-            return self.compositor.finish_frame_in_order(&[fg_surface]);
+            let order = [(fg_surface, bounds_of(&self.windows, fg_surface))];
+            return self.compositor.finish_frame_in_order(&order);
         }
-        let mut order: Vec<window_manager::SurfaceId> = vec![fg_surface];
+        let mut order: Vec<(window_manager::SurfaceId, window_manager::Rect)> =
+            vec![(fg_surface, bounds_of(&self.windows, fg_surface))];
         let mut overlays: Vec<window_manager::SurfaceId> =
             self.dialogs.open_dialogs().map(|d| d.surface).collect();
         overlays.sort();
-        order.extend(overlays);
+        order.extend(
+            overlays.into_iter().map(|id| (id, bounds_of(&self.windows, id))),
+        );
         self.compositor.finish_frame_in_order(&order)
     }
 
@@ -996,8 +1009,14 @@ impl Framework {
                 let saved_stack = std::mem::replace(&mut self.stack, vec![activity]);
                 let _ = self.render_frame(ts);
                 self.stack = saved_stack;
+                // Phase 15.1 — DEFAULT_SURFACE is the legacy
+                // screen-bound sentinel; pass `Rect::ZERO` and the
+                // renderer interprets it as "paint to screen, no
+                // offscreen". Multi-display path is not yet a real
+                // surface (WindowManager has no record for
+                // DEFAULT_SURFACE), so bounds wouldn't help.
                 self.compositor.finish_frame_in_order(
-                    &[compositor::Compositor::DEFAULT_SURFACE],
+                    &[(compositor::Compositor::DEFAULT_SURFACE, window_manager::Rect::ZERO)],
                 )
             }
             None => {

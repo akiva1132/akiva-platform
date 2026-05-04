@@ -539,6 +539,17 @@ function buildImports() {
     hal_draw_set_global_alpha: (alpha) => backend?.setGlobalAlpha(alpha),
     hal_draw_present: () => backend?.present(),
 
+    // Phase 15.1 — per-Activity surface compositor ops. The framework
+    // emits these around each surface's paint pass and as a final
+    // composite step before `present`. See
+    // docs/compositor-architecture.md for the frame shape.
+    hal_begin_surface: (id, x, y, w, h) =>
+      backend?.beginSurface(id >>> 0, x, y, w, h),
+    hal_end_surface: () => backend?.endSurface(),
+    hal_composite_surface: (id, x, y, w, h) =>
+      backend?.compositeSurface(id >>> 0, x, y, w, h),
+    hal_destroy_surface: (id) => backend?.destroySurfaceCanvas(id >>> 0),
+
     hal_storage_read:   (kptr, klen, outLenPtr) => halStorageRead(kptr, klen, outLenPtr),
     hal_storage_write:  (kptr, klen, vptr, vlen) => halStorageWrite(kptr, klen, vptr, vlen),
     hal_storage_delete: (kptr, klen) => halStorageDelete(kptr, klen),

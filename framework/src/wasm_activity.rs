@@ -585,6 +585,20 @@ pub mod opcode {
     // `PushClip` / `PopClip` boundaries) or until another
     // SetGlobalAlpha. 5 bytes total: opcode + alpha (f32 LE).
     pub const SET_GLOBAL_ALPHA:  u8 = 13;
+    // Phase 15.1 — per-Activity surface compositor markers.
+    // Framework-internal: emitted by `Compositor::finish_frame_in_order`,
+    // consumed by the kernel's DrawHal impl. Apps cannot produce these
+    // through the SDK paint API; the wire codec round-trips them only
+    // for completeness / tests.
+    /// `BeginSurface { id: u32, x: f32, y: f32, w: f32, h: f32 }` —
+    /// 21 bytes total: opcode + u32 + 4×f32.
+    pub const BEGIN_SURFACE:     u8 = 14;
+    /// `EndSurface` — 1 byte (opcode only).
+    pub const END_SURFACE:       u8 = 15;
+    /// `CompositeSurface { id, x, y, w, h }` — 21 bytes.
+    pub const COMPOSITE_SURFACE: u8 = 16;
+    /// `DestroySurface { id }` — 5 bytes.
+    pub const DESTROY_SURFACE:   u8 = 17;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -711,6 +725,27 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             out.push(opcode::SET_GLOBAL_ALPHA);
             out.extend_from_slice(&alpha.to_le_bytes());
         }
+        PaintOp::BeginSurface { id, x, y, w, h } => {
+            out.push(opcode::BEGIN_SURFACE);
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+        }
+        PaintOp::EndSurface => out.push(opcode::END_SURFACE),
+        PaintOp::CompositeSurface { id, x, y, w, h } => {
+            out.push(opcode::COMPOSITE_SURFACE);
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+        }
+        PaintOp::DestroySurface { id } => {
+            out.push(opcode::DESTROY_SURFACE);
+            out.extend_from_slice(&id.to_le_bytes());
+        }
     }
 }
 
@@ -831,6 +866,27 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
             opcode::SET_GLOBAL_ALPHA => {
                 let alpha = read_f32(&mut bytes)?;
                 out.push(PaintOp::SetGlobalAlpha { alpha });
+            }
+            opcode::BEGIN_SURFACE => {
+                let id = read_u32(&mut bytes)?;
+                let x = read_f32(&mut bytes)?;
+                let y = read_f32(&mut bytes)?;
+                let w = read_f32(&mut bytes)?;
+                let h = read_f32(&mut bytes)?;
+                out.push(PaintOp::BeginSurface { id, x, y, w, h });
+            }
+            opcode::END_SURFACE => out.push(PaintOp::EndSurface),
+            opcode::COMPOSITE_SURFACE => {
+                let id = read_u32(&mut bytes)?;
+                let x = read_f32(&mut bytes)?;
+                let y = read_f32(&mut bytes)?;
+                let w = read_f32(&mut bytes)?;
+                let h = read_f32(&mut bytes)?;
+                out.push(PaintOp::CompositeSurface { id, x, y, w, h });
+            }
+            opcode::DESTROY_SURFACE => {
+                let id = read_u32(&mut bytes)?;
+                out.push(PaintOp::DestroySurface { id });
             }
             other => return Err(DecodeError::UnknownOp(other)),
         }
@@ -1186,6 +1242,11 @@ mod tests {
             PaintOp::PopClip,
             PaintOp::PushTransform { dx: 10.0, dy: 20.0, scale: 1.25 },
             PaintOp::PopTransform,
+            // Phase 15.1 — surface compositor markers.
+            PaintOp::BeginSurface { id: 7, x: 1.0, y: 2.0, w: 100.0, h: 200.0 },
+            PaintOp::EndSurface,
+            PaintOp::CompositeSurface { id: 7, x: 1.0, y: 2.0, w: 100.0, h: 200.0 },
+            PaintOp::DestroySurface { id: 7 },
         ];
         let mut wire = Vec::new();
         for op in &inputs { encode_op(&mut wire, op); }
@@ -1193,6 +1254,32 @@ mod tests {
         let mut frame = FrameCommands::new();
         decode_frame(&wire, &mut frame).unwrap();
         assert_eq!(frame.ops().len(), inputs.len());
+    }
+
+    /// Phase 15.1 — wire size pinning for the four surface compositor
+    /// opcodes. BeginSurface and CompositeSurface are 21 bytes
+    /// (opcode + u32 + 4×f32); EndSurface is 1 byte; DestroySurface
+    /// is 5 bytes (opcode + u32). A regression in the encoder padding
+    /// or layout would fail this byte-count assertion before it
+    /// became a silent decode error in the field.
+    #[test]
+    fn surface_ops_wire_sizes_are_pinned() {
+        let mut buf = Vec::new();
+        encode_op(&mut buf, &PaintOp::BeginSurface {
+            id: 1, x: 0.0, y: 0.0, w: 0.0, h: 0.0,
+        });
+        assert_eq!(buf.len(), 1 + 4 + 4 * 4, "BEGIN_SURFACE = 21 bytes");
+        buf.clear();
+        encode_op(&mut buf, &PaintOp::EndSurface);
+        assert_eq!(buf.len(), 1, "END_SURFACE = 1 byte");
+        buf.clear();
+        encode_op(&mut buf, &PaintOp::CompositeSurface {
+            id: 1, x: 0.0, y: 0.0, w: 0.0, h: 0.0,
+        });
+        assert_eq!(buf.len(), 1 + 4 + 4 * 4, "COMPOSITE_SURFACE = 21 bytes");
+        buf.clear();
+        encode_op(&mut buf, &PaintOp::DestroySurface { id: 1 });
+        assert_eq!(buf.len(), 1 + 4, "DESTROY_SURFACE = 5 bytes");
     }
 
     /// Stone 13.0prep C — `OP_DRAW_IMAGE` encode/decode roundtrip and

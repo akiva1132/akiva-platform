@@ -87,6 +87,18 @@ extern "C" {
     pub fn hal_draw_set_global_alpha(alpha: f32);
     pub fn hal_draw_present();
 
+    // Phase 15.1 — per-Activity surface compositor ops. The host
+    // maintains a Map<surface_id, OffscreenCanvas>; `begin_surface`
+    // switches subsequent paint imports to that surface's 2D context
+    // (allocating the OffscreenCanvas if first sighting of `id`),
+    // `end_surface` returns the target to the screen canvas, and
+    // `composite_surface` `drawImage`s the surface into the screen at
+    // `(x, y, w, h)`. `destroy_surface` frees the backing canvas.
+    pub fn hal_begin_surface(id: u32, x: f32, y: f32, w: f32, h: f32);
+    pub fn hal_end_surface();
+    pub fn hal_composite_surface(id: u32, x: f32, y: f32, w: f32, h: f32);
+    pub fn hal_destroy_surface(id: u32);
+
     // ── Storage ───────────────────────────────────────────────────────────
     // Backed by OPFS + SyncAccessHandle inside the worker. MVP uses string
     // keys / byte values; see docs/observability.md and ARCHITECTURE.md
