@@ -433,7 +433,7 @@ architecture is the load-bearing change.
       - [x] **15.4.1** Architectural split (paint backend vs.
             compositor backend) + WebGPU detection + identity
             composite. Visual parity with 15.3.
-      - [ ] **15.4.2** Translate / scale / opacity opts on the
+      - [x] **15.4.2** Translate / scale / opacity opts on the
             WebGPU path.
       - [ ] **15.4.3** Backdrop blur (frosted glass) — two-pass
             Gaussian on downsampled texture.

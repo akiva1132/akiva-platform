@@ -1,11 +1,11 @@
 // WebGPU compositor backend.
 //
-// Phase 15.4.1 — minimum viable. Identity composite only: each
-// `compositeSurface` copies the source `OffscreenCanvas` into a cached
-// per-source `GPUTexture` (path B per the plan §1.5) and emits a
-// textured quad at the destination rect. SurfaceDrawOpts (`opacity`,
-// `translate_x`, `translate_y`, `scale`) are accepted but ignored —
-// that's 15.4.2's stone. Blur, shadow, tint are 15.4.3+.
+// Phase 15.4.2 — identity composite + SurfaceDrawOpts (opacity,
+// translate, scale). Each `compositeSurface` copies the source
+// `OffscreenCanvas` into a cached per-source `GPUTexture` (path B
+// per the plan §1.5) and emits a textured quad at the destination
+// rect, transformed by the opts in the vertex shader and alpha-
+// multiplied in the fragment shader. Blur / shadow / tint are 15.4.3+.
 //
 // Why path B and not `importExternalTexture`: as of mid-2026, Chrome /
 // Edge / Firefox restrict `importExternalTexture` to
@@ -31,6 +31,8 @@ const IDENTITY_WGSL = `
 struct Uniforms {
   dst_rect:    vec4<f32>,
   screen_size: vec4<f32>,
+  // opts: (opacity, translate_x, translate_y, scale)
+  opts:        vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -45,7 +47,14 @@ struct VsOut {
 @vertex
 fn vs(@builtin(vertex_index) vid: u32) -> VsOut {
   let corner = vec2<f32>(f32(vid & 1u), f32((vid >> 1u) & 1u));
-  let pixel  = u.dst_rect.xy + corner * u.dst_rect.zw;
+  // Scale around the dst-rect centre, then translate. Order matches
+  // the Canvas2D path's save → translate → scale → drawImage so
+  // slide/fade animations look identical between backends.
+  let scaled_size = u.dst_rect.zw * u.opts.w;
+  let pivot       = u.dst_rect.xy + u.dst_rect.zw * 0.5;
+  let pixel       = pivot
+                  + (corner - vec2<f32>(0.5, 0.5)) * scaled_size
+                  + u.opts.yz;
   let ndc = vec2<f32>(
     pixel.x / u.screen_size.x * 2.0 - 1.0,
     1.0 - pixel.y / u.screen_size.y * 2.0,
@@ -61,8 +70,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let c = textureSample(t, s, in.uv);
   // Pre-multiply on the way out — the canvas configuration uses
   // alphaMode "premultiplied" but our source canvases are straight
-  // alpha. Effects (15.4.5+) mix BEFORE this multiply.
-  return vec4<f32>(c.rgb * c.a, c.a);
+  // alpha. Effective alpha = sampled alpha × surface opacity.
+  // (15.4.5+ effect mixing happens BEFORE this multiply.)
+  let a = c.a * u.opts.x;
+  return vec4<f32>(c.rgb * a, a);
 }
 `;
 
@@ -213,10 +224,11 @@ export class WebGPUCompositor {
   }
 
   /** Composite `src` (an OffscreenCanvas allocated by the paint
-   *  backend) onto the screen at `(x, y, w, h)`. Opts ignored in
-   *  15.4.1 — they land in 15.4.2 by extending the uniform layout
-   *  and the vertex shader. */
-  compositeSurface(src, x, y, w, h, _opacity, _tx, _ty, _scale) {
+   *  backend) onto the screen at `(x, y, w, h)`, transformed by the
+   *  SurfaceDrawOpts (`opacity`, `translateX`, `translateY`, `scale`).
+   *  Defaults match `SurfaceDrawOpts::IDENTITY`: opacity=1, no
+   *  translate, scale=1. */
+  compositeSurface(src, x, y, w, h, opacity = 1, translateX = 0, translateY = 0, scale = 1) {
     if (!this.device || this._lost || !src || w <= 0 || h <= 0) return;
     if (!this._frameInProgress) {
       this.beginFrame();
@@ -257,17 +269,29 @@ export class WebGPUCompositor {
       return;
     }
 
-    // Per-call uniform buffer. We can't reuse one buffer across
-    // multiple composites in the same submission — `writeBuffer`
-    // ordering vs. `draw` ordering isn't preserved within a single
-    // submit, so a shared buffer would deliver the LAST frame's
-    // uniforms to every draw. A small per-call allocation is correct
-    // and the GPU/driver pools small uniforms efficiently.
-    const uniforms = new Float32Array(8);
+    // Per-call uniform buffer (48 bytes = 3 × vec4<f32>). We can't
+    // reuse one buffer across multiple composites in the same
+    // submission — `writeBuffer` ordering vs. `draw` ordering isn't
+    // preserved within a single submit, so a shared buffer would
+    // deliver the LAST frame's uniforms to every draw. A small
+    // per-call allocation is correct and the GPU/driver pools small
+    // uniforms efficiently.
+    const uniforms = new Float32Array(12);
+    // dst_rect
     uniforms[0] = x; uniforms[1] = y; uniforms[2] = w; uniforms[3] = h;
-    uniforms[4] = this.metrics.width_px; uniforms[5] = this.metrics.height_px;
+    // screen_size
+    uniforms[4] = this.metrics.width_px;
+    uniforms[5] = this.metrics.height_px;
+    // opts (opacity, translate_x, translate_y, scale) — clamp opacity
+    // defensively to match the Canvas2D path's `setGlobalAlpha`
+    // clamping; an animation that overshoots [0,1] otherwise washes
+    // out (>1) or inverts (<0) on some GPUs.
+    uniforms[8]  = Math.max(0, Math.min(1, opacity));
+    uniforms[9]  = translateX;
+    uniforms[10] = translateY;
+    uniforms[11] = scale > 0 ? scale : 1;
     const uniformBuffer = this.device.createBuffer({
-      size: 32,
+      size: 48,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.device.queue.writeBuffer(uniformBuffer, 0, uniforms);
