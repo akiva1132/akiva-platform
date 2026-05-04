@@ -309,19 +309,38 @@ export class Canvas2DBackend {
    *  background gets crisp compositing without ghosting from the
    *  previous frame.
    *
-   *  Per-Activity surface allocation is independent of the screen ctx,
-   *  so this method runs even in Phase 15.4.1 WebGPU mode where
-   *  `screenCtx` is null. The zero-bounds DEFAULT_SURFACE sentinel
-   *  still routes paint to `this.screenCtx` (null in WebGPU mode →
-   *  subsequent paint ops silently no-op via their own ctx checks). */
+   *  Zero-bounds DEFAULT_SURFACE sentinel: in Canvas2D mode (or
+   *  followers / standalone with a real screen ctx) we route paint
+   *  directly to the screen ctx, the legacy 15.1 behaviour. In
+   *  Phase 15.4.1 WebGPU mode the screen has no 2D ctx, so we
+   *  expand the bounds to the full screen and allocate a real
+   *  per-Activity offscreen — the framework's intent is "this
+   *  Activity covers the whole screen", just expressed through the
+   *  ZERO bounds sentinel because the WindowManager hasn't recorded
+   *  layout yet on early frames. */
   beginSurface(id, x, y, w, h) {
-    // Zero-bounds sentinel: keep painting to the screen ctx (or null
-    // in WebGPU mode — paint ops gate on `this.ctx` and turn into
-    // no-ops on null).
     if (w <= 0 || h <= 0) {
-      this._ctxStack.push(this.ctx);
-      this.ctx = this.screenCtx;
-      return;
+      if (this.screenCtx) {
+        // Canvas2D mode: paint goes to screen, no per-Activity
+        // offscreen needed. Pop balances on endSurface.
+        this._ctxStack.push(this.ctx);
+        this.ctx = this.screenCtx;
+        return;
+      }
+      // WebGPU mode: synthesise screen-sized bounds so the activity
+      // gets a real backing canvas. The matching CompositeSurface
+      // for this id ALSO arrives with zero bounds; the pipeline
+      // synthesises the screen rect there too.
+      w = Math.max(1, this.metrics.width_px  | 0);
+      h = Math.max(1, this.metrics.height_px | 0);
+      if (w <= 1 && h <= 1) {
+        // Metrics also degenerate (pre-resize, no display attached).
+        // Fall back to the old behaviour to keep paint silent rather
+        // than allocating a 1×1 canvas that aliases to a single pixel.
+        this._ctxStack.push(this.ctx);
+        this.ctx = this.screenCtx;
+        return;
+      }
     }
     let entry = this._surfaces.get(id);
     if (!entry) {

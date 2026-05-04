@@ -123,12 +123,37 @@ export class CompositingPipeline {
   }
 
   compositeSurface(id, x, y, w, h, opacity, tx, ty, scale) {
-    // Zero-bounds is the legacy DEFAULT_SURFACE sentinel — nothing
-    // was offscreen to composite. Drop early before the lookup.
-    if (w <= 0 || h <= 0) return;
+    // Zero-bounds DEFAULT_SURFACE sentinel. In Canvas2D mode the
+    // activity painted directly to the screen ctx during BeginSurface,
+    // so there's nothing to composite — return. In WebGPU mode the
+    // matching beginSurface allocated a screen-sized offscreen; we
+    // composite it at full screen bounds.
+    //
+    // Why bounds=0 in production: the framework calls
+    // `bounds_of(id) → Rect::ZERO` for an Activity whose surface is
+    // registered but the WindowManager hasn't recorded layout yet.
+    // That happens for the first ~25ms of every boot, between
+    // `register(...)` and `init_ok`. Until 15.4.1's WebGPU compositor,
+    // those frames painted directly to the screen ctx — we restore
+    // that contract here.
+    if (w <= 0 || h <= 0) {
+      if (this.compositorKind !== "webgpu") return;
+      w = this.metrics.width_px;
+      h = this.metrics.height_px;
+      if (w <= 0 || h <= 0) return;
+      x = 0; y = 0;
+    }
     const src = this.paint?.getSurfaceCanvas(id);
     if (!src) return;
     this.compositor?.compositeSurface(src, x, y, w, h, opacity, tx, ty, scale);
+  }
+
+  // ── Frame lifecycle ───────────────────────────────────────────────
+
+  present() {
+    this.paint?.present();
+    this.compositor?.endFrame?.();
+    this.compositor?.present?.();
   }
 
   destroySurfaceCanvas(id) {
@@ -141,14 +166,6 @@ export class CompositingPipeline {
   forgetDrawable(id)                            { this.paint?.forgetDrawable(id); }
   registerForeignDrawable(pkg, name, source)    { this.paint?.registerForeignDrawable(pkg, name, source); }
   forgetForeignDrawables(pkg)                   { this.paint?.forgetForeignDrawables(pkg); }
-
-  // ── Frame lifecycle ───────────────────────────────────────────────
-
-  present() {
-    this.paint?.present();
-    this.compositor?.endFrame?.();
-    this.compositor?.present?.();
-  }
 
   destroy() {
     this.compositor?.destroy?.();
