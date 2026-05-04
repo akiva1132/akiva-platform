@@ -81,11 +81,19 @@ fn vs(@builtin(vertex_index) vid: u32) -> VsOut {
 
 // Surface composite: source is straight alpha (Canvas2D), output
 // is pre-multiplied (matches the swapchain's "premultiplied" alphaMode).
+// Phase 15.4.5 — also blends a colour tint over the surface RGB.
+// blur_dir.xyz is the tint colour in 0..1 sRGB; blur_dir.w is the
+// tint alpha (mix factor). When tint alpha is 0, mix() returns the
+// surface's own RGB unchanged — that's the fast path for the common
+// "no tint" case.
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let c = textureSample(t, s, in.uv);
+  let tint_rgb  = u.blur_dir.xyz;
+  let tint_a    = u.blur_dir.w;
+  let mixed_rgb = mix(c.rgb, tint_rgb, tint_a);
   let a = c.a * u.opts.x;
-  return vec4<f32>(c.rgb * a, a);
+  return vec4<f32>(mixed_rgb * a, a);
 }
 
 // Pre-multiplied passthrough: used for blits between intermediate
@@ -419,6 +427,7 @@ export class WebGPUCompositor {
     opacity = 1, translateX = 0, translateY = 0, scale = 1,
     blurRadius = 0,
     shadowOX = 0, shadowOY = 0, shadowBlur = 0, shadowRgba = 0,
+    tint = 0,
   ) {
     if (!this.device || this._lost || !src || w <= 0 || h <= 0) return;
     if (!this._frameInProgress) {
@@ -440,6 +449,14 @@ export class WebGPUCompositor {
       this._encodeBackdropBlur(x, y, w, h, blurRadius);
     }
 
+    // Phase 15.4.5 — unpack tint rgba (alpha=0 = no tint, fast path
+    // in the shader's `mix()`). Packed into `blur_dir` to fit the
+    // shared 80-byte uniform shape.
+    const tintR = ((tint >>> 16) & 0xff) / 255;
+    const tintG = ((tint >>>  8) & 0xff) / 255;
+    const tintB = ( tint         & 0xff) / 255;
+    const tintA = ((tint >>> 24) & 0xff) / 255;
+
     // Surface composite onto the scene (over any shadow / blurred
     // backdrop deposited above).
     this._encodeIdentityDraw(this._scenePass, srcEntry.view, {
@@ -451,6 +468,7 @@ export class WebGPUCompositor {
         scale > 0 ? scale : 1,
       ],
       srcUv:      [0, 0, 1, 1],
+      blurDir:    [tintR, tintG, tintB, tintA],
     });
   }
 
@@ -726,14 +744,17 @@ export class WebGPUCompositor {
 
   /** Encode one identity textured-quad draw into `pass`. The pipeline
    *  must already be set on the pass (caller's choice of OVER vs
-   *  REPLACE blend). */
+   *  REPLACE blend). `args.blurDir` is the surface composite shader's
+   *  tint slot (15.4.5) when this is going through `this.pipeline`;
+   *  it's unread by `fs_blit` (the blit pipeline) so blits can leave
+   *  the default. */
   _encodeIdentityDraw(pass, srcView, args) {
     const buf = this._uploadUniforms({
       dstRect:    args.dstRect,
       targetSize: args.targetSize,
       opts:       args.opts,
       srcUv:      args.srcUv,
-      blurDir:    [0, 0],  // unused
+      blurDir:    args.blurDir ?? [0, 0, 0, 0],
     });
     const bindGroup = this.device.createBindGroup({
       layout: this.bindGroupLayout,

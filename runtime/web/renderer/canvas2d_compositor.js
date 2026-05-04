@@ -82,10 +82,14 @@ export class Canvas2DCompositor {
    *  Phase 15.4.4 — `_shadowOX/OY/blur/rgba` are accepted but
    *  ignored. CSS `filter: drop-shadow()` is similarly too slow at
    *  60Hz; surfaces that need a soft drop shadow boot on the WebGPU
-   *  path. */
+   *  path.
+   *
+   *  Phase 15.4.5 — `_tint` is accepted but ignored. CSS doesn't
+   *  expose a per-surface mix blend without re-rendering the layer,
+   *  so tinting requires the WebGPU path. */
   compositeSurface(
     src, x, y, w, h, opacity, translateX, translateY, scale,
-    _blurRadius, _shadowOX, _shadowOY, _shadowBlur, _shadowRgba,
+    _blurRadius, _shadowOX, _shadowOY, _shadowBlur, _shadowRgba, _tint,
   ) {
     if (!this.screenCtx) return;
     if (!src || w <= 0 || h <= 0) return;

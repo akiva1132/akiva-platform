@@ -114,6 +114,7 @@ impl DrawHal for ExternDrawHal {
                 opts.drop_shadow.offset_y,
                 opts.drop_shadow.blur_radius,
                 opts.drop_shadow.rgba,
+                opts.tint,
             )
         }
     }

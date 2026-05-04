@@ -191,10 +191,12 @@ export function applyPaintStream(bytes, backend) {
         const shadowOffsetY = readF32();
         const shadowBlurRadius = readF32();
         const shadowRgba = readU32();
+        const tint = readU32();
         backend.compositeSurface?.(
           id, x, y, w, h, opacity, tx, ty, scale,
           backdropBlurRadius,
           shadowOffsetX, shadowOffsetY, shadowBlurRadius, shadowRgba,
+          tint,
         );
         break;
       }

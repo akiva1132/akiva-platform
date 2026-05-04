@@ -569,14 +569,17 @@ function buildImports() {
     // `backdrop_blur_radius` (live frosted glass behind sheets and
     // dialogs); Canvas2D ignores, WebGPU runs a two-pass Gaussian.
     // Phase 15.4.4 added drop shadow (`shadowOX/OY/blur/rgba`) for
-    // soft elevation under modals / popovers.
+    // soft elevation under modals / popovers. Phase 15.4.5 added
+    // `tint` (rgba u32; alpha=0 = no tint) — surface RGB mix-blended
+    // with the tint colour for macOS-style background-app dimming.
     hal_composite_surface: (
       id, x, y, w, h, opacity, tx, ty, scale,
-      blurR, shadowOX, shadowOY, shadowBlur, shadowRgba,
+      blurR, shadowOX, shadowOY, shadowBlur, shadowRgba, tint,
     ) =>
       backend?.compositeSurface(
         id >>> 0, x, y, w, h, opacity, tx, ty, scale,
         blurR, shadowOX, shadowOY, shadowBlur, shadowRgba >>> 0,
+        tint >>> 0,
       ),
     hal_destroy_surface: (id) => backend?.destroySurfaceCanvas(id >>> 0),
 

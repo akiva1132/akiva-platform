@@ -86,6 +86,14 @@ pub struct SurfaceDrawOpts {
     /// surface — modal / popover shadows. `DropShadow::NONE` (alpha
     /// byte zero) is the fast-path default; Canvas2D ignores.
     pub drop_shadow: DropShadow,
+    /// Phase 15.4.5 — colour tint blended over the surface's RGB.
+    /// `0xAARRGGBB`; alpha byte `0` = no tint (fast path). The
+    /// fragment shader does `mix(surf.rgb, tint.rgb, tint.a)` so a
+    /// half-alpha black tint dims the surface 50%, matching macOS-
+    /// style "background app fade" during multitasking transitions.
+    /// Doesn't change surface alpha — the tint colours the visible
+    /// pixels; it doesn't add transparency.
+    pub tint: u32,
 }
 
 impl SurfaceDrawOpts {
@@ -93,6 +101,7 @@ impl SurfaceDrawOpts {
         opacity: 1.0, translate_x: 0.0, translate_y: 0.0, scale: 1.0,
         backdrop_blur_radius: 0.0,
         drop_shadow: DropShadow::NONE,
+        tint: 0,
     };
 
     /// True when the opts are exactly identity. Renderers can
@@ -108,6 +117,7 @@ impl SurfaceDrawOpts {
             && self.scale == 1.0
             && self.backdrop_blur_radius == 0.0
             && self.drop_shadow.is_none()
+            && (self.tint >> 24) & 0xff == 0
     }
 }
 
@@ -785,10 +795,11 @@ mod tests {
             &mut self, id: u32, x: f32, y: f32, w: f32, h: f32, opts: SurfaceDrawOpts,
         ) {
             self.trace.push(format!(
-                "composite_surface({id},{x},{y},{w},{h},opacity={},tx={},ty={},scale={},blur={},shadow={:#010x})",
+                "composite_surface({id},{x},{y},{w},{h},opacity={},tx={},ty={},scale={},blur={},shadow={:#010x},tint={:#010x})",
                 opts.opacity, opts.translate_x, opts.translate_y, opts.scale,
                 opts.backdrop_blur_radius,
                 opts.drop_shadow.rgba,
+                opts.tint,
             ));
         }
         fn destroy_surface(&mut self, id: u32) {
@@ -861,7 +872,7 @@ mod tests {
             "set_global_alpha(0.5)",
             "begin_surface(42,1,2,100,200)",
             "end_surface",
-            "composite_surface(42,1,2,100,200,opacity=1,tx=0,ty=0,scale=1,blur=0,shadow=0x00000000)",
+            "composite_surface(42,1,2,100,200,opacity=1,tx=0,ty=0,scale=1,blur=0,shadow=0x00000000,tint=0x00000000)",
             "destroy_surface(42)",
         ]);
     }

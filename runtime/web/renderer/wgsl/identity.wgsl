@@ -61,13 +61,18 @@ fn vs(@builtin(vertex_index) vid: u32) -> VsOut {
 
 // Surface composite: source is straight alpha (Canvas2D), output
 // is pre-multiplied (matches the swapchain's "premultiplied" alphaMode).
+// Phase 15.4.5 — also blends a colour tint over the surface RGB.
+// blur_dir.xyz is the tint colour in 0..1 sRGB; blur_dir.w is the
+// tint alpha (mix factor). When tint alpha is 0, mix() returns the
+// surface's own RGB unchanged.
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let c = textureSample(t, s, in.uv);
-  // Effective alpha = sampled alpha × surface opacity.
-  // (15.4.5+ effect mixing happens BEFORE this pre-multiply.)
+  let tint_rgb  = u.blur_dir.xyz;
+  let tint_a    = u.blur_dir.w;
+  let mixed_rgb = mix(c.rgb, tint_rgb, tint_a);
   let a = c.a * u.opts.x;
-  return vec4<f32>(c.rgb * a, a);
+  return vec4<f32>(mixed_rgb * a, a);
 }
 
 // Pre-multiplied passthrough: used for blits between intermediate

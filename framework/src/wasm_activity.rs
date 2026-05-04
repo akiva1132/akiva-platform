@@ -595,14 +595,15 @@ pub mod opcode {
     pub const BEGIN_SURFACE:     u8 = 14;
     /// `EndSurface` — 1 byte (opcode only).
     pub const END_SURFACE:       u8 = 15;
-    /// `CompositeSurface { id, x, y, w, h, opts }` — 57 bytes (15.4.4).
+    /// `CompositeSurface { id, x, y, w, h, opts }` — 61 bytes (15.4.5).
     /// Opcode + u32 + 4×f32 (bounds) + 5×f32 (15.3+15.4.3 opts:
     /// opacity / translate_x / translate_y / scale /
     /// backdrop_blur_radius) + 3×f32 + u32 (15.4.4 drop_shadow:
-    /// offset_x / offset_y / blur_radius / rgba). Phase 15.3 moved
-    /// the first four opts here from the activity's own paint ops;
-    /// 15.4.3 added live frosted-glass blur; 15.4.4 added drop
-    /// shadow.
+    /// offset_x / offset_y / blur_radius / rgba) + u32 (15.4.5
+    /// tint). Phase 15.3 moved the first four opts here from the
+    /// activity's own paint ops; 15.4.3 added live frosted-glass
+    /// blur; 15.4.4 added drop shadow; 15.4.5 added a colour tint
+    /// blended over the surface RGB.
     pub const COMPOSITE_SURFACE: u8 = 16;
     /// `DestroySurface { id }` — 5 bytes.
     pub const DESTROY_SURFACE:   u8 = 17;
@@ -757,6 +758,7 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             out.extend_from_slice(&opts.drop_shadow.offset_y.to_le_bytes());
             out.extend_from_slice(&opts.drop_shadow.blur_radius.to_le_bytes());
             out.extend_from_slice(&opts.drop_shadow.rgba.to_le_bytes());
+            out.extend_from_slice(&opts.tint.to_le_bytes());
         }
         PaintOp::DestroySurface { id } => {
             out.push(opcode::DESTROY_SURFACE);
@@ -907,6 +909,7 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                 let shadow_offset_y = read_f32(&mut bytes)?;
                 let shadow_blur_radius = read_f32(&mut bytes)?;
                 let shadow_rgba = read_u32(&mut bytes)?;
+                let tint = read_u32(&mut bytes)?;
                 out.push(PaintOp::CompositeSurface {
                     id, x, y, w, h,
                     opts: crate::compositor::SurfaceDrawOpts {
@@ -918,6 +921,7 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                             blur_radius: shadow_blur_radius,
                             rgba:        shadow_rgba,
                         },
+                        tint,
                     },
                 });
             }
@@ -1296,14 +1300,14 @@ mod tests {
         assert_eq!(frame.ops().len(), inputs.len());
     }
 
-    /// Phase 15.1/15.3/15.4.3/15.4.4 — wire size pinning for the four
-    /// surface compositor opcodes. BeginSurface = 21 bytes (opcode +
-    /// u32 + 4×f32); EndSurface = 1 byte; CompositeSurface = 57 bytes
-    /// (15.3: bounds + 4×f32 opts; 15.4.3 added f32 backdrop blur;
-    /// 15.4.4 added 3×f32 + u32 drop shadow); DestroySurface = 5
-    /// bytes. A regression in encoder padding or layout would fail
-    /// these assertions before becoming a silent decode error in the
-    /// field.
+    /// Phase 15.1/15.3/15.4.3/15.4.4/15.4.5 — wire size pinning for
+    /// the four surface compositor opcodes. BeginSurface = 21 bytes
+    /// (opcode + u32 + 4×f32); EndSurface = 1 byte; CompositeSurface
+    /// = 61 bytes (15.3: bounds + 4×f32 opts; 15.4.3 added f32
+    /// backdrop blur; 15.4.4 added 3×f32 + u32 drop shadow; 15.4.5
+    /// added u32 tint); DestroySurface = 5 bytes. A regression in
+    /// encoder padding or layout would fail these assertions before
+    /// becoming a silent decode error in the field.
     #[test]
     fn surface_ops_wire_sizes_are_pinned() {
         let mut buf = Vec::new();
@@ -1319,8 +1323,8 @@ mod tests {
             id: 1, x: 0.0, y: 0.0, w: 0.0, h: 0.0,
             opts: crate::compositor::SurfaceDrawOpts::IDENTITY,
         });
-        assert_eq!(buf.len(), 1 + 4 + 4 * 4 + 5 * 4 + 3 * 4 + 4,
-            "COMPOSITE_SURFACE = 57 bytes (15.4.4 added 16-byte drop shadow)");
+        assert_eq!(buf.len(), 1 + 4 + 4 * 4 + 5 * 4 + 3 * 4 + 4 + 4,
+            "COMPOSITE_SURFACE = 61 bytes (15.4.5 added 4-byte tint)");
         buf.clear();
         encode_op(&mut buf, &PaintOp::DestroySurface { id: 1 });
         assert_eq!(buf.len(), 1 + 4, "DESTROY_SURFACE = 5 bytes");

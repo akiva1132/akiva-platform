@@ -439,9 +439,9 @@ architecture is the load-bearing change.
             Gaussian on downsampled texture.
       - [x] **15.4.4** Drop shadow — separable blur on the
             surface's alpha channel.
-      - [ ] **15.4.5** Color tint / dim — single-fragment
+      - [x] **15.4.5** Color tint / dim — single-fragment
             shader on `SurfaceDrawOpts.tint`.
-      - [ ] **15.4.6** `SurfaceDrawOpts` wire format
+      - [x] **15.4.6** `SurfaceDrawOpts` wire format
             consolidation (61-byte CompositeSurface pinned).
 
       Feature-detect WebGPU at boot, fall back to

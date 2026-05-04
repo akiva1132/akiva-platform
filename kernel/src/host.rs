@@ -102,6 +102,7 @@ extern "C" {
         backdrop_blur_radius: f32,
         shadow_offset_x: f32, shadow_offset_y: f32,
         shadow_blur_radius: f32, shadow_rgba: u32,
+        tint: u32,
     );
     pub fn hal_destroy_surface(id: u32);
 

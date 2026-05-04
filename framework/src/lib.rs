@@ -826,6 +826,10 @@ impl Framework {
                 // 15.4.4 — animations don't shadow either; surfaces
                 // that want a shadow set `drop_shadow` explicitly.
                 drop_shadow: compositor::DropShadow::NONE,
+                // 15.4.5 — animations don't tint by default. Surfaces
+                // (e.g. inactive activities during multitasking
+                // transitions) set `tint` explicitly.
+                tint: 0,
             }
         } else {
             compositor::SurfaceDrawOpts::IDENTITY
