@@ -1,9 +1,12 @@
 // Phase 15.4.1 — identity textured-quad composite.
 //
-// Samples the source surface as an external texture (path A) and emits
-// a quad at `dst_rect` (in screen pixels) onto the screen. No
-// translate / scale / opacity yet — those land in 15.4.2. No effects
-// (blur / shadow / tint) — those are 15.4.3+.
+// Samples the source surface as a regular `texture_2d<f32>` (the
+// pipeline copies the OffscreenCanvas pixels into this texture each
+// frame via `copyExternalImageToTexture` — `importExternalTexture`
+// only accepts video sources in current browsers). Emits a quad at
+// `dst_rect` (in screen pixels) onto the screen. No translate / scale
+// / opacity yet — those land in 15.4.2. No effects (blur / shadow /
+// tint) — those are 15.4.3+.
 //
 // Vertex order is `triangle-strip` over vids 0..3 producing the corners
 // (0,0) (1,0) (0,1) (1,1).
@@ -17,7 +20,7 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var s: sampler;
-@group(0) @binding(2) var t: texture_external;
+@group(0) @binding(2) var t: texture_2d<f32>;
 
 struct VsOut {
   @builtin(position) clip: vec4<f32>,
@@ -41,7 +44,7 @@ fn vs(@builtin(vertex_index) vid: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let c = textureSampleBaseClampToEdge(t, s, in.uv);
+  let c = textureSample(t, s, in.uv);
   // The screen surface is configured `alphaMode: "premultiplied"`. The
   // source canvas produces straight alpha, so pre-multiply on the way
   // out. (15.4.5+ effect mixing happens BEFORE this multiply.)

@@ -1,23 +1,27 @@
 // WebGPU compositor backend.
 //
 // Phase 15.4.1 — minimum viable. Identity composite only: each
-// `compositeSurface` samples the source `OffscreenCanvas` as an
-// external texture and emits a textured quad at the destination rect.
-// SurfaceDrawOpts (`opacity`, `translate_x`, `translate_y`, `scale`)
-// are accepted but ignored — that's 15.4.2's stone. Blur, shadow, tint
-// are 15.4.3+.
+// `compositeSurface` copies the source `OffscreenCanvas` into a cached
+// per-source `GPUTexture` (path B per the plan §1.5) and emits a
+// textured quad at the destination rect. SurfaceDrawOpts (`opacity`,
+// `translate_x`, `translate_y`, `scale`) are accepted but ignored —
+// that's 15.4.2's stone. Blur, shadow, tint are 15.4.3+.
+//
+// Why path B and not `importExternalTexture`: as of mid-2026, Chrome /
+// Edge / Firefox restrict `importExternalTexture` to
+// `HTMLVideoElement` and `VideoFrame` sources. `OffscreenCanvas`
+// throws "The provided value is not of type '(HTMLVideoElement or
+// VideoFrame)'". Path B (`copyExternalImageToTexture`) is universal at
+// the cost of one canvas-pixels → texture copy per surface per frame
+// (~4 surfaces × 1080p × 4 bytes × 60 fps ≈ 2 GB/s of memcpy on a
+// dGPU; well within bandwidth on every modern machine).
 //
 // Frame model: `beginFrame` opens a render pass against the swapchain
-// texture; each `compositeSurface` encodes a draw into it; `endFrame`
-// (called via `present`) ends the pass and submits. The pipeline
-// triggers `beginFrame` lazily on the first `compositeSurface` per
-// frame, so a frame with no composites is a no-op (no submit, no
-// presented texture acquired).
-//
-// Browser support: Chrome ≥ 113, Edge ≥ 113, Firefox ≥ 147, Safari
-// ≥ 18. Init throws on missing `navigator.gpu`, missing adapter, or
-// `getContext("webgpu")` returning null. The pipeline catches and
-// falls back to `Canvas2DCompositor`.
+// texture; each `compositeSurface` enqueues a copy + encodes a draw;
+// `endFrame` (called via `present`) ends the pass and submits. The
+// pipeline triggers `beginFrame` lazily on the first
+// `compositeSurface` per frame, so a frame with no composites is a
+// no-op (no submit, no presented texture acquired).
 
 // Embedded WGSL — keeping it in-source avoids a separate fetch path
 // and makes the shader visible alongside its bind-group layout. The
@@ -31,7 +35,7 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var s: sampler;
-@group(0) @binding(2) var t: texture_external;
+@group(0) @binding(2) var t: texture_2d<f32>;
 
 struct VsOut {
   @builtin(position) clip: vec4<f32>,
@@ -54,7 +58,10 @@ fn vs(@builtin(vertex_index) vid: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-  let c = textureSampleBaseClampToEdge(t, s, in.uv);
+  let c = textureSample(t, s, in.uv);
+  // Pre-multiply on the way out — the canvas configuration uses
+  // alphaMode "premultiplied" but our source canvases are straight
+  // alpha. Effects (15.4.5+) mix BEFORE this multiply.
   return vec4<f32>(c.rgb * c.a, c.a);
 }
 `;
@@ -73,8 +80,6 @@ export class WebGPUCompositor {
     this.pipeline = null;
     /** @type {GPUSampler|null} */
     this.sampler = null;
-    /** @type {GPUBuffer|null} */
-    this.uniformBuffer = null;
     /** @type {GPUBindGroupLayout|null} */
     this.bindGroupLayout = null;
     this.metrics = { width_px: 0, height_px: 0, density: 1 };
@@ -84,6 +89,12 @@ export class WebGPUCompositor {
     this._pass = null;
     this._frameInProgress = false;
     this._lost = false;
+    /** Per-source GPUTexture cache. Keyed by the source canvas object
+     *  (paint backend keeps the offscreens alive between frames, so
+     *  the WeakMap keys stay valid). Each entry is
+     *  `{ texture, w, h }`; we recreate when `(w, h)` changes.
+     *  @type {WeakMap<object, {texture: GPUTexture, w: number, h: number}>} */
+    this._textureCache = new WeakMap();
   }
 
   static async isAvailable() {
@@ -119,7 +130,7 @@ export class WebGPUCompositor {
       entries: [
         { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, externalTexture: {} },
+        { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
       ],
     });
 
@@ -145,13 +156,6 @@ export class WebGPUCompositor {
     this.sampler = this.device.createSampler({
       magFilter: "linear", minFilter: "linear",
       addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge",
-    });
-
-    // Two vec4<f32> = 32 bytes. 16-byte aligned per WGSL std140-ish
-    // uniform layout rules.
-    this.uniformBuffer = this.device.createBuffer({
-      size: 32,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
   }
 
@@ -218,32 +222,62 @@ export class WebGPUCompositor {
       this.beginFrame();
       if (!this._frameInProgress) return;  // beginFrame failed
     }
-    // Uniform: dst_rect (vec4) + screen_size (vec4).
+
+    // Look up or allocate a GPUTexture matching the source's current
+    // pixel dimensions. Source canvases are stable across frames
+    // (paint backend reuses them), so the WeakMap keys persist; the
+    // texture is recreated only when the activity resizes its surface.
+    const srcW = Math.max(1, src.width  | 0);
+    const srcH = Math.max(1, src.height | 0);
+    let entry = this._textureCache.get(src);
+    if (!entry || entry.w !== srcW || entry.h !== srcH) {
+      if (entry) entry.texture.destroy();
+      const texture = this.device.createTexture({
+        size:   [srcW, srcH, 1],
+        format: "rgba8unorm",
+        usage:  GPUTextureUsage.TEXTURE_BINDING
+              | GPUTextureUsage.COPY_DST
+              | GPUTextureUsage.RENDER_ATTACHMENT,
+      });
+      entry = { texture, w: srcW, h: srcH, view: texture.createView() };
+      this._textureCache.set(src, entry);
+    }
+
+    // Snapshot the canvas pixels into the texture. Synchronous from
+    // the JS side; the GPU sees the copy in queue order (before the
+    // encoder we're about to submit).
+    try {
+      this.device.queue.copyExternalImageToTexture(
+        { source: src },
+        { texture: entry.texture },
+        [srcW, srcH, 1],
+      );
+    } catch (err) {
+      console.warn("[akiva] copyExternalImageToTexture failed:", err);
+      return;
+    }
+
+    // Per-call uniform buffer. We can't reuse one buffer across
+    // multiple composites in the same submission — `writeBuffer`
+    // ordering vs. `draw` ordering isn't preserved within a single
+    // submit, so a shared buffer would deliver the LAST frame's
+    // uniforms to every draw. A small per-call allocation is correct
+    // and the GPU/driver pools small uniforms efficiently.
     const uniforms = new Float32Array(8);
     uniforms[0] = x; uniforms[1] = y; uniforms[2] = w; uniforms[3] = h;
     uniforms[4] = this.metrics.width_px; uniforms[5] = this.metrics.height_px;
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, uniforms);
-
-    let texture;
-    try {
-      // Path A — zero-copy import of the OffscreenCanvas. If this
-      // throws on a particular browser we'd ideally fall back to
-      // `copyExternalImageToTexture`, but as of 15.4.1 every
-      // browser that exposes WebGPU also exposes
-      // importExternalTexture for OffscreenCanvas — keep the
-      // fallback as a 15.4.x follow-up rather than guessing.
-      texture = this.device.importExternalTexture({ source: src });
-    } catch (err) {
-      console.warn("[akiva] importExternalTexture failed:", err);
-      return;
-    }
+    const uniformBuffer = this.device.createBuffer({
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(uniformBuffer, 0, uniforms);
 
     const bindGroup = this.device.createBindGroup({
       layout: this.bindGroupLayout,
       entries: [
-        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 0, resource: { buffer: uniformBuffer } },
         { binding: 1, resource: this.sampler },
-        { binding: 2, resource: texture },
+        { binding: 2, resource: entry.view },
       ],
     });
     this._pass.setBindGroup(0, bindGroup);
@@ -254,7 +288,6 @@ export class WebGPUCompositor {
 
   destroy() {
     if (this._frameInProgress) this.endFrame();
-    this.uniformBuffer = null;
     this.pipeline = null;
     this.sampler = null;
     this.bindGroupLayout = null;
@@ -262,5 +295,8 @@ export class WebGPUCompositor {
     this.device = null;
     this.adapter = null;
     this.screenCanvas = null;
+    // _textureCache is a WeakMap; entries get GC'd when their source
+    // canvases do. We don't `destroy()` each texture explicitly —
+    // device teardown reclaims them.
   }
 }
