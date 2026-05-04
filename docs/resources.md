@@ -1,53 +1,67 @@
 # Resource System
 
-## 1. מטרה
+> **Implementation status (May 2026):** strings + colors are live
+> with one qualifier dimension — **`night`** (Stone 11.6.9 #3,
+> light vs. dark). Drawables ship as PNG bitmaps (`icon.png`) keyed
+> by package, registered through the cross-package drawable cache
+> in [`runtime/web/canvas2d.js`](../runtime/web/renderer/canvas2d.js).
+> Locale, density, orientation, layout-direction, screen-size, and
+> styles are **not yet implemented** — they are reserved in the
+> design but the resource manager currently has no fields for them.
+> See [§13](#13-current-coverage-vs-design) for the live-vs-design
+> matrix.
 
-מערכת resources מפרידה בין **תוכן נוכחי של אפליקציה** (קובעי טקסט, צבעים, גודלים, אייקונים) לבין **קוד האפליקציה**. זה מאפשר:
-- תרגום ללא שינוי קוד
-- dark mode ללא שינוי קוד
-- התאמות orientation/density ללא שינוי קוד
-- קריאות ותחזוקה
+## 1. Purpose
 
-## 2. מבנה תיקיות
+The resource system separates an app's **content** (text, colours,
+sizes, icons) from its **code**. This enables:
+
+- translation without code changes;
+- dark mode without code changes;
+- orientation / density adaptations without code changes;
+- readability and maintainability.
+
+## 2. Directory layout
 
 ```
 apps/my-app/
 └── res/
-    ├── layout/            ← AKML layouts (default)
-    ├── layout-land/       ← landscape variant
-    ├── values/            ← default strings, colors, dimens, styles
+    ├── layout/                ← AKML layouts (default)
+    ├── layout-land/           ← landscape variant            (planned)
+    ├── values/                ← default strings, colors, dimens, styles
     │   ├── strings.toml
     │   ├── colors.toml
     │   ├── dimens.toml
-    │   └── styles.toml
-    ├── values-he/         ← Hebrew translations
+    │   └── styles.toml        (planned)
+    ├── values-he/             ← Hebrew translations          (planned)
     │   └── strings.toml
-    ├── values-night/      ← dark mode colors
+    ├── values-night/          ← dark-mode colours            (LIVE)
     │   └── colors.toml
-    ├── values-he-night/   ← combined
-    │   └── (not required, falls back to values-night and values-he)
-    └── drawable/          ← icons, images
-        └── drawable-xhdpi/
+    ├── values-he-night/       ← combined override            (planned)
+    │   └── (not required; falls back to values-night and values-he)
+    └── drawable/              ← icons, images
+        └── drawable-xhdpi/    ← density bucket               (planned)
 ```
 
-## 3. Qualifiers נתמכים
+## 3. Supported qualifiers (target list)
 
-ה-qualifiers נכתבים בסדר קבוע (המחשב מפרסר לפי הסדר הזה):
+Qualifiers are read in a fixed order — the parser picks them off in
+this sequence:
 
-| # | Qualifier | ערכים | דוגמה |
-|---|---|---|---|
-| 1 | MCC/MNC | לא נתמך ב-MVP | — |
-| 2 | Locale | ISO 639-1 code | `he`, `en`, `ar`, `he-IL` |
-| 3 | Layout direction | `ldltr`, `ldrtl` | `ldrtl` |
-| 4 | Smallest width | `sw<N>dp` | `sw600dp` (tablets) |
-| 5 | Available width | `w<N>dp` | — |
-| 6 | Available height | `h<N>dp` | — |
-| 7 | Screen size | `small`, `normal`, `large`, `xlarge` | `large` |
-| 8 | Screen orientation | `port`, `land` | `land` |
-| 9 | UI mode | `night`, `notnight`, `car`, `tv` | `night` |
-| 10 | Density | `mdpi`, `hdpi`, `xhdpi`, `xxhdpi`, `xxxhdpi` | `xhdpi` |
+| # | qualifier            | values                                                          | example          | status         |
+|---|----------------------|-----------------------------------------------------------------|------------------|----------------|
+| 1 | MCC / MNC            | not in scope                                                    | —                | n/a            |
+| 2 | Locale               | ISO 639-1 code                                                  | `he`, `en`, `ar` | planned        |
+| 3 | Layout direction     | `ldltr`, `ldrtl`                                                | `ldrtl`          | planned        |
+| 4 | Smallest width       | `sw<N>dp`                                                       | `sw600dp`        | planned        |
+| 5 | Available width      | `w<N>dp`                                                        | —                | planned        |
+| 6 | Available height     | `h<N>dp`                                                        | —                | planned        |
+| 7 | Screen size          | `small`, `normal`, `large`, `xlarge`                            | `large`          | planned        |
+| 8 | Orientation          | `port`, `land`                                                  | `land`           | planned        |
+| 9 | UI mode              | `night`, `notnight`, `car`, `tv`                                | `night`          | **live**       |
+| 10| Density              | `mdpi`, `hdpi`, `xhdpi`, `xxhdpi`, `xxxhdpi`                    | `xhdpi`          | planned        |
 
-### דוגמאות של combinations חוקיים
+### Examples of legal combinations (target)
 
 ```
 values/
@@ -58,231 +72,255 @@ values-he-land-night/
 values-large-xhdpi/
 ```
 
-## 4. Resolution Algorithm
+## 4. Resolution algorithm
 
-כש-app מבקשת `@string/welcome`, ה-ResourceManager:
+When an app requests `@string/welcome`, the `ResourceManager`:
 
-1. בודק את ה-config הנוכחי של המכשיר, למשל: `{ locale: he-IL, dir: rtl, orient: port, ui: night, density: xhdpi }`
-2. מחפש את ה-resource directory עם הכי הרבה qualifier matches:
-   - `values-he-rIL-night/` ← match 3, 9
-   - `values-he-night/` ← match 2, 9
-   - `values-he/` ← match 2
-   - `values-night/` ← match 9
-   - `values/` ← fallback
-3. מחזיר את המציאה הכי ספציפית (הכי הרבה matches).
-4. אם ה-key לא נמצא בתיקייה הנבחרת — יורד לפחות ספציפי עד שמוצא.
+1. reads the device config — e.g. `{ locale: he-IL, dir: rtl,
+   orient: port, ui: night, density: xhdpi }`;
+2. searches resource directories for the most-qualifier-matched
+   set:
+   - `values-he-rIL-night/` — matches 3, 9
+   - `values-he-night/`     — matches 2, 9
+   - `values-he/`           — matches 2
+   - `values-night/`        — matches 9
+   - `values/`              — fallback;
+3. returns the most specific match;
+4. if the key isn't present in the chosen directory, falls back
+   level-by-level until found.
 
 ### Priority order (simplified)
 
 Locale > Orientation > Dark mode > Density.
 
-## 5. ResourceTable ב-boot
+> Today only step "9. night" is implemented. The active dimension
+> is fed by `DeviceConfig.night: bool`; `ResourceTable::string` /
+> `color` look in the `night` overlay first if `cfg.night` is on,
+> falling back to `default`.
 
-ה-ResourceManager בונה בטעינה ראשונית:
+## 5. `ResourceTable` in memory
+
+The `ResourceManager` holds, per package:
 
 ```rust
-pub struct ResourceTable {
-    // key = "@string/welcome", value = final resolved string (after qualifier pick)
+pub struct ValueSet {
     strings: HashMap<String, String>,
-    colors: HashMap<String, Color>,
-    dimens: HashMap<String, Dimen>,
-    styles: HashMap<String, Style>,
-    drawables: HashMap<String, Drawable>,
-    layouts: HashMap<String, PathBuf>,  // AKML file path (inflated on demand)
+    colors:  HashMap<String, u32>,
+}
+
+pub struct ResourceTable {
+    default: ValueSet,
+    night:   Option<ValueSet>,
+    // future fields: locale: HashMap<Locale, ValueSet>, …
 }
 ```
 
-Rebuild of the table happens on config change (orientation flip, language switch, dark mode toggle).
+Lookups consult the active overlay first, then the default. The
+active overlay is selected by the current `DeviceConfig`. Future
+qualifier dimensions slot in as additional fields.
 
-## 6. Values Files (TOML format)
+A rebuild happens on config change today: night-mode toggle calls
+`ResourceManager::set_night_mode(bool)`, which switches the active
+overlay; the next lookup returns the new value. Activities that
+care about the change recompose on the following frame.
 
-### res/values/strings.toml
+## 6. Values files (TOML)
+
+### `res/values/strings.toml`
 
 ```toml
 [strings]
-app_name = "Calculator"
-zero = "0"
-clear = "C"
-action_go = "Go"
-welcome = "שלום %{name}"  # format arg
+app_name   = "Calculator"
+zero       = "0"
+clear      = "C"
+action_go  = "Go"
+welcome    = "Hello %{name}"   # named format arg
 ```
 
-Named arguments (`%{name}`) להקשר במקום מיקום (`%1`).
+Named arguments (`%{name}`) are used instead of positional (`%1`).
+The format function is provided by the SDK helper `res::string_fmt`.
 
-### res/values/colors.toml
+### `res/values/colors.toml`
 
 ```toml
 [colors]
-primary = "#5B6CF9"
-on_primary = "#FFFFFF"
-surface = "#FFFFFF"
-on_surface = "#0C0C10"
-display_bg = "#F4F4F7"
+primary       = "#5B6CF9"
+on_primary    = "#FFFFFF"
+surface       = "#FFFFFF"
+on_surface    = "#0C0C10"
+display_bg    = "#F4F4F7"
 num_button_bg = "#E8E8EC"
-op_button_bg = "#FFA500"
+op_button_bg  = "#FFA500"
 ```
 
-### res/values-night/colors.toml
+### `res/values-night/colors.toml`
 
 ```toml
 [colors]
-primary = "#7B8CFF"
-on_primary = "#FFFFFF"
-surface = "#0C0C10"
-on_surface = "#F4F4F7"
-display_bg = "#1A1A1E"
+primary       = "#7B8CFF"
+on_primary    = "#FFFFFF"
+surface       = "#0C0C10"
+on_surface    = "#F4F4F7"
+display_bg    = "#1A1A1E"
 num_button_bg = "#2A2A2E"
-op_button_bg = "#FFA500"
+op_button_bg  = "#FFA500"
 ```
 
-### res/values/dimens.toml
+### `res/values/dimens.toml` *(planned — not parsed today)*
 
 ```toml
 [dimens]
-spacing_small = "4dp"
-spacing_medium = "8dp"
-spacing_large = "16dp"
-text_size_body = "16sp"
-text_size_title = "24sp"
-text_size_display = "48sp"
-button_min_width = "64dp"
+spacing_small      = "4dp"
+spacing_medium     = "8dp"
+spacing_large      = "16dp"
+text_size_body     = "16sp"
+text_size_title    = "24sp"
+text_size_display  = "48sp"
+button_min_width   = "64dp"
 ```
 
-### res/values/styles.toml
+### `res/values/styles.toml` *(planned)*
 
 ```toml
 [styles."num_button"]
 background = "@color/num_button_bg"
-textColor = "@color/on_surface"
-textSize = "@dimen/text_size_title"
-padding = "@dimen/spacing_large"
+textColor  = "@color/on_surface"
+textSize   = "@dimen/text_size_title"
+padding    = "@dimen/spacing_large"
 
 [styles."op_button"]
-parent = "num_button"  # inheritance
+parent     = "num_button"   # inheritance
 background = "@color/op_button_bg"
-textColor = "@color/on_primary"
+textColor  = "@color/on_primary"
 ```
 
 Style inheritance: child overrides parent.
 
-## 7. Localization Flow
+## 7. Localisation flow (target)
 
 ```
-User changes system language from EN to HE
+User changes the system language from EN to HE
      │
      ▼
-Browser fires languagechange event
+Browser fires the languagechange event
      │
      ▼
 Tab HAL → Worker: "config change: locale=he"
      │
      ▼
-Worker/ResourceManager: rebuild ResourceTable
+Worker / ResourceManager: rebuild ResourceTable
      │
      ▼
 ResourceManager notifies ActivityManager
      │
      ▼
-Each active Activity gets onConfigChange
+Each active activity gets on_config_change
      │
      ▼
-Default behavior: recreate activity
+Default behaviour: recreate the activity
      │
      ▼
-onSaveState → onDestroy → onCreate(savedState) → onRestoreState
+on_save_state → on_destroy → on_create(savedState) → on_restore_state
      │
      ▼
-Activity re-inflates AKML with new resources
+The activity re-inflates its AKML against the new resources
      │
      ▼
-Strings now shown in Hebrew, layout-ldrtl used if present
+Strings render in Hebrew; layout-ldrtl is used if present
 ```
 
-## 8. Drawables (icons/images)
+The plumbing for the language flow does not exist yet (locale is
+not a qualifier dimension). The night-mode flow does work and
+follows the same shape.
 
-### Formats נתמכים (MVP)
+## 8. Drawables (icons, images)
 
-**PNG בלבד ב-MVP.** כן, אין SVG ואין JPG לעת עתה. הסיבה:
-- SVG דורש parser + rasterizer משלו (resvg או equivalent, ~400KB wasm). בונים את זה אחרי ש-Compositor יציב.
-- JPG דורש decoder; אין upside ל-app icons; ל-backgrounds נחזור ב-v0.2.
-- PNG ניתן ל-decode מהירות דרך browser native API (`createImageBitmap(blob)`) שה-Worker HAL חושפת.
+### Formats supported (today)
 
-**Post-MVP (v0.2+):**
-- SVG דרך `resvg` compiled ל-wasm, מעוקל פנימית ל-PNG per-density ב-install time, לא runtime.
-- JPG דרך `createImageBitmap`.
+**PNG only.** SVG and JPG are deferred:
 
-### Decoding flow
+- SVG would require its own parser + rasteriser (e.g. `resvg`,
+  ~400 KB of wasm). Build it after the Compositor is stable.
+- JPG decoder is unnecessary for icons; for backgrounds we'll
+  revisit.
+- PNG decodes quickly via the browser's native `createImageBitmap`
+  exposed by the worker HAL.
 
-```
-App: resources.get-drawable("@drawable/icon")
-  │
-  ▼
-ResourceManager picks variant by density bucket
-  │
-  ▼
-Worker HAL: createImageBitmap(blob) → ImageBitmap
-  │
-  ▼
-Uploaded to RendererBackend cache with ImageId
-  │
-  ▼
-Returned to app as `drawable` resource handle
-  │
-  ▼
-App: widget.set-image-drawable(image_widget, drawable_handle)
-  │
-  ▼
-Compositor emits DrawImage(dst, image_id)
-```
+**Planned (post-MVP):**
 
-ה-PNG עצמה לא מגיעה ל-wasm של האפליקציה — רק handle.
+- SVG via `resvg` compiled to wasm, rasterised at install time
+  per density bucket, not at runtime.
+- JPG via `createImageBitmap`.
 
-### Density qualifiers for PNGs
+### Decoding flow (today)
 
 ```
-res/drawable-mdpi/logo.png    ← 48x48 for 160dpi baseline
-res/drawable-hdpi/logo.png    ← 72x72 for 240dpi
-res/drawable-xhdpi/logo.png   ← 96x96 for 320dpi
-res/drawable-xxhdpi/logo.png  ← 144x144 for 480dpi
-res/drawable-xxxhdpi/logo.png ← 192x192 for 640dpi (optional)
+Calculator launches → its app worker reads pkgs/<pkg>/res/drawable/icon.png from OPFS
+  │
+  ▼
+createImageBitmap(bytes) → ImageBitmap
+  │
+  ▼
+postMessage to the kernel worker — bitmap registered in the
+foreign-drawable cache (Map<package_id, Map<name, ImageBitmap>>)
+  │
+  ▼
+Shell's render code calls c.draw_foreign_image(&app.id, &app.icon, …)
+  │
+  ▼
+canvas2d backend resolves the ImageBitmap and paints
 ```
 
-אם ל-`@drawable/logo` יש רק `drawable-xhdpi/logo.png`, ResourceManager ישתמש בו בכל הצפיפויות (עם scaling). המלצה: ספק לפחות xhdpi + xxhdpi.
+The PNG bytes never reach the calling app's wasm — only a
+package-id + drawable-name reference.
 
-### האם אפשר רק `drawable/logo.png` בלי density?
+### Density qualifiers for PNGs *(planned — not used today)*
 
-כן — זה fallback לכל הצפיפויות. מופץ כ-xhdpi (density 2.0) באמונה. אופטימלי לאייקונים של MVP.
+```
+res/drawable-mdpi/logo.png    ← 48×48  for 160 dpi baseline
+res/drawable-hdpi/logo.png    ← 72×72  for 240 dpi
+res/drawable-xhdpi/logo.png   ← 96×96  for 320 dpi
+res/drawable-xxhdpi/logo.png  ← 144×144 for 480 dpi
+res/drawable-xxxhdpi/logo.png ← 192×192 for 640 dpi (optional)
+```
 
-### מה עם density-independent אייקונים?
+If `@drawable/logo` exists only at `drawable-xhdpi/`, the
+ResourceManager would use it everywhere with scaling. Recommended
+floor when this lands: ship `xhdpi` + `xxhdpi`.
 
-ב-MVP: PNG ברזולוציה הגבוהה שצפוי להתאים (xxhdpi = 144×144 ל-icon רגיל), ה-renderer יעשה scale down. איכות מקובלת. לטווח ארוך SVG יפתור זאת.
+### Can I just have `drawable/logo.png` without a density?
 
-## 9. Device Config API
+Yes — that is the path the runtime uses today. Fallback for every
+density. Treated as `xhdpi` (density 2.0) in spirit.
+
+### What about density-independent icons?
+
+For now, ship a PNG at the highest density that's likely to fit
+(`xxhdpi` = 144 × 144 for a normal icon); the renderer scales down.
+Quality is acceptable for MVP. SVG closes this long-term.
+
+## 9. Device config (in tree today)
 
 ```rust
 pub struct DeviceConfig {
-    pub locale: Locale,           // "he-IL"
-    pub layout_dir: LayoutDir,    // Rtl | Ltr
-    pub orientation: Orientation, // Portrait | Landscape
-    pub ui_mode: UiMode,          // Light | Dark
-    pub density: Density,         // Xhdpi, etc.
-    pub screen_width_dp: u32,
-    pub screen_height_dp: u32,
-}
-
-pub struct ResourceManager {
-    pub fn current_config(&self) -> &DeviceConfig;
-    pub fn on_config_change(&mut self, new: DeviceConfig);
-    pub fn get_string(&self, ref_: &str) -> Option<&str>;
-    pub fn get_color(&self, ref_: &str) -> Option<Color>;
-    pub fn get_dimen(&self, ref_: &str) -> Option<Dimen>;
-    pub fn get_layout(&self, ref_: &str) -> Option<PathBuf>;
+    pub night: bool,
+    // Reserved for future qualifier dimensions:
+    // pub locale: Locale,
+    // pub layout_dir: LayoutDir,    // Rtl | Ltr
+    // pub orientation: Orientation, // Portrait | Landscape
+    // pub density: Density,
+    // pub screen_width_dp: u32,
+    // pub screen_height_dp: u32,
 }
 ```
 
-## 10. ל-app: איך לגשת ל-resources
+Today, only `night` is consulted. Adding fields here + a matching
+`ValueSet` overlay slot in `ResourceTable` is how each new
+dimension lands.
 
-ה-SDK חושף API פשוט:
+## 10. App access to resources
+
+The SDK exposes a small API:
 
 ```rust
 use akiva_sdk::res;
@@ -291,25 +329,50 @@ let welcome = res::string("@string/welcome");
 let primary = res::color("@color/primary");
 let spacing = res::dimen("@dimen/spacing_large");
 
-// עם format args
-let greeting = res::string_fmt("@string/welcome", &[("name", "עקיבא")]);
+// With format args:
+let greeting = res::string_fmt("@string/welcome", &[("name", "Akiva")]);
 ```
 
-מתחת למכסה ה-macro `res::string` מתרגם ל-ABI call.
+Underneath, the macros expand into ABI calls
+(`akiva_host_resource_string` / `_color`, with a planned `_dimen`
+once dimens land).
 
-## 11. Validation ב-build time
+## 11. Build-time validation (planned)
 
-`akiva build` מריץ validator על ה-resources:
-- כל `@string/foo` שמופיע ב-AKML **חייב** להיות מוגדר ב-strings.toml
-- Locales שונות חייבות להכיל את אותן keys (אחרת fallback, עם warning)
-- Types: `@color/x` חייב להיות color valid, `@dimen/y` חייב להיות dimen valid
+`akiva build` will run a validator over the resources:
 
-שגיאות כאלה מונעות build.
+- every `@string/foo` referenced from AKML must be defined in
+  `strings.toml`;
+- every locale must contain the same key set (otherwise fall back
+  with a warning);
+- types: `@color/x` must be a valid colour, `@dimen/y` must be a
+  valid dimen.
 
-## 12. מגבלות MVP
+These rules will block the build. The current CLI does not
+implement them yet.
 
-- אין `@array/` (arrays of strings) — נוסף ב-v0.2
-- אין `@integer/`, `@boolean/` — לעת עתה מגדירים ישירות
-- אין theme inheritance מחוץ ל-styles (themes מלאים ב-v0.2)
-- אין transitions/animations עם resource refs
-- Pluralization: רק `@string/foo` ברוב הגרסאות, אבל יש תמיכה בסיסית ב-`@plurals/foo { one, other }` ל-MVP.
+## 12. MVP limitations
+
+- No `@array/` (string arrays) — planned for v0.2+.
+- No `@integer/`, `@boolean/` — define inline for now.
+- No theme inheritance outside of styles (full themes in v0.2+).
+- No transitions / animations bound to resource refs.
+- Pluralisation: `@string/foo` only; basic `@plurals/foo { one,
+  other }` is reserved but not parsed.
+
+## 13. Current coverage vs. design
+
+| capability                                                 | status                |
+|------------------------------------------------------------|-----------------------|
+| `@string/...` lookup                                       | ✅ live               |
+| `@color/...` lookup                                        | ✅ live               |
+| `night` qualifier (dark / light)                           | ✅ live (Stone 11.6.9 #3) |
+| Cross-package drawables (PNG, no density bucket)            | ✅ live               |
+| `@dimen/...` lookup                                        | ❌ planned            |
+| `@drawable/...` density buckets                            | ❌ planned            |
+| Locale (translation) qualifier                              | ❌ planned            |
+| Orientation / layout-direction qualifiers                   | ❌ planned            |
+| Screen-size / smallest-width qualifiers                     | ❌ planned            |
+| Styles (`@style/...`) + inheritance                         | ❌ planned            |
+| `@plurals/...`                                              | ❌ planned            |
+| Build-time validator                                        | ❌ planned            |

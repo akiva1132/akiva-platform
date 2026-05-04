@@ -1,21 +1,42 @@
 # Window Manager & Shell
 
-## 1. מטרה
+> **Implementation status (May 2026):** the `WindowManager`
+> ([`framework/src/window_manager.rs`](../framework/src/window_manager.rs))
+> ships with the four-layer z-band model below
+> (`Wallpaper / App / Overlay / System`), per-surface bounds and
+> visibility, and focus tracking. Activities allocate real surfaces
+> via `Framework::ensure_activity_surface` (Stone 13.0). Push / pop
+> transitions (slide + fade, ease-out cubic) ship in
+> [`framework/src/animation.rs`](../framework/src/animation.rs).
+> System dialogs ship in
+> [`framework/src/dialog.rs`](../framework/src/dialog.rs).
+> **Multi-display, toasts, status / nav bar, and PIP are not
+> implemented** — every running tab today is exactly one display
+> surface; the `Overlay` z-band is reserved but has no widget
+> renderer wired into it yet.
 
-**WindowManager** הוא תת-המערכת שמחליטה **מה מוצג על איזה display בכל רגע נתון**. הוא הגשר בין ActivityManager (שיודע "מי אמור להיות Resumed") לבין Compositor (שיודע "איך לצייר").
+## 1. Purpose
 
-**Shell** היא אפליקציית Akiva רגילה שממלאת תפקיד מיוחד — מסך הבית.
+The **WindowManager** decides **what is visible on which display at
+any given moment**. It is the bridge between the `ActivityManager`
+(which knows "who should be Resumed") and the Compositor (which
+knows "how to paint").
 
-## 2. תפקידי ה-WindowManager
+**Shell** is a regular Akiva app that fills a special role — the
+home screen.
 
-- **Display registry** — רשימת displays מחוברים (tabs)
-- **Activity placement** — איזה activity על איזה display
-- **Z-order** — מה מעל מה (system UI, dialogs, toasts)
-- **Focus management** — לאיזו activity נשלחים input events
-- **Transitions** — אנימציה של מעברים (ב-MVP: cut מיידי)
-- **Chooser / Dialogs** — הצגת system dialogs (intent chooser, permission prompts)
+## 2. WindowManager responsibilities
 
-## 3. Display Model
+- **Display registry** — list of connected displays (tabs).
+- **Activity placement** — which activity sits on which display.
+- **Z-order** — what paints over what (system UI, dialogs, toasts).
+- **Focus management** — which activity receives input events.
+- **Transitions** — animating a switch (cuts in v0.1; slide / fade
+  with ease-out cubic from Stone 13.3).
+- **Chooser / dialogs** — system-owned modal surfaces (intent
+  chooser, permission prompts).
+
+## 3. Display model
 
 ```rust
 pub struct Display {
@@ -24,25 +45,31 @@ pub struct Display {
     pub height_dp: u32,
     pub density: f32,
     pub orientation: Orientation,
-    pub message_port: MessagePort,  // link to Tab HAL
+    pub message_port: MessagePort,  // link to the Tab HAL
     pub state: DisplayState,
 }
 
 pub enum DisplayState {
-    Active,     // tab visible, receiving events
-    Idle,       // tab exists but not focused
-    Disconnected, // tab closed
+    Active,        // tab visible, receiving events
+    Idle,          // tab exists but unfocused
+    Disconnected,  // tab closed
 }
 ```
 
-Displays באים והולכים:
-- `register_display(info)` — כש-tab חדש מתחבר
-- `unregister_display(id)` — כש-tab נסגר
-- `update_display(id, info)` — resize, orientation change
+Displays come and go:
 
-## 4. Activity Placement
+- `register_display(info)` — when a new tab connects.
+- `unregister_display(id)` — when a tab closes.
+- `update_display(id, info)` — resize, orientation change.
 
-ActivityManager מבקש מ-WindowManager "הצג את activity X":
+> **Today:** there is exactly one display per Akiva session — the
+> first / leader tab. Follower tabs see the multi-tab failover
+> banner rather than mirror the leader's content. Multi-display
+> support (the API above) is the v0.3+ shape.
+
+## 4. Activity placement
+
+The ActivityManager asks the WindowManager to "show activity X":
 
 ```rust
 pub trait WindowManager {
@@ -53,36 +80,48 @@ pub trait WindowManager {
 }
 ```
 
-### Mapping ב-MVP
+In the current code,
+[`framework/src/window_manager.rs`](../framework/src/window_manager.rs)
+exposes a slimmer surface (`create_surface`, `destroy_surface`,
+`set_bounds`, `set_visible`, `focus`, `surfaces_in_z_order`) and
+the framework wires this to the activity lifecycle via
+`ensure_activity_surface` / `release_activity_surface` in
+[`framework/src/lib.rs`](../framework/src/lib.rs).
 
-פשוט: activity אחד פעיל → מוצג ב-display שבו הוא היה אחרון. אם display לא קיים (tab נסגר בינתיים) → activity עובר ל-display הראשון הזמין.
+### Today's mapping
 
-### עתיד
+Single display: the foreground activity from the task stack is
+attached to the `App` layer of the lone display. Background-but-
+visible activities (during a transition) keep their surface around
+until the transition resolves.
 
-- Multi-window: שתי activities side-by-side
-- Picture-in-Picture: activity צפה ב-overlay
-- Secondary display: activity פתוחה ב-tab 2 בלבד
+### Future
 
-## 5. Z-Order Layers
+- **Multi-window** — two activities side-by-side.
+- **Picture-in-Picture** — an activity floating in an overlay band.
+- **Secondary display** — an activity scoped to tab 2 only.
 
-WindowManager מנהל layers בכל display:
+## 5. Z-order layers
 
 ```
-┌─────────────────────────────────────┐  ← z=1000: System toast
+┌─────────────────────────────────────┐  ← System  (300):   pinned UI, status / nav bar, blocking dialogs
 ├─────────────────────────────────────┤
-├─────────────────────────────────────┤  ← z=900:  Dialogs (chooser, permission)
+├─────────────────────────────────────┤  ← Overlay (200):   transient panels — toasts, snackbars, drop-downs, IME
 ├─────────────────────────────────────┤
-├─────────────────────────────────────┤  ← z=800:  System UI overlays (PIP)
+├─────────────────────────────────────┤  ← App     (100):   every running activity
 ├─────────────────────────────────────┤
-├─────────────────────────────────────┤  ← z=100:  Status bar / nav bar
-├─────────────────────────────────────┤
-├─────────────────────────────────────┤  ← z=0:    Current activity
-└─────────────────────────────────────┘
+└─────────────────────────────────────┘  ← Wallpaper (0):  background fill, dynamic background
 ```
 
-Compositor מציג כל layer בסדר, top-down. Input events מגיעים קודם לשכבה העליונה שכוללת את הנקודה.
+The compositor paints layers in increasing-z order. Input events
+hit-test top-down — the highest layer covering the pointer claims
+the event.
 
-## 6. Input Routing
+The values (0/100/200/300) deliberately leave gaps so a future
+band (e.g. `Drag = 250` for a drag-and-drop ghost) can slot in
+without renumbering.
+
+## 6. Input routing
 
 ```
 Tab HAL receives pointer_down(x, y)
@@ -91,60 +130,72 @@ Tab HAL receives pointer_down(x, y)
 MessagePort → Worker
   │
   ▼
-EventQueue (kernel) receives event
+EventQueue (kernel) receives the event
   │
   ▼
-Dispatcher looks at display_id from event
+Dispatcher reads the display id from the event
   │
   ▼
-WindowManager.hit_test(display_id, x, y) → widget_id
+WindowManager.hit_test(display, x, y) → widget id
   │
-  ├─ check top layer first (dialogs, toasts)
-  ├─ if no hit, next layer down
-  └─ finally, activity layer
+  ├─ check the System layer first (dialogs, toasts)
+  ├─ then Overlay
+  ├─ then App (the running activities)
+  └─ finally Wallpaper
   │
   ▼
 Activity receives akiva_on_event(widget_id, event_type, payload)
   │
   ▼
-Callback fired, state updated
+Callback fires, state updates
   │
   ▼
-Next frame: re-layout, re-compose, new draw commands
+Next frame: re-layout, re-compose, fresh paint ops
 ```
 
-## 7. Focus Management
+## 7. Focus management
 
-בכל רגע, בכל display, יש **exactly one activity** ב-Resumed state (המצב היחיד שמקבל input):
+At any given moment, on any given display, **exactly one activity**
+is in the `Resumed` state — the only state that receives input.
 
-- Activity חדש נפתח → הישן → Paused, החדש → Resumed.
-- User לוחץ במקום ריק → focus נשאר (בניגוד ל-web, אין focus-on-click).
-- Input widget focus (typing): focus פנימי של ה-activity.
+- A new activity opens → the previous goes `Paused`, the new one
+  reaches `Resumed`.
+- A click in empty space leaves focus where it was (no
+  focus-on-click, contrary to web defaults).
+- Within an activity, an input widget that has focus consumes
+  text-input events first.
 
-### Keyboard events
+### Keyboard / text events
 
-- רק activity ב-Resumed מקבלת keyboard events.
-- אם יש input widget בעל focus — הטקסט הולך אליו.
-- אחרת, האפליקציה מקבלת את ה-raw key event ל-callback `on_key_event`.
+- Only the `Resumed` activity receives them.
+- If an input widget has focus, the text goes to it.
+- Otherwise the activity gets the raw event in `on_key_event`.
+- IME composition resolves through the `compositionend` listener in
+  `tab.js`, surfacing as `Event::TextInput { text }` to the
+  activity.
 
-## 8. Shell App
+## 8. Shell app
 
-### הגדרה
+### Definition
 
-Shell היא **אפליקציית Akiva**, עם mods מסוימים:
-- Pre-installed, לא ניתן להסיר
-- מקבלת permission מיוחד: `akiva.permission.LAUNCH_ANY_APP`
-- מטפלת ב-intent `category=HOME`
-- נטענת אוטומטית ב-boot
+Shell is **a regular Akiva app**, with a few privileges:
 
-### תפקידים
+- Pre-installed; cannot be uninstalled.
+- Holds `akiva.permission.LAUNCH_ANY_APP` and
+  `akiva.permission.QUERY_PACKAGES`.
+- Handles the `category=HOME` intent.
+- Loads automatically at boot.
 
-- **Home screen** — רשימת apps מותקנות, launcher
-- **Task switcher** — רשימת activities רצות, מעבר ביניהן
-- **System UI host** — הצגת status bar (בעתיד)
-- **Default fallback** — אם activity נסגרת ואין עוד בstack, חזרה ל-Shell
+### Responsibilities
 
-### Shell ב-MVP (פשוט)
+- **Home screen** — list of installed apps; the launcher.
+- **Task switcher** — list of running activities, switch between
+  them. *(Not implemented yet.)*
+- **System UI host** — render the status bar / nav bar (future).
+- **Default fallback** — when an activity finishes and no other
+  remains on the stack, control returns to Shell.
+
+### Shell at present
 
 ```xml
 <!-- apps/shell/res/layout/home.akml -->
@@ -152,7 +203,7 @@ Shell היא **אפליקציית Akiva**, עם mods מסוימים:
     <Text text="@string/akiva_os" textSize="32sp" textColor="@color/on_bg" />
 
     <Grid columns="4" spacing="8dp" flex="1">
-        <!-- אייקונים מוכנסים דינמית ע"י Shell code -->
+        <!-- icons inserted dynamically by Shell code -->
     </Grid>
 </VStack>
 ```
@@ -172,7 +223,6 @@ impl App for Shell {
     }
 
     fn on_resume(&mut self, ctx: &ActivityContext) {
-        // Refresh in case apps were installed/uninstalled
         let current = ctx.package_manager().installed_apps();
         if current.len() != self.installed.len() {
             self.installed = current;
@@ -180,89 +230,102 @@ impl App for Shell {
         }
     }
 }
-
-impl Shell {
-    fn render_app_grid(&self, ctx: &ActivityContext) {
-        let grid = ctx.find_view("@+id/app_grid");
-        grid.clear_children();
-        for app in &self.installed {
-            let icon = ctx.inflate("@layout/app_icon"); // mini layout for each icon
-            icon.set_text("@+id/label", &app.name);
-            icon.set_tag(&app.id);
-            icon.set_click_handler("on_app_click");
-            grid.add_child(icon);
-        }
-    }
-}
-
-#[akiva::callback]
-fn on_app_click(app: &mut Shell, ctx: &CallbackContext) {
-    let package_id = ctx.tag();
-    let intent = Intent::new("akiva.intent.action.MAIN")
-        .with_category("akiva.intent.category.LAUNCHER")
-        .with_package(package_id);
-    ctx.activity().start_activity(intent);
-}
 ```
 
-## 9. Back Navigation
+Icons are rendered via `c.draw_foreign_image(&app.id, &app.icon,
+…)` — the cross-package drawable cache pulls each package's
+`@drawable/icon` resource. Tap dispatches an explicit intent
+launching that package's main activity.
 
-כל display מנהל task stack משלו (כרגע — ב-MVP שני displays משותפים את אותו stack).
+## 9. Back navigation
 
-**Back button** (hardware, software, או browser):
-1. Tab HAL שולח event `back_pressed`
-2. WindowManager → ActivityManager.on_back()
+Each display owns its own task stack (today there is one display,
+so one stack).
+
+A **Back** event (hardware key, software key, or browser back):
+
+1. Tab HAL emits `back_pressed`.
+2. WindowManager → `ActivityManager::on_back()`.
 3. ActivityManager:
-   - אם יש dialog פתוח → סגור dialog
-   - אחרת אם ל-activity current יש `on_back_pressed` callback → קרא לו, משתמש יכול לבטל
-   - אחרת → pop from stack
-   - אם stack ריק → exit ל-Shell
+   - if a dialog is open → close the dialog;
+   - else if the current activity has an `on_back_pressed`
+     callback → call it, the app may consume / cancel;
+   - else → pop the stack;
+   - if the stack is empty → return to Shell.
 
-### המקרה של browser Back button
+### Browser Back button
 
-הדפדפן יש לו היסטוריה משלו. WindowManager יכול לסנכרן:
-- כל pushActivity → `history.pushState()`
-- browser back → האר תעוצר ונקבל event
-- ה-event מופנה ל-ActivityManager.on_back()
+The browser maintains its own history. The WindowManager can sync:
 
-זה נותן ל-browser back button את המשמעות הצפויה של "חזור" בתוך Akiva.
+- every `pushActivity` → `history.pushState()`;
+- a browser-side back triggers a popstate event;
+- the event flows into `ActivityManager::on_back()`.
 
-## 10. Transition Animations
+This makes the browser Back button feel native within Akiva.
 
-**MVP:** אין. החלפת activities = "cut" מיידי.
+## 10. Transition animations
 
-**V0.2:** תוספות:
-- Fade (opacity 0→1 / 1→0)
-- Slide (מאוחד עם direction)
-- Shared element (widget "ממשיך" מ-activity אחת לאחרת)
+**Today (Stone 13.3 + ease-out cubic).** Push transitions
+(`SlideFromRight` + `FadeIn`) and pop transitions
+(`SlideToLeft` + `FadeOut`) are wired through the
+`AnimationController` in
+[`framework/src/animation.rs`](../framework/src/animation.rs). The
+controller uses cubic ease-out so motion decelerates into place;
+linear motion read as stuttery on dense activities (see the
+animation source for the rationale comment).
 
-WindowManager יהיה אחראי על ה-animation — ActivityManager רק יגיד "transition from X to Y" והרכיב יטפל.
+**Available transitions** today: `SlideFromRight`, `SlideFromLeft`,
+`SlideToLeft`, `FadeIn`, `FadeOut`. Composition is supported (push
+typically uses slide + fade in parallel).
 
-## 11. Dialogs & Toasts
+**Future:**
+
+- Shared element (a widget "continues" from one activity to
+  another).
+- Custom per-activity transitions (declared in the manifest).
+
+The WindowManager owns the animation; the ActivityManager only
+declares "transition from X to Y" and the rest is bookkeeping.
+
+## 11. Dialogs and toasts
 
 ### Dialogs
 
-מוצגים כ-activity modal (בשכבה 900). משתמש לא יכול ללחוץ על activity מתחתם.
+Modal surfaces in the `System` band — input below them is blocked.
+Examples: intent chooser, permission prompt, custom app dialogs.
 
-דוגמאות: intent chooser, permission prompt, custom app dialogs.
+The implementation lives in
+[`framework/src/dialog.rs`](../framework/src/dialog.rs). The
+DialogManager queues pending dialogs and resolutions; the kernel
+drains resolutions per frame (see `kernel/src/lib.rs`) and routes
+them back to the requesting app via `host_op_done`.
 
 ### Toasts
 
-הודעות קצרות ב-bottom, מופיעות ל-2-3 שניות ונעלמות. שכבה 1000. לא בלוקים input.
+Designed as `Overlay`-band ephemeral surfaces (2–3 second
+persistence, no input blocking). The intended SDK shape:
 
 ```rust
 ctx.show_toast("Saved!");
 ctx.show_toast_long("This will take a moment...");
 ```
 
-## 12. System UI (v0.2+)
+**Status:** the layer slot exists; no widget / op renders into it
+yet. See [`docs/notifications.md §5`](notifications.md#5-not-yet-implemented).
 
-Status bar (למעלה), navigation bar (למטה) יוצגו בעתיד כ-overlays של Shell. עכשיו — כל activity מילוי המסך המלא.
+## 12. System UI (future)
 
-## 13. מגבלות MVP
+Status bar (top), navigation bar (bottom) will eventually live as
+overlays painted by Shell into the `System` band. Today every
+activity fills the screen.
 
-- Display אחד בפועל (tab ראשון); tabs נוספים מציגים "Akiva is running in another tab"  — או משקפים את אותה activity.
-- אין transitions, אין animations.
-- אין PIP, אין split-screen.
-- Dialogs פשוטים (center, fixed size).
-- Shell מינימלי — רק grid של apps, אין task switcher, אין search.
+## 13. Today's limits
+
+- A single display in practice (the leader tab); follower tabs see
+  the multi-tab banner rather than a mirror or independent display.
+- No toasts — the layer is reserved, the renderer is not.
+- No PIP, no split-screen.
+- Dialogs render in a fixed centred shape; size and theming pass
+  through whatever the requesting code produces.
+- Shell is intentionally minimal — an app grid and not much else.
+  No task switcher, no search, no widgets-on-home.

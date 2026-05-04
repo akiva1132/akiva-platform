@@ -1,314 +1,464 @@
-# עקיבא
-## פלטפורמת אפליקציות חדשה שרצה על הדפדפן כ-runtime
-### מסמך עקרונות וחזון
-**גרסה 0.2 — טיוטה מעודכנת**
+# Akiva
+## A new application platform that runs on the browser as its runtime
+### Principles and vision
+**Version 0.2 — updated draft**
 
 ---
 
-## 1. תקציר מנהלים
+## 1. Executive summary
 
-עקיבא היא **מערכת הפעלה אפליקטיבית** חדשה, שרצה בתוך הדפדפן ומאפשרת למפתחים לבנות אפליקציות שעובדות באיכות native אמיתית, זמינות בכל מכשיר עם דפדפן מודרני, ללא צורך בהתקנה.
+Akiva is a **new applicative operating system** that runs inside the
+browser and lets developers build apps that feel truly native, work
+on any device with a modern browser, and need no installation.
 
-**העמדה הבסיסית של עקיבא:**
-עקיבא אינה מנסה להיות "אתר טוב יותר" או "web מודרני יותר". היא מתייחסת לדפדפן כ-**runtime / VM** — בדיוק באותה צורה ש-Android Runtime מתייחסת ל-Linux kernel. היא מוותרת בכוונה על SEO, על DOM, ועל תאימות אחורה לאקוסיסטם ה-web — בתמורה לחוויה native אמיתית, עקביות מובנית, ואקוסיסטם מבוקר עם סטנדרט איכות.
+**Akiva's basic position.** Akiva is not trying to be a "better
+website" or "more modern web." It treats the browser as a
+**runtime / VM** — exactly the way the Android Runtime treats the
+Linux kernel. Akiva deliberately gives up SEO, the DOM, and
+backwards compatibility with the web ecosystem in exchange for a
+truly native experience, built-in consistency, and a curated
+ecosystem with a meaningful quality bar.
 
-**המוטיבציה:** אתרי האינטרנט של היום סובלים מבעיות יסודיות של יציבות, ביצועים ועיצוב, בגלל שהדפדפן תוכנן להציג מסמכים ולא אפליקציות. במקום להמשיך לעטוף את ה-DOM עם framework אחר framework (jQuery → React → Svelte → ...), עקיבא עוקפת אותו לגמרי: רנדור ישיר על Canvas/WebGPU, WebAssembly כ-runtime, ו-framework אפליקטיבי שלם מעליו.
+**Motivation.** Today's websites suffer from systemic stability,
+performance, and design problems because the browser was designed
+to display documents, not applications. Instead of wrapping the DOM
+in another framework after another (jQuery → React → Svelte → …),
+Akiva bypasses it entirely: direct rendering on Canvas / WebGPU,
+WebAssembly as the runtime, and a complete application framework
+on top.
 
-**הקונספט בקצרה:** בדיוק כמו שאפליקציות אנדרואיד נכתבות ב-Java/Kotlin — שפות קיימות — אבל כפופות ל-Android Framework (Manifest, Activity, Intent, Lifecycle), כך אפליקציות עקיבא יכתבו בשפה קיימת (JavaScript/TypeScript) אבל כפופות ל-**Akiva Framework**: מערכת חוקים, manifest, lifecycle, ו-widgets סטנדרטיים.
-
----
-
-## 2. הבעיה שעקיבא באה לפתור
-
-### 2.1 הפער בין אתרים לאפליקציות
-
-אפליקציות native על iOS ואנדרואיד מספקות חוויה יציבה: 60fps, אנימציות חלקות, ממשק עקבי, ללא קפיצות לא צפויות. אתרי אינטרנט, לעומת זאת, סובלים בעקביות מ:
-
-- Layout shifts — אלמנטים שמשנים מיקום אחרי טעינה
-- כפתורים בגדלים שונים, מרווחים לא עקביים
-- אובדן state בניווט
-- ביצועים שמשתנים בין דפדפנים ומכשירים
-- טעינה איטית בגלל scripts שלישיים
-- חוסר עקביות בין אפליקציות שונות
-
-### 2.2 הסיבה השורשית
-
-הדפדפן תוכנן ב-1990 כפלטפורמת מסמכים. HTML היא שפה לתיאור מסמכים, CSS לעיצוב מסמכים, DOM הוא מודל של מסמך. כל תעשיית פיתוח האפליקציות באינטרנט מנסה כבר 25 שנה להעמיד פנים שמסמכים הם אפליקציות. כל ה-frameworks (jQuery, React, Vue, Svelte, Solid) הם ניסיונות לעטוף את הבעיה — לא לפתור אותה.
-
-**התוצאה:** טלאי על טלאי של legacy DOM, שמושך את כל האקוסיסטם למטה.
+**The concept in short.** Just as Android apps are written in
+Java / Kotlin — existing languages — but bound to the Android
+Framework (Manifest, Activity, Intent, Lifecycle), Akiva apps are
+written in existing languages (Rust today; any wasm-targeting
+language later) but bound to **Akiva's framework**: a system of
+rules — manifest, lifecycle, intents, and a standard widget kit.
 
 ---
 
-## 3. הפתרון: עקיבא כפלטפורמה שלישית
+## 2. The problem Akiva is solving
 
-### 3.1 הקונספט הליבתי
+### 2.1 The gap between websites and apps
 
-עקיבא היא **מערכת הפעלה אפליקטיבית מלאה** — לא framework, לא library, לא עוד כלי לבניית אתרים. היא מתפקדת באותה רמה ש-iOS ואנדרואיד מתפקדים: יש לה Framework משלה, חנות אפליקציות משלה, סטנדרטי איכות משלה, ותרבות פיתוח משלה.
+Native apps on iOS and Android deliver a stable experience: 60 fps,
+smooth animations, a consistent UI, no jarring layout jumps.
+Websites, in contrast, consistently suffer from:
 
-המהלך המהותי: להשתמש בדפדפן כ-**runtime אוניברסלי**. הדפדפן הוא הדבר היחיד שכבר מותקן בכל מחשב, טלפון וטאבלט בעולם. במקום לבנות OS חדש שדורש התקנה (כמו ChromeOS שדורש מכשיר ייעודי), עקיבא רצה בתוך הדפדפן הקיים — והופכת אותו לפלטפורמת אפליקציות.
+- Layout shifts — elements that move after load.
+- Buttons of varying heights, inconsistent spacing.
+- State loss on navigation.
+- Performance that varies between browsers and devices.
+- Slow load due to third-party scripts.
+- Incoherence between apps — every site reinvents the basics.
 
-### 3.2 ארכיטקטורה ברמה גבוהה
+### 2.2 Root cause
 
-מבנה השכבות של עקיבא, בהשראת אנדרואיד:
+The browser was designed in 1990 as a document platform. HTML is a
+language for describing documents, CSS is for styling documents,
+the DOM is a document model. The whole web-app industry has spent
+25 years pretending that documents are applications. Every
+framework (jQuery, React, Vue, Svelte, Solid) is an attempt to
+wrap the problem — not to solve it.
+
+**Outcome:** patches on top of patches of legacy DOM, dragging the
+entire ecosystem down.
+
+---
+
+## 3. The solution: Akiva as a third platform
+
+### 3.1 The core concept
+
+Akiva is **a complete applicative operating system** — not a
+framework, not a library, not yet another website-building tool.
+It operates at the same level as iOS and Android: it has its own
+Framework, its own application store, its own quality standards,
+and its own development culture.
+
+The substantive move: **use the browser as a universal runtime**.
+The browser is the one thing already installed on every computer,
+phone, and tablet in the world. Instead of building a brand-new OS
+that needs an install (the way ChromeOS demands dedicated
+hardware), Akiva runs inside the existing browser — and turns it
+into an application platform.
+
+### 3.2 High-level architecture
+
+Akiva's layering, inspired by Android:
 
 ```
-שכבה 5: Akiva Apps              — מה שמפתחים כותבים (JS/TS + חוקי עקיבא)
-שכבה 4: Akiva Framework         — Manifest, Activity, Intent, Lifecycle, Permissions
-שכבה 3: UI Toolkit              — widgets סטנדרטיים, design language, אנימציות
-שכבה 2: Rendering Engine        — Canvas/WebGPU + WebAssembly (רנדור ישיר, ללא DOM)
-שכבה 1: Browser Abstraction     — מסתיר הבדלים בין Chrome/Safari/Firefox
-שכבה 0: Browser (כ-kernel)      — ה-runtime האוניברסלי
+Layer 5: Akiva Apps              — what developers write (Rust → wasm; later, any wasm target)
+Layer 4: Akiva Framework         — Manifest, Activity, Intent, Lifecycle, Permissions
+Layer 3: UI Toolkit              — standard widgets, design language, animations
+Layer 2: Rendering Engine        — Canvas / WebGPU + WebAssembly (direct, no DOM)
+Layer 1: Browser Abstraction     — hides Chrome / Safari / Firefox differences
+Layer 0: Browser (as kernel)     — the universal runtime
 ```
 
-**הבהרה חשובה:** שכבת הרנדור (שכבה 2) היא החלטה טכנית נפרדת. אפשר לבחור לבנות משלנו, אפשר לבחון שימוש ב-Flutter Web או במנוע קיים אחר. הדבר שמגדיר את עקיבא הוא השכבות 3-4-5, לא שכבת הציור עצמה.
+**Important clarification.** The rendering layer (layer 2) is a
+separate technical decision. We can choose to build our own, or
+adopt Flutter Web, or any existing engine. What defines Akiva is
+layers 3-4-5, not the painting layer itself.
 
-### 3.3 מה זה בעצם ה-Framework של עקיבא
+### 3.3 What the Akiva Framework actually is
 
-זה הלב של ההצעה. בדיוק כמו ש-Android Framework מגדיר חוקים שכל אפליקציה חייבת לציית להם, Akiva Framework מגדיר:
+This is the heart of the proposal. Just as the Android Framework
+defines rules every app must follow, the Akiva Framework defines:
 
-**Manifest** — כל אפליקציה מצהירה על עצמה בקובץ סטנדרטי: שם, גרסה, הרשאות נדרשות, screens, intents, icon, מטא-דאטה.
+**Manifest** — every app declares itself in a standard file: name,
+version, required permissions, screens, intents, icon, metadata.
 
-**Screens & Lifecycle** — כל מסך באפליקציה הוא Screen עם lifecycle מוגדר: onCreate, onStart, onPause, onResume, onDestroy. הפלטפורמה אחראית להפעיל אותם בזמנים הנכונים ולשמור state אוטומטית.
+**Screens & Lifecycle** — every screen is a Screen with a defined
+lifecycle: `on_create`, `on_start`, `on_pause`, `on_resume`,
+`on_destroy`. The platform invokes them at the right moments and
+preserves state automatically.
 
-**Intents** — תקשורת בין אפליקציות דרך מסרים מובנים. אפליקציה שרוצה לפתוח קובץ PDF שולחת Intent, והפלטפורמה מנתבת לאפליקציה שיודעת לטפל בזה.
+**Intents** — inter-app communication via structured messages. An
+app that wants to open a PDF dispatches an intent; the platform
+routes it to whichever app declared it can handle the type.
 
-**Permissions** — מודל הרשאות אחיד שנאכף ברמת ה-runtime. משתמש מאשר פעם אחת, הפלטפורמה אוכפת.
+**Permissions** — a single permission model enforced by the
+runtime. The user approves once; the platform enforces forever.
 
-**State Persistence** — המפתח לא אחראי לשמור state. הפלטפורמה שומרת אוטומטית ומשחזרת בכל נקודה.
+**State persistence** — developers do not own this. The platform
+saves and restores transparently.
 
-**Background Work** — Services מוגדרים ונאכפים על ידי הפלטפורמה, עם חוקים ברורים על צריכת סוללה ומשאבים.
+**Background work** — services are defined and policed by the
+platform, with explicit rules on battery and resource budget.
 
-**Navigation & URL mapping** — stack של Screens שמתואם עם היסטוריית הדפדפן, כך שכפתור Back של הדפדפן עובד כמצופה ו-deep links פועלים.
+**Navigation & URL mapping** — a Screen stack that lines up with
+browser history, so the browser Back button does the expected
+thing and deep links work.
 
-### 3.4 עקרונות העיצוב
+### 3.4 Design principles
 
-- **עקביות מובנית**: כל אפליקציה משתמשת באותם widgets סטנדרטיים. כפתור הוא תמיד באותו גובה, input תמיד מתנהג אותו דבר.
-- **Sandbox מוחלט**: כל אפליקציה רצה בבידוד מלא. אין גישה לקבצים של אפליקציות אחרות, אין גישה למערכת הקבצים של המכשיר.
-- **Offline-first**: כל אפליקציה חייבת לעבוד גם ללא חיבור אינטרנט. הפלטפורמה מנהלת את הסנכרון.
-- **State persistence מובנה**: ללא קוד, ללא מחשבה.
-- **נגישות native מובנית**: כל widget מכריז על עצמו ל-accessibility tree (לא דרך DOM/ARIA, אלא דרך AOM — Accessibility Object Model). אפליקציה שלא מגדירה נגישות לא מקבלת אישור בחנות.
-- **Review סטנדרטי**: חנות עקיבא מקיימת review לכל אפליקציה. אפליקציה שלא עומדת בסטנדרטים לא נכנסת. זה מאפשר baseline איכות שלא קיים ב-web פתוח.
+- **Built-in consistency**: every app uses the same standard
+  widgets. A button is always the same height; an input always
+  behaves the same way.
+- **Hard sandbox**: every app runs in full isolation. No access to
+  another app's files; no access to the device file system.
+- **Offline-first**: every app must work without an internet
+  connection. The platform manages sync.
+- **Built-in state persistence**: no code, no thought.
+- **Native accessibility**: every widget announces itself to the
+  accessibility tree (not via DOM/ARIA, but via AOM — the
+  Accessibility Object Model). An app that doesn't define
+  accessibility doesn't pass review.
+- **Standard review**: the Akiva store reviews every app. Apps
+  that don't meet the standards aren't admitted. This enables a
+  baseline of quality the open web cannot deliver.
 
-### 3.5 מודל ההפצה — פתוחה לפיתוח, מבוקרת בהפצה
+### 3.5 Distribution model — open to develop, curated to distribute
 
-אקוסיסטם איכותי לא נוצר לבד. פלטפורמות שהשאירו את ההפצה פתוחה לחלוטין מתמלאות במהירות ב-wrappers של אתרים, copy-paste apps, ו-misuse של permissions. מצד שני, פלטפורמה שסוגרת את השער למפתחים הופכת לגן-חתום ואין בה חיים.
+A high-quality ecosystem doesn't form on its own. Platforms that
+left distribution wide open fill quickly with website wrappers,
+copy-paste apps, and permission misuse. On the other side, a
+platform that closes the gate to developers becomes a walled
+garden with no life.
 
-העמדה של עקיבא: **פתוחה לפיתוח, מבוקרת בהפצה**. זו לא החלטה שיווקית בלבד — היא החלטה ארכיטקטונית, כי היא מעצבת את ה-API של PackageManager, את ה-permission model, ואת publisher identity.
+Akiva's stance: **open to develop, curated to distribute**. This
+isn't only a marketing decision — it's an architectural one,
+because it shapes the PackageManager API, the permission model,
+and publisher identity.
 
-העקרונות:
+The principles:
 
-- **Packages חתומים.** לכל app יש publisher identity ו-manifest חתום. unsigned packages לא מותקנים מה-registry הראשי.
-- **Registry רשמי כברירת מחדל.** מקור ההתקנה העיקרי, עם quality + security gate. apps שלא עוברים — לא מופיעים.
-- **Sideload למפתחים בלבד.** dev-mode flag מאפשר התקנה מקומית ישירות מ-manifest ללא חתימה, ורק ב-sessions מסומנות כ-dev. המשתמש הרגיל לא יוכל להתקין package לא חתום "במקרה".
-- **Publisher identity מצטברת.** מוניטין, היסטוריית violations, trust tiers — משפיעים על מה ש-app יכולה לבקש ב-permissions, לא רק על visibility בחנות.
+- **Signed packages.** Every app has a publisher identity and a
+  signed manifest. Unsigned packages are not installed from the
+  primary registry.
+- **Official registry by default.** The main install source has a
+  quality + security gate. Apps that don't pass don't appear.
+- **Sideload for developers only.** A dev-mode flag allows local
+  install directly from a manifest without signing — and only in
+  sessions explicitly marked as dev. Regular users won't install
+  an unsigned package "by accident."
+- **Cumulative publisher identity.** Reputation, violation
+  history, trust tiers — these affect what an app may request in
+  permissions, not just visibility in the store.
 
-**מה לא ב-MVP:** ה-registry עצמו, תהליך ה-review, publisher verification ו-trust tiers. הם מופיעים כאן כדי ש-API surface של PackageManager וה-permission model יתוכננו מראש בצורה שתומכת בהם — ולא יצטרכו rewrite ברגע שפתאום יש חנות.
-
----
-
-## 4. מה עקיבא *אינה* — הבהרות חשובות
-
-### 4.1 עקיבא אינה "web טוב יותר"
-היא לא מנסה לתקן את ה-web. היא בונה משהו אחר שרץ על אותו runtime. בדיוק כמו שאפליקציית אנדרואיד לא "מתחרה באתרים" — היא פלטפורמה נפרדת.
-
-### 4.2 עקיבא אינה דורשת שפה חדשה
-אין Akiva Script. הכתיבה היא ב-JavaScript/TypeScript — שפה קיימת, מוכרת, בוגרת. החידוש הוא ב-**Framework** ובחוקים, לא בשפה. בדיוק כמו שאפליקציית אנדרואיד נכתבת ב-Kotlin/Java שהן שפות רגילות.
-
-### 4.3 עקיבא אינה Flutter
-Flutter הוא UI toolkit ומנוע רנדור. עקיבא היא מערכת הפעלה אפליקטיבית. Flutter יכול, תיאורטית, להיות שכבת הרנדור של עקיבא — אבל הוא לא מספק את מה שעקיבא מספקת: Manifest, Intent, Lifecycle, חנות, Permission model, Services, Inter-app communication.
-
-### 4.4 עקיבא לא מחויבת ל-SEO
-אפליקציות עקיבא מתגלות דרך חנות עקיבא, לא דרך גוגל. בדיוק כמו אפליקציות אנדרואיד שלא "מופיעות בגוגל" — הן מופיעות ב-Play Store. מפתח שרוצה landing page לשיווק יכול לבנות אתר רגיל — עקיבא היא האפליקציה עצמה, לא דף השיווק שלה.
-
-### 4.5 עקיבא לא תלויה ב-DOM
-רנדור ישיר על Canvas/WebGPU, עם WebAssembly כ-runtime. זו בחירה מכוונת: אין טלאי על טלאי של legacy, אין הבדלי דפדפנים ברמת ה-layout, אין CSS quirks.
-
----
-
-## 5. יתרונות
-
-### 5.1 למשתמש הסופי
-- אפליקציות באיכות native, ללא התקנה
-- חוויה עקבית — כל אפליקציה מתנהגת באותו אופן ברמת הבסיס
-- אבטחה ברמת sandbox
-- ללא tracking — הפלטפורמה אוסרת זאת
-- ללא ads מסיחות — סטנדרט החנות
-- הסרה נקייה — כל הנתונים נמחקים מיד
-- רצה על Mac, PC, iPhone, Android, כל מכשיר עם דפדפן מודרני
-
-### 5.2 למפתחים
-- כתיבה פעם אחת — ריצה בכל פלטפורמה
-- שפה קיימת ומוכרת (JS/TS)
-- ללא browser fragmentation — סביבת runtime מוגדרת
-- Widgets סטנדרטיים שמטפלים ב-edge cases (RTL, accessibility, responsive)
-- ללא צורך לבנות backend (Akiva Cloud כאופציה)
-- Distribution דרך חנות
-- ללא צורך באישור Apple/Google — עדכונים מיידיים
-
-### 5.3 לאקוסיסטם
-- פלטפורמה שלישית עצמאית מ-Apple ו-Google
-- Open standards
-- סטנדרט איכות שמעלה את הרף
+**Not in the MVP:** the registry itself, the review process,
+publisher verification, trust tiers. They appear here so the
+PackageManager API surface and the permission model are designed
+upfront in a way that supports them — and don't need a rewrite the
+moment a store appears.
 
 ---
 
-## 6. חסרונות וסיכונים
+## 4. What Akiva *is not* — important clarifications
 
-### 6.1 אתגרים טכניים
+### 4.1 Akiva is not "a better web"
+It is not trying to fix the web. It builds something else that
+runs on the same runtime. Just as an Android app does not "compete
+with websites" — it is a separate platform.
 
-- **Bundle size**: ה-runtime של עקיבא ייטען בכל אפליקציה. כמה מאות KB עד מגה ראשון — מה שעלול להאט טעינה ראשונה לעומת אתר HTML קליל. פחות משמעותי באפליקציות שמשתמשים חוזרים אליהן.
+### 4.2 Akiva does not require a new language
+There is no "Akiva Script". Apps are written in existing,
+widely-used, mature languages — Rust today, any wasm-targeting
+language later. The novelty is in the **Framework** and the rules,
+not in the language. Just as an Android app is written in regular
+Kotlin / Java.
 
-- **Text editing ו-IME**: עריכת טקסט על Canvas היא אתגר ידוע (Figma, Google Docs, Flutter Web כולם נתקלו בזה). בעיקר ב-IME של שפות אסיאתיות ובאינטגרציה עם מקלדת המערכת ב-iOS. דורש השקעה רצינית ב-BAL.
+### 4.3 Akiva is not Flutter
+Flutter is a UI toolkit and rendering engine. Akiva is an
+applicative operating system. Flutter could, in theory, be Akiva's
+rendering layer — but Flutter does not provide what Akiva
+provides: Manifest, Intent, Lifecycle, store, permission model,
+services, inter-app communication.
 
-- **Accessibility**: עקיבא לא משתמשת ב-DOM, לכן חייבת לבנות שכבת accessibility מקבילה דרך AOM (Accessibility Object Model). זה דומה למה שאנדרואיד עושה עם TalkBack — אפשרי ומוכח, אבל דורש עבודה.
+### 4.4 Akiva does not commit to SEO
+Akiva apps are discovered through Akiva's store, not Google. Just
+as Android apps don't "show up in Google" — they show up in the
+Play Store. A developer who wants a marketing landing page can
+build a regular website — Akiva is the app itself, not its
+marketing page.
 
-- **תאימות בין דפדפנים**: WebGPU, OffscreenCanvas, ויכולות מודרניות אחרות לא נתמכות באופן זהה. נדרש baseline מוגדר ו-fallbacks.
-
-- **URL ו-routing**: עקיבא חייבת להסתנכרן עם היסטוריית הדפדפן (כפתור Back, bookmarks, deep links) תוך שמירה על מודל ה-Screen/Stack. אנדרואיד פתרה זאת עם Activity stack — עקיבא תצטרך משהו מקביל.
-
-### 6.2 אתגרים אסטרטגיים
-
-- **בעיית הביצה והתרנגולת**: מפתחים יבואו רק אם יש משתמשים. משתמשים יבואו רק אם יש אפליקציות. כל פלטפורמה חדשה מתמודדת עם זה.
-
-- **תחרות עם web פתוח**: מפתחים יצטרכו לבחור — לבנות אפליקציה רגילה שעובדת בכל דפדפן, או אפליקציית עקיבא שעובדת רק בעקיבא.
-
-- **תלות ב-Big Tech**: אם גוגל, אפל או מיקרוסופט יגבילו WebAssembly או WebGPU — עקיבא פגיעה.
-
-- **השקעה ראשונית גדולה**: בניית פלטפורמה שלמה דורשת שנים של פיתוח, צוות מיומן, ומיליוני דולרים.
-
----
-
-## 7. היתכנות טכנולוגית
-
-### 7.1 הערכה כוללת
-
-מבחינה טכנולוגית, עקיבא ניתנת למימוש מלא. כל הרכיבים קיימים, יציבים, ונתמכים בדפדפנים מודרניים. אין פריצת דרך מחקרית — רק integration וצירוף נכון של טכנולוגיות בוגרות.
-
-### 7.2 הטכנולוגיות הקיימות שמאפשרות זאת
-
-- **WebAssembly** — runtime מהיר לקוד מכל שפה (Rust, C++, Go)
-- **WebGPU** — גישה ישירה ל-GPU דרך API מודרני
-- **OffscreenCanvas + Web Workers** — ריבוי threads אמיתי
-- **OPFS (Origin Private File System)** — מערכת קבצים sandbox
-- **Service Workers + PWA APIs** — התקנה למסך הבית, push, offline
-- **Hardware APIs** — WebUSB, Web Bluetooth, WebHID, MediaDevices, Geolocation
-- **WebAuthn + Payment Request API** — אימות חזק ותשלומים native
-- **AOM (Accessibility Object Model)** — accessibility ללא DOM
-
-### 7.3 פרויקטים שמוכיחים חלק מהקונספט
-
-Makepad (Rust), Flutter Web (Google), Figma — מוכיחים שארכיטקטורת wasm-first + canvas רנדור עובדת. **עקיבא לוקחת את הבסיס הטכני שלהם ובונה מעליו פלטפורמה מלאה** עם Framework, חנות, וסטנדרטים. זה מה שהם לא עשו.
-
-### 7.4 הערכת מאמץ
-
-- **MVP פונקציונלי**: 3-5 מהנדסים, 12-18 חודשים, 2-5 מיליון דולר
-- **פלטפורמה בוגרת עם ecosystem**: 15-30 אנשים, 3-5 שנים, 10-30 מיליון דולר
-- **מסה קריטית**: 5-10 שנים, תלוי בהצלחה שיווקית
+### 4.5 Akiva does not depend on the DOM
+Direct rendering on Canvas / WebGPU, with WebAssembly as the
+runtime. A deliberate choice: no patches on patches of legacy, no
+browser-level layout differences, no CSS quirks.
 
 ---
 
-## 8. היתכנות שיווקית
+## 5. Benefits
 
-### 8.1 הערכה כוללת
+### 5.1 For end users
+- Apps with native quality, no installation.
+- A consistent experience — every app behaves the same way at the
+  base.
+- Sandbox-grade security.
+- No tracking — the platform forbids it.
+- No distracting ads — store standards.
+- Clean uninstall — every byte gone immediately.
+- Runs on Mac, PC, iPhone, Android, any device with a modern
+  browser.
 
-מורכבת יותר מההיתכנות הטכנולוגית. נדרש שכנוע מקביל של מפתחים ומשתמשי קצה.
+### 5.2 For developers
+- Write once — runs on every platform.
+- A familiar language (Rust today, more later).
+- No browser fragmentation — a defined runtime environment.
+- Standard widgets that handle the edge cases (RTL,
+  accessibility, responsive).
+- No need to build a backend (Akiva Cloud as an option).
+- Distribution through the store.
+- No need for Apple / Google approval — instant updates.
 
-### 8.2 קהלי יעד אפשריים
-
-- **אסטרטגיה Vertical**: להתמקד בתחילה ב-vertical אחד שבו ההצעת ערך הכי חזקה — כלי SaaS לעסקים קטנים, כלי יצירה, או אפליקציות פנים-ארגוניות
-- **מפתחים שונאי web**: מפתחים שמתוסכלים מ-frontend מודרני ומחפשים חוויית פיתוח native-like
-- **שווקים מתפתחים**: הודו, אפריקה, דרום-מזרח אסיה — קהלים שכבר מאמצים PWAs בשיעור גבוה
-
-### 8.3 מסרים מרכזיים
-
-- **למפתחים**: בנו פעם אחת, רוצו בכל מקום, באיכות native, עם פלטפורמה שמטפלת עבורכם באקססיביליות, RTL, responsive ו-performance
-- **למשתמשים**: אפליקציות שעובדות מצוין, ללא התקנה, ללא tracking, בכל מכשיר
-- **לעסקים**: במקום לפתח שלוש פעמים, פתחו פעם אחת. במקום עמלות 30%, גשו ישירות למשתמש
-
-### 8.4 סיכונים שיווקיים
-
-- מפתחים שמרניים — דורשים הוכחת ROI
-- Apple/Google עלולים להגביל יכולות בדפדפן
-- שוק רווי בנסיונות — "עוד פלטפורמה"
-- אמון — מפתחים לא יבנו עסק על פלטפורמה שעלולה להיעלם
-
----
-
-## 9. מודל הצלחה
-
-פלטפורמת עקיבא תיחשב מוצלחת אם תוך 5 שנים:
-
-- 10,000 מפתחים פעילים
-- 1,000,000 משתמשים פעילים חודשיים
-- 100 אפליקציות דגל באיכות מקצועית
-- מודל הכנסה יציב — עמלת חנות, Akiva Cloud, או enterprise
-- הכרה כפלטפורמה שלישית לגיטימית
+### 5.3 For the ecosystem
+- A third platform, independent of Apple and Google.
+- Open standards.
+- A quality bar that raises the floor.
 
 ---
 
-## 10. צעדים בסיסיים לפיתוח
+## 6. Drawbacks and risks
 
-### שלב 1: תכנון מפורט (חודש 1-2)
-- Spec מלא של Akiva Framework — Manifest, Activity, Intent, Lifecycle, Permissions
-- הגדרת ה-Standard Library של widgets
-- הגדרת מודל ההרשאות
-- הגדרת Akiva Design Language
-- החלטה על שכבת הרנדור (בנייה עצמית vs אימוץ קיים)
+### 6.1 Technical challenges
 
-### שלב 2: Proof of Concept (חודש 3-6)
-- Runtime מינימלי ב-Rust → WebAssembly
-- Layout engine בסיסי (Flexbox-like)
-- 5-10 widgets בסיסיים
-- Event system
-- Demo apps (Notes, Counter, Todo)
+- **Bundle size.** The Akiva runtime loads with every app. A few
+  hundred KB to a first MB — could slow first load relative to a
+  light HTML site. Less significant for apps users return to.
+- **Text editing and IME.** Editing text on Canvas is a known
+  challenge (Figma, Google Docs, Flutter Web have all hit it),
+  especially the IME story for Asian languages and integration
+  with the iOS system keyboard. Demands serious investment in the
+  HAL.
+- **Accessibility.** Akiva does not use the DOM, so it must build
+  a parallel accessibility layer through AOM. Similar to what
+  Android does with TalkBack — feasible and proven, but real work.
+- **Cross-browser compatibility.** WebGPU, OffscreenCanvas, and
+  other modern capabilities are not supported uniformly. A defined
+  baseline + fallbacks are required.
+- **URL and routing.** Akiva must sync with browser history (Back
+  button, bookmarks, deep links) while preserving the Screen /
+  Stack model. Android solved this with its Activity stack; Akiva
+  needs an equivalent.
 
-### שלב 3: SDK ו-Tooling (חודש 7-12)
-- CLI (akiva init, build, run)
-- Dev server עם hot reload
-- Inspector / debugger
-- תיעוד ראשוני
+### 6.2 Strategic challenges
 
-### שלב 4: Alpha פרטי (חודש 13-18)
-- 20-50 מפתחי alpha
-- 5-10 reference apps
-- איטרציה על ה-API
-- ייצוב ביצועים
-
-### שלב 5: Beta ציבורי + חנות (שנה 2)
-- SDK פתוח
-- akiva.store עם תהליך review
-- Developer portal
-- Akiva Cloud (storage, auth, push)
-
-### שלב 6: 1.0 Launch (שנה 3)
-- השקה ציבורית
-- מודל מימון יציב
-- שותפויות עם 3-5 חברות גדולות
-- כנסים, חינוך, content
-
-### שלב 7: צמיחה (שנה 4-5)
-- יכולות מורחבות (3D, AR, AI)
-- שווקים נוספים
-- Tooling נוסף (IDE, linters, testing)
-- תרומה ל-W3C/WHATWG standards
+- **Chicken and egg.** Developers come only when there are users.
+  Users come only when there are apps. Every new platform faces
+  this.
+- **Competing with the open web.** Developers will have to choose:
+  build a regular app that works in any browser, or an Akiva app
+  that works only in Akiva.
+- **Big-Tech dependency.** If Google, Apple, or Microsoft
+  restricts WebAssembly or WebGPU — Akiva is exposed.
+- **Heavy upfront investment.** Building a complete platform
+  takes years of development, a skilled team, and millions of
+  dollars.
 
 ---
 
-## 11. סיכום
+## 7. Technological feasibility
 
-עקיבא היא הצעה ל**פלטפורמה שלישית** של אפליקציות — מערכת הפעלה אפליקטיבית שרצה על דפדפן כ-runtime, בדיוק כמו שאנדרואיד רצה על Linux kernel.
+### 7.1 Overall assessment
 
-היא לא אתר, לא framework, לא כלי לבניית אתרים. היא מוותרת בכוונה על SEO, DOM, ותאימות אחורה ל-web — בתמורה לחוויה native אמיתית, עקביות מובנית, ואקוסיסטם מבוקר עם סטנדרט איכות.
+Technologically, Akiva can be implemented in full. Every component
+exists, is stable, and is supported by modern browsers. There is
+no research breakthrough required — only integration and the right
+combination of mature technologies.
 
-**הקונספט תקף מבחינה טכנולוגית** — כל הרכיבים קיימים, נדרש integration ובנייה.
+### 7.2 Existing technologies that enable this
 
-**הקונספט מורכב מבחינה שיווקית** — דורש פתרון לבעיית הביצה והתרנגולת.
+- **WebAssembly** — a fast runtime for code from any language
+  (Rust, C++, Go).
+- **WebGPU** — direct GPU access via a modern API.
+- **OffscreenCanvas + Web Workers** — real multi-threading.
+- **OPFS (Origin Private File System)** — sandboxed file system.
+- **Service Workers + PWA APIs** — install-to-home, push,
+  offline.
+- **Hardware APIs** — WebUSB, Web Bluetooth, WebHID,
+  MediaDevices, Geolocation.
+- **WebAuthn + Payment Request API** — strong auth and native
+  payments.
+- **AOM (Accessibility Object Model)** — accessibility without
+  DOM.
 
-**הקונספט ייחודי ביחס לקיים** — Flutter, React Native, PWA כולם פותרים חלק מהבעיה. אף אחד לא מציע פלטפורמה מלאה עם Framework, חנות, Review, וסטנדרטי איכות.
+### 7.3 Projects that prove parts of the concept
 
-הצלחה דורשת חזון ברור, ביצוע עקבי, מימון ארוך טווח, וצוות מיומן. אבל היא אפשרית, וקיים בה פוטנציאל להפוך לפלטפורמת אפליקציות שלישית בעולם — לצד iOS ואנדרואיד.
+Makepad (Rust), Flutter Web (Google), Figma — all prove that
+wasm-first + canvas rendering works. **Akiva takes their technical
+foundation and builds a complete platform** with Framework, store,
+and standards above it. That part is the missing piece.
+
+### 7.4 Effort estimate
+
+- **Functional MVP:** 3–5 engineers, 12–18 months, $2–5 M.
+- **Mature platform with ecosystem:** 15–30 people, 3–5 years,
+  $10–30 M.
+- **Critical mass:** 5–10 years, depending on marketing success.
 
 ---
 
-*מסמך זה הוא נקודת התחלה. הוא אינו תוכנית עסקית או ספסיפיקציה טכנית סופית.*
-*גרסה 0.2 — אפריל 2026*
+## 8. Market feasibility
+
+### 8.1 Overall assessment
+
+More complex than the technological feasibility. Requires
+simultaneously convincing developers and end users.
+
+### 8.2 Possible target audiences
+
+- **Vertical strategy:** focus initially on a single vertical
+  where the value proposition is strongest — SaaS tools for SMBs,
+  creative tools, or internal enterprise apps.
+- **Web-frustrated developers:** developers tired of modern
+  frontend who are looking for a more native-like development
+  experience.
+- **Emerging markets:** India, Africa, South-East Asia — already
+  high PWA adoption.
+
+### 8.3 Core messages
+
+- **For developers:** build once, run anywhere, at native
+  quality, on a platform that takes care of accessibility, RTL,
+  responsive, and performance for you.
+- **For users:** apps that work great, no installation, no
+  tracking, on any device.
+- **For businesses:** instead of building three times, build once.
+  Instead of 30 % store fees, reach the user directly.
+
+### 8.4 Market risks
+
+- Conservative developers — demand proof of ROI.
+- Apple / Google may restrict capabilities in the browser.
+- A market crowded with attempts — "yet another platform."
+- Trust — developers will not build a business on a platform that
+  could disappear.
+
+---
+
+## 9. Success model
+
+The Akiva platform will be considered successful if, within five
+years:
+
+- 10 000 active developers.
+- 1 000 000 monthly active users.
+- 100 flagship apps at professional quality.
+- A stable revenue model — store cut, Akiva Cloud, or enterprise.
+- Recognition as a legitimate third platform.
+
+---
+
+## 10. Basic development steps
+
+### Phase 1: detailed planning (months 1–2)
+- Full spec of the Akiva Framework — Manifest, Activity, Intent,
+  Lifecycle, Permissions.
+- Definition of the Standard Library of widgets.
+- Definition of the permission model.
+- Definition of the Akiva Design Language.
+- Decision on the rendering layer (build our own vs. adopt).
+
+### Phase 2: Proof of Concept (months 3–6)
+- Minimal runtime in Rust → WebAssembly.
+- Basic layout engine (Flexbox-like).
+- 5–10 basic widgets.
+- Event system.
+- Demo apps (Notes, Counter, Todo).
+
+### Phase 3: SDK and tooling (months 7–12)
+- CLI (`akiva init`, `build`, `run`).
+- Dev server with hot reload.
+- Inspector / debugger.
+- Initial documentation.
+
+### Phase 4: private alpha (months 13–18)
+- 20–50 alpha developers.
+- 5–10 reference apps.
+- Iteration on the API.
+- Performance stabilisation.
+
+### Phase 5: public beta + store (year 2)
+- Open SDK.
+- `akiva.store` with a review process.
+- Developer portal.
+- Akiva Cloud (storage, auth, push).
+
+### Phase 6: 1.0 launch (year 3)
+- Public launch.
+- Stable funding model.
+- Partnerships with 3–5 major companies.
+- Conferences, education, content.
+
+### Phase 7: growth (years 4–5)
+- Extended capabilities (3D, AR, AI).
+- Additional markets.
+- More tooling (IDE, linters, testing).
+- Contribution to W3C / WHATWG standards.
+
+---
+
+## 11. Summary
+
+Akiva is a proposal for **a third platform** of applications — an
+applicative operating system that runs on the browser as a
+runtime, exactly the way Android runs on the Linux kernel.
+
+It is not a website, not a framework, not a website-builder. It
+deliberately gives up SEO, the DOM, and backwards compatibility
+with the web — in exchange for a truly native experience, built-in
+consistency, and a curated ecosystem with a meaningful quality
+standard.
+
+**The concept is technologically valid** — every component
+exists; what's needed is integration and execution.
+
+**The concept is market-complex** — it requires a solution to the
+chicken-and-egg problem.
+
+**The concept is unique relative to existing options** — Flutter,
+React Native, PWA each solve part of the problem. None offers a
+complete platform with Framework, store, review, and quality
+standards.
+
+Success requires a clear vision, consistent execution, long-term
+funding, and a skilled team. But it is possible, and the platform
+holds the potential to become the world's third application
+platform — alongside iOS and Android.
+
+---
+
+*This document is a starting point. It is not a business plan or a
+final technical specification.*
+*Version 0.2 — April 2026*
