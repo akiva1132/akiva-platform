@@ -41,6 +41,33 @@ pub struct FrameCommands {
 /// the WebGPU compositor in 15.4 (Canvas2D's `filter: blur()` is too
 /// slow for live blur, so 15.3 has no Canvas2D fallback for those —
 /// they just don't render until 15.4).
+/// Phase 15.4.4 — soft drop shadow under a surface. Encoded in
+/// `SurfaceDrawOpts.drop_shadow`. `rgba` is the shadow colour packed
+/// `0xAARRGGBB`; an alpha byte of `0` means "no shadow" (fast path).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DropShadow {
+    pub offset_x:    f32,
+    pub offset_y:    f32,
+    pub blur_radius: f32,
+    pub rgba:        u32,
+}
+
+impl DropShadow {
+    pub const NONE: DropShadow = DropShadow {
+        offset_x: 0.0, offset_y: 0.0, blur_radius: 0.0, rgba: 0,
+    };
+
+    /// `true` when the alpha byte is zero — the renderer skips the
+    /// 4-pass shadow pipeline entirely.
+    pub fn is_none(self) -> bool {
+        ((self.rgba >> 24) & 0xff) == 0
+    }
+}
+
+impl Default for DropShadow {
+    fn default() -> Self { Self::NONE }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceDrawOpts {
     pub opacity: f32,
@@ -53,12 +80,19 @@ pub struct SurfaceDrawOpts {
     /// composites the result under the surface — frosted-glass for
     /// sheets / dialogs / nav bars. Canvas2D ignores (no live blur).
     pub backdrop_blur_radius: f32,
+    /// Phase 15.4.4 — soft drop shadow under the surface. The
+    /// WebGPU compositor renders the surface's alpha as a tinted
+    /// silhouette, blurs it, and composites it offset under the
+    /// surface — modal / popover shadows. `DropShadow::NONE` (alpha
+    /// byte zero) is the fast-path default; Canvas2D ignores.
+    pub drop_shadow: DropShadow,
 }
 
 impl SurfaceDrawOpts {
     pub const IDENTITY: SurfaceDrawOpts = SurfaceDrawOpts {
         opacity: 1.0, translate_x: 0.0, translate_y: 0.0, scale: 1.0,
         backdrop_blur_radius: 0.0,
+        drop_shadow: DropShadow::NONE,
     };
 
     /// True when the opts are exactly identity. Renderers can
@@ -73,6 +107,7 @@ impl SurfaceDrawOpts {
             && self.translate_y == 0.0
             && self.scale == 1.0
             && self.backdrop_blur_radius == 0.0
+            && self.drop_shadow.is_none()
     }
 }
 
@@ -750,9 +785,10 @@ mod tests {
             &mut self, id: u32, x: f32, y: f32, w: f32, h: f32, opts: SurfaceDrawOpts,
         ) {
             self.trace.push(format!(
-                "composite_surface({id},{x},{y},{w},{h},opacity={},tx={},ty={},scale={},blur={})",
+                "composite_surface({id},{x},{y},{w},{h},opacity={},tx={},ty={},scale={},blur={},shadow={:#010x})",
                 opts.opacity, opts.translate_x, opts.translate_y, opts.scale,
                 opts.backdrop_blur_radius,
+                opts.drop_shadow.rgba,
             ));
         }
         fn destroy_surface(&mut self, id: u32) {
@@ -825,7 +861,7 @@ mod tests {
             "set_global_alpha(0.5)",
             "begin_surface(42,1,2,100,200)",
             "end_surface",
-            "composite_surface(42,1,2,100,200,opacity=1,tx=0,ty=0,scale=1,blur=0)",
+            "composite_surface(42,1,2,100,200,opacity=1,tx=0,ty=0,scale=1,blur=0,shadow=0x00000000)",
             "destroy_surface(42)",
         ]);
     }

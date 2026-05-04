@@ -437,7 +437,7 @@ architecture is the load-bearing change.
             WebGPU path.
       - [x] **15.4.3** Backdrop blur (frosted glass) — two-pass
             Gaussian on downsampled texture.
-      - [ ] **15.4.4** Drop shadow — separable blur on the
+      - [x] **15.4.4** Drop shadow — separable blur on the
             surface's alpha channel.
       - [ ] **15.4.5** Color tint / dim — single-fragment
             shader on `SurfaceDrawOpts.tint`.

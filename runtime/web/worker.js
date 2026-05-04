@@ -568,8 +568,16 @@ function buildImports() {
     // moved here from per-frame ops rewriting. Phase 15.4.3 added
     // `backdrop_blur_radius` (live frosted glass behind sheets and
     // dialogs); Canvas2D ignores, WebGPU runs a two-pass Gaussian.
-    hal_composite_surface: (id, x, y, w, h, opacity, tx, ty, scale, blurR) =>
-      backend?.compositeSurface(id >>> 0, x, y, w, h, opacity, tx, ty, scale, blurR),
+    // Phase 15.4.4 added drop shadow (`shadowOX/OY/blur/rgba`) for
+    // soft elevation under modals / popovers.
+    hal_composite_surface: (
+      id, x, y, w, h, opacity, tx, ty, scale,
+      blurR, shadowOX, shadowOY, shadowBlur, shadowRgba,
+    ) =>
+      backend?.compositeSurface(
+        id >>> 0, x, y, w, h, opacity, tx, ty, scale,
+        blurR, shadowOX, shadowOY, shadowBlur, shadowRgba >>> 0,
+      ),
     hal_destroy_surface: (id) => backend?.destroySurfaceCanvas(id >>> 0),
 
     hal_storage_read:   (kptr, klen, outLenPtr) => halStorageRead(kptr, klen, outLenPtr),

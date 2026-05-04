@@ -77,8 +77,16 @@ export class Canvas2DCompositor {
    *  compositor signature but ignored on the Canvas2D path. CSS
    *  `filter: blur()` on a 60Hz live-blurred sheet is too slow for an
    *  app-grade UI; sheets / dialogs that need frosted glass must boot
-   *  on the WebGPU path. */
-  compositeSurface(src, x, y, w, h, opacity, translateX, translateY, scale, _blurRadius) {
+   *  on the WebGPU path.
+   *
+   *  Phase 15.4.4 — `_shadowOX/OY/blur/rgba` are accepted but
+   *  ignored. CSS `filter: drop-shadow()` is similarly too slow at
+   *  60Hz; surfaces that need a soft drop shadow boot on the WebGPU
+   *  path. */
+  compositeSurface(
+    src, x, y, w, h, opacity, translateX, translateY, scale,
+    _blurRadius, _shadowOX, _shadowOY, _shadowBlur, _shadowRgba,
+  ) {
     if (!this.screenCtx) return;
     if (!src || w <= 0 || h <= 0) return;
     const isIdentity =

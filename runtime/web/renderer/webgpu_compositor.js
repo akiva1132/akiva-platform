@@ -97,6 +97,20 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
   return textureSample(t, s, in.uv);
 }
+
+// Phase 15.4.4 — alpha-tint silhouette pass for drop shadow. Samples
+// the surface texture (straight alpha), keeps only the alpha channel,
+// and tints with the shadow colour packed in \`blur_dir.xyz\` (rgb in
+// 0..1) and \`blur_dir.w\` (alpha 0..1). Output is pre-multiplied:
+//     a = src.a * shadow.a
+//     rgb = shadow.rgb * a
+@fragment
+fn fs_alpha_tint(in: VsOut) -> @location(0) vec4<f32> {
+  let src_a   = textureSample(t, s, in.uv).a;
+  let tint_a  = u.blur_dir.w;
+  let a       = src_a * tint_a;
+  return vec4<f32>(u.blur_dir.xyz * a, a);
+}
 `;
 
 const BLUR_WGSL = SHARED_UNIFORM_PREFIX + `
@@ -160,9 +174,11 @@ export class WebGPUCompositor {
     /** @type {GPURenderPipeline|null} */
     this.pipeline = null;          // identity-blend (over); reads identity-vs/fs
     /** @type {GPURenderPipeline|null} */
-    this.blitPipeline = null;      // identity-replace; reads identity-vs/fs
+    this.blitPipeline = null;      // identity-replace; reads identity-vs/fs_blit
     /** @type {GPURenderPipeline|null} */
     this.blurPipeline = null;      // blur-vs/fs, replace blend
+    /** @type {GPURenderPipeline|null} */
+    this.alphaTintPipeline = null; // identity-vs + fs_alpha_tint, replace blend
     /** @type {GPUSampler|null} */
     this.sampler = null;
     /** @type {GPUBindGroupLayout|null} */
@@ -264,6 +280,17 @@ export class WebGPUCompositor {
       layout: pipelineLayout,
       vertex:   { module: blurModule, entryPoint: "vs" },
       fragment: { module: blurModule, entryPoint: "fs",
+                  targets: [{ format: this.format, blend: REPLACE_BLEND }] },
+      primitive: { topology: "triangle-strip" },
+    });
+    // Alpha-tint pipeline: identity vs + fs_alpha_tint, REPLACE blend.
+    // Phase 15.4.4 — first pass of the drop-shadow pipeline. Reads the
+    // surface's alpha, tints with the shadow rgba (packed in
+    // `blur_dir`), writes a pre-multiplied silhouette into scratchA.
+    this.alphaTintPipeline = this.device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex:   { module: idModule, entryPoint: "vs" },
+      fragment: { module: idModule, entryPoint: "fs_alpha_tint",
                   targets: [{ format: this.format, blend: REPLACE_BLEND }] },
       primitive: { topology: "triangle-strip" },
     });
@@ -382,11 +409,17 @@ export class WebGPUCompositor {
 
   /** Composite `src` (an OffscreenCanvas allocated by the paint
    *  backend) onto the scene at `(x, y, w, h)`, transformed by the
-   *  SurfaceDrawOpts. When `blurRadius > 0`, first runs a backdrop-
-   *  blur pass — captures the scene region behind the surface,
-   *  downsamples + Gaussian-blurs, composites the blurred result at
-   *  surface bounds — then layers the surface itself on top. */
-  compositeSurface(src, x, y, w, h, opacity = 1, translateX = 0, translateY = 0, scale = 1, blurRadius = 0) {
+   *  SurfaceDrawOpts. When `blurRadius > 0`, runs a backdrop-blur
+   *  pass; when `shadowRgba` has a non-zero alpha byte, also runs a
+   *  drop-shadow pass. Order matches the plan §15.4.4: shadow first
+   *  (extends past surface edges), then backdrop blur (samples scene
+   *  including shadow at surface bounds), then surface on top. */
+  compositeSurface(
+    src, x, y, w, h,
+    opacity = 1, translateX = 0, translateY = 0, scale = 1,
+    blurRadius = 0,
+    shadowOX = 0, shadowOY = 0, shadowBlur = 0, shadowRgba = 0,
+  ) {
     if (!this.device || this._lost || !src || w <= 0 || h <= 0) return;
     if (!this._frameInProgress) {
       this.beginFrame();
@@ -398,13 +431,17 @@ export class WebGPUCompositor {
     const srcEntry = this._uploadSourceCanvas(src);
     if (!srcEntry) return;
 
+    const shadowAlpha = (shadowRgba >>> 24) & 0xff;
+    if (shadowAlpha > 0) {
+      this._encodeDropShadow(srcEntry, x, y, w, h, shadowOX, shadowOY, shadowBlur, shadowRgba);
+    }
+
     if (blurRadius > 0) {
       this._encodeBackdropBlur(x, y, w, h, blurRadius);
     }
 
-    // Surface composite onto the scene (now possibly with blurred
-    // backdrop drawn at the same bounds, blended underneath because
-    // we just deposited it via REPLACE before resuming this pass).
+    // Surface composite onto the scene (over any shadow / blurred
+    // backdrop deposited above).
     this._encodeIdentityDraw(this._scenePass, srcEntry.view, {
       dstRect:    [x, y, w, h],
       targetSize: [this.metrics.width_px, this.metrics.height_px],
@@ -446,6 +483,140 @@ export class WebGPUCompositor {
       return null;
     }
     return entry;
+  }
+
+  /** End the scene pass, render an alpha-tint silhouette of the
+   *  surface into scratchA at the surface's screen position (1/4
+   *  res), blur the silhouette, then composite the result into the
+   *  scene at `(offset_x, offset_y, screen_w, screen_h)` so the soft
+   *  shadow lands at `(x + offset_x, y + offset_y, w, h)` plus its
+   *  blur halo.
+   *
+   *  Uses scratchA + scratchB for ping-pong blur. Same as
+   *  backdrop-blur except the source for downsample is the surface
+   *  texture (not the scene), and we write alpha-tinted output
+   *  instead of pre-multiplied colour passthrough. */
+  _encodeDropShadow(srcEntry, x, y, w, h, offsetX, offsetY, blurRadius, rgba) {
+    this._scenePass.end();
+    this._scenePass = null;
+
+    const sw = this._scratchW, sh = this._scratchH;
+    const screenW = this.metrics.width_px, screenH = this.metrics.height_px;
+    const tintR = ((rgba >>> 16) & 0xff) / 255;
+    const tintG = ((rgba >>>  8) & 0xff) / 255;
+    const tintB = ( rgba         & 0xff) / 255;
+    const tintA = ((rgba >>> 24) & 0xff) / 255;
+
+    // 1) Render alpha-tinted silhouette of the surface into scratchA
+    //    at (x/4, y/4, w/4, h/4). Clear scratchA first so the rest
+    //    of the scratch is transparent — the blur will smear the
+    //    silhouette outward into that empty area, giving the soft
+    //    shadow halo.
+    const sx = x / SCRATCH_DOWNSAMPLE;
+    const sy = y / SCRATCH_DOWNSAMPLE;
+    const sWidth  = w / SCRATCH_DOWNSAMPLE;
+    const sHeight = h / SCRATCH_DOWNSAMPLE;
+    const tintPass = this._encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.scratchAView,
+        loadOp: "clear",
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        storeOp: "store",
+      }],
+    });
+    tintPass.setPipeline(this.alphaTintPipeline);
+    // The tint shader reads `blur_dir.xyz` for rgb and `blur_dir.w`
+    // for alpha — reuse the existing uniform shape rather than add a
+    // dedicated layout. opts is unread by this fragment.
+    this._uploadAndBindDraw(tintPass, srcEntry.view, {
+      dstRect:    [sx, sy, sWidth, sHeight],
+      targetSize: [sw, sh],
+      opts:       [1, 0, 0, 1],
+      srcUv:      [0, 0, 1, 1],
+      blurDir:    [tintR, tintG, tintB, tintA],
+    });
+    tintPass.end();
+
+    // 2) Blur silhouette in scratch space. Same kernel as backdrop
+    //    blur — see `_encodeBackdropBlur` for the radius math.
+    const tapPx = blurRadius / (4 * SCRATCH_DOWNSAMPLE);
+    const blurHPass = this._encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.scratchBView,
+        loadOp: "clear",
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        storeOp: "store",
+      }],
+    });
+    blurHPass.setPipeline(this.blurPipeline);
+    this._encodeBlurDraw(blurHPass, this.scratchAView, {
+      dstRect:    [0, 0, sw, sh],
+      targetSize: [sw, sh],
+      srcUv:      [0, 0, 1, 1],
+      blurDir:    [tapPx / sw, 0],
+    });
+    blurHPass.end();
+
+    const blurVPass = this._encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.scratchAView,
+        loadOp: "clear",
+        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+        storeOp: "store",
+      }],
+    });
+    blurVPass.setPipeline(this.blurPipeline);
+    this._encodeBlurDraw(blurVPass, this.scratchBView, {
+      dstRect:    [0, 0, sw, sh],
+      targetSize: [sw, sh],
+      srcUv:      [0, 0, 1, 1],
+      blurDir:    [0, tapPx / sh],
+    });
+    blurVPass.end();
+
+    // 3) Resume scene pass with loadOp=load, then composite the
+    //    blurred shadow onto scene as a full-screen draw offset by
+    //    (offsetX, offsetY). UV (0,0) → top-left of scratch → screen
+    //    pixel (offsetX, offsetY); UV (1,1) → bottom-right of scratch
+    //    → screen pixel (offsetX + screenW, offsetY + screenH). The
+    //    silhouette in scratch at (sx,sy) thus lands on screen at
+    //    (x + offsetX, y + offsetY). OVER blend so the shadow
+    //    composites correctly with prior surfaces underneath.
+    this._scenePass = this._encoder.beginRenderPass({
+      colorAttachments: [{
+        view: this.sceneView,
+        loadOp: "load",
+        storeOp: "store",
+      }],
+    });
+    this._scenePass.setPipeline(this.pipeline);  // OVER blend
+    this._uploadAndBindDraw(this._scenePass, this.scratchAView, {
+      dstRect:    [offsetX, offsetY, screenW, screenH],
+      targetSize: [screenW, screenH],
+      opts:       [1, 0, 0, 1],
+      srcUv:      [0, 0, 1, 1],
+      blurDir:    [0, 0, 0, 0],
+    });
+    // pipeline is already OVER blend — leave it set so the surface
+    // composite that follows reuses it.
+  }
+
+  /** Internal helper — encode a draw against `pass` whichever pipeline
+   *  is currently set on it. Identical to `_encodeIdentityDraw`
+   *  except the `blurDir` is caller-supplied (the alpha-tint shader
+   *  reads it as the shadow rgba). */
+  _uploadAndBindDraw(pass, srcView, args) {
+    const buf = this._uploadUniforms(args);
+    const bindGroup = this.device.createBindGroup({
+      layout: this.bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: buf } },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: srcView },
+      ],
+    });
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(4);
   }
 
   /** End the scene pass, run downsample + blurH + blurV, then resume
@@ -630,6 +801,7 @@ export class WebGPUCompositor {
     this.pipeline = null;
     this.blitPipeline = null;
     this.blurPipeline = null;
+    this.alphaTintPipeline = null;
     this.sampler = null;
     this.bindGroupLayout = null;
     this.ctx = null;

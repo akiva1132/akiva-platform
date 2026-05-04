@@ -122,7 +122,10 @@ export class CompositingPipeline {
     this.paint?.endSurface();
   }
 
-  compositeSurface(id, x, y, w, h, opacity, tx, ty, scale, blurRadius) {
+  compositeSurface(
+    id, x, y, w, h, opacity, tx, ty, scale,
+    blurRadius, shadowOX, shadowOY, shadowBlur, shadowRgba,
+  ) {
     // Zero-bounds DEFAULT_SURFACE sentinel. In Canvas2D mode the
     // activity painted directly to the screen ctx during BeginSurface,
     // so there's nothing to composite — return. In WebGPU mode the
@@ -145,7 +148,10 @@ export class CompositingPipeline {
     }
     const src = this.paint?.getSurfaceCanvas(id);
     if (!src) return;
-    this.compositor?.compositeSurface(src, x, y, w, h, opacity, tx, ty, scale, blurRadius);
+    this.compositor?.compositeSurface(
+      src, x, y, w, h, opacity, tx, ty, scale,
+      blurRadius, shadowOX, shadowOY, shadowBlur, shadowRgba,
+    );
   }
 
   // ── Frame lifecycle ───────────────────────────────────────────────

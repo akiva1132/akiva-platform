@@ -110,6 +110,10 @@ impl DrawHal for ExternDrawHal {
                 id, x, y, w, h,
                 opts.opacity, opts.translate_x, opts.translate_y, opts.scale,
                 opts.backdrop_blur_radius,
+                opts.drop_shadow.offset_x,
+                opts.drop_shadow.offset_y,
+                opts.drop_shadow.blur_radius,
+                opts.drop_shadow.rgba,
             )
         }
     }

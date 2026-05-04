@@ -79,3 +79,17 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
   return textureSample(t, s, in.uv);
 }
+
+// Phase 15.4.4 — alpha-tint silhouette pass for drop shadow. Samples
+// the surface texture (straight alpha), keeps only the alpha channel,
+// and tints with the shadow colour packed in `blur_dir.xyz` (rgb in
+// 0..1) and `blur_dir.w` (alpha 0..1). Output is pre-multiplied:
+//     a = src.a * shadow.a
+//     rgb = shadow.rgb * a
+@fragment
+fn fs_alpha_tint(in: VsOut) -> @location(0) vec4<f32> {
+  let src_a   = textureSample(t, s, in.uv).a;
+  let tint_a  = u.blur_dir.w;
+  let a       = src_a * tint_a;
+  return vec4<f32>(u.blur_dir.xyz * a, a);
+}

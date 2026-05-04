@@ -823,6 +823,9 @@ impl Framework {
                 // that want blur set `backdrop_blur_radius` explicitly
                 // when they emit their own CompositeSurface (15.4.3+).
                 backdrop_blur_radius: 0.0,
+                // 15.4.4 — animations don't shadow either; surfaces
+                // that want a shadow set `drop_shadow` explicitly.
+                drop_shadow: compositor::DropShadow::NONE,
             }
         } else {
             compositor::SurfaceDrawOpts::IDENTITY
