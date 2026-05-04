@@ -826,6 +826,23 @@ let backend: Box<dyn RendererBackend> = if gpu_available() {
 and the Compositor writes against it — replacing the backend is
 a pure implementation addition.
 
+> **Scope of this section.** `RendererBackend` is the **per-op
+> leaf** of the rendering pipeline — it answers "given a
+> `FillRect` command, how do pixels reach a surface?". It does
+> *not* answer "which surface? when? composited with what
+> effects?". Those questions are the **compositor architecture**
+> and have a separate design spec —
+> [`docs/compositor-architecture.md`](docs/compositor-architecture.md).
+>
+> The current implementation paints every layer directly into a
+> single screen `OffscreenCanvas`. The target architecture gives
+> each Activity its own backing surface and adds a separate
+> compositor pass that samples those surfaces (with optional
+> effects: backdrop blur, drop shadow, tint) into the screen.
+> A future `WebGPUBackend` swap is most valuable as a swap of
+> the **compositor** backend, not the per-Activity backend —
+> see the design doc for the migration plan (ROADMAP Phase 15).
+
 ### OffscreenCanvas mandatory
 
 All rendering happens in the **Worker** through an

@@ -319,6 +319,43 @@ Status bar (top), navigation bar (bottom) will eventually live as
 overlays painted by Shell into the `System` band. Today every
 activity fills the screen.
 
+## 12.5 Compositor architecture
+
+The WindowManager's surface model is the input to the compositor;
+the **compositor** is what turns surfaces into pixels. Today
+those two roles are collapsed: the kernel walks
+`surfaces_in_z_order` and replays each surface's PaintOps
+directly into the one screen `OffscreenCanvas`. There is no
+separate "surface texture" — the surface is purely a logical
+record of bounds, z-band, and paint ops.
+
+**Target shape (planned, ROADMAP Phase 15):** every surface owns
+a backing `OffscreenCanvas` + `Canvas2DBackend`. Activity
+PaintOps paint into *that* surface's backend. A separate
+compositor pass — running on its own rAF cadence, decoupled
+from per-Activity paint — samples the surface canvases into the
+screen via `drawImage` in z-order.
+
+This unlocks the OS-grade properties today's model doesn't have:
+
+- A slow Activity stalls **only its own surface refresh**, not
+  the system bar or other apps.
+- A crashed Activity leaves a frozen pane (its surface canvas
+  retains its last pixels), not a black region.
+- The compositor pass becomes the natural home for effects
+  (live backdrop blur, drop shadows, dim overlays, color
+  grading) — Canvas2D fallback for v1, WebGPU for the polished
+  version.
+
+The full design — surface lifecycle, compositor scheduling,
+effects pipeline (`SurfaceDrawOpts`), memory budget, migration
+plan — lives in
+[`docs/compositor-architecture.md`](compositor-architecture.md).
+Note in particular that this work is **prerequisite** to a
+useful WebGPU swap: a WebGPU compositor on top of today's
+single-canvas model gains nothing of substance; the per-surface
+architecture is the load-bearing change.
+
 ## 13. Today's limits
 
 - A single display in practice (the leader tab); follower tabs see
@@ -329,3 +366,8 @@ activity fills the screen.
   through whatever the requesting code produces.
 - Shell is intentionally minimal — an app grid and not much else.
   No task switcher, no search, no widgets-on-home.
+- **Single-canvas direct paint.** Surfaces are logical records;
+  there is no per-surface backing texture. A slow or crashed
+  Activity affects the whole frame. The fix is the per-Activity
+  surface + decoupled compositor described in §12.5 (ROADMAP
+  Phase 15).

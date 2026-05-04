@@ -384,6 +384,69 @@ was retired in May 2026).
 
 ---
 
+## Phase 15 — Compositor Hardening (planned)
+
+Move from the single-canvas direct-paint model to a **per-Activity
+surface + decoupled compositor pass**, the architectural shape
+every desktop / mobile OS uses. Full design spec in
+[`docs/compositor-architecture.md`](docs/compositor-architecture.md);
+the highlights:
+
+- **Today:** kernel paints every layer (Wallpaper / App / Overlay
+  / System) serially into one `OffscreenCanvas` every frame. A
+  slow Activity stalls the whole frame; a crashed Activity blanks
+  its pane; compositor effects (live blur, drop shadow, tint)
+  have nothing to sample.
+- **Target:** every Activity surface owns its own backing
+  `OffscreenCanvas` + backend. A separate compositor pass samples
+  those surfaces into the screen on its own rAF loop, decoupled
+  from per-Activity paint cadence.
+
+This work is **prerequisite to a `WebGPUBackend` swap being
+worth doing.** A WebGPU compositor on top of today's
+single-surface model gains nothing of substance; the per-surface
+architecture is the load-bearing change.
+
+- [ ] **15.1** Per-Activity surface canvases (Canvas2D). Allocate
+      `OffscreenCanvas` + `Canvas2DBackend` per WindowManager
+      surface; Activity PaintOps route to *its* backend; new
+      compositor module replays surfaces in z-order. DoD: a
+      busy-loop in one Activity no longer stalls the system bar.
+- [ ] **15.2** Decoupled frame scheduler. Split the kernel rAF
+      into compositor-loop + activity-loop. Compositor reads
+      latest dirty texture; never waits for an Activity. DoD:
+      kill -9 on an Activity worker shows a frozen pane, not a
+      black region; slow `apply_props` halves Activity refresh
+      rate while compositor stays at 60 fps.
+- [ ] **15.3** Compositor effects pipeline (Canvas2D fallbacks).
+      `CompositorBackend` trait + `SurfaceDrawOpts` (opacity,
+      transform, backdrop_blur, drop_shadow, tint, clip).
+      Re-platform the existing slide+fade transitions onto
+      compositor opts; retire the per-frame paint-op rewriter in
+      [`framework/src/animation.rs`](framework/src/animation.rs).
+      DoD: transitions are pixel-identical to Stone 13.3 output
+      but driven by compositor opts.
+- [ ] **15.4** WebGPU compositor implementation. `WebGPUCompositor`
+      against `CompositorBackend`; only the compositor pass, not
+      per-Activity backends. Real backdrop blur (two-pass
+      Gaussian on downsampled texture), drop shadows (separable
+      blur on alpha), color grading. Feature-detect at boot,
+      fall back to `Canvas2DCompositor`. DoD: a sheet over a
+      busy app shows live frosted-glass blur of the app's
+      pixels; older browsers fall back without visual loss for
+      basic shapes.
+- [ ] **15.5** (optional, opt-in) WebGPU per-Activity backend —
+      the original `RendererBackend` swap from
+      [`ARCHITECTURE.md §10`](ARCHITECTURE.md). Per-app manifest
+      opt-in for charts / 3D / particle apps. Not a default.
+
+Memory cost to plan for: each fullscreen surface is ~16 MB at
+1080p × dpr 2; 4 Resumed/Paused surfaces ≈ 64 MB. The LMK in
+[`framework/src/lmk.rs`](framework/src/lmk.rs) must account for
+surface memory in its budget.
+
+---
+
 ## v0.4 — Connected OS (next)
 
 After v0.3, Akiva moves from an isolated OS to a **connected
@@ -395,14 +458,21 @@ follow-ups). What remains:
   [`docs/risks.md §7.11`](docs/risks.md)).
 - **Multi-tab paint** — follower tabs render their own surface
   rather than showing the multi-tab banner.
+- **Compositor hardening** — Phase 15.1 + 15.2 are the
+  prerequisite for native-grade animation work; recommended to
+  land them inside v0.4.
 - **Native-grade animations** — shared-element transitions
-  beyond slide+fade, easing curves per app.
+  beyond slide+fade, easing curves per app. Best landed on top
+  of the compositor effects pipeline (Phase 15.3).
 - **More platform integration** — `open-url`, drag-and-drop
   acceptance, embedded browser view.
 - **Demonstrate** — Akiva apps do what apps on every other OS
   do.
 
-Estimated time: ~5–7 weeks after v0.3.
+Estimated time: ~5–7 weeks after v0.3 *excluding* Phase 15;
+Phase 15.1+15.2 add ~3–4 weeks; 15.3 adds ~2 weeks; 15.4 is a
+larger investment (~4–6 weeks) and can slip to v0.5 if WebGPU
+adoption is still climbing.
 
 ---
 
@@ -566,7 +636,9 @@ Thin **in depth**, not in completeness:
 - ❌ SVG / JPG drawables (PNG only — see
   [`docs/resources.md §8`](docs/resources.md)).
 - ❌ WebGPU (Canvas 2D through abstract `RendererBackend` —
-  swap-in available post-MVP).
+  swap-in scheduled in Phase 15.4 / 15.5; see
+  [`docs/compositor-architecture.md`](docs/compositor-architecture.md)
+  for the per-surface architecture this depends on).
 - ❌ Hebrew / RTL / BiDi text rendering (Latin-only `fillText`
   in MVP; HarfBuzz + FriBidi in v0.3+).
 - ❌ IME / virtual keyboard for Hebrew.
