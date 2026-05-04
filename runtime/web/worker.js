@@ -12,7 +12,7 @@
 // The worker never touches the DOM. All "display" state is owned here;
 // the main thread is a thin input/output surface.
 
-import { Canvas2DBackend } from "./renderer/canvas2d.js";
+import { CompositingPipeline } from "./renderer/compositing_pipeline.js";
 import { Storage, SR_BAD_KEY } from "./storage.js";
 import { AppRegistry } from "./app_registry.js";
 import { FRAME_FALLBACK_MS } from "./config.js";
@@ -23,7 +23,14 @@ let instance = null;
 let memory = null;
 /** Primary display — Phase 1a supports exactly one. */
 let primary = null;
-/** Renderer backend instance. */
+/**
+ * Renderer pipeline (Phase 15.4.1). Routes per-op paint to a paint
+ * backend (Canvas2D, always) and `compositeSurface` to a compositor
+ * backend (WebGPU when available, Canvas2D otherwise). The variable
+ * name stays `backend` so existing call sites (HAL imports + app
+ * registry) read unchanged — the pipeline exposes the same surface.
+ * @type {CompositingPipeline | null}
+ */
 let backend = null;
 /** Kernel init state. */
 let booted = false;
@@ -76,7 +83,14 @@ self.addEventListener("message", (e) => {
       log("info", `debug categories set: ${(msg.debug ?? []).join(",") || "(none)"}`);
       break;
     case "attach_display":
-      attachDisplay(msg);
+      // Pipeline init is async (WebGPU requestAdapter / requestDevice).
+      // Fire-and-forget; surface failures via the panic channel so the
+      // tab knows boot didn't fully complete. The frame loop is
+      // started synchronously inside attachDisplay only after the
+      // pipeline is ready, so there's no race against early frames.
+      attachDisplay(msg).catch((err) => {
+        self.postMessage({ type: "panic", text: `attach_display failed: ${err?.message ?? err}` });
+      });
       break;
     case "register_follower_display":
       // MVP: followers just reserve a slot; compositor multiplexing lands
@@ -355,14 +369,17 @@ function handleConfigChange(msg) {
   }
 }
 
-function attachDisplay(msg) {
+async function attachDisplay(msg) {
   primary = {
     tabId: msg.tabId,
     surface: msg.surface,
     metrics: msg.metrics,
   };
-  backend = new Canvas2DBackend();
-  backend.init(msg.surface, msg.metrics);
+  // Phase 15.4.1 — boot the compositing pipeline. WebGPU detection +
+  // requestAdapter/requestDevice happens inside `init`; on failure it
+  // falls back to Canvas2D so init() resolves either way.
+  backend = new CompositingPipeline();
+  await backend.init(msg.surface, msg.metrics);
   // Stone 13.0prep C2 — wire AppRegistry to the renderer so async
   // drawable PNG decodes can register their ImageBitmaps. Any decodes
   // that completed before this call (queued in

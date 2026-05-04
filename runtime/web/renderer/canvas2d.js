@@ -49,21 +49,34 @@ export class Canvas2DBackend {
   // screen surface (never the per-Activity ones).
   get canvas() { return this.screenCanvas; }
 
+  // `canvas` may be null in Phase 15.4.1+'s WebGPU mode — the screen
+  // canvas is bound to "webgpu" by the compositor backend, and a 2D
+  // ctx can't be obtained from it. With a null screenCanvas the legacy
+  // DEFAULT_SURFACE / zero-bounds sentinel becomes a silent no-op (in
+  // production the framework always emits real BeginSurface bounds,
+  // so this never triggers). In Canvas2D mode and in standalone uses
+  // (followers, tests) `canvas` is the screen canvas as before.
   init(canvas, metrics) {
-    this.screenCanvas = canvas;
     this.metrics = metrics;
-    this.screenCtx = canvas.getContext("2d", { alpha: false });
-    if (!this.screenCtx) throw new Error("Canvas2D context unavailable");
-    this.screenCtx.imageSmoothingEnabled = true;
-    this.screenCtx.textBaseline = "top";
-    this.ctx = this.screenCtx;
+    if (canvas) {
+      this.screenCanvas = canvas;
+      this.screenCtx = canvas.getContext("2d", { alpha: false });
+      if (!this.screenCtx) throw new Error("Canvas2D context unavailable");
+      this.screenCtx.imageSmoothingEnabled = true;
+      this.screenCtx.textBaseline = "top";
+      this.ctx = this.screenCtx;
+    } else {
+      this.screenCanvas = null;
+      this.screenCtx = null;
+      this.ctx = null;
+    }
   }
 
   resize(width_px, height_px, density) {
+    this.metrics = { width_px, height_px, density };
     if (!this.screenCanvas) return;
     this.screenCanvas.width = width_px;
     this.screenCanvas.height = height_px;
-    this.metrics = { width_px, height_px, density };
     // The context is reset when the canvas is resized; re-apply defaults.
     if (this.screenCtx) {
       this.screenCtx.textBaseline = "top";
@@ -294,10 +307,17 @@ export class Canvas2DBackend {
    *  the existing one if `(w, h)` changed. The canvas is cleared on
    *  every begin so an Activity that paints with a transparent
    *  background gets crisp compositing without ghosting from the
-   *  previous frame. */
+   *  previous frame.
+   *
+   *  Per-Activity surface allocation is independent of the screen ctx,
+   *  so this method runs even in Phase 15.4.1 WebGPU mode where
+   *  `screenCtx` is null. The zero-bounds DEFAULT_SURFACE sentinel
+   *  still routes paint to `this.screenCtx` (null in WebGPU mode →
+   *  subsequent paint ops silently no-op via their own ctx checks). */
   beginSurface(id, x, y, w, h) {
-    if (!this.screenCtx) return;
-    // Zero-bounds sentinel: keep painting to the screen ctx.
+    // Zero-bounds sentinel: keep painting to the screen ctx (or null
+    // in WebGPU mode — paint ops gate on `this.ctx` and turn into
+    // no-ops on null).
     if (w <= 0 || h <= 0) {
       this._ctxStack.push(this.ctx);
       this.ctx = this.screenCtx;
@@ -309,7 +329,8 @@ export class Canvas2DBackend {
       const ctx = canvas.getContext("2d", { alpha: true });
       if (!ctx) {
         // Highly unlikely on a fresh OffscreenCanvas; degrade to the
-        // screen ctx so we never leave `this.ctx` pointing at null.
+        // screen ctx so we never leave `this.ctx` pointing at null
+        // mid-frame.
         this._ctxStack.push(this.ctx);
         this.ctx = this.screenCtx;
         return;
@@ -341,9 +362,9 @@ export class Canvas2DBackend {
 
   /** Restore the renderer's paint target to whatever it was before the
    *  most recent unmatched `beginSurface`. Pops the ctx stack; if the
-   *  stack is empty (unmatched), reverts to the screen ctx. */
+   *  stack is empty (unmatched), reverts to the screen ctx (which is
+   *  `null` in WebGPU mode — paint ops gate on `this.ctx`). */
   endSurface() {
-    if (!this.screenCtx) return;
     this.ctx = this._ctxStack.pop() ?? this.screenCtx;
   }
 
@@ -401,6 +422,18 @@ export class Canvas2DBackend {
    *  fixtures destroy surfaces that never rendered). */
   destroySurfaceCanvas(id) {
     this._surfaces.delete(id);
+  }
+
+  /** Phase 15.4.1 — hand the source canvas for surface `id` to the
+   *  pipeline, so a `CompositorBackend` (Canvas2D or WebGPU) can
+   *  sample/blit it. Returns `null` for unknown ids and for the
+   *  zero-bounds DEFAULT_SURFACE sentinel (which never allocates a
+   *  backing canvas). The pipeline uses this lookup instead of going
+   *  through `compositeSurface` here, so the same paint backend can
+   *  drive either compositor without ever calling its own
+   *  `compositeSurface`. */
+  getSurfaceCanvas(id) {
+    return this._surfaces.get(id)?.canvas ?? null;
   }
 
   destroy() {

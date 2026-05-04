@@ -430,7 +430,7 @@ architecture is the load-bearing change.
       implementation plan in
       [`docs/phase-15.4-plan.md`](docs/phase-15.4-plan.md);
       broken into six sub-stones:
-      - [ ] **15.4.1** Architectural split (paint backend vs.
+      - [x] **15.4.1** Architectural split (paint backend vs.
             compositor backend) + WebGPU detection + identity
             composite. Visual parity with 15.3.
       - [ ] **15.4.2** Translate / scale / opacity opts on the
