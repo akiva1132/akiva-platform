@@ -356,7 +356,7 @@ export class Canvas2DBackend {
       }
       ctx.imageSmoothingEnabled = true;
       ctx.textBaseline = "top";
-      entry = { canvas, ctx, w: canvas.width, h: canvas.height };
+      entry = { canvas, ctx, w: canvas.width, h: canvas.height, version: 0 };
       this._surfaces.set(id, entry);
     } else if (entry.w !== (w | 0) || entry.h !== (h | 0)) {
       // Bounds changed → resize. Resizing an OffscreenCanvas wipes its
@@ -375,6 +375,16 @@ export class Canvas2DBackend {
       // them as a damage-mask.
       entry.ctx.clearRect(0, 0, entry.w, entry.h);
     }
+    // Phase 15.4 perf — version counter for the WebGPU compositor's
+    // copyExternalImageToTexture skip path. `beginSurface` is called
+    // ONLY when the framework re-emits paint ops for this surface
+    // (15.2's "frozen pane" rule: an Activity that didn't paint this
+    // frame skips Begin/End entirely). So bumping here is exactly the
+    // signal "the canvas pixels changed since last upload" — the
+    // compositor compares to its `lastVersion` and skips the GPU copy
+    // for frozen panes.
+    entry.version += 1;
+    entry.canvas._akVersion = entry.version;
     this._ctxStack.push(this.ctx);
     this.ctx = entry.ctx;
   }

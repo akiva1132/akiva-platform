@@ -473,12 +473,28 @@ export class WebGPUCompositor {
   }
 
   /** Upload (or reuse) a GPUTexture for the source canvas. Returns
-   *  `{texture, view, w, h}` or `null` on copy failure. */
+   *  `{texture, view, w, h, lastVersion}` or `null` on copy failure.
+   *
+   *  Phase 15.4 perf — frozen-pane skip. The paint backend bumps
+   *  `canvas._akVersion` every time `beginSurface(id, ...)` runs (i.e.
+   *  every time the framework actually re-paints the surface). 15.2's
+   *  frozen-pane rule means a surface that didn't paint this frame
+   *  has the SAME `_akVersion` as last frame; if our cache entry's
+   *  `lastVersion` matches, the GPU texture already holds the right
+   *  pixels and the `copyExternalImageToTexture` call is pure waste
+   *  (~8 MB per surface per frame at 1080p). Skipping is invisible
+   *  and saves ~2 GB/s of memcpy when 4 idle Activities composite. */
   _uploadSourceCanvas(src) {
     const srcW = Math.max(1, src.width  | 0);
     const srcH = Math.max(1, src.height | 0);
+    const version = src._akVersion ?? 0;
     let entry = this._textureCache.get(src);
-    if (!entry || entry.w !== srcW || entry.h !== srcH) {
+    const sameTexture = entry && entry.w === srcW && entry.h === srcH;
+    if (sameTexture && entry.lastVersion === version) {
+      // Frozen pane: GPU texture already holds these exact pixels.
+      return entry;
+    }
+    if (!sameTexture) {
       if (entry) entry.texture.destroy();
       const texture = this.device.createTexture({
         size:   [srcW, srcH, 1],
@@ -487,7 +503,7 @@ export class WebGPUCompositor {
               | GPUTextureUsage.COPY_DST
               | GPUTextureUsage.RENDER_ATTACHMENT,
       });
-      entry = { texture, w: srcW, h: srcH, view: texture.createView() };
+      entry = { texture, w: srcW, h: srcH, view: texture.createView(), lastVersion: -1 };
       this._textureCache.set(src, entry);
     }
     try {
@@ -500,6 +516,7 @@ export class WebGPUCompositor {
       console.warn("[akiva] copyExternalImageToTexture failed:", err);
       return null;
     }
+    entry.lastVersion = version;
     return entry;
   }
 
