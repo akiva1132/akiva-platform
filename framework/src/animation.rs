@@ -260,6 +260,21 @@ pub fn apply_props(
     if props.is_rest() {
         return;
     }
+    // Phase 15.2 — empty ops means the Activity didn't paint this
+    // frame (worker is slow / trapped / paused). Wrapping empty with
+    // PushTransform/PopTransform would leave the surface buffer
+    // non-empty (just the wrappers) — finish_frame_in_order would
+    // then emit a Begin/End block, the renderer would clearRect the
+    // backing canvas, and the wrappers wouldn't paint anything → the
+    // activity's last-known pixels disappear during the animation.
+    // Bail when there's nothing to wrap; the surface stays empty,
+    // finish_frame_in_order suppresses Begin/End, and the renderer
+    // composites the prior frame's pixels (translated by 0; the
+    // animation simply doesn't advance for a frame the activity
+    // missed).
+    if ops.is_empty() {
+        return;
+    }
     // Build the wrapper ops and prepend in one shot — `splice` is
     // O(prefix.len() + ops.len()) but only does a single memmove, no
     // per-op clone, no alpha-byte arithmetic.
@@ -418,6 +433,21 @@ mod tests {
             other => panic!("expected FillRect, got {other:?}"),
         }
         assert!(matches!(ops[3], PaintOp::PopTransform));
+    }
+
+    /// Phase 15.2 — apply_props on empty ops is a no-op. If the
+    /// Activity didn't paint this frame, wrapping empty ops with
+    /// transform/alpha would leave the surface buffer non-empty
+    /// (just wrappers, no actual paint) — finish_frame_in_order
+    /// would then emit a destructive Begin/End block, clearing the
+    /// renderer's backing canvas mid-animation. Empty stays empty
+    /// so the "frozen pane" guard upstream can do its job.
+    #[test]
+    fn apply_props_empty_ops_is_a_noop() {
+        let mut ops: Vec<PaintOp> = Vec::new();
+        apply_props(&mut ops, SurfaceProps { translate_x: 50.0, alpha: 0.5 });
+        assert!(ops.is_empty(),
+            "no activity ops → no wrapper ops; surface stays empty");
     }
 
     #[test]

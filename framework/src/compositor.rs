@@ -343,12 +343,24 @@ impl Compositor {
         &mut self, order: &[(SurfaceId, Rect)],
     ) -> &FrameCommands {
         self.flat.clear();
-        // Per-surface paint passes. Skip surfaces that haven't drawn
-        // (matches pre-15.1 silently-skip semantics) so we never emit
-        // an empty Begin/End block for a surface the activity hasn't
-        // produced ops for this frame.
+        // Per-surface paint passes. Phase 15.2 — emit Begin/End only
+        // when the surface has fresh ops this frame. An empty buffer
+        // means "the activity didn't paint this frame" (it's slow,
+        // trapped, paused, etc.); we must NOT emit Begin/End in that
+        // case because the renderer's `beginSurface` clears the
+        // backing canvas, which would wipe the activity's last-known
+        // pixels. With Begin/End suppressed, only the trailing
+        // CompositeSurface fires for that surface and the renderer
+        // drawImages the prior frame's pixels — the load-bearing
+        // "frozen pane" property of the per-Activity surface model.
+        //
+        // `begin_frame` clears every surface's ops at the start of the
+        // frame, so `fc.ops.is_empty()` reliably distinguishes "didn't
+        // paint" from "painted, even if just a clear" — a paint always
+        // produces at least one op.
         for (id, bounds) in order {
             if let Some(fc) = self.surfaces.get(id) {
+                if fc.ops.is_empty() { continue; }
                 self.flat.ops.push(PaintOp::BeginSurface {
                     id: id.0, x: bounds.x, y: bounds.y,
                     w: bounds.w, h: bounds.h,
@@ -513,6 +525,73 @@ mod tests {
             .filter(|op| matches!(op, PaintOp::CompositeSurface { .. })).count();
         assert_eq!(begin_count, 1, "only the surface with ops emits a Begin");
         assert_eq!(composite_count, 2, "every listed surface composites");
+    }
+
+    /// Phase 15.2 — load-bearing "frozen pane" property. A surface
+    /// whose Activity didn't paint this frame must NOT emit Begin/End
+    /// (which would clear the renderer's backing canvas), but must
+    /// STILL emit CompositeSurface (so the renderer drawImages the
+    /// last-known pixels). Without this guard, a slow / trapped /
+    /// paused Activity would paint a black region every frame.
+    #[test]
+    fn empty_surface_skips_begin_end_but_still_composites() {
+        let mut c = Compositor::new();
+        let s = SurfaceId(7);
+        // Frame 1: Activity painted normally.
+        c.begin_frame();
+        c.surface_target(s).push(one_op());
+        let _ = c.finish_frame_in_order(&[(s, r(0.0, 0.0, 100.0, 100.0))]);
+
+        // Frame 2: Activity didn't paint. begin_frame clears the
+        // surface's ops vec; the buffer entry stays in `surfaces`.
+        c.begin_frame();
+        let flat = c.finish_frame_in_order(&[(s, r(0.0, 0.0, 100.0, 100.0))]);
+        let begin_count = flat.ops.iter()
+            .filter(|op| matches!(op, PaintOp::BeginSurface { .. })).count();
+        let end_count = flat.ops.iter()
+            .filter(|op| matches!(op, PaintOp::EndSurface)).count();
+        let composite_count = flat.ops.iter()
+            .filter(|op| matches!(op, PaintOp::CompositeSurface { .. })).count();
+        assert_eq!(begin_count, 0,
+            "empty-ops surface must not emit BeginSurface (would clear canvas)");
+        assert_eq!(end_count, 0, "no Begin → no End");
+        assert_eq!(composite_count, 1,
+            "Composite still fires so the renderer drawImages last pixels");
+    }
+
+    /// Phase 15.2 — Begin/End suppression triggers per-surface, not
+    /// per-frame. In a frame where surface A painted and surface B
+    /// didn't, A must emit a Begin/End block and B must not — both
+    /// composite at the end.
+    #[test]
+    fn finish_frame_emits_begin_end_only_for_surfaces_with_fresh_ops() {
+        let mut c = Compositor::new();
+        let a = SurfaceId(10);
+        let b = SurfaceId(20);
+        // Pre-allocate B's buffer (e.g. from a prior frame's paint)
+        // so it sits in `self.surfaces` with empty ops in this frame.
+        c.surface_target(b).push(one_op());
+        let _ = c.finish_frame_in_order(&[(b, r(0.0, 0.0, 100.0, 100.0))]);
+
+        c.begin_frame();
+        c.surface_target(a).push(one_op());
+        // Don't push to B — it stays empty this frame.
+        let flat = c.finish_frame_in_order(&[
+            (a, r(0.0, 0.0, 100.0, 100.0)),
+            (b, r(0.0, 0.0, 50.0, 50.0)),
+        ]);
+        // Begin/End block only for A.
+        let begin_ids: Vec<u32> = flat.ops.iter().filter_map(|op| match op {
+            PaintOp::BeginSurface { id, .. } => Some(*id),
+            _ => None,
+        }).collect();
+        assert_eq!(begin_ids, vec![10], "only the painting surface emits Begin");
+        // Composite for both, in caller order.
+        let composite_ids: Vec<u32> = flat.ops.iter().filter_map(|op| match op {
+            PaintOp::CompositeSurface { id, .. } => Some(*id),
+            _ => None,
+        }).collect();
+        assert_eq!(composite_ids, vec![10, 20]);
     }
 
     #[test]
