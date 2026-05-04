@@ -1,117 +1,195 @@
-# Akiva ABI — חוזה בין Runtime ל-Applications
+# Akiva ABI — the contract between Runtime and Applications
 
-## 1. מטרה
+## 1. Purpose
 
-ה-ABI מגדיר איך wasm component של אפליקציה מדבר עם ה-runtime. חוזה יציב, מתועד, version-tracked, מתואר ב-**WIT (WebAssembly Interface Types)** של ה-Component Model.
+The ABI defines how an app's wasm component talks to the
+runtime. A stable, documented, version-tracked contract,
+described in **WIT (WebAssembly Interface Types)** of the
+Component Model.
 
-## 1.1 שני רבדים: v0 "raw" ↔ v1 "component"
+## 1.1 Two layers: v0 "raw" ↔ v1 "component"
 
-התיעוד מחולק לשני מצבים:
+The documentation is split between two states:
 
-| רובד | מצב | איפה מוגדר |
-|---|---|---|
-| **v0 — Raw exports** | המצב הנוכחי ב-Phase 2b. apps הם פשוט `wasm32-unknown-unknown` modules שמייצאים `extern "C"` functions. אין Component Model, אין wit-bindgen. | §2 למטה |
-| **v1 — Component Model** | היעד. apps הם Components שמייצאים את ה-world `akiva:app/guest` ומייבאים `akiva:app/host`. | §3 ואילך |
+| layer                       | state | where defined  |
+|-----------------------------|-------|----------------|
+| **v0 — Raw exports**        | The current state through Phase 14. Apps are plain `wasm32-unknown-unknown` modules exporting `extern "C"` functions. No Component Model, no `wit-bindgen`. | §2 below |
+| **v1 — Component Model**    | The target. Apps are Components that export the `akiva:app/guest` world and import `akiva:app/host`.                              | §3 onward |
 
-הסיבה לרובד הכפול: ל-browser wasm עדיין אין runtime מובנה ל-Component Model. אימוץ מוקדם של wit-bindgen מחייב toolchain ו-glue נוספים לכל שפה. ה-v0 הוא חוזה זמני שמאפשר לנו ל-boot את הפלטפורמה ב-Rust ללא תלויות חיצוניות, תוך שמירה על ה-v1 כ-shape של העתיד.
+The reason for the dual layer: browser wasm still has no
+built-in Component Model runtime. Adopting `wit-bindgen` early
+forces toolchain and glue work for every language. v0 is the
+interim contract that lets us boot the platform in Rust without
+external dependencies, while v1 stays the shape of the future.
 
-המעבר מ-v0 ל-v1 יהיה additive, לא breaking: ה-WIT interfaces ב-§5 תוכננו כך שה-raw ABI של v0 נמפה אליהם 1:1 (משפחות הקריאות זהות).
+The transition from v0 to v1 will be additive, not breaking:
+the WIT interfaces in §5 are designed so the raw v0 ABI maps
+1:1 onto them (the call families are identical).
 
 ## 1.2 ABI versioning policy (Stone 11.6.8 #5)
 
-`ABI_VERSION` מוצהר בשני צדדים — `sdk-rust/src/lib.rs` ו-`framework/src/lib.rs` — ונבדק ב-instantiation. mismatch fails-loudly. הסעיף הזה קובע *איך ומתי* ה-version עולה, מה נחשב breaking, ומי מאשר.
+`ABI_VERSION` is declared on both sides — `sdk-rust/src/lib.rs`
+and `framework/src/lib.rs` — and checked at instantiation; a
+mismatch fails loudly. This section pins **how and when** the
+version bumps, what counts as breaking, and who approves it.
 
-### 1.2.1 In-scope של ה-ABI
+### 1.2.1 In-scope of the ABI
 
-הדברים שהשינוי בהם דורש version bump:
-- **Extern function signatures** בשני הצדדים — `akiva_app_*` exports (kernel→app) ו-`akiva_host_*` / `hal_app_*` imports (app→host).
-- **`op_kind` constants** — fire kinds, io kinds (`STORAGE_GET`, `QUERY_PACKAGES`, …), cmd kinds (CREATE, RESIZE, …).
-- **Status code constants** — POLL_STATUS::PENDING/READY/ERROR, future status values, `STATUS_BUSY` (post-11.6.8 #2).
-- **Wire format byte layouts** — intent encoding (§2.5), paint encoding (§2.7), saved-state, pkgs blob, result blob, capability list. שינוי field order, alignment, או prefix length הוא MAJOR.
-- **Capability constants** — `akiva.permission.*` strings ב-manifest.
-- **Public `MAX_*_BYTES` constants** — `Intent::MAX_WIRE_BYTES`, etc. הקטנת המגבלה היא breaking; הגדלה אדיטיבית.
+Things that, when changed, require a version bump:
 
-### 1.2.2 NOT in-scope של ה-ABI
+- **Extern function signatures** on both sides — `akiva_app_*`
+  exports (kernel→app) and `akiva_host_*` / `hal_app_*`
+  imports (app→host).
+- **`op_kind` constants** — fire kinds, io kinds
+  (`STORAGE_GET`, `QUERY_PACKAGES`, …), cmd kinds (CREATE,
+  RESIZE, …).
+- **Status code constants** — `POLL_STATUS::PENDING/READY/ERROR`,
+  future status values, `STATUS_BUSY` (post-11.6.8 #2).
+- **Wire-format byte layouts** — intent encoding (§2.5), paint
+  encoding (§2.7), saved-state, pkgs blob, result blob,
+  capability list. Changing field order, alignment, or prefix
+  length is MAJOR.
+- **Capability constants** — `akiva.permission.*` strings in
+  the manifest.
+- **Public `MAX_*_BYTES` constants** — `Intent::MAX_WIRE_BYTES`,
+  etc. Lowering a limit is breaking; raising one is additive.
 
-שינויים שלא דורשים bump:
-- **SDK Rust ergonomics** — שמות פונקציות, error types, doc comments, helper signatures. `WriteHandle` קיבל `must_use` ב-Stone 11.6.7 #1 בלי bump כי החתימה ה-binary לא השתנתה.
-- **Internal kernel implementation** — kernel internals, framework internal logic, `runtime/web` JS internals, scheduler tweaks, watchdog thresholds.
-- **Test harness** — test fixtures, mock implementations, vitest helpers.
-- **Documentation** — text in `docs/`, README, code comments, log messages.
+### 1.2.2 NOT in-scope of the ABI
+
+Changes that don't require a bump:
+
+- **SDK Rust ergonomics** — function names, error types, doc
+  comments, helper signatures. `WriteHandle` got `must_use` in
+  Stone 11.6.7 #1 without a bump because the binary signature
+  did not change.
+- **Internal kernel implementation** — kernel internals,
+  framework internal logic, `runtime/web` JS internals,
+  scheduler tweaks, watchdog thresholds.
+- **Test harness** — test fixtures, mock implementations,
+  vitest helpers.
+- **Documentation** — text in `docs/`, README, code comments,
+  log messages.
 
 ### 1.2.3 Bump rules
 
-**PATCH** (`0.X.Y` → `0.X.(Y+1)`): bug fix במימוש, contract לא משתנה. חסום בעידן 0.X — לא נשתמש; קיים על נייר ל-1.0+.
+**PATCH** (`0.X.Y` → `0.X.(Y+1)`): bug fix in the
+implementation, contract unchanged. Frozen during the 0.X
+era — we won't use it; reserved for 1.0+.
 
-**MINOR** (`0.X.Y` → `0.(X+1).0`): additive change. דוגמאות:
-- New op_kind מוסף לטבלה
-- New extern import (apps שלא קוראות אותו ממשיכות לעבוד)
-- New capability string (apps שלא דורשות אותה אינן מושפעות)
-- Field appended ל-wire format שמתועד כ-"may be extended" (decoder ישן מתעלם מ-trailing bytes)
-- Status code חדש (apps שלא בודקות אותו ספציפית מקבלות אותו כ-fallback ERROR)
+**MINOR** (`0.X.Y` → `0.(X+1).0`): additive change. Examples:
 
-Apps שנבנו על MINOR-N עובדות על MINOR-(N+k) ללא rebuild. Apps שנבנו על MINOR-(N+k) **לא** מובטחות לעבוד על MINOR-N (יחסר להן primitive).
+- A new op_kind added to the table.
+- A new extern import (apps that don't call it keep working).
+- A new capability string (apps that don't request it are
+  unaffected).
+- A field appended to a wire format documented as "may be
+  extended" (an old decoder ignores the trailing bytes).
+- A new status code (apps that don't check it specifically see
+  it as a fallback ERROR).
 
-**MAJOR** (pre-1.0: `0.X` → `0.(X+1).0`; post-1.0: `X.Y` → `(X+1).0.0`): breaking change. דוגמאות:
-- הסרה / שינוי שם של primitive
-- שינוי טיפוס של arg
-- Reorder של field-ים ב-wire format
-- שינוי semantics של op_kind קיים
-- תוספת field ל-wire format שלא מתועד כ-extensible
+Apps built on MINOR-N work on MINOR-(N+k) without rebuild.
+Apps built on MINOR-(N+k) are **not** guaranteed to work on
+MINOR-N (they may rely on a primitive that didn't exist).
 
-Apps חייבות rebuild + retest.
+**MAJOR** (pre-1.0: `0.X` → `0.(X+1).0`; post-1.0: `X.Y` →
+`(X+1).0.0`): breaking change. Examples:
 
-### 1.2.4 Promotion ל-1.0
+- Removal / renaming of a primitive.
+- Changing the type of an arg.
+- Reordering fields in a wire format.
+- Changing the semantics of an existing op_kind.
+- Adding a field to a wire format that wasn't documented as
+  extensible.
 
-קריטריונים שכולם חייבים להיות ירוקים לפני `1.0.0`:
-- **Phase 11 + 12 + 13 exit criteria** all met (workers, governance, WindowManager).
-- **שלוש apps third-party** באקוסיסטם הציבורי השתמשו ב-ABI ושרדו `MINOR` bump אחד לפחות בלי breakage.
-- **WIT migration plan** מוגדר בכתב (לא ביצוע — תכנון מחייב).
-- **CHANGELOG.md** מקיף עם נימוק לכל MAJOR / MINOR מאז `0.1.0`.
-- **Public docs** ב-`docs/abi.md` סומנו כ"frozen surface" (לא draft).
+Apps require rebuild + retest.
 
-עד ש-1.0 נופל, MAJOR bumps ב-0.X חופשיים יחסית — אבל כל אחד דורש `CHANGELOG.md` entry ו-PR review מפורש.
+### 1.2.4 Promotion to 1.0
+
+Criteria, all green before `1.0.0`:
+
+- **Phase 11 + 12 + 13 exit criteria** all met (workers,
+  governance, WindowManager).
+- **Three third-party apps** in the public ecosystem used the
+  ABI and survived at least one MINOR bump without breakage.
+- **WIT migration plan** written down (not executed —
+  planning required).
+- **CHANGELOG.md** comprehensive with rationale for every
+  MAJOR / MINOR since `0.1.0`.
+- **Public docs** in `docs/abi.md` marked "frozen surface" (no
+  longer draft).
+
+Until 1.0 lands, MAJOR bumps in 0.X are relatively free — but
+each requires a `CHANGELOG.md` entry and explicit PR review.
 
 ### 1.2.5 Review process
 
-- **MINOR / PATCH**: PR אחד; reviewer יחיד; checklist של "הוספתי entry ב-CHANGELOG, הברתי `ABI_VERSION` בשני הצדדים".
-- **MAJOR (pre-1.0)**: PR + design memo קצר ב-`docs/research-*.md` שמסביר למה ה-old shape שגוי. ה-CHANGELOG entry חייב לציין break-compat path.
-- **MAJOR (post-1.0)**: דורש 2 reviewer-im ו-30-day announcement window לפני merge ל-`main`. ה-window מאפשר ל-third-party apps להגיב ולשנות planning.
+- **MINOR / PATCH:** one PR; one reviewer; checklist of "I
+  added a CHANGELOG entry, I bumped `ABI_VERSION` on both
+  sides".
+- **MAJOR (pre-1.0):** PR + a short design memo in
+  `docs/research-*.md` explaining why the old shape is wrong.
+  The CHANGELOG entry must specify the break-compat path.
+- **MAJOR (post-1.0):** requires 2 reviewers and a 30-day
+  announcement window before merging to `main`. The window
+  lets third-party apps respond and adjust planning.
 
 ### 1.2.6 Symbolic source of truth
 
-מערכת מקור-אמת לערך הנוכחי של `ABI_VERSION`:
+The source-of-truth chain for `ABI_VERSION`:
 
 ```
-sdk-rust/src/lib.rs::ABI_VERSION  ←  קנוני
-framework/src/lib.rs::ABI_VERSION ←  חייב להיות שווה; mismatch = panic ב-load
-CHANGELOG.md                       ←  history של כל bump עם הסבר
-docs/abi.md (this section)         ←  policy של איך ומתי לעלות
+sdk-rust/src/runtime.rs::ABI_VERSION  ← canonical
+framework/src/lib.rs::ABI_VERSION     ← must match; mismatch = panic at load
+CHANGELOG.md                           ← history of every bump with rationale
+docs/abi.md (this section)             ← policy of how / when to bump
 ```
 
-שינוי של `ABI_VERSION` שלא מתועד ב-CHANGELOG חייב להיתפס ב-CI (TODO: tooling — Stone 11.8 או 12).
+A change to `ABI_VERSION` not documented in CHANGELOG must be
+caught in CI (TODO: tooling — Stone 11.8 or 12).
 
 ---
 
-## 1.3 עיקרון: ABI narrow-by-design
+## 1.3 Principle: ABI narrow-by-design
 
-ABI v0 קטן בכוונה. זה לא accident; זה policy. ABI רחב מדי מוקדם מדי הופך לעוגן שמאט כל שינוי עתידי, ומכתיב decisions שכבת framework לעוד שנים.
+ABI v0 is intentionally small. That isn't an accident; it is
+policy. An ABI that goes wide too early becomes an anchor that
+slows every future change, dictating decisions for the framework
+layer for years.
 
-כל הרחבה ל-ABI — בין אם export חדש ב-app, import חדש ב-host, או שדה חדש ב-wire format — חייבת לעבור על שלושת המבחנים:
+Every extension to the ABI — whether a new app export, a new
+host import, or a new wire-format field — has to pass three
+gates:
 
-1. **Use case מוכח.** לפחות reference app אחד שבלי ההרחבה לא פועל בצורה סבירה. "might be useful later" לא מספיק.
-2. **Cross-app justification.** הרחבה שמשרתת app בודד או use case נישתי שייכת ל-framework או ל-sdk, לא ל-ABI. ABI משרת רק את הדברים שכל app, או runtime core, חייבים.
-3. **Forward-compat ל-v1.** יש mapping ברור ל-WIT interface ב-§5. אם ההרחבה לא מתורגמת לצורה נקייה ב-Component Model, זה תמרור אזהרה שה-shape שלה לא נכון.
+1. **Proven use case.** At least one reference app is
+   meaningfully impaired without the extension. "Might be
+   useful later" doesn't qualify.
+2. **Cross-app justification.** An extension that serves a
+   single app or a niche use case belongs in the framework or
+   the SDK, not the ABI. The ABI serves only what every app, or
+   the runtime core, requires.
+3. **Forward compat to v1.** A clear mapping exists to a WIT
+   interface in §5. If the extension doesn't translate cleanly
+   to the Component Model, that's a sign its shape is wrong.
 
-הכלל המעשי: עדיף פונקציה אחת חסרה היום מאשר שבע פונקציות מיותרות שנצטרך לגרור לנצח. הרחבות נוספות ל-`hal_app_*` או ל-paint-op opcodes עוברות review מפורש ב-PR, ומתועדות ב-CHANGELOG (§1.2.6) ובסעיף גרסאות (§10).
+The practical rule: better one missing function today than
+seven unnecessary ones we'd have to drag forever. New
+extensions to `hal_app_*` or paint-op opcodes get explicit PR
+review and are documented in CHANGELOG (§1.2.6) and the
+versions section (§10).
 
 ---
 
 ## 2. App ABI v0 — raw exports (Phase 2b)
 
-### 2.1 מודל ריצה
+### 2.1 Runtime model
 
-כל app הוא wasm module עצמאי שה-host (worker.js) טוען לצד ה-kernel wasm. ה-kernel **לא** מזהה את האפליקציה ב-address space שלו — הוא שולח את הבקשות ל-host דרך imports בשם `hal_app_*`, וה-host מנתב אותן ל-instance הנכון של ה-app. יש לכך יתרונות מיידיים: isolation בין apps, memory growth עצמאי, crash containment.
+Every app is a stand-alone wasm module the host (`worker.js`)
+loads alongside the kernel wasm. The kernel **does not**
+identify the app inside its own address space — it sends
+requests to the host through imports named `hal_app_*`, and
+the host routes them to the right app instance. Immediate
+benefits: isolation between apps, independent memory growth,
+crash containment.
 
 ```
   Kernel wasm           Worker JS host             App wasm (one per package)
@@ -122,66 +200,77 @@ ABI v0 קטן בכוונה. זה לא accident; זה policy. ABI רחב מדי �
                         hal_app_get_result
 ```
 
-ה-`handle` הוא `u32` לא-אפסי שה-host מקצה ב-`hal_app_register` ושומר בו את ה-tuple `(package_id, class, wasm_instance)`. ל-kernel אין מושג מה ה-handle מייצג.
+The `handle` is a non-zero `u32` the host allocates in
+`hal_app_register` and uses as the key for the tuple
+`(package_id, class, wasm_instance)`. The kernel has no
+visibility into what the handle stands for.
 
-### 2.2 Exports שה-app חייב לספק
+### 2.2 Exports the app must provide
 
-כל app חייב לייצא את ה-wasm `memory` (מופעל אוטומטית ע"י rustc ל-`wasm32-unknown-unknown`) ואת הפונקציות הבאות (C ABI). `runtime/web/app_registry.js::REQUIRED_EXPORTS` בודק את הרשימה בזמן טעינה; apps שחסרים משהו נדחים לפני הקריאה הראשונה למחזור חיים.
+Every app must export the wasm `memory` (rustc does this
+automatically for `wasm32-unknown-unknown`) and the following
+functions (C ABI). `runtime/web/app_registry.js::REQUIRED_EXPORTS`
+checks the list at load time; apps missing anything are rejected
+before the first lifecycle call.
 
 #### 2.2.1 Memory ABI (always required)
 
 ```rust
-// ה-host משתמש בכדי להזריק data ל-app (intents, saved state, dispatch payloads).
+// The host uses this to inject data into the app (intents, saved state, dispatch payloads).
 extern "C" fn akiva_app_alloc(size: u32) -> *mut u8;
 extern "C" fn akiva_app_dealloc(ptr: *mut u8, size: u32);
 
-// ABI version — null-terminated UTF-8 ("0.1.0").
+// ABI version — null-terminated UTF-8 ("0.12.0").
 extern "C" fn akiva_app_abi_version() -> *const u8;
 ```
 
 #### 2.2.2 Unified dispatch entry (P0 #4 async-resumable)
 
-ה-Exports שהוצגו ב-Stone 11.4b הפכו ב-P0 #4 (May 2026) ל-async-resumable. שלושה exports מחליפים את הזוג הקודם:
+The exports introduced in Stone 11.4b became async-resumable in
+P0 #4 (May 2026). Three exports replace the previous pair:
 
 ```rust
-// Hand-off into the SDK runtime. dispatch_id is allocated by the
-// host (the AppRegistry's per-package monotonic counter) and is the
-// stable handle the host uses for all follow-up calls related to
-// this dispatch (poll_dispatch + get_result). Every payload begins
-// with [handle: u32 LE, ...] — the cmd_kind table at §2.2 lists the
-// per-cmd remainder.
+// Hand-off into the SDK runtime. dispatch_id is allocated by
+// the host (the AppRegistry's per-package monotonic counter)
+// and is the stable handle the host uses for every follow-up
+// call related to this dispatch (poll_dispatch + get_result).
+// Every payload begins with [handle: u32 LE, ...] — the
+// cmd_kind table at §2.2 lists the per-cmd remainder.
 //
 // Returns a status code:
-//   0  — accepted; host should drive to terminal status via
-//        poll_dispatch.
-//   !=0 — hard refusal (bad payload, unknown cmd_kind, OOM during
-//        slot construction). The host treats it as ack-only and
-//        does NOT poll.
+//   0   — accepted; host should drive to terminal status via
+//         poll_dispatch.
+//   !=0 — hard refusal (bad payload, unknown cmd_kind, OOM
+//         during slot construction). The host treats it as
+//         ack-only and does NOT poll.
 extern "C" fn akiva_app_dispatch(
     dispatch_id: u64,
-    cmd_kind: u32,
+    cmd_kind:    u32,
     payload_ptr: *const u8,
     payload_len: u32,
 ) -> u32;
 
 // Drive a dispatch one poll forward. Returns packed (status, len):
 //   * status (low 32 bits):
-//       0 PENDING — wasm is parked on a host_op; host should call
-//                   again after `host_op_done` arrives at the shell.
+//       0 PENDING — wasm is parked on a host_op; the host
+//                   should call again after `host_op_done`
+//                   arrives at the shell.
 //       1 READY   — bytes (if any) available via get_result.
-//       2 ERROR   — future trapped, wire bug, or unknown dispatch_id.
+//       2 ERROR   — the future trapped, wire bug, or unknown
+//                   dispatch_id.
 //   * len (high 32 bits): byte count for READY/ERROR; 0 for
 //     PENDING and ack-only dispatches.
 extern "C" fn akiva_app_poll_dispatch(dispatch_id: u64) -> u64;
 
 // Two-phase fetch of the result bytes for a READY dispatch.
-// `*out_len_ptr` receives the length; returned pointer + length are
-// valid until this single call evicts the dispatch_id (single-shot).
-// For ack-only dispatches (lifecycle, input, intent, etc.) the
-// pointer may be null and length 0.
+// `*out_len_ptr` receives the length; the returned pointer +
+// length are valid until this single call evicts the
+// dispatch_id (single-shot). For ack-only dispatches
+// (lifecycle, input, intent, …) the pointer may be null and
+// the length 0.
 //
-// DESTROY is special: get_result also tears down the slot once the
-// bytes are drained (which are always 0 for destroy). This delays
+// DESTROY is special: get_result also tears down the slot once
+// the bytes are drained (always 0 for destroy). This delays
 // slot teardown until AFTER any pending future has dropped its
 // borrows into the slot.
 extern "C" fn akiva_app_get_result(
@@ -190,58 +279,100 @@ extern "C" fn akiva_app_get_result(
 ) -> *const u8;
 ```
 
-`cmd_kind` הוא integer יציב מ-`framework::wire::op_kinds::cmd::*` (mirror ב-`akiva_sdk::op_kinds::cmd::*` וב-`runtime/web/op_kinds.mjs::CMD`). הטווחים מקובעים לעולם:
+`cmd_kind` is a stable integer from
+`framework::wire::op_kinds::cmd::*` (mirrored in
+`akiva_sdk::op_kinds::cmd::*` and
+`runtime/web/op_kinds.mjs::CMD`). The ranges are pinned for
+all time:
 
-| Range          | קטגוריה   | Ops                                                       |
-|----------------|-----------|-----------------------------------------------------------|
-| `0x01..=0x0F`  | Lifecycle | CREATE / START / RESUME / PAUSE / STOP / DESTROY          |
-| `0x10..=0x1F`  | Input     | POINTER / KEY / RESIZE                                    |
-| `0x20..=0x2F`  | Render    | RENDER                                                    |
-| `0x30..=0x3F`  | State     | SAVE_STATE / RESTORE_STATE                                |
-| `0x40..=0x4F`  | Intent    | NEW_INTENT / ACTIVITY_RESULT                              |
-| `0x50..=`      | reserved  | streams / pushed events (Stone 11.5+)                     |
+| range          | category   | ops                                                       |
+|----------------|------------|-----------------------------------------------------------|
+| `0x01..=0x0F`  | Lifecycle  | CREATE / START / RESUME / PAUSE / STOP / DESTROY          |
+| `0x10..=0x1F`  | Input      | POINTER / KEY / RESIZE / TEXT_INPUT (`0x13`)              |
+| `0x20..=0x2F`  | Render     | RENDER                                                    |
+| `0x30..=0x3F`  | State      | SAVE_STATE / RESTORE_STATE                                |
+| `0x40..=0x4F`  | Intent     | NEW_INTENT / ACTIVITY_RESULT                              |
+| `0x50..=`      | reserved   | streams / pushed events                                   |
 
-Payload layout פר-cmd (כל אחד מתחיל ב-`[handle: u32 LE, ...]`):
+Per-cmd payload layout (each starts with `[handle: u32 LE, ...]`):
 
-| cmd_kind          | payload after handle                                                     |
-|-------------------|--------------------------------------------------------------------------|
-| CREATE            | `class: utf8` (host-augmented — kernel passes only `[handle]`)           |
-| START/RESUME/PAUSE/STOP/DESTROY | אין                                                        |
-| POINTER           | `x: f32, y: f32, button: u32, phase: u32, ts: f64` (24 bytes)            |
-| KEY               | `code: u32, modifiers: u32, phase: u32, ts: f64` (20 bytes)              |
-| RESIZE            | `width: u32, height: u32, density: f32` (12 bytes)                       |
-| RENDER            | `ts: f64` (8 bytes); result = paint-op stream                            |
-| SAVE_STATE        | אין; result = `SavedState::encode` bytes                                 |
-| RESTORE_STATE     | `state: bytes`                                                           |
-| NEW_INTENT        | `intent: encoded Intent`                                                 |
-| ACTIVITY_RESULT   | `request_code: u32, result: encoded ActivityResult`                      |
+| cmd_kind                           | payload after handle                                                     |
+|------------------------------------|--------------------------------------------------------------------------|
+| CREATE                             | `class: utf8` (host-augmented — kernel passes only `[handle]`)           |
+| START / RESUME / PAUSE / STOP / DESTROY | none                                                                |
+| POINTER                            | `x: f32, y: f32, button: u32, phase: u32, ts: f64` (24 bytes)            |
+| KEY                                | `code: u32, modifiers: u32, phase: u32, ts: f64` (20 bytes)              |
+| TEXT_INPUT                         | `len: u16 LE, text: utf8`                                                |
+| RESIZE                             | `width: u32, height: u32, density: f32` (12 bytes)                       |
+| RENDER                             | `ts: f64` (8 bytes); result = paint-op stream                            |
+| SAVE_STATE                         | none; result = `SavedState::encode` bytes                                |
+| RESTORE_STATE                      | `state: bytes`                                                           |
+| NEW_INTENT                         | `intent: encoded Intent`                                                 |
+| ACTIVITY_RESULT                    | `request_code: u32, result: encoded ActivityResult`                      |
 
-`dispatch_id` הוא monotonic counter ש-AppRegistry מקצה כל פעם ש-`hal_app_dispatch` נקרא. ה-id משמש כמפתח גם ב-host-side `_dispatches` map וגם ב-app-side per-handle pending registry — שני הצדדים מסכימים על אותו ערך, מה שעושה את ה-debugging trivial (אותו int במסד נתונים אחד).
+`dispatch_id` is a monotonic counter the AppRegistry allocates
+each time `hal_app_dispatch` is called. The id keys both the
+host-side `_dispatches` map and the app-side per-handle pending
+registry — both sides agree on the same value, which makes
+debugging trivial (the same int across the two pools).
 
-ה-buffer שמוחזר מ-`akiva_app_get_result` הוא app-owned ותקף עד הקריאה עצמה תופסת אותו (single-shot consume). למשל ל-RENDER, ה-paint buffer reused על-כל-handle; ה-pointer שמוחזר עתה תקף עד ה-RENDER הבא על אותו handle. ל-SAVE_STATE/ack-only ה-buffer-lifetime זהה.
+The buffer returned by `akiva_app_get_result` is app-owned and
+valid until the very call that consumes it (single-shot). For
+RENDER, the paint buffer is reused per handle; the pointer
+returned now is valid until the next RENDER on the same handle.
+SAVE_STATE / ack-only buffers have the same lifetime.
 
 #### 2.2.3 Async-resumable dispatch — pending → host_op_done → re-poll
 
-P0 #4 (May 2026) שינה את ה-protocol מ-"sync-or-handle" ל-async-resumable כדי לתמוך ב-`storage::read().await` באופן שקוף:
+P0 #4 (May 2026) changed the protocol from "sync-or-handle"
+to async-resumable so `storage::read().await` can work
+transparently:
 
-1. App-worker shell מקבל `{type:"dispatch", dispatch_id, cmd_kind, payload}` מ-AppRegistry.
-2. Shell מעתיק את ה-payload לזיכרון של ה-wasm, קורא `akiva_app_dispatch(dispatch_id, cmd, ptr, len)`. ה-runtime ב-wasm בונה future, polls פעם אחת.
-3. Shell קורא `akiva_app_poll_dispatch(dispatch_id)`:
-   * **READY** — שולף bytes (אם יש) דרך `get_result`, שולח `{type:"dispatch_done", dispatch_id, bytes}` ל-AppRegistry.
-   * **PENDING** — שומר ב-`pendingDispatches` Map, **לא** שולח dispatch_done.
-   * **ERROR** — שולח dispatch_done עם null bytes; trapped notice אופציונלי.
-4. עבור pending dispatches: כש-`host_op_done` מגיע ל-shell (storage read resolved, network reply, וכו'), shell עושה re-poll על **כל** ה-pending dispatches. כל אחד מהם יכול להיות parked על ה-future הזה. זה במובן מ-O(n) iteration — אבל n ≤ 1 בפועל (framework allows רק dispatch אחד per handle).
-5. כשה-poll מחזיר READY, הflow ב-§3 ממשיך כרגיל.
+1. The app worker shell receives
+   `{type: "dispatch", dispatch_id, cmd_kind, payload}` from
+   the AppRegistry.
+2. The shell copies the payload into wasm memory and calls
+   `akiva_app_dispatch(dispatch_id, cmd, ptr, len)`. The
+   runtime in wasm builds a future and polls once.
+3. The shell calls `akiva_app_poll_dispatch(dispatch_id)`:
+   - **READY** — fetches the bytes (if any) via
+     `get_result`; sends
+     `{type: "dispatch_done", dispatch_id, bytes}` to the
+     AppRegistry.
+   - **PENDING** — stores in `pendingDispatches` Map; **does
+     not** send dispatch_done.
+   - **ERROR** — sends dispatch_done with null bytes; an
+     optional trapped notice may follow.
+4. For pending dispatches: when `host_op_done` arrives at the
+   shell (storage read resolved, network reply, etc.), the
+   shell re-polls **every** pending dispatch. Any of them
+   could have been parked on this future. This is O(n) iter
+   — but n ≤ 1 in practice (the framework allows only one
+   dispatch per handle at a time).
+5. When a poll returns READY, the §3 flow continues normally.
 
-ה-AppRegistry על הצד של ה-kernel לא מחליף — הוא ממשיך לראות `dispatch_id` יוצא ו-`dispatch_done` חוזר, איפה שהוא רק חיכה יותר זמן. ה-kernel polling דרך `hal_app_poll_future` ממשיך לראות PENDING עד שה-shell שולח dispatch_done.
+The AppRegistry on the kernel side is unchanged — it keeps
+seeing a `dispatch_id` go out and a `dispatch_done` come back;
+it just waited longer. Kernel polling through
+`hal_app_poll_future` keeps seeing PENDING until the shell
+sends dispatch_done.
 
 ### 2.3 Imports (host → app)
 
-ה-host מייצא ל-wasm של האפליקציה imports תחת module name `env`. נכון ל-Stone 11.3 ה-import surface מכוון ל-**unified ABI** של שלוש פונקציות multiplexer + ארבע פונקציות resource lookup. כל פעולה host-mediated עוברת דרך `akiva_host_fire` (fire-and-forget), `akiva_host_io_start` + `akiva_host_io_poll` (async עם future ID), או דרך אחת מ-resource lookup הקלים. ה-mapping ל-`op_kind` הקבוע מתועד ב-§2.3.2.
+The host exposes imports under module name `env`. As of Stone
+11.3, the import surface is the **unified ABI**: three
+multiplexer functions + four lightweight resource lookups.
+Every host-mediated operation routes through `akiva_host_fire`
+(fire-and-forget), `akiva_host_io_start` +
+`akiva_host_io_poll` (async with a future ID), or one of the
+lightweight resource lookups. The mapping to fixed `op_kind`
+constants is documented in §2.3.2.
 
-#### 2.3.1 Resource lookups (legacy, נשארים)
+#### 2.3.1 Resource lookups (legacy, kept)
 
-ארבע פונקציות readonly per-package שלא משתלבות יפה ב-fire/io shape (אין side effect, אין handle context, אין async). מועברות אוטומטית בלי gating:
+Four readonly per-package functions that don't fit the fire/io
+shape (no side effect, no handle context, no async). Always
+mounted, no gating:
 
 ```rust
 // Resolve @color/name for the calling package. Returns 0xAARRGGBB.
@@ -250,12 +381,12 @@ P0 #4 (May 2026) שינה את ה-protocol מ-"sync-or-handle" ל-async-resumabl
 extern "C" fn akiva_host_resource_color(name_ptr: *const u8, name_len: u32) -> u32;
 
 // Resolve @string/name. Writes UTF-8 bytes into [out_ptr, out_ptr+out_cap)
-// and returns the *actual* length. If the returned length exceeds
-// out_cap, nothing was written — caller reallocates to that size and
-// calls again. Undefined names write "⟨missing:NAME⟩".
+// and returns the *actual* length. If the returned length exceeds out_cap,
+// nothing is written — the caller reallocates and tries again. Undefined
+// names write "⟨missing:NAME⟩".
 extern "C" fn akiva_host_resource_string(
     name_ptr: *const u8, name_len: u32,
-    out_ptr: *mut u8, out_cap: u32,
+    out_ptr: *mut u8,    out_cap:  u32,
 ) -> u32;
 
 // Probes: 1 if the ref is registered, 0 otherwise.
@@ -263,146 +394,207 @@ extern "C" fn akiva_host_resource_has_color(name_ptr: *const u8, name_len: u32) 
 extern "C" fn akiva_host_resource_has_string(name_ptr: *const u8, name_len: u32) -> u32;
 
 // Stone 13.0prep C — resolve @drawable/name to a stable per-package
-// drawable_id. The host built the index at install / boot time by
-// scanning res/drawable/*.png and decoding each PNG to an ImageBitmap;
-// this lookup is an O(1) Map fetch. Id 0 is the missing-drawable
-// sentinel (renderer paints a magenta placeholder).
+// drawable_id. The host built the index at install / boot by scanning
+// res/drawable/*.png and decoding each PNG to an ImageBitmap; this
+// lookup is an O(1) Map fetch. Id 0 is the missing-drawable sentinel
+// (the renderer paints a magenta placeholder).
 extern "C" fn akiva_host_resource_drawable(name_ptr: *const u8, name_len: u32) -> u32;
 ```
 
 #### 2.3.2 Unified ABI multiplexers (Stone 11.3)
 
-שלושה imports שמעבירים את כל הפעולות host-mediated (log, finish, start_activity, set_result, text_width, query_packages, storage…) דרך ה-`op_kind` integer. ה-args layout לכל op_kind ידוע ב-side של ה-SDK ושל ה-host; ה-encoder/decoder מוצמד 1:1 בין `framework/src/wire/op_kinds.rs` (kernel side) ל-`sdk-rust/src/op_kinds.rs` (app side, mirror) — מבחן unit cross-crate מאמת equality.
+Three imports route every host-mediated operation (log,
+finish, start_activity, set_result, text_width, query_packages,
+storage, …) through an `op_kind` integer. The args layout per
+op_kind is known on both the SDK side and the host side; the
+encoder/decoder is matched 1:1 between
+`framework/src/wire/op_kinds.rs` (kernel side) and
+`sdk-rust/src/op_kinds.rs` (app side, mirror) — a unit test
+across crates verifies equality.
 
 ```rust
-// Fire-and-forget — ה-host מבצע את הפעולה ולא מחזיר נתונים. ערך החזרה:
-// 0 = הצליח, !=0 = שגיאה (op_kind לא ידוע, args malformed, capability
-// not granted). אופייני ל-LOG, FINISH, START_ACTIVITY, START_ACTIVITY
-// _FOR_RESULT, SET_RESULT.
+// Fire-and-forget — the host performs the operation without
+// returning data. Return value: 0 = ok, !=0 = error (unknown
+// op_kind, malformed args, capability not granted). Used by
+// LOG, FINISH, START_ACTIVITY, START_ACTIVITY_FOR_RESULT,
+// SET_RESULT, etc.
 extern "C" fn akiva_host_fire(
-    op_kind: u32,
+    op_kind:  u32,
     args_ptr: *const u8,
     args_len: u32,
 ) -> u32;
 
-// Async start — ה-host מקצה future_id ומתחיל לעבד. ערך החזרה: future_id
-// non-zero בהצלחה, 0n בכישלון (op_kind לא ידוע, capability not granted,
-// args malformed). אופייני ל-TEXT_WIDTH, QUERY_PACKAGES, STORAGE_GET/SET.
+// Async start — the host allocates a future_id and starts
+// processing. Return: non-zero future_id on success, 0n on
+// failure (unknown op_kind, capability not granted, malformed
+// args). Used by TEXT_WIDTH, QUERY_PACKAGES, STORAGE_GET/SET,
+// HTTP_FETCH, WS_*, …
 extern "C" fn akiva_host_io_start(
-    op_kind: u32,
+    op_kind:  u32,
     args_ptr: *const u8,
     args_len: u32,
 ) -> u64;
 
-// Poll עד שה-future מתממש. ערך החזרה packed (status: u32 low, length:
-// u32 high). status: 0=PENDING (לא מוכן עדיין, עוד לא חוקי ב-11.3
-// single-worker אבל יקרה ב-11.4+), 1=READY (length bytes נכתבו ל-out_ptr),
-// 2=ERROR. אם length > out_cap — שום דבר לא נכתב; ה-caller מקצה buffer
-// בגודל הנדרש ומנסה שוב (two-phase contract — ה-future נשמר עד שהקריאה
-// מצליחה). אחרי קריאה מוצלחת ה-future evicted מה-registry.
+// Poll until the future resolves. Return packed (status: u32
+// low, length: u32 high). status: 0=PENDING, 1=READY (length
+// bytes written to out_ptr), 2=ERROR. If length > out_cap —
+// nothing is written; the caller allocates a buffer of the
+// required size and calls again (two-phase contract — the
+// future is retained until the call succeeds). After a
+// successful call the future is evicted from the registry.
 extern "C" fn akiva_host_io_poll(
     future_id: u64,
-    out_ptr: *mut u8,
-    out_cap: u32,
+    out_ptr:   *mut u8,
+    out_cap:   u32,
 ) -> u64;
 ```
 
-**op_kind layout** (פרטים מלאים ב-`framework/src/wire/op_kinds.rs`):
+**op_kind layout** (full detail in
+`framework/src/wire/op_kinds.rs`):
 
-| Range            | Transport       | קבועים                                                                                              |
-|------------------|-----------------|-----------------------------------------------------------------------------------------------------|
-| `0x0001..0x00FF` | `fire`          | `LOG=0x01`, `FINISH=0x02`, `START_ACTIVITY=0x03`, `START_ACTIVITY_FOR_RESULT=0x04`, `SET_RESULT=0x05`, `WS_SEND=0x06` (Stone 14.1), `WS_CLOSE=0x07` (Stone 14.1), `WT_SEND_DATAGRAM=0x08` (14.2), `WT_SEND_STREAM=0x09` (14.2), `WT_CLOSE_STREAM=0x0A` (14.2), `WT_CLOSE=0x0B` (14.2), `NOTIFY_CLOSE=0x0C` (14.3), `VIBRATE=0x0D` (14.5) |
-| `0x0101..0x01FF` | `io_start`/poll | `TEXT_WIDTH=0x101`, `QUERY_PACKAGES=0x102`, `STORAGE_GET=0x103`, `STORAGE_SET=0x104`, `STORAGE_DELETE=0x105`, `TIMER_SLEEP=0x106` (Stone 13.0prep A), `SHOW_DIALOG=0x107` (Stone 13.2), `HTTP_FETCH=0x108` (Stone 14.1), `WS_OPEN=0x109` (Stone 14.1), `WS_RECV=0x10A` (Stone 14.1), `WT_OPEN=0x10B` (14.2), `WT_RECV_DATAGRAM=0x10C` (14.2), `WT_OPEN_BIDI=0x10D` (14.2), `WT_RECV_STREAM=0x10E` (14.2), `NOTIFY_REQUEST_PERMISSION=0x10F` (14.3), `NOTIFY_POST=0x110` (14.3), `CLIPBOARD_READ_TEXT=0x111` (14.4), `CLIPBOARD_WRITE_TEXT=0x112` (14.4), `GEO_GET_POSITION=0x113` (14.6) |
-| `0x0200..`       | reserved        | streams / pushed events ל-Stone 11.4+                                                              |
+| range            | transport       | constants                                                                                          |
+|------------------|-----------------|----------------------------------------------------------------------------------------------------|
+| `0x0001..0x00FF` | `fire`          | `LOG=0x01`, `FINISH=0x02`, `START_ACTIVITY=0x03`, `START_ACTIVITY_FOR_RESULT=0x04`, `SET_RESULT=0x05`, `WS_SEND=0x06`, `WS_CLOSE=0x07`, `WT_SEND_DATAGRAM=0x08`, `WT_SEND_STREAM=0x09`, `WT_CLOSE_STREAM=0x0A`, `WT_CLOSE=0x0B`, `NOTIFY_CLOSE=0x0C`, `VIBRATE=0x0D` |
+| `0x0101..0x01FF` | `io_start`/poll | `TEXT_WIDTH=0x101`, `QUERY_PACKAGES=0x102`, `STORAGE_GET=0x103`, `STORAGE_SET=0x104`, `STORAGE_DELETE=0x105`, `TIMER_SLEEP=0x106`, `SHOW_DIALOG=0x107`, `HTTP_FETCH=0x108`, `WS_OPEN=0x109`, `WS_RECV=0x10A`, `WT_OPEN=0x10B`, `WT_RECV_DATAGRAM=0x10C`, `WT_OPEN_BIDI=0x10D`, `WT_RECV_STREAM=0x10E`, `NOTIFY_REQUEST_PERMISSION=0x10F`, `NOTIFY_POST=0x110`, `CLIPBOARD_READ_TEXT=0x111`, `CLIPBOARD_WRITE_TEXT=0x112`, `GEO_GET_POSITION=0x113`, `STORAGE_LIST=0x114` |
+| `0x0200..`       | reserved        | streams / pushed events                                                                            |
 
-Args layout per op_kind (LE byte-stream — encoded inline ב-dispatcher):
+Args layouts per op_kind (LE byte stream — encoded inline in
+the dispatcher) are tabulated here. Wire shapes for every
+Phase 14 capability (Notifications / Clipboard / Vibration /
+Geolocation / WebSocket / WebTransport) are pinned in this
+table:
 
-| op_kind                       | args                                                       | result                                  |
-|-------------------------------|-----------------------------------------------------------|-----------------------------------------|
-| `FIRE::LOG`                   | `[level: u32 LE \| msg_bytes…]`                            | —                                       |
-| `FIRE::FINISH`                | `[handle: u32 LE]`                                         | —                                       |
-| `FIRE::START_ACTIVITY`        | `[handle: u32 LE \| intent_bytes…]`                        | —                                       |
-| `FIRE::START_ACTIVITY_FOR_RESULT` | `[handle: u32 LE \| request_code: u32 LE \| intent_bytes…]` | —                                       |
-| `FIRE::SET_RESULT`            | `[handle: u32 LE \| result_bytes…]`                        | —                                       |
-| `IO::TEXT_WIDTH`              | `[size: f32 LE \| text_bytes…]`                            | `[width: f32 LE]`                       |
-| `IO::QUERY_PACKAGES`          | `[]`                                                       | `pkgs_wire blob` (ראה `wire/pkgs.rs`)    |
-| `IO::STORAGE_GET`             | TBD (Stone 11.6)                                           | TBD                                     |
-| `IO::STORAGE_SET`             | TBD (Stone 11.6)                                           | TBD                                     |
-| `IO::TIMER_SLEEP`             | `[delay_ms: u32 LE]`                                       | `[]` (READY after delay)                |
-| `IO::SHOW_DIALOG`             | `[handle: u32 LE \| title_len: u16 LE \| title: utf8… \| body_len: u16 LE \| body: utf8… \| btn_count: u8 \| (btn_len: u16 LE \| btn: utf8…)*]` | `[kind: u8, btn_idx: u8]` — `kind == 0` → `Button(btn_idx)`, `kind == 1` → `Dismissed` |
-| `IO::HTTP_FETCH` (14.1)       | `[method: u8 \| url_len: u16 LE \| url: utf8 \| hdr_count: u16 LE \| (name_len: u16 LE \| name: utf8 \| val_len: u16 LE \| val: utf8)* \| body…]`. Method codes: 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=HEAD. Gated by `akiva.permission.NETWORK`. CORS rules apply. | `[status: u16 LE \| hdr_count: u16 LE \| (headers as above) \| body…]`; ERROR = utf8 reason |
-| `IO::WS_OPEN`     (14.1)      | `[url_len: u16 LE \| url: utf8 \| proto_count: u8 \| (proto_len: u16 LE \| proto: utf8)*]`. Gated by `akiva.permission.NETWORK`. | `[ws_handle: u32 LE]` once `open` event fires; ERROR on handshake failure |
-| `IO::WS_RECV`     (14.1)      | `[ws_handle: u32 LE]` | `[event_kind: u8 \| data…]` — kind 0=text (data utf8), 1=binary, 2=closed (data = `[code: u16 LE \| reason: utf8…]`) |
-| `FIRE::WS_SEND`   (14.1)      | `[ws_handle: u32 LE \| kind: u8 \| data…]` (kind 0=text, 1=binary). Silent no-op on closed handle. | — |
-| `FIRE::WS_CLOSE`  (14.1)      | `[ws_handle: u32 LE \| code: u16 LE \| reason_len: u16 LE \| reason: utf8…]`. Idempotent. | — |
-| `IO::WT_OPEN`     (14.2)      | `[url_len: u16 LE \| url: utf8…]`. Gated by `akiva.permission.NETWORK`. | `[wt_handle: u32 LE]` once `wt.ready` resolves; ERROR on handshake failure |
-| `IO::WT_RECV_DATAGRAM` (14.2) | `[wt_handle: u32 LE]` | `[event_kind: u8 \| data…]` — kind 0=datagram bytes, 1=closed (data = `[code: u32 LE \| reason: utf8…]`). Datagrams unreliable + unordered (RFC 9221) |
-| `IO::WT_OPEN_BIDI` (14.2)     | `[wt_handle: u32 LE]` | `[stream_handle: u32 LE]` — opens a reliable, ordered bidi stream under the session |
-| `IO::WT_RECV_STREAM` (14.2)   | `[stream_handle: u32 LE]` | `[event_kind: u8 \| data…]` — kind 0=bytes, 1=fin (peer closed write side; data empty), 2=error (data=utf8 reason) |
-| `FIRE::WT_SEND_DATAGRAM` (14.2) | `[wt_handle: u32 LE \| data: bytes…]`. Best-effort. | — |
-| `FIRE::WT_SEND_STREAM`  (14.2) | `[stream_handle: u32 LE \| data: bytes…]` | — |
-| `FIRE::WT_CLOSE_STREAM` (14.2) | `[stream_handle: u32 LE \| code: u32 LE]`. Idempotent. | — |
-| `FIRE::WT_CLOSE`        (14.2) | `[wt_handle: u32 LE \| code: u32 LE \| reason_len: u16 LE \| reason: utf8…]`. Idempotent; closes every stream under the session. | — |
-| `IO::NOTIFY_REQUEST_PERMISSION` (14.3) | `[]`. Gated by `akiva.permission.NOTIFICATIONS`. | `[status: u8]` — 0=Default, 1=Granted, 2=Denied. Browsers auto-deny outside user-gesture handlers |
-| `IO::NOTIFY_POST` (14.3)      | `[title_len: u16 LE \| title: utf8… \| body_len: u16 LE \| body: utf8… \| tag_len: u16 LE \| tag: utf8…]`. Empty `tag` lets the browser allocate a fresh slot per call; non-empty tag collapses duplicates. | `[notify_id: u32 LE]` once the browser accepts; ERROR with utf8 reason on permission denial / browser refusal |
-| `FIRE::NOTIFY_CLOSE` (14.3)   | `[notify_id: u32 LE]`. Idempotent. | — |
-| `IO::CLIPBOARD_READ_TEXT` (14.4) | `[]`. Gated by `akiva.permission.CLIPBOARD`. | `[text: utf8…]`; ERROR with reason on browser refusal |
-| `IO::CLIPBOARD_WRITE_TEXT` (14.4) | `[text: utf8…]` | empty (READY = success); ERROR on refusal |
-| `FIRE::VIBRATE` (14.5)        | `[count: u16 LE \| (duration_ms: u32 LE){count}]`. Empty pattern cancels in-progress vibration. Gated by `akiva.permission.VIBRATE`. | — |
-| `IO::GEO_GET_POSITION` (14.6) | `[]`. Gated by `akiva.permission.LOCATION`. | `[lat:f64 LE \| lon:f64 LE \| accuracy_m:f64 LE \| has_alt:u8 \| (alt:f64 LE)? \| has_speed:u8 \| (speed:f64 LE)? \| has_heading:u8 \| (heading:f64 LE)? \| ts_ms:f64 LE]` |
+| op_kind                                    | args                                                                                                                                                                                                                                                                                            | result                                                                                                                                       |
+|--------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| `FIRE::LOG`                                | `[level: u32 LE \| msg_bytes…]`                                                                                                                                                                                                                                                                  | —                                                                                                                                            |
+| `FIRE::FINISH`                             | `[handle: u32 LE]`                                                                                                                                                                                                                                                                              | —                                                                                                                                            |
+| `FIRE::START_ACTIVITY`                     | `[handle: u32 LE \| intent_bytes…]`                                                                                                                                                                                                                                                             | —                                                                                                                                            |
+| `FIRE::START_ACTIVITY_FOR_RESULT`          | `[handle: u32 LE \| request_code: u32 LE \| intent_bytes…]`                                                                                                                                                                                                                                     | —                                                                                                                                            |
+| `FIRE::SET_RESULT`                         | `[handle: u32 LE \| result_bytes…]`                                                                                                                                                                                                                                                             | —                                                                                                                                            |
+| `IO::TEXT_WIDTH`                           | `[size: f32 LE \| text_bytes…]`                                                                                                                                                                                                                                                                 | `[width: f32 LE]`                                                                                                                            |
+| `IO::QUERY_PACKAGES`                       | `[]`                                                                                                                                                                                                                                                                                            | `pkgs_wire blob` (see `wire/pkgs.rs`)                                                                                                        |
+| `IO::STORAGE_GET`                          | `[user_key: utf8…]`                                                                                                                                                                                                                                                                             | `[present: u8, value…]`                                                                                                                      |
+| `IO::STORAGE_SET`                          | `[key_len: u32 LE, key, value]`                                                                                                                                                                                                                                                                 | `[]`                                                                                                                                         |
+| `IO::STORAGE_DELETE`                       | `[user_key: utf8…]`                                                                                                                                                                                                                                                                             | `[]`                                                                                                                                         |
+| `IO::STORAGE_LIST`                         | `[prefix: utf8…]`                                                                                                                                                                                                                                                                               | `[count: u32 LE, (key_len: u16 LE, key){count}]`                                                                                              |
+| `IO::TIMER_SLEEP`                          | `[delay_ms: u32 LE]`                                                                                                                                                                                                                                                                            | `[]` (READY after delay)                                                                                                                     |
+| `IO::SHOW_DIALOG`                          | `[handle: u32 LE \| title_len: u16 LE \| title: utf8 \| body_len: u16 LE \| body: utf8 \| btn_count: u8 \| (btn_len: u16 LE \| btn: utf8)*]`                                                                                                                                                    | `[kind: u8, btn_idx: u8]` — `kind == 0` → `Button(btn_idx)`, `kind == 1` → `Dismissed`                                                       |
+| `IO::HTTP_FETCH` (14.1)                    | `[method: u8 \| url_len: u16 LE \| url: utf8 \| hdr_count: u16 LE \| (name_len: u16 LE \| name: utf8 \| val_len: u16 LE \| val: utf8)* \| body…]`. Method codes: 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=HEAD. Gated by `akiva.permission.NETWORK`. CORS rules apply.                          | `[status: u16 LE \| hdr_count: u16 LE \| (headers as above) \| body…]`; ERROR = utf8 reason                                                  |
+| `IO::WS_OPEN` (14.1)                       | `[url_len: u16 LE \| url: utf8 \| proto_count: u8 \| (proto_len: u16 LE \| proto: utf8)*]`. Gated by `akiva.permission.NETWORK`.                                                                                                                                                                  | `[ws_handle: u32 LE]` once `open` fires; ERROR on handshake failure                                                                          |
+| `IO::WS_RECV` (14.1)                       | `[ws_handle: u32 LE]`                                                                                                                                                                                                                                                                            | `[event_kind: u8 \| data…]` — kind 0=text (data utf8), 1=binary, 2=closed (data = `[code: u16 LE \| reason: utf8…]`)                       |
+| `FIRE::WS_SEND` (14.1)                     | `[ws_handle: u32 LE \| kind: u8 \| data…]` (kind 0=text, 1=binary). Silent no-op on a closed handle.                                                                                                                                                                                            | —                                                                                                                                            |
+| `FIRE::WS_CLOSE` (14.1)                    | `[ws_handle: u32 LE \| code: u16 LE \| reason_len: u16 LE \| reason: utf8…]`. Idempotent.                                                                                                                                                                                                       | —                                                                                                                                            |
+| `IO::WT_OPEN` (14.2)                       | `[url_len: u16 LE \| url: utf8…]`. Gated by `akiva.permission.NETWORK`.                                                                                                                                                                                                                          | `[wt_handle: u32 LE]` once `wt.ready` resolves; ERROR on handshake failure                                                                   |
+| `IO::WT_RECV_DATAGRAM` (14.2)              | `[wt_handle: u32 LE]`                                                                                                                                                                                                                                                                            | `[event_kind: u8 \| data…]` — kind 0=datagram, 1=closed (data = `[code: u32 LE \| reason: utf8…]`). Datagrams unreliable + unordered.       |
+| `IO::WT_OPEN_BIDI` (14.2)                  | `[wt_handle: u32 LE]`                                                                                                                                                                                                                                                                            | `[stream_handle: u32 LE]` — opens a reliable, ordered bidi stream under the session                                                          |
+| `IO::WT_RECV_STREAM` (14.2)                | `[stream_handle: u32 LE]`                                                                                                                                                                                                                                                                        | `[event_kind: u8 \| data…]` — kind 0=bytes, 1=fin (peer closed write side; data empty), 2=error (data=utf8 reason)                          |
+| `FIRE::WT_SEND_DATAGRAM` (14.2)            | `[wt_handle: u32 LE \| data: bytes…]`. Best-effort.                                                                                                                                                                                                                                              | —                                                                                                                                            |
+| `FIRE::WT_SEND_STREAM` (14.2)              | `[stream_handle: u32 LE \| data: bytes…]`                                                                                                                                                                                                                                                       | —                                                                                                                                            |
+| `FIRE::WT_CLOSE_STREAM` (14.2)             | `[stream_handle: u32 LE \| code: u32 LE]`. Idempotent.                                                                                                                                                                                                                                          | —                                                                                                                                            |
+| `FIRE::WT_CLOSE` (14.2)                    | `[wt_handle: u32 LE \| code: u32 LE \| reason_len: u16 LE \| reason: utf8…]`. Idempotent; closes every stream under the session.                                                                                                                                                                | —                                                                                                                                            |
+| `IO::NOTIFY_REQUEST_PERMISSION` (14.3)     | `[]`. Gated by `akiva.permission.NOTIFICATIONS`.                                                                                                                                                                                                                                                 | `[status: u8]` — 0=Default, 1=Granted, 2=Denied. Browsers auto-deny outside user-gesture handlers.                                          |
+| `IO::NOTIFY_POST` (14.3)                   | `[title_len: u16 LE \| title: utf8 \| body_len: u16 LE \| body: utf8 \| tag_len: u16 LE \| tag: utf8…]`. Empty `tag` lets the browser allocate a fresh slot per call; non-empty tag collapses duplicates.                                                                                       | `[notify_id: u32 LE]` once the browser accepts; ERROR with utf8 reason on permission denial / browser refusal                                |
+| `FIRE::NOTIFY_CLOSE` (14.3)                | `[notify_id: u32 LE]`. Idempotent.                                                                                                                                                                                                                                                              | —                                                                                                                                            |
+| `IO::CLIPBOARD_READ_TEXT` (14.4)           | `[]`. Gated by `akiva.permission.CLIPBOARD`.                                                                                                                                                                                                                                                     | `[text: utf8…]`; ERROR with reason on browser refusal                                                                                        |
+| `IO::CLIPBOARD_WRITE_TEXT` (14.4)          | `[text: utf8…]`                                                                                                                                                                                                                                                                                  | empty (READY = success); ERROR on refusal                                                                                                    |
+| `FIRE::VIBRATE` (14.5)                     | `[count: u16 LE \| (duration_ms: u32 LE){count}]`. Empty pattern cancels in-progress vibration. Gated by `akiva.permission.VIBRATE`.                                                                                                                                                            | —                                                                                                                                            |
+| `IO::GEO_GET_POSITION` (14.6)              | `[]`. Gated by `akiva.permission.LOCATION`.                                                                                                                                                                                                                                                      | `[lat:f64 LE \| lon:f64 LE \| accuracy_m:f64 LE \| has_alt:u8 \| (alt:f64 LE)? \| has_speed:u8 \| (speed:f64 LE)? \| has_heading:u8 \| (heading:f64 LE)? \| ts_ms:f64 LE]` |
 
-**Capability gating moved into the dispatcher.** עד Stone 10.3b ה-gating קרה בזמן instantiate (LinkError על import חסר). מאז Stone 11.3 ה-gating קורה per-call: ה-import עצמו תמיד מותקן, אבל ה-dispatcher בודק את ה-grants לפני שהוא מבצע op_kind שדורש capability. App ללא הרשאה → return code שגיאה (1 או 2 לפי הנתיב), warning בלוג. הצדק לבחירה: import אחד משרת ~250 op_kinds, חלקם auto חלקם gated; מסננים ב-call site, לא ב-link.
+**Capability gating moved into the dispatcher.** Through Stone
+10.3b gating happened at instantiate time (LinkError on a
+missing import). Since Stone 11.3 gating happens per-call: the
+import itself is always mounted, but the dispatcher checks
+grants before serving an op_kind that requires a capability.
+An app without permission → an error return code (1 or 2,
+depending on the path), and a warning in the log. The reason
+for the choice: one import serves ~250 op_kinds, some auto and
+some gated; filter at call site, not at link.
 
-**Exports שה-app חושף עבור delivery של intent / result** (אלה לא מולטיפלקסר — נשארים separate exports):
+**Exports the app exposes for intent / result delivery** (these
+are not multiplexed — they stay as separate exports):
 
 ```rust
-// Stone 9.4 — SingleTop / SingleTask / SingleInstance reuse fires this
-// with the fresh intent. handle מזהה את ה-activity הקיימת; ptr/len —
-// blob של `Intent::encode` שה-host מעתיק לתוך app memory לפני הקריאה
-// (symmetric עם `akiva_app_restore_state`). ה-activity נשארת `Resumed`
-// ולא עוברת דרך on_create/on_start/on_resume.
+// Stone 9.4 — SingleTop / SingleTask / SingleInstance reuse
+// fires this with the fresh intent. handle identifies the
+// existing activity; ptr/len — a blob from `Intent::encode`
+// the host copies into app memory before the call (symmetric
+// with `akiva_app_restore_state`). The activity stays
+// `Resumed` and does not pass through on_create / on_start /
+// on_resume.
 extern "C" fn akiva_app_new_intent(handle: u32, ptr: *const u8, len: u32);
 
-// Stone 9.5 — caller sees — result hand-off from a for-result launch.
-// bytes encode an ActivityResult (see §2.5.2). Fires AFTER the callee's
-// on_destroy, BEFORE the caller's Paused→Resumed edge (Android parity).
+// Stone 9.5 — caller-side hand-off from a for-result launch.
+// Bytes encode an ActivityResult (see §2.5.2). Fires AFTER
+// the callee's on_destroy, BEFORE the caller's
+// Paused → Resumed edge (Android parity).
 extern "C" fn akiva_app_activity_result(
     handle: u32, request_code: u32, ptr: *const u8, len: u32,
 );
 ```
 
-**ב-v1 (Component Model)** כל ה-op_kinds ימופו ל-WIT interfaces: `LOG` → `log.write`, `TEXT_WIDTH` → `text.measure-width`, `START_ACTIVITY` → `activity-api.start-activity`, וכו'. ה-multiplexers נעלמים — אבל ה-sematics זהות (futures, fire-and-forget, status codes) כך שה-translation layer נקייה.
+**In v1 (Component Model)** every op_kind maps to a WIT
+interface: `LOG` → `log.write`, `TEXT_WIDTH` →
+`text.measure-width`, `START_ACTIVITY` →
+`activity-api.start-activity`, etc. The multiplexers go away —
+but the semantics are unchanged (futures, fire-and-forget,
+status codes), so the translation layer is clean.
 
 #### 2.3.3 Capability gating (Stone 10.3 → 11.3)
 
-ה-`PermissionController` מקצה ל-package הרשאות ב-install time וה-framework דוחף אותן ל-host דרך `hal_host_set_grants`. ה-Rust-side source of truth ב-[`framework/src/permissions.rs`](../framework/src/permissions.rs) (`AUTO_IMPORTS` + `imports_for_capability`) ומקבילו ב-`runtime/web/app_registry.js` (`AUTO_IMPORTS` + `CAPABILITY_IMPORTS`); מבחני vitest + Rust מאמתים את ה-symmetry.
+The `PermissionController` allocates per-package permissions at
+install time and the framework pushes them to the host through
+`hal_host_set_grants`. The Rust-side source of truth is
+[`framework/src/permissions.rs`](../framework/src/permissions.rs)
+(`AUTO_IMPORTS` + `imports_for_capability`) with its mirror in
+`runtime/web/app_registry.js` (`AUTO_IMPORTS` +
+`CAPABILITY_IMPORTS`); vitest + Rust tests verify the
+symmetry.
 
-| Capability                          | Imports mounted at link time           | op_kinds gated at dispatch time           |
-|-------------------------------------|----------------------------------------|-------------------------------------------|
-| `auto` (ללא הצהרה)                  | 4 resource lookups + 3 multiplexers    | `FIRE::LOG`, `FIRE::FINISH`, `FIRE::SET_RESULT`, `IO::TEXT_WIDTH` |
-| `akiva.permission.LAUNCH_ANY_APP`   | —                                      | `FIRE::START_ACTIVITY`, `FIRE::START_ACTIVITY_FOR_RESULT` |
-| `akiva.permission.QUERY_PACKAGES`   | —                                      | `IO::QUERY_PACKAGES`                      |
-| `akiva.permission.STORAGE_SANDBOX`  | —                                      | `IO::STORAGE_GET`, `IO::STORAGE_SET` (Stone 11.6 wires) |
-| `akiva.permission.NOTIFICATIONS`    | —                                      | *(reserved — post-MVP)*                   |
-| `akiva.permission.NETWORK`          | —                                      | *(reserved — post-MVP)*                   |
-| `akiva.permission.CAMERA`           | —                                      | *(reserved — post-MVP)*                   |
+| capability                          | imports mounted at link time          | op_kinds gated at dispatch time                                                        |
+|-------------------------------------|---------------------------------------|----------------------------------------------------------------------------------------|
+| `auto` (no declaration)             | 4 resource lookups + 3 multiplexers   | `FIRE::LOG`, `FIRE::FINISH`, `FIRE::SET_RESULT`, `IO::TEXT_WIDTH`                      |
+| `akiva.permission.LAUNCH_ANY_APP`   | —                                     | `FIRE::START_ACTIVITY`, `FIRE::START_ACTIVITY_FOR_RESULT`                              |
+| `akiva.permission.QUERY_PACKAGES`   | —                                     | `IO::QUERY_PACKAGES`                                                                   |
+| `akiva.permission.STORAGE_SANDBOX`  | —                                     | `IO::STORAGE_GET / SET / DELETE / LIST`                                                |
+| `akiva.permission.NETWORK`          | —                                     | `IO::HTTP_FETCH`, `IO::WS_*`, `IO::WT_*` + `FIRE::WS_*` + `FIRE::WT_*`                  |
+| `akiva.permission.NOTIFICATIONS`    | —                                     | `IO::NOTIFY_REQUEST_PERMISSION`, `IO::NOTIFY_POST`, `FIRE::NOTIFY_CLOSE`               |
+| `akiva.permission.CLIPBOARD`        | —                                     | `IO::CLIPBOARD_READ_TEXT`, `IO::CLIPBOARD_WRITE_TEXT`                                  |
+| `akiva.permission.VIBRATE`          | —                                     | `FIRE::VIBRATE`                                                                        |
+| `akiva.permission.LOCATION`         | —                                     | `IO::GEO_GET_POSITION`                                                                 |
 
-**שני שלבי האכיפה:**
+**Two enforcement layers:**
 
-1. **Link time** — ה-import set מוגבל ל-7 פונקציות (4 resource + 3 multiplexers). ה-`AUTO_IMPORTS` הוא הסט שכל app מקבל; שום capability היום לא מוסיפה imports נוספים. אם wasm app מנסה לייבא שם שלא נמצא → `LinkError` ב-instantiation. זה תופס שמות שגויים מאחר ש-(אסור) או imports שכבר לא קיימים אחרי refactor.
+1. **Link time** — the import set is bounded at 7 functions
+   (4 resource + 3 multiplexers). `AUTO_IMPORTS` is the set
+   every app receives; no capability today adds more imports.
+   If a wasm app tries to import a name that isn't there →
+   `LinkError` at instantiation. This catches typos and
+   imports left over from refactors.
+2. **Dispatch time** — inside `akiva_host_fire` /
+   `akiva_host_io_start`, the dispatcher checks grants before
+   running an op_kind that needs a capability. An app without
+   permission → `fire` returns `2` (denied), `io_start`
+   returns `0n` (couldn't start). The warning in the log lets
+   the developer see the deny.
 
-2. **Dispatch time** — בתוך `akiva_host_fire` / `akiva_host_io_start` ה-dispatcher בודק את ה-grants לפני ביצוע op_kind שצריך capability. App ללא הרשאה → `fire` מחזיר `2` (denied), `io_start` מחזיר `0n` (couldn't start). ה-warning בלוג מאפשר למפתח לראות את ה-deny.
-
-**הצדק לחלוקה.** עד 11.3 ה-gating היה בלעדית link-time (כל capability מיפתה לקבוצת imports); אחרי 11.3 import אחד משרת ~250 op_kinds, רובם auto, חלקם gated. gating ב-link time היה מצריך מולטיפלקסר נפרד לכל capability — מסבך את ה-ABI מבלי להשיג שום דבר. ה-dispatch-time gating משאיר את ה-import surface קטן (7 ערכים) ומרכז את הלוגיקה במקום אחד שקל לבדוק.
+**Why the split.** Up to 11.3 gating was link-time only (each
+capability mapped to a set of imports); after 11.3, one import
+serves ~250 op_kinds, mostly auto, some gated. Link-time
+gating would have required a separate multiplexer per
+capability — complicating the ABI without buying anything.
+Dispatch-time gating keeps the import surface tiny (7 entries)
+and concentrates the logic in one place that's easy to test.
 
 ### 2.4 Imports (kernel → host) — `hal_app_*`
 
-אלה imports שה-kernel wasm מבקש; ה-host (worker.js) מספק. מוגדרים ב-[kernel/src/host.rs](../kernel/src/host.rs):
+These are imports the kernel wasm requests; the host
+(`worker.js`) provides. Defined in
+[`kernel/src/host.rs`](../kernel/src/host.rs):
 
 ```rust
 fn hal_app_register(
     package_id_ptr: *const u8, package_id_len: usize,
-    class_ptr: *const u8,      class_len: usize,
+    class_ptr:      *const u8, class_len:      usize,
 ) -> u32;  // 0 = unknown package/class
 fn hal_app_unregister(handle: u32);
 
@@ -413,21 +605,21 @@ fn hal_app_unregister(handle: u32);
 // intent). The JS host reads `[handle: u32 LE, ...]` from the payload,
 // looks up the wasm process that owns the handle, copies the payload
 // into app memory, and forwards to the app's `akiva_app_dispatch`.
-// CREATE special case: kernel passes only `[handle]`; JS host augments
-// with the slot's class string before forwarding.
+// CREATE special case: kernel passes only `[handle]`; the JS host
+// augments with the slot's class string before forwarding.
 //
 // Returns the app's u64 future_id:
 //   0           — sync, no result bytes (every ack-only cmd_kind).
-//   non-zero    — sync, bytes available; kernel calls
+//   non-zero    — sync, bytes available; the kernel calls
 //                 `hal_app_get_result(future_id, ...)` next.
 fn hal_app_dispatch(
     cmd_kind: u32, payload_ptr: *const u8, payload_len: u32,
 ) -> u64;
 
 // Companion to `hal_app_dispatch`: fetch the bytes for a non-zero
-// future_id (RENDER paint stream, SAVE_STATE encoded state). Two-phase
-// buffer contract: returns the *needed* length; truncated copies
-// trigger a retry with a larger buffer.
+// future_id (RENDER paint stream, SAVE_STATE encoded state).
+// Two-phase buffer contract: returns the *needed* length; truncated
+// copies trigger a retry with a larger buffer.
 fn hal_app_get_result(
     future_id: u64, out_ptr: *mut u8, out_cap: u32,
 ) -> u32;
@@ -449,14 +641,15 @@ fn hal_app_drain_finish(handle: u32) -> u32;
 fn hal_app_drain_intent(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
 
 // Stone 9.5 — two drain primitives matching the Stone 9.4 shapes.
-// (Host→app delivery for ACTIVITY_RESULT goes through `hal_app_dispatch`
-// with cmd_kind = ACTIVITY_RESULT; no dedicated import.)
+// (Host→app delivery for ACTIVITY_RESULT goes through
+// `hal_app_dispatch` with cmd_kind = ACTIVITY_RESULT; no dedicated
+// import.)
 //
 // Drain a pending start_activity_for_result request. Two-phase buffer:
-// returns total size of the encoded Intent. `rc_out` is always written
-// with the request_code on a successful probe — so a retry (when
-// `needed > out_cap`) finds the same value. Zero return = nothing
-// pending.
+// returns the total encoded size of the Intent. `rc_out` is always
+// written with the request_code on a successful probe — so a retry
+// (when `needed > out_cap`) finds the same value. Zero return =
+// nothing pending.
 fn hal_app_drain_start_for_result(
     handle: u32, out_ptr: *mut u8, out_cap: u32, rc_out: *mut u32,
 ) -> u32;
@@ -470,28 +663,42 @@ fn hal_app_drain_set_result(handle: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
 
 ### 2.5 Paint-op wire format
 
-ה-app מ-serialize את פקודות הציור שלו ל-stream שטוח של bytes שה-kernel מפרשר חזרה ל-[`FrameCommands`](../framework/src/compositor.rs). כל op מתחיל ב-`u8` opcode:
+The app serialises its paint commands into a flat byte stream
+that the kernel parses back into
+[`FrameCommands`](../framework/src/compositor.rs). Every op
+starts with a `u8` opcode:
 
-| Opcode | Op              | Payload (little-endian)                                          |
-|--------|-----------------|------------------------------------------------------------------|
-| `0x00` | `Clear`         | `u32 rgba`                                                       |
-| `0x01` | `FillRect`      | `f32 x, f32 y, f32 w, f32 h, u32 rgba`                           |
-| `0x02` | `DrawText`      | `f32 x, f32 y, f32 size, u32 rgba, u32 len, <len> UTF-8 bytes`   |
-| `0x03` | `PushClip`      | `f32 x, f32 y, f32 w, f32 h`                                     |
-| `0x04` | `PopClip`       | —                                                                |
-| `0x05` | `PushTransform` | `f32 dx, f32 dy, f32 scale`                                      |
-| `0x06` | `PopTransform`  | —                                                                |
-| `0x07` | `FillRoundRect` | `f32 x, f32 y, f32 w, f32 h, f32 radius, u32 rgba` *(Stone 11.6.9 #1)* |
-| `0x08` | `StrokeRect`    | `f32 x, f32 y, f32 w, f32 h, f32 width, u32 rgba` *(Stone 13.0prep B)* |
-| `0x09` | `StrokeRoundRect` | `f32 x, f32 y, f32 w, f32 h, f32 radius, f32 width, u32 rgba` *(Stone 13.0prep B)* |
-| `0x0A` | `DrawLine`      | `f32 x0, f32 y0, f32 x1, f32 y1, f32 width, u32 rgba` *(Stone 13.0prep B)* |
-| `0x0B` | `DrawImage`     | `u32 drawable_id, f32 x, f32 y, f32 w, f32 h` *(Stone 13.0prep C)* — `drawable_id` from `akiva_host_resource_drawable`; `0` paints magenta placeholder |
+| Opcode | Op                | Payload (little-endian)                                                                       |
+|--------|-------------------|-----------------------------------------------------------------------------------------------|
+| `0x00` | `Clear`           | `u32 rgba`                                                                                    |
+| `0x01` | `FillRect`        | `f32 x, f32 y, f32 w, f32 h, u32 rgba`                                                        |
+| `0x02` | `DrawText`        | `f32 x, f32 y, f32 size, u32 rgba, u32 len, <len> UTF-8 bytes`                                |
+| `0x03` | `PushClip`        | `f32 x, f32 y, f32 w, f32 h`                                                                  |
+| `0x04` | `PopClip`         | —                                                                                             |
+| `0x05` | `PushTransform`   | `f32 dx, f32 dy, f32 scale`                                                                   |
+| `0x06` | `PopTransform`    | —                                                                                             |
+| `0x07` | `FillRoundRect`   | `f32 x, f32 y, f32 w, f32 h, f32 radius, u32 rgba` *(Stone 11.6.9 #1)*                        |
+| `0x08` | `StrokeRect`      | `f32 x, f32 y, f32 w, f32 h, f32 width, u32 rgba` *(Stone 13.0prep B)*                        |
+| `0x09` | `StrokeRoundRect` | `f32 x, f32 y, f32 w, f32 h, f32 radius, f32 width, u32 rgba` *(Stone 13.0prep B)*            |
+| `0x0A` | `DrawLine`        | `f32 x0, f32 y0, f32 x1, f32 y1, f32 width, u32 rgba` *(Stone 13.0prep B)*                    |
+| `0x0B` | `DrawImage`       | `u32 drawable_id, f32 x, f32 y, f32 w, f32 h` *(Stone 13.0prep C)* — id `0` paints a magenta placeholder |
+| `0x0C` | `DrawForeignImage`| `u16 pkg_len, pkg utf8, u16 name_len, name utf8, f32 x, f32 y, f32 w, f32 h` *(post-13)* — cross-package drawable cache |
+| `0x0D` | `SetGlobalAlpha`  | `f32 alpha` *(post-13 transition)* — multiplies the GPU-side alpha for a transform window     |
 
-הקודק המלא ב-[framework/src/wasm_activity.rs](../framework/src/wasm_activity.rs) — `encode_op` / `decode_frame`. תוספות (additive) יקבלו opcodes חדשים ב-continuation של הרצף; ה-decoder דוחה opcodes לא מוכרים כ-error (אי אפשר לדעת את אורך ה-payload כדי לדלג).
+The full codec is in
+[`framework/src/wasm_activity.rs`](../framework/src/wasm_activity.rs)
+— `encode_op` / `decode_frame`. Additive entries get new
+opcodes that continue the sequence; the decoder rejects unknown
+opcodes as an error (it can't know the payload length to skip).
 
 ### 2.5.1 Intent wire format (Stone 9.4)
 
-פורמט שטוח שה-SDK מ-encode עם `Intent::encode` וה-framework מ-decode עם `Intent::decode`. ה-blob נוסע ב-שני הכיוונים — app→kernel דרך `akiva_host_fire(FIRE::START_ACTIVITY, …)` + `hal_app_drain_intent`, ו-kernel→app דרך `hal_app_new_intent` + `akiva_app_new_intent`.
+A flat format the SDK encodes with `Intent::encode` and the
+framework decodes with `Intent::decode`. The blob travels both
+directions — app→kernel through
+`akiva_host_fire(FIRE::START_ACTIVITY, …)` +
+`hal_app_drain_intent`, and kernel→app through
+`hal_app_new_intent` + `akiva_app_new_intent`.
 
 ```
 u32  action_len + <action_len> UTF-8 bytes
@@ -501,68 +708,126 @@ u8   has_data_uri       (0/1) + if 1: u32 len + bytes
 u8   has_mime_type      (0/1) + if 1: u32 len + bytes
 u8   has_target_package (0/1) + if 1: u32 len + bytes
 u8   has_target_class   (0/1) + if 1: u32 len + bytes
-u32  extras_count       (v0.2: חייב להיות 0 — reserved ל-Stone 9.5)
+u32  extras_count       (v0.2: must be 0 — reserved for Stone 9.5)
 ```
 
-- **Max size:** 16 KiB (`Intent::MAX_WIRE_BYTES`) — בודק בשני הצדדים; blob גדול יותר → `IntentDecodeError::TooLarge`.
-- **Min size:** 17 bytes (action של 0 bytes + 4 × flag=0 + extras_count=0). לכן `drain_intent` מחזיר `0` ⇒ "אין pending" באופן חד-משמעי — כל intent ממשי יהיה ≥ 17.
-- **Extensibility:** `extras_count=0` הוא checkpoint. גרסת extras תוסיף payload של (`u32 key_len` + bytes + `u8 tag` + payload לפי tag). reader של גרסה ישנה שיפגוש `extras_count > 0` ידחה עם `ExtrasNotSupported` במקום להתבלבל על ה-offsets. Stone 9.5 לא נזקק ל-extras — הוא משתמש ב-`ActivityResult` נפרד (§2.5.2).
-- **Identical encode on both sides:** `framework::intent::Intent::encode` ו-`sdk-rust::intent::Intent::encode` חייבים להישאר byte-for-byte symmetric — כמו ה-paint codec, כל שינוי הוא breaking event שעובר מבחני §1.2.
+- **Max size:** 16 KiB (`Intent::MAX_WIRE_BYTES`) — checked on
+  both sides; a larger blob → `IntentDecodeError::TooLarge`.
+- **Min size:** 17 bytes (action of 0 bytes + 4 × flag=0 +
+  extras_count=0). So `drain_intent` returning `0` ⇒
+  unambiguously "nothing pending" — every real intent is ≥ 17
+  bytes.
+- **Extensibility:** `extras_count = 0` is a checkpoint. A
+  future extras layout adds a payload of (`u32 key_len` +
+  bytes + `u8 tag` + payload-by-tag). An older reader meeting
+  `extras_count > 0` rejects with `ExtrasNotSupported` rather
+  than getting confused on offsets. Stone 9.5 didn't need
+  extras — it uses a separate `ActivityResult` (§2.5.2).
+- **Identical encode on both sides:**
+  `framework::intent::Intent::encode` and
+  `sdk-rust::intent::Intent::encode` must remain byte-for-byte
+  symmetric — like the paint codec, every change is a
+  breaking event covered by §1.2.
 
-הקודק המלא ב-[framework/src/intent.rs](../framework/src/intent.rs) ומקבילו ב-[sdk-rust/src/intent.rs](../sdk-rust/src/intent.rs).
+The full codec is in
+[`framework/src/intent.rs`](../framework/src/intent.rs) and its
+mirror in [`sdk-rust/src/intent.rs`](../sdk-rust/src/intent.rs).
 
 ### 2.5.2 ActivityResult wire format (Stone 9.5)
 
-הקטן ביותר משני פורמטי ה-wire של ה-stone: קוד `i32` + בלוב bytes אטום באורך משתנה. נוסע משני הכיוונים — app→kernel דרך `akiva_host_fire(FIRE::SET_RESULT, …)` + `hal_app_drain_set_result`, ו-kernel→app דרך `hal_app_activity_result` + `akiva_app_activity_result`.
+The smaller of the two stone-9.5 wire formats: a `i32` code +
+an opaque variable-length blob. Travels both directions —
+app→kernel through `akiva_host_fire(FIRE::SET_RESULT, …)` +
+`hal_app_drain_set_result`, and kernel→app through
+`hal_app_activity_result` + `akiva_app_activity_result`.
 
 ```
-i32  code           (little-endian — RESULT_OK=0, RESULT_CANCELED=1, שאר הערכים app-defined)
+i32  code           (little-endian — RESULT_OK=0, RESULT_CANCELED=1, others app-defined)
 u32  data_len + <data_len> bytes
 ```
 
-- **Max size:** 16 KiB (`ActivityResult::MAX_WIRE_BYTES`) — אותו cap של Intent; result ממוצע של "picked=42" הוא עשרות bytes, כל מה שמעבר לזה כדאי לעבור דרך shared storage.
-- **Min size:** 8 bytes (code + data_len=0). `drain_set_result` מחזיר `0` ⇒ "אין result stashed"; synthesis של `RESULT_CANCELED` עם data ריק קורה בצד ה-framework ב-`deliver_activity_result_for`.
-- **Opaque data:** ה-framework לא בודק את ה-bytes. זוג caller+callee מסכמים על format (JSON, bincode, number כ-LE u32 ישיר) — אין lineage schema.
-- **Identical encode on both sides:** `framework::result::ActivityResult::encode` ו-`sdk-rust::result::ActivityResult::encode` byte-for-byte symmetric. breaking-change discipline כמו Intent.
+- **Max size:** 16 KiB (`ActivityResult::MAX_WIRE_BYTES`) —
+  the same cap as Intent; an average result of "picked=42" is
+  tens of bytes; anything beyond should travel through shared
+  storage.
+- **Min size:** 8 bytes (code + data_len=0).
+  `drain_set_result` returning `0` ⇒ "no result stashed";
+  synthesising `RESULT_CANCELED` with empty data happens on
+  the framework side in `deliver_activity_result_for`.
+- **Opaque data:** the framework does not inspect the bytes.
+  The caller+callee pair agrees on a format (JSON, bincode, a
+  number as LE u32) — there is no schema lineage.
+- **Identical encode on both sides:**
+  `framework::result::ActivityResult::encode` and
+  `sdk-rust::result::ActivityResult::encode` byte-for-byte
+  symmetric. Breaking-change discipline like Intent.
 
-הקודק ב-[framework/src/result.rs](../framework/src/result.rs) ומקבילו ב-[sdk-rust/src/result.rs](../sdk-rust/src/result.rs).
+The codec is in
+[`framework/src/result.rs`](../framework/src/result.rs) and its
+mirror in [`sdk-rust/src/result.rs`](../sdk-rust/src/result.rs).
 
-### 2.6 שכבת הביניים ב-framework
+### 2.6 The intermediate framework layer
 
-ב-framework עצמו:
+In the framework itself:
 
-- `akiva_framework::wasm_activity::WasmHost` — trait שה-kernel מיישם (`KernelWasmHost`) דרך ה-externs למעלה; בבדיקות יחידה מיישמים `MockHost` שמצבע את הקריאות.
-- `WasmActivity` — struct שמיישם את ה-`Activity` trait הפנימי, ומעביר כל callback ל-`WasmHost` עם ה-handle שלו. זו נקודת ה-bridge היחידה בין ה-framework ל-wasm apps.
-- `LifecycleTransition`, `opcode::*`, `encode_op`, `decode_frame` — ה-ABI במלואו מרוכז במקום אחד.
+- `akiva_framework::wasm_activity::WasmHost` — trait the
+  kernel implements (`KernelWasmHost`) through the externs
+  above; in unit tests we implement `MockHost` to capture
+  calls.
+- `WasmActivity` — struct that implements the internal
+  `Activity` trait and routes every callback to `WasmHost`
+  with the relevant handle. This is the only bridge between
+  the framework and wasm apps.
+- `LifecycleTransition`, `opcode::*`, `encode_op`,
+  `decode_frame` — the entire ABI gathered in one place.
 
-### 2.7 מה לא כלול ב-v0
+### 2.7 What is **not** included in v0
 
-- **Storage** — `IO::STORAGE_GET` ו-`IO::STORAGE_SET` יש להם op_kind מוקצה, אבל ה-handler עדיין מחזיר ERROR (Stone 11.6 ימפה אל OPFS readonly handles ב-app-worker + write-through דרך ה-kernel). **השם וה-args layout נמצאים בתהליך תכנון** — אל תסתמך עליהם עד 11.6.
-- **Notifications** — אין op_kind עדיין; ה-capability `akiva.permission.NOTIFICATIONS` reserved.
-- **Network / Camera** — אין op_kind, אין HAL ב-host. post-MVP, יחתכו את §2.7 כשהם נוחתים.
-- **Streams / pushed events** — range `0x0200..` reserved; ה-shape ייעקב ב-Stone 11.4+ (worker-per-app מאפשר push events מ-host ל-app בלי polling).
+- **Network / Camera ABI v0** — Phase 14 added Network
+  (HTTP_FETCH + WebSocket + WebTransport). Camera, microphone,
+  and MIDI remain post-MVP.
+- **Streams / pushed events** — range `0x0200..` is reserved;
+  the shape will follow once a real-time capability needs it
+  (audio, gestures). See
+  [`docs/risks.md §7.11`](risks.md).
 
 ---
 
-> **שאר המסמך מתאר את רובד v1 (Component Model).** הסעיפים הממוספרים שלהלן (עקרונות, WIT definitions, capability model וכו') נשארים כ-spec היעד. הם אינם מתממשים ב-Phase 2b, אבל חוזקת ה-API של §2 מעוצבת במודע להתיישר איתם.
+> **The rest of this document describes the v1 layer (Component
+> Model).** The numbered sections that follow (principles, WIT
+> definitions, capability model, etc.) remain the target spec.
+> They are not implemented in Phase 2b, but the API strength
+> in §2 is shaped consciously to align with them.
 
-## 3. עקרונות (v1)
+## 3. Principles (v1)
 
-1. **Component Model + WIT** — ה-ABI מוגדר דרך [WIT](https://component-model.bytecodealliance.org/design/wit.html). אין `extern "C"`, אין raw pointers ידניים, אין alloc/free ידני בצד ה-host. `wit-bindgen` מייצר את קוד ה-glue אוטומטית לכל שפה (Rust, C, Go, Python, JS).
-2. **Typed resources** — widgets, activities, intents הם `resource` של WIT, לא `u32 handle`. זה נותן type safety ו-lifetime management שה-runtime אוכף.
-3. **Strings, records, lists, options, results** — ברמה native של WIT. אין marshalling ידני.
-4. **Version-tracked** — כל world מקבל SemVer (`akiva:app/activity@0.1.0`). breaking changes → major bump.
-5. **Capability via imports** — אפליקציה מקבלת רק imports שה-runtime החליט להעניק. Permission denied = import חסר = link error, לא runtime check. ראה סעיף 6.
-6. **Additive only בתוך major** — תוספות תואמות-אחורה בתוך gap של major version.
+1. **Component Model + WIT** — the ABI is defined through
+   [WIT](https://component-model.bytecodealliance.org/design/wit.html).
+   No `extern "C"`, no manual raw pointers, no manual
+   alloc/free on the host side. `wit-bindgen` produces glue
+   automatically for every language (Rust, C, Go, Python, JS).
+2. **Typed resources** — widgets, activities, intents are WIT
+   `resource`s, not `u32` handles. This gives type safety and
+   lifetime management the runtime enforces.
+3. **Strings, records, lists, options, results** — at the
+   native WIT level. No manual marshalling.
+4. **Version-tracked** — every world gets SemVer
+   (`akiva:app/activity@0.1.0`). Breaking changes → MAJOR bump.
+5. **Capability via imports** — an app receives only imports
+   the runtime decided to grant. Permission denied = import
+   missing = link error, not a runtime check. See §6.
+6. **Additive only within MAJOR** — backward-compatible
+   additions inside a MAJOR.
 
-## 4. מבנה המודול
+## 4. Module shape
 
-אפליקציית Akiva היא **Component** שמיישמת את ה-world `akiva:app/guest` ומייבאת את ה-world `akiva:app/host`.
+An Akiva app is a **Component** that implements the
+`akiva:app/guest` world and imports `akiva:app/host`.
 
 ```
 akiva:app package:
-├── world guest      ← מה שהאפליקציה חייבת לייצא (lifecycle + event dispatch)
-├── world host       ← מה שה-runtime חושפת (widgets, resources, intents, storage, ...)
+├── world guest      ← what the app must export (lifecycle + event dispatch)
+├── world host       ← what the runtime exposes (widgets, resources, intents, storage, ...)
 └── interfaces:
     ├── lifecycle
     ├── events
@@ -888,9 +1153,10 @@ interface activity-api {
 
 ### 4.6 Storage (imports) — capability gated
 
-The storage interface is **only linked** if the app's manifest declared
-`akiva.permission.STORAGE_SANDBOX` (which is auto-granted — it's the app's own
-sandbox). Cross-app storage is a separate, user-granted capability.
+The storage interface is **only linked** if the app's manifest
+declared `akiva.permission.STORAGE_SANDBOX` (which is
+auto-granted — it's the app's own sandbox). Cross-app storage
+is a separate, user-granted capability.
 
 ```wit
 interface storage {
@@ -900,7 +1166,7 @@ interface storage {
     set:    func(key: string, value: list<u8>) -> result<_, storage-error>;
     get:    func(key: string) -> result<list<u8>, storage-error>;
     remove: func(key: string) -> result<_, storage-error>;
-    keys:   func() -> list<string>;
+    keys:   func(prefix: string) -> list<string>;
     size-of: func(key: string) -> option<u64>;
 }
 ```
@@ -970,52 +1236,64 @@ world host {
 }
 ```
 
-An Akiva app is a component that imports `host` and exports `guest`. The runtime
-inspects the component's imports, validates each against the granted capability
-set, and instantiates only if every import is permitted.
+An Akiva app is a component that imports `host` and exports
+`guest`. The runtime inspects the component's imports,
+validates each against the granted capability set, and
+instantiates only if every import is permitted.
 
 ---
 
-## 6. Capability-via-imports Model
+## 6. Capability-via-imports model
 
-Permissions in Akiva are enforced at **instantiation time**, not at call time.
+Permissions in Akiva are enforced at **instantiation time**,
+not at call time.
 
-- The `manifest.toml` declares which capabilities the app requires / may use.
-- The PackageManager maps each capability to a concrete set of WIT imports.
-- On instantiate, the runtime builds an import map containing **only** the
-  imports the app is authorized to use. Calls to missing imports fail at link
-  time, not with a runtime permission error.
+- The `manifest.toml` declares which capabilities the app
+  requires / may use.
+- The PackageManager maps each capability to a concrete set of
+  WIT imports.
+- On instantiate, the runtime builds an import map containing
+  **only** the imports the app is authorised to use. Calls to
+  missing imports fail at link time, not with a runtime
+  permission error.
 
 Example mapping:
 
-| Capability                         | Imports gated                        |
+| capability                         | imports gated                        |
 |------------------------------------|--------------------------------------|
 | `akiva.permission.STORAGE_SANDBOX` | `storage` (always granted)           |
-| `akiva.permission.NETWORK`         | `network` (post-MVP)                 |
-| `akiva.permission.CAMERA`          | `camera` (post-MVP)                  |
+| `akiva.permission.NETWORK`         | `network` (Phase 14.1+)              |
+| `akiva.permission.NOTIFICATIONS`   | `notifications` (Phase 14.3)         |
+| `akiva.permission.CLIPBOARD`       | `clipboard` (Phase 14.4)             |
+| `akiva.permission.VIBRATE`         | `vibration` (Phase 14.5)             |
+| `akiva.permission.LOCATION`        | `geolocation` (Phase 14.6)           |
 | `akiva.permission.QUERY_PACKAGES`  | extra methods on `activity-api`      |
+| `akiva.permission.LAUNCH_ANY_APP`  | `start_activity` for any package     |
 
 Benefits over a runtime-check model:
-- **Fast**: no branch on every API call.
-- **Unforgeable**: an app with no NETWORK capability cannot synthesize a network
-  call by any trick — the function doesn't exist in its import namespace.
-- **Auditable**: capability set == linked imports, visible in `akiva build`
-  output.
+
+- **Fast:** no branch on every API call.
+- **Unforgeable:** an app with no NETWORK capability cannot
+  synthesise a network call by any trick — the function does
+  not exist in its import namespace.
+- **Auditable:** capability set == linked imports, visible in
+  `akiva build` output.
 
 ---
 
 ## 7. Observability hooks
 
-The `log` interface is always imported. Output is sinked in the host as
-follows:
+The `log` interface is always imported. Output is sunk in the
+host as follows:
 
-| Sink             | Audience        | Routing                                       |
-|------------------|-----------------|-----------------------------------------------|
-| Browser console  | Developer       | `log.write` at info+ ; all debug if devtools flag |
-| In-app log view  | End user / QA   | Shell's "Developer → Logs" (post-MVP)         |
-| Structured trace | Host tooling    | `span-begin` / `span-end` → OT-compatible events |
+| sink             | audience        | routing                                            |
+|------------------|-----------------|----------------------------------------------------|
+| Browser console  | Developer       | `log.write` at info+ ; all debug if devtools flag  |
+| In-app log view  | End user / QA   | Shell's "Developer → Logs" (post-MVP)              |
+| Structured trace | Host tooling    | `span-begin` / `span-end` → OT-compatible events   |
 
-See [docs/observability.md](observability.md) for how the host wires this up.
+See [`docs/observability.md`](observability.md) for how the
+host wires this up.
 
 ---
 
@@ -1045,18 +1323,19 @@ Runtime:       next frame re-layout + re-composite
 
 ## 9. Not in v1 ABI
 
-- Network (`network` interface — post-MVP).
 - Camera / microphone / sensors.
 - Custom font loading.
-- Animation driver (post-MVP; fade/slide handled by runtime transitions).
-- WASI-Threads (when it stabilizes on the browser).
+- Animation driver (post-MVP; fade/slide handled by runtime
+  transitions).
+- WASI-Threads (when it stabilises on the browser).
 - Broadcast receivers (post-MVP).
 - PendingIntent (post-MVP).
 
 ## 10. Versioning
 
-- Each interface has its own SemVer. Guest declares via `abi-version()`.
-- Runtime keeps a compatibility matrix: "runtime X can host guests with ABI
-  0.1.0–0.1.z".
-- Breaking changes require major bump; guests pin to a range in manifest
-  (`min_abi_version = "0.1.0"`).
+- Each interface has its own SemVer. Guest declares via
+  `abi-version()`.
+- Runtime keeps a compatibility matrix: "runtime X can host
+  guests with ABI 0.1.0–0.1.z".
+- Breaking changes require a major bump; guests pin to a range
+  in the manifest (`min_abi_version = "0.1.0"`).
