@@ -670,7 +670,7 @@ impl Framework {
                 self.activities.state_of(id),
                 Some(activity_manager::LifecycleState::Trapped)
             ) {
-                return self.finalize_frame(foreground);
+                return self.finalize_frame(foreground, ts);
             }
             let metrics = self.metrics;
             let pointer = self.pointer;
@@ -724,26 +724,16 @@ impl Framework {
             }
         }
 
-        // Stone 13.3 — if a transition is active on the foreground
-        // activity, rewrite its surface ops with the resulting
-        // (translate_x, alpha) props. No-op fast path when nothing is
-        // animating.
-        if foreground.is_some() && self.animations.is_animating(fg_surface) {
-            let props = self.animations.props_for(
-                fg_surface, ts, self.metrics.width_px as f32,
-            );
-            if !props.is_rest() {
-                // In-place wrap: prepend `PushTransform` (+ optional
-                // `SetGlobalAlpha`), append `PopTransform`. No clone,
-                // no per-op alpha rewriting — the previous O(ops)
-                // path made 60Hz transitions stutter on activities
-                // with more than ~50 paint ops.
-                let target = self.compositor.surface_target(fg_surface);
-                animation::apply_props(&mut target.ops, props);
-            }
-        }
+        // Phase 15.3 — animations no longer rewrite the activity's
+        // own paint ops. The compositor pass reads
+        // `Animations::props_for(fg_surface)` per frame and threads
+        // it into each surface's `CompositeSurface { opts }`. Slide
+        // animations now translate the entire offscreen during
+        // composite (preserving content past surface bounds),
+        // instead of clipping inside the offscreen.
+        // See `finalize_frame` for the lookup.
 
-        self.finalize_frame(foreground)
+        self.finalize_frame(foreground, ts)
     }
 
     /// Foundation gap fix — allocate (idempotently) a `WindowLayer::App`
@@ -797,7 +787,9 @@ impl Framework {
     /// shape keeps the only-foreground-paints invariant from the
     /// Trapped guard intact.
     fn finalize_frame(
-        &mut self, foreground: Option<activity_manager::ActivityId>,
+        &mut self,
+        foreground: Option<activity_manager::ActivityId>,
+        ts: f64,
     ) -> &FrameCommands {
         let fg_surface = foreground
             .and_then(|id| self.activity_surfaces.get(&id).copied())
@@ -807,21 +799,47 @@ impl Framework {
         // Bounds come from the WindowManager; the legacy DEFAULT_SURFACE
         // (test fallback) has no record there, so it gets `Rect::ZERO` —
         // the renderer's "screen-bound default" sentinel.
+        //
+        // Phase 15.3 — also read per-surface animation opts. Only the
+        // foreground (`fg_surface`) animates today; overlays composite
+        // at IDENTITY. The transitions module produces `SurfaceProps`
+        // (translate_x + alpha); we lift those to `SurfaceDrawOpts`
+        // and let the compositor pass apply them during the screen
+        // composite, not by rewriting the activity's own ops.
         let bounds_of = |windows: &window_manager::WindowManager,
                          id: window_manager::SurfaceId| -> window_manager::Rect {
             windows.surface(id).map(|s| s.bounds).unwrap_or(window_manager::Rect::ZERO)
         };
+        let fg_opts = if self.animations.is_animating(fg_surface) {
+            let props = self.animations.props_for(
+                fg_surface, ts, self.metrics.width_px as f32,
+            );
+            compositor::SurfaceDrawOpts {
+                opacity: props.alpha.clamp(0.0, 1.0),
+                translate_x: props.translate_x,
+                translate_y: 0.0,
+                scale: 1.0,
+            }
+        } else {
+            compositor::SurfaceDrawOpts::IDENTITY
+        };
         if self.dialogs.open_dialogs().next().is_none() {
-            let order = [(fg_surface, bounds_of(&self.windows, fg_surface))];
+            let order = [(fg_surface, bounds_of(&self.windows, fg_surface), fg_opts)];
             return self.compositor.finish_frame_in_order(&order);
         }
-        let mut order: Vec<(window_manager::SurfaceId, window_manager::Rect)> =
-            vec![(fg_surface, bounds_of(&self.windows, fg_surface))];
+        let mut order: Vec<(
+            window_manager::SurfaceId,
+            window_manager::Rect,
+            compositor::SurfaceDrawOpts,
+        )> = vec![(fg_surface, bounds_of(&self.windows, fg_surface), fg_opts)];
         let mut overlays: Vec<window_manager::SurfaceId> =
             self.dialogs.open_dialogs().map(|d| d.surface).collect();
         overlays.sort();
         order.extend(
-            overlays.into_iter().map(|id| (id, bounds_of(&self.windows, id))),
+            overlays.into_iter().map(|id| (
+                id, bounds_of(&self.windows, id),
+                compositor::SurfaceDrawOpts::IDENTITY,
+            )),
         );
         self.compositor.finish_frame_in_order(&order)
     }
@@ -1016,7 +1034,11 @@ impl Framework {
                 // surface (WindowManager has no record for
                 // DEFAULT_SURFACE), so bounds wouldn't help.
                 self.compositor.finish_frame_in_order(
-                    &[(compositor::Compositor::DEFAULT_SURFACE, window_manager::Rect::ZERO)],
+                    &[(
+                        compositor::Compositor::DEFAULT_SURFACE,
+                        window_manager::Rect::ZERO,
+                        compositor::SurfaceDrawOpts::IDENTITY,
+                    )],
                 )
             }
             None => {

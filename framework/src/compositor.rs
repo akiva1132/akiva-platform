@@ -27,6 +27,51 @@ pub struct FrameCommands {
     pub ops: Vec<PaintOp>,
 }
 
+/// Phase 15.3 — per-composite effects. Applied by the renderer
+/// during `compositeSurface` (drawImage of the surface's offscreen
+/// onto the screen), wrapped in save/translate/scale/globalAlpha/
+/// restore.
+///
+/// `IDENTITY` is the no-op default — `(opacity 1.0, translate 0/0,
+/// scale 1.0)` — so every surface that isn't animating emits opts
+/// that the renderer can fast-path through (skip the save/restore).
+///
+/// 15.3 ships with the four basic effects shared by every desktop /
+/// mobile compositor; backdrop_blur, drop_shadow, and tint land with
+/// the WebGPU compositor in 15.4 (Canvas2D's `filter: blur()` is too
+/// slow for live blur, so 15.3 has no Canvas2D fallback for those —
+/// they just don't render until 15.4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceDrawOpts {
+    pub opacity: f32,
+    pub translate_x: f32,
+    pub translate_y: f32,
+    pub scale: f32,
+}
+
+impl SurfaceDrawOpts {
+    pub const IDENTITY: SurfaceDrawOpts = SurfaceDrawOpts {
+        opacity: 1.0, translate_x: 0.0, translate_y: 0.0, scale: 1.0,
+    };
+
+    /// True when the opts are exactly identity. Renderers can
+    /// fast-path this to a single `drawImage` with no save/restore.
+    /// Floating-point compare is exact: opts come from animation
+    /// computations that emit literal `1.0` / `0.0` for rest, and
+    /// `props_for` returns REST as a literal too — no rounding error
+    /// path produces a near-identity-but-not.
+    pub fn is_identity(self) -> bool {
+        self.opacity == 1.0
+            && self.translate_x == 0.0
+            && self.translate_y == 0.0
+            && self.scale == 1.0
+    }
+}
+
+impl Default for SurfaceDrawOpts {
+    fn default() -> Self { Self::IDENTITY }
+}
+
 #[derive(Debug, Clone)]
 pub enum PaintOp {
     Clear { rgba: u32 },
@@ -92,11 +137,27 @@ pub enum PaintOp {
     /// the most recent unmatched `BeginSurface`.
     EndSurface,
     /// Sample surface `id`'s backing canvas onto the current paint
-    /// target (always the screen in v1) at `(x, y, w, h)`. Implemented
-    /// as `ctx.drawImage(surface.canvas, x, y, w, h)` — Canvas2D's
-    /// drawImage with an OffscreenCanvas source is GPU-accelerated and
-    /// effectively free vs. the texture-sample on a real GPU API.
-    CompositeSurface { id: u32, x: f32, y: f32, w: f32, h: f32 },
+    /// target (always the screen in v1) at `(x, y, w, h)`, with
+    /// per-composite effects (`opts`). Implemented as
+    /// `ctx.drawImage(surface.canvas, ...)` wrapped in
+    /// translate/scale/globalAlpha — Canvas2D's drawImage with an
+    /// OffscreenCanvas source is GPU-accelerated and effectively free
+    /// vs. the texture-sample on a real GPU API.
+    ///
+    /// Phase 15.3 — `opts` carries the slide / fade animation state,
+    /// applied during composite rather than by rewriting the
+    /// activity's ops. Pre-15.3 `apply_props` wrapped the activity's
+    /// own paint with `PushTransform`/`SetGlobalAlpha`/`PopTransform`,
+    /// which translated content INSIDE the offscreen canvas — the
+    /// edges past the surface bounds got clipped, breaking slide
+    /// animations the moment per-Activity surfaces landed in 15.1.
+    /// Compositor-level transform translates the entire offscreen
+    /// during the screen composite, so slides preserve the activity's
+    /// full content.
+    CompositeSurface {
+        id: u32, x: f32, y: f32, w: f32, h: f32,
+        opts: SurfaceDrawOpts,
+    },
     /// Free the renderer's backing canvas for surface `id`. Emitted
     /// once, at the next `finish_frame_in_order` after the framework
     /// calls `Compositor::destroy_surface`. Idempotent on the renderer
@@ -151,7 +212,10 @@ pub trait DrawHal {
     // the frame shape and semantics.
     fn begin_surface(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32);
     fn end_surface(&mut self);
-    fn composite_surface(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32);
+    fn composite_surface(
+        &mut self, id: u32, x: f32, y: f32, w: f32, h: f32,
+        opts: SurfaceDrawOpts,
+    );
     fn destroy_surface(&mut self, id: u32);
 }
 
@@ -190,8 +254,8 @@ pub fn dispatch_paint_op<H: DrawHal + ?Sized>(hal: &mut H, op: &PaintOp) {
         PaintOp::SetGlobalAlpha { alpha } => hal.set_global_alpha(*alpha),
         PaintOp::BeginSurface { id, x, y, w, h } => hal.begin_surface(*id, *x, *y, *w, *h),
         PaintOp::EndSurface => hal.end_surface(),
-        PaintOp::CompositeSurface { id, x, y, w, h } => {
-            hal.composite_surface(*id, *x, *y, *w, *h);
+        PaintOp::CompositeSurface { id, x, y, w, h, opts } => {
+            hal.composite_surface(*id, *x, *y, *w, *h, *opts);
         }
         PaintOp::DestroySurface { id } => hal.destroy_surface(*id),
     }
@@ -340,7 +404,7 @@ impl Compositor {
     /// across calls — it stays valid until the next `begin_frame` /
     /// `finish_frame_in_order` / `finish_frame` call invalidates it.
     pub fn finish_frame_in_order(
-        &mut self, order: &[(SurfaceId, Rect)],
+        &mut self, order: &[(SurfaceId, Rect, SurfaceDrawOpts)],
     ) -> &FrameCommands {
         self.flat.clear();
         // Per-surface paint passes. Phase 15.2 — emit Begin/End only
@@ -358,7 +422,7 @@ impl Compositor {
         // frame, so `fc.ops.is_empty()` reliably distinguishes "didn't
         // paint" from "painted, even if just a clear" — a paint always
         // produces at least one op.
-        for (id, bounds) in order {
+        for (id, bounds, _opts) in order {
             if let Some(fc) = self.surfaces.get(id) {
                 if fc.ops.is_empty() { continue; }
                 self.flat.ops.push(PaintOp::BeginSurface {
@@ -374,16 +438,17 @@ impl Compositor {
             }
         }
         // Compositor pass — drawImage every surface in z-order onto
-        // the screen. We emit Composite even for surfaces that didn't
-        // paint this frame, so a Paused activity's last-known pixels
-        // stay on screen (the renderer's backing canvas retains the
-        // previous frame's content). That's the load-bearing
-        // robustness property of 15.1: a surface that didn't paint
-        // this frame is still visible at its last-painted pixels.
-        for (id, bounds) in order {
+        // the screen, applying per-composite effects via `opts`. We
+        // emit Composite even for surfaces that didn't paint this
+        // frame, so a Paused activity's last-known pixels stay on
+        // screen (the renderer's backing canvas retains the previous
+        // frame's content). That's the load-bearing robustness
+        // property of 15.1.
+        for (id, bounds, opts) in order {
             self.flat.ops.push(PaintOp::CompositeSurface {
                 id: id.0, x: bounds.x, y: bounds.y,
                 w: bounds.w, h: bounds.h,
+                opts: *opts,
             });
         }
         // Trailing destroys — the renderer can free its backing
@@ -404,7 +469,9 @@ impl Compositor {
     /// straight to the screen with no offscreen allocation"; matched
     /// by an equally zero-bounds CompositeSurface that's a no-op.
     pub fn finish_frame(&mut self) -> &FrameCommands {
-        self.finish_frame_in_order(&[(Self::DEFAULT_SURFACE, Rect::ZERO)])
+        self.finish_frame_in_order(&[(
+            Self::DEFAULT_SURFACE, Rect::ZERO, SurfaceDrawOpts::IDENTITY,
+        )])
     }
 
     /// Backward-compat: emit into the default surface.
@@ -436,6 +503,13 @@ mod tests {
 
     fn r(x: f32, y: f32, w: f32, h: f32) -> Rect { Rect { x, y, w, h } }
 
+    /// Helper for tests — pair a surface id with bounds and identity
+    /// opts. Most tests don't exercise opts; this keeps the call
+    /// sites readable. Phase 15.3 added the third tuple element.
+    fn triple(id: SurfaceId, rect: Rect) -> (SurfaceId, Rect, SurfaceDrawOpts) {
+        (id, rect, SurfaceDrawOpts::IDENTITY)
+    }
+
     /// Phase 15.1 — two surfaces emit Begin/ops/End blocks in caller
     /// order, then Composite ops in caller order. App below, overlay
     /// above → overlay's content composites last, painted on top of
@@ -450,8 +524,8 @@ mod tests {
         c.surface_target(overlay).push(other_op());
 
         let flat = c.finish_frame_in_order(&[
-            (app, r(0.0, 0.0, 100.0, 100.0)),
-            (overlay, r(10.0, 10.0, 50.0, 50.0)),
+            triple(app, r(0.0, 0.0, 100.0, 100.0)),
+            triple(overlay, r(10.0, 10.0, 50.0, 50.0)),
         ]);
         assert!(matches!(flat.ops[0], PaintOp::BeginSurface { id: 10, .. }));
         assert!(matches!(flat.ops[1], PaintOp::FillRect { .. }));
@@ -475,8 +549,8 @@ mod tests {
 
         // Reverse order → overlay composites first, app last.
         let flat = c.finish_frame_in_order(&[
-            (overlay, r(0.0, 0.0, 50.0, 50.0)),
-            (app, r(0.0, 0.0, 100.0, 100.0)),
+            triple(overlay, r(0.0, 0.0, 50.0, 50.0)),
+            triple(app, r(0.0, 0.0, 100.0, 100.0)),
         ]);
         // Last two ops are the Composites in caller order.
         let n = flat.ops.len();
@@ -490,7 +564,7 @@ mod tests {
         let s = SurfaceId(7);
         c.surface_target(s).push(one_op());
         c.destroy_surface(s);
-        let flat = c.finish_frame_in_order(&[(s, r(0.0, 0.0, 1.0, 1.0))]);
+        let flat = c.finish_frame_in_order(&[triple(s, r(0.0, 0.0, 1.0, 1.0))]);
         // Surface gone → no Begin/End block, no Composite-with-content.
         // We do still emit the trailing Composite for `s` (the renderer
         // is told "the texture should land at these bounds") but the
@@ -516,8 +590,8 @@ mod tests {
         let s = SurfaceId(7);
         c.surface_target(s).push(one_op());
         let flat = c.finish_frame_in_order(&[
-            (s, r(0.0, 0.0, 100.0, 100.0)),
-            (SurfaceId(999), r(0.0, 0.0, 100.0, 100.0)),
+            triple(s, r(0.0, 0.0, 100.0, 100.0)),
+            triple(SurfaceId(999), r(0.0, 0.0, 100.0, 100.0)),
         ]);
         let begin_count = flat.ops.iter()
             .filter(|op| matches!(op, PaintOp::BeginSurface { .. })).count();
@@ -540,12 +614,12 @@ mod tests {
         // Frame 1: Activity painted normally.
         c.begin_frame();
         c.surface_target(s).push(one_op());
-        let _ = c.finish_frame_in_order(&[(s, r(0.0, 0.0, 100.0, 100.0))]);
+        let _ = c.finish_frame_in_order(&[triple(s, r(0.0, 0.0, 100.0, 100.0))]);
 
         // Frame 2: Activity didn't paint. begin_frame clears the
         // surface's ops vec; the buffer entry stays in `surfaces`.
         c.begin_frame();
-        let flat = c.finish_frame_in_order(&[(s, r(0.0, 0.0, 100.0, 100.0))]);
+        let flat = c.finish_frame_in_order(&[triple(s, r(0.0, 0.0, 100.0, 100.0))]);
         let begin_count = flat.ops.iter()
             .filter(|op| matches!(op, PaintOp::BeginSurface { .. })).count();
         let end_count = flat.ops.iter()
@@ -571,14 +645,14 @@ mod tests {
         // Pre-allocate B's buffer (e.g. from a prior frame's paint)
         // so it sits in `self.surfaces` with empty ops in this frame.
         c.surface_target(b).push(one_op());
-        let _ = c.finish_frame_in_order(&[(b, r(0.0, 0.0, 100.0, 100.0))]);
+        let _ = c.finish_frame_in_order(&[triple(b, r(0.0, 0.0, 100.0, 100.0))]);
 
         c.begin_frame();
         c.surface_target(a).push(one_op());
         // Don't push to B — it stays empty this frame.
         let flat = c.finish_frame_in_order(&[
-            (a, r(0.0, 0.0, 100.0, 100.0)),
-            (b, r(0.0, 0.0, 50.0, 50.0)),
+            triple(a, r(0.0, 0.0, 100.0, 100.0)),
+            triple(b, r(0.0, 0.0, 50.0, 50.0)),
         ]);
         // Begin/End block only for A.
         let begin_ids: Vec<u32> = flat.ops.iter().filter_map(|op| match op {
@@ -605,7 +679,7 @@ mod tests {
         // Surface is still tracked — it's just empty. Push again works
         // without a re-create cost (the inner Vec keeps its capacity).
         c.surface_target(s).push(other_op());
-        let flat = c.finish_frame_in_order(&[(s, r(0.0, 0.0, 1.0, 1.0))]);
+        let flat = c.finish_frame_in_order(&[triple(s, r(0.0, 0.0, 1.0, 1.0))]);
         // Begin, the op, End, Composite → 4 ops total.
         assert_eq!(flat.ops.len(), 4);
     }
@@ -664,8 +738,13 @@ mod tests {
             self.trace.push(format!("begin_surface({id},{x},{y},{w},{h})"));
         }
         fn end_surface(&mut self) { self.trace.push("end_surface".into()); }
-        fn composite_surface(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {
-            self.trace.push(format!("composite_surface({id},{x},{y},{w},{h})"));
+        fn composite_surface(
+            &mut self, id: u32, x: f32, y: f32, w: f32, h: f32, opts: SurfaceDrawOpts,
+        ) {
+            self.trace.push(format!(
+                "composite_surface({id},{x},{y},{w},{h},opacity={},tx={},ty={},scale={})",
+                opts.opacity, opts.translate_x, opts.translate_y, opts.scale,
+            ));
         }
         fn destroy_surface(&mut self, id: u32) {
             self.trace.push(format!("destroy_surface({id})"));
@@ -710,7 +789,10 @@ mod tests {
             PaintOp::SetGlobalAlpha { alpha: 0.5 },
             PaintOp::BeginSurface { id: 42, x: 1.0, y: 2.0, w: 100.0, h: 200.0 },
             PaintOp::EndSurface,
-            PaintOp::CompositeSurface { id: 42, x: 1.0, y: 2.0, w: 100.0, h: 200.0 },
+            PaintOp::CompositeSurface {
+                id: 42, x: 1.0, y: 2.0, w: 100.0, h: 200.0,
+                opts: SurfaceDrawOpts::IDENTITY,
+            },
             PaintOp::DestroySurface { id: 42 },
         ];
         let mut hal = RecordingHal::default();
@@ -734,7 +816,7 @@ mod tests {
             "set_global_alpha(0.5)",
             "begin_surface(42,1,2,100,200)",
             "end_surface",
-            "composite_surface(42,1,2,100,200)",
+            "composite_surface(42,1,2,100,200,opacity=1,tx=0,ty=0,scale=1)",
             "destroy_surface(42)",
         ]);
     }

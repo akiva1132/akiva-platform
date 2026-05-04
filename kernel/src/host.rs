@@ -96,7 +96,10 @@ extern "C" {
     // `(x, y, w, h)`. `destroy_surface` frees the backing canvas.
     pub fn hal_begin_surface(id: u32, x: f32, y: f32, w: f32, h: f32);
     pub fn hal_end_surface();
-    pub fn hal_composite_surface(id: u32, x: f32, y: f32, w: f32, h: f32);
+    pub fn hal_composite_surface(
+        id: u32, x: f32, y: f32, w: f32, h: f32,
+        opacity: f32, translate_x: f32, translate_y: f32, scale: f32,
+    );
     pub fn hal_destroy_surface(id: u32);
 
     // ── Storage ───────────────────────────────────────────────────────────

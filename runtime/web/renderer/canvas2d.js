@@ -348,19 +348,52 @@ export class Canvas2DBackend {
   }
 
   /** Sample surface `id`'s backing canvas onto the screen at
-   *  `(x, y, w, h)`. Always paints to the screen ctx — composite is
-   *  the explicit "this is what reaches the display" step. Unknown
-   *  ids and zero-bounds are no-ops (zero-bounds is the legacy
-   *  DEFAULT_SURFACE sentinel — nothing was offscreen to composite). */
-  compositeSurface(id, x, y, w, h) {
+   *  `(x, y, w, h)`, with per-composite effects (Phase 15.3). Always
+   *  paints to the screen ctx — composite is the explicit "this is
+   *  what reaches the display" step. Unknown ids and zero-bounds are
+   *  no-ops (zero-bounds is the legacy DEFAULT_SURFACE sentinel —
+   *  nothing was offscreen to composite).
+   *
+   *  `opacity`, `translateX`, `translateY`, `scale` are the
+   *  `SurfaceDrawOpts` that animations produce. Identity opts (1, 0,
+   *  0, 1) fast-path through to a single drawImage with no
+   *  save/restore. Anything else uses save → translate → scale →
+   *  globalAlpha → drawImage → restore so each frame's effects are
+   *  fully independent (no leak into the next composite).
+   *
+   *  The translate is applied to the ENTIRE offscreen during the
+   *  composite step — so a slide animation preserves the full
+   *  activity content; pre-15.3's PushTransform-on-ops approach
+   *  translated content INSIDE the offscreen and clipped at its
+   *  edges. */
+  compositeSurface(id, x, y, w, h, opacity, translateX, translateY, scale) {
     if (!this.screenCtx) return;
     if (w <= 0 || h <= 0) return;
     const entry = this._surfaces.get(id);
     if (!entry) return;
-    // drawImage from one OffscreenCanvas into another is GPU-accelerated
-    // in every modern browser — same code path as `drawImage` from an
-    // ImageBitmap, no readback, no copy.
-    this.screenCtx.drawImage(entry.canvas, x, y, w, h);
+    const isIdentity =
+      opacity === undefined ||
+      (opacity === 1 && translateX === 0 && translateY === 0 && scale === 1);
+    if (isIdentity) {
+      // Fast path — no transition, no save/restore.
+      this.screenCtx.drawImage(entry.canvas, x, y, w, h);
+      return;
+    }
+    const ctx = this.screenCtx;
+    ctx.save();
+    if (translateX !== 0 || translateY !== 0) {
+      ctx.translate(translateX, translateY);
+    }
+    if (scale !== 1 && scale > 0) {
+      ctx.scale(scale, scale);
+    }
+    if (opacity !== 1) {
+      // Clamp defensively; an animation that overshoots [0, 1] would
+      // wash out (>1) or invert (<0) on some browsers.
+      ctx.globalAlpha = Math.max(0, Math.min(1, opacity));
+    }
+    ctx.drawImage(entry.canvas, x, y, w, h);
+    ctx.restore();
   }
 
   /** Free the backing canvas for surface `id`. Idempotent — destroying

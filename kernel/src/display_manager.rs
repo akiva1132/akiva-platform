@@ -28,7 +28,9 @@
 
 use std::collections::HashMap;
 
-use akiva_framework::compositor::{dispatch_paint_op, DrawHal, FrameCommands};
+use akiva_framework::compositor::{
+    dispatch_paint_op, DrawHal, FrameCommands, SurfaceDrawOpts,
+};
 
 use crate::host;
 
@@ -100,8 +102,15 @@ impl DrawHal for ExternDrawHal {
     fn end_surface(&mut self) {
         unsafe { host::hal_end_surface() }
     }
-    fn composite_surface(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {
-        unsafe { host::hal_composite_surface(id, x, y, w, h) }
+    fn composite_surface(
+        &mut self, id: u32, x: f32, y: f32, w: f32, h: f32, opts: SurfaceDrawOpts,
+    ) {
+        unsafe {
+            host::hal_composite_surface(
+                id, x, y, w, h,
+                opts.opacity, opts.translate_x, opts.translate_y, opts.scale,
+            )
+        }
     }
     fn destroy_surface(&mut self, id: u32) {
         unsafe { host::hal_destroy_surface(id) }

@@ -235,63 +235,13 @@ fn apply_transition_to_props(
     }
 }
 
-/// Wrap `ops` in-place with translate + alpha props from a transition.
-///
-/// Allocation profile:
-/// - `props.is_rest()` → zero work, returns immediately.
-/// - Otherwise: at most 2 prepends (`PushTransform` always when
-///   non-rest, optional `SetGlobalAlpha` if `alpha != 1.0`) and at
-///   most 1 append (`PopTransform`). The `PopTransform`'s implicit
-///   `restore()` resets `globalAlpha` along with the transform, so
-///   we don't need a separate restore op for alpha.
-///
-/// **Why this changed.** The earlier implementation cloned the full
-/// ops vec every frame and rewrote each colour-bearing op's rgba
-/// alpha byte. With ~50 ops in a typical Shell row + 60Hz that was
-/// 3000 allocations/sec during a 250ms transition; on a busy surface
-/// the per-frame work pushed past the 16 ms vsync budget and the
-/// animation visibly stuttered. Routing alpha through Canvas 2D's
-/// `globalAlpha` (a free GPU-side multiplier) and reusing the
-/// existing transform stack drops the per-frame cost to O(1).
-pub fn apply_props(
-    ops: &mut Vec<crate::compositor::PaintOp>, props: SurfaceProps,
-) {
-    use crate::compositor::PaintOp;
-    if props.is_rest() {
-        return;
-    }
-    // Phase 15.2 — empty ops means the Activity didn't paint this
-    // frame (worker is slow / trapped / paused). Wrapping empty with
-    // PushTransform/PopTransform would leave the surface buffer
-    // non-empty (just the wrappers) — finish_frame_in_order would
-    // then emit a Begin/End block, the renderer would clearRect the
-    // backing canvas, and the wrappers wouldn't paint anything → the
-    // activity's last-known pixels disappear during the animation.
-    // Bail when there's nothing to wrap; the surface stays empty,
-    // finish_frame_in_order suppresses Begin/End, and the renderer
-    // composites the prior frame's pixels (translated by 0; the
-    // animation simply doesn't advance for a frame the activity
-    // missed).
-    if ops.is_empty() {
-        return;
-    }
-    // Build the wrapper ops and prepend in one shot — `splice` is
-    // O(prefix.len() + ops.len()) but only does a single memmove, no
-    // per-op clone, no alpha-byte arithmetic.
-    let mut prefix: Vec<PaintOp> = Vec::with_capacity(2);
-    prefix.push(PaintOp::PushTransform {
-        dx: props.translate_x, dy: 0.0, scale: 1.0,
-    });
-    if (props.alpha - 1.0).abs() > 1e-6 {
-        prefix.push(PaintOp::SetGlobalAlpha {
-            alpha: props.alpha.clamp(0.0, 1.0),
-        });
-    }
-    ops.splice(0..0, prefix);
-    // PopTransform's implicit `ctx.restore()` resets globalAlpha too,
-    // so a single trailing op is enough.
-    ops.push(PaintOp::PopTransform);
-}
+// Phase 15.3 — `apply_props` (op-list rewriter) deleted. Animations
+// now flow through `Animations::props_for(surface)` straight to
+// `compositor::SurfaceDrawOpts` on the CompositeSurface op, and the
+// renderer applies translate/scale/globalAlpha around drawImage at
+// the screen-composite step. The pre-15.3 op-list wrapper translated
+// content INSIDE the per-Activity offscreen, which clipped slide
+// animations the moment 15.1 introduced per-Activity surfaces.
 
 #[cfg(test)]
 mod tests {
@@ -303,11 +253,6 @@ mod tests {
     #[test]
     fn rest_props_is_identity() {
         assert!(SurfaceProps::REST.is_rest());
-        let mut ops = vec![PaintOp::FillRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0, rgba: 0xff112233 }];
-        apply_props(&mut ops, SurfaceProps::REST);
-        // No wrapper, no rewriting — exact same single op as before.
-        assert_eq!(ops.len(), 1);
-        assert!(matches!(ops[0], PaintOp::FillRect { .. }));
     }
 
     #[test]
@@ -386,114 +331,6 @@ mod tests {
         // Subsequent tick has nothing to complete.
         ctrl.tick(2000.0);
         assert!(ctrl.take_completed().is_empty());
-    }
-
-    #[test]
-    fn apply_props_translates_with_push_pop_transform() {
-        let mut ops = vec![PaintOp::FillRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0, rgba: 0xff112233 }];
-        let p = SurfaceProps { translate_x: 100.0, alpha: 1.0 };
-        apply_props(&mut ops, p);
-        // 1 prefix (PushTransform) + 1 activity op + 1 suffix (PopTransform) = 3.
-        assert_eq!(ops.len(), 3);
-        match &ops[0] {
-            PaintOp::PushTransform { dx, dy, scale } => {
-                assert!((dx - 100.0).abs() < 0.001);
-                assert_eq!(*dy, 0.0);
-                assert_eq!(*scale, 1.0);
-            }
-            other => panic!("expected PushTransform, got {other:?}"),
-        }
-        assert!(matches!(ops[1], PaintOp::FillRect { .. }));
-        assert!(matches!(ops[2], PaintOp::PopTransform));
-    }
-
-    #[test]
-    fn apply_props_alpha_emits_set_global_alpha_and_does_not_rewrite_rgba() {
-        // The previous implementation walked every op and multiplied
-        // its alpha byte. The new contract is "emit one
-        // SetGlobalAlpha and let Canvas2D do the multiplication
-        // GPU-side" — the activity's rgba stays exactly as the app
-        // emitted it.
-        let mut ops = vec![PaintOp::FillRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0, rgba: 0xff112233 }];
-        let p = SurfaceProps { translate_x: 0.0, alpha: 0.5 };
-        apply_props(&mut ops, p);
-
-        // PushTransform (always) + SetGlobalAlpha + activity op + PopTransform
-        assert_eq!(ops.len(), 4);
-        assert!(matches!(ops[0], PaintOp::PushTransform { dx, .. } if dx == 0.0));
-        match &ops[1] {
-            PaintOp::SetGlobalAlpha { alpha } => assert!((alpha - 0.5).abs() < 1e-6),
-            other => panic!("expected SetGlobalAlpha, got {other:?}"),
-        }
-        // Activity op untouched — alpha byte still 0xff, rgb still 0x112233.
-        match &ops[2] {
-            PaintOp::FillRect { rgba, .. } => {
-                assert_eq!(*rgba, 0xff112233, "rgba must not be rewritten");
-            }
-            other => panic!("expected FillRect, got {other:?}"),
-        }
-        assert!(matches!(ops[3], PaintOp::PopTransform));
-    }
-
-    /// Phase 15.2 — apply_props on empty ops is a no-op. If the
-    /// Activity didn't paint this frame, wrapping empty ops with
-    /// transform/alpha would leave the surface buffer non-empty
-    /// (just wrappers, no actual paint) — finish_frame_in_order
-    /// would then emit a destructive Begin/End block, clearing the
-    /// renderer's backing canvas mid-animation. Empty stays empty
-    /// so the "frozen pane" guard upstream can do its job.
-    #[test]
-    fn apply_props_empty_ops_is_a_noop() {
-        let mut ops: Vec<PaintOp> = Vec::new();
-        apply_props(&mut ops, SurfaceProps { translate_x: 50.0, alpha: 0.5 });
-        assert!(ops.is_empty(),
-            "no activity ops → no wrapper ops; surface stays empty");
-    }
-
-    #[test]
-    fn apply_props_full_alpha_skips_set_global_alpha() {
-        // Slide-only transition (the common case for activity push/pop)
-        // shouldn't pay the SetGlobalAlpha cost — `alpha == 1.0` is
-        // detected and the op is skipped.
-        let mut ops = vec![PaintOp::FillRect { x: 0.0, y: 0.0, w: 1.0, h: 1.0, rgba: 0xff112233 }];
-        let p = SurfaceProps { translate_x: 100.0, alpha: 1.0 };
-        apply_props(&mut ops, p);
-        assert_eq!(ops.len(), 3);
-        assert!(matches!(ops[0], PaintOp::PushTransform { .. }));
-        assert!(matches!(ops[1], PaintOp::FillRect { .. }));
-        assert!(matches!(ops[2], PaintOp::PopTransform));
-    }
-
-    #[test]
-    fn apply_props_does_not_clone_activity_ops() {
-        // Foundation gap fix — the per-frame allocation that caused
-        // the stutter at 60Hz on a busy surface. With ~50 ops the old
-        // path allocated 50 PaintOp clones every frame; this test
-        // pins that the new path moves the activity ops into place
-        // without per-op clones (verified by checking the original
-        // ops Vec's pointer hasn't been replaced — `splice` extends
-        // in place when capacity allows, never copies element-wise).
-        let mut ops = Vec::with_capacity(64);
-        for i in 0..50 {
-            ops.push(PaintOp::FillRect {
-                x: i as f32, y: 0.0, w: 1.0, h: 1.0, rgba: 0xff112233 + i,
-            });
-        }
-        let p = SurfaceProps { translate_x: 100.0, alpha: 0.5 };
-        apply_props(&mut ops, p);
-        // 2 prefix (Push + SetGlobalAlpha) + 50 activity + 1 suffix = 53.
-        assert_eq!(ops.len(), 53);
-        // Activity ops are at indices 2..52 unchanged (rgba byte for
-        // byte). Spot-check a few.
-        for i in 0..50 {
-            match &ops[2 + i] {
-                PaintOp::FillRect { rgba, x, .. } => {
-                    assert_eq!(*rgba, 0xff112233 + i as u32);
-                    assert_eq!(*x, i as f32);
-                }
-                other => panic!("activity op {i} mutated: {other:?}"),
-            }
-        }
     }
 
     #[test]

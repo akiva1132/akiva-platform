@@ -587,13 +587,85 @@ describe("Canvas2DBackend — per-Activity surface compositor (Phase 15.1)", () 
   it("compositeSurface drawImages the surface canvas onto the screen", () => {
     backend.beginSurface(42, 10, 20, 300, 400);
     backend.endSurface();
-    backend.compositeSurface(42, 10, 20, 300, 400);
+    // Identity opts → fast path, no save/restore.
+    backend.compositeSurface(42, 10, 20, 300, 400, 1, 0, 0, 1);
     const screenOps = tail(screenTrace, "---init---");
     const drawImage = screenOps.find(op => op[0] === "drawImage");
     expect(drawImage).toBeTruthy();
     // First arg is the surface canvas itself.
     expect(drawImage[1]).toBe(allocated[0]);
     expect(drawImage.slice(2)).toEqual([10, 20, 300, 400]);
+    // No save/restore in the fast path.
+    expect(screenOps.find(op => op[0] === "save")).toBeUndefined();
+    restoreOC();
+  });
+
+  // ── Phase 15.3 — opts on compositeSurface ──────────────────────────
+
+  it("compositeSurface with opacity < 1 wraps drawImage in save/globalAlpha/restore", () => {
+    backend.beginSurface(42, 0, 0, 100, 100);
+    backend.endSurface();
+    backend.compositeSurface(42, 0, 0, 100, 100, 0.4, 0, 0, 1);
+    const screenOps = tail(screenTrace, "---init---");
+    expect(screenOps[0]).toEqual(["save"]);
+    expect(screenOps).toContainEqual(["set:globalAlpha", 0.4]);
+    expect(screenOps[screenOps.length - 1]).toEqual(["restore"]);
+    restoreOC();
+  });
+
+  it("compositeSurface with translate emits ctx.translate before drawImage", () => {
+    backend.beginSurface(42, 0, 0, 100, 100);
+    backend.endSurface();
+    backend.compositeSurface(42, 0, 0, 100, 100, 1, 50, 0, 1);
+    const screenOps = tail(screenTrace, "---init---");
+    expect(screenOps[0]).toEqual(["save"]);
+    expect(screenOps).toContainEqual(["translate", 50, 0]);
+    expect(screenOps).toContainEqual(["drawImage", allocated[0], 0, 0, 100, 100]);
+    expect(screenOps[screenOps.length - 1]).toEqual(["restore"]);
+    restoreOC();
+  });
+
+  it("compositeSurface clamps opacity to [0, 1]", () => {
+    backend.beginSurface(42, 0, 0, 100, 100);
+    backend.endSurface();
+    backend.compositeSurface(42, 0, 0, 100, 100, 1.5, 0, 0, 1);
+    let screenOps = tail(screenTrace, "---init---");
+    expect(screenOps).toContainEqual(["set:globalAlpha", 1]);
+    // Reset and try negative.
+    screenTrace.length = 0;
+    screenTrace.push("---init---");
+    backend.compositeSurface(42, 0, 0, 100, 100, -0.5, 0, 0, 1);
+    screenOps = tail(screenTrace, "---init---");
+    expect(screenOps).toContainEqual(["set:globalAlpha", 0]);
+    restoreOC();
+  });
+
+  it("slide animation translates the entire offscreen, not its inner content", () => {
+    // Phase 15.3's whole point: pre-15.3 the activity ops were
+    // wrapped with PushTransform inside the per-Activity offscreen,
+    // which clipped the slide content at the offscreen's right edge
+    // the moment 15.1 introduced per-Activity surfaces. The new
+    // model translates during the screen composite, preserving the
+    // full content.
+    //
+    // This test simulates frame N of a SlideFromRight animation:
+    // activity painted normally into the offscreen; composite
+    // applies the translate at the screen step.
+    backend.beginSurface(42, 0, 0, 800, 600);
+    backend.fillRect(0, 0, 800, 600, 0xff112233);  // activity fills the whole offscreen
+    backend.endSurface();
+    // Composite translates by 200 → activity slides into view from the right.
+    backend.compositeSurface(42, 0, 0, 800, 600, 1, 200, 0, 1);
+    const surfaceTrace = allocated[0]._trace;
+    const screenOps = tail(screenTrace, "---init---");
+    // The surface's offscreen ctx received fillRect at (0,0,800,600)
+    // — NO translate / save inside, so the activity's pixels fill
+    // the offscreen end-to-end, no clipping.
+    expect(surfaceTrace.find(op => op[0] === "translate")).toBeUndefined();
+    expect(surfaceTrace).toContainEqual(["fillRect", 0, 0, 800, 600]);
+    // The screen ctx applied translate(200, 0) around the drawImage.
+    expect(screenOps).toContainEqual(["translate", 200, 0]);
+    expect(screenOps).toContainEqual(["drawImage", allocated[0], 0, 0, 800, 600]);
     restoreOC();
   });
 
