@@ -379,7 +379,7 @@ async function attachDisplay(msg) {
   // requestAdapter/requestDevice happens inside `init`; on failure it
   // falls back to Canvas2D so init() resolves either way.
   backend = new CompositingPipeline();
-  await backend.init(msg.surface, msg.metrics);
+  await backend.init(msg.surface, msg.metrics, { preferGPU: msg.preferGPU !== false });
   // Stone 13.0prep C2 — wire AppRegistry to the renderer so async
   // drawable PNG decodes can register their ImageBitmaps. Any decodes
   // that completed before this call (queued in

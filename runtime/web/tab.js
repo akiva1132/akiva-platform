@@ -159,8 +159,23 @@ function onRoleChange({ role, promoted }) {
       }
       state.canvasTransferred = true;
       state.ownsCanvas = false;
+      // Compositor selection. WebGPU on a worker-side OffscreenCanvas
+      // hits a black-screen bug on several mobile drivers (init succeeds,
+      // draws encode, but the swapchain pixels never reach the visible
+      // canvas). Default to Canvas2D on touch / mobile UAs; allow
+      // explicit override via `?webgpu` (force on) or `?canvas2d`
+      // (force off).
+      const params = new URLSearchParams(location.search);
+      const ua = (navigator.userAgent || "").toLowerCase();
+      const isMobile = /android|iphone|ipad|ipod|mobile|tablet/.test(ua)
+                    || (navigator.maxTouchPoints || 0) > 1;
+      let preferGPU;
+      if (params.has("canvas2d"))      preferGPU = false;
+      else if (params.has("webgpu"))   preferGPU = true;
+      else                             preferGPU = !isMobile;
+      console.log(`[akiva] compositor preference: preferGPU=${preferGPU} (mobile=${isMobile})`);
       session.send(
-        { type: "attach_display", tabId, surface: offscreen, metrics: state.metrics },
+        { type: "attach_display", tabId, surface: offscreen, metrics: state.metrics, preferGPU },
         [offscreen],
       );
     }
@@ -487,6 +502,20 @@ function installInputForwarding(canvas) {
   };
   canvas.addEventListener("keydown", keyEvent("down"));
   canvas.addEventListener("keyup", keyEvent("up"));
+
+  // Browser back-button → kernel back. Mobile users (and laptop users
+  // with no Escape key handy) reach for the OS-level back gesture; we
+  // bridge it to the framework's KEY_CODE_BACK (27) so `dispatch_key`
+  // pops the activity stack just like Escape does. Pattern: seed one
+  // sentinel state at boot so popstate fires on the first back; the
+  // handler re-pushes after acting so subsequent backs keep firing
+  // without the browser actually leaving the page.
+  history.pushState({ akiva: 1 }, "", location.href);
+  window.addEventListener("popstate", () => {
+    session.send({ type: "event", kind: "key", tabId, code: 27, modifiers: 0, phase: "down" });
+    session.send({ type: "event", kind: "key", tabId, code: 27, modifiers: 0, phase: "up"   });
+    history.pushState({ akiva: 1 }, "", location.href);
+  });
 
   // IME / multi-codepoint paste path. `compositionend.data` carries
   // the committed text — for Latin layouts this is what the user
