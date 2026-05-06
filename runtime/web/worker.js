@@ -306,6 +306,29 @@ async function installOneDevApp(name, log) {
   storage.set(`packages/${packageId}/manifest.toml`, enc.encode(manifestText));
   storage.set(`packages/${packageId}/app.wasm`, wasmBytes);
 
+  // Dev-install also rewrites `sys/permissions/{id}` from the manifest
+  // so a manifest edit (e.g. adding LAUNCH_ANY_APP) takes effect on the
+  // next boot without forcing the developer to clear OPFS. Production
+  // installs go through `PackageManager::install` which handles this
+  // atomically; the dev path bypasses that, so we replicate the
+  // permission-blob write here. Format: LF-separated permission names,
+  // matching `apply_grants` in `framework/src/package_manager.rs`.
+  const permsRe = /\[permissions\][\s\S]*?required\s*=\s*\[([\s\S]*?)\]/m;
+  const permsMatch = manifestText.match(permsRe);
+  let permsBlob = "";
+  if (permsMatch) {
+    const list = permsMatch[1]
+      .split(/[,\n]/)
+      .map((s) => s.replace(/(^|\s)#.*$/, "").trim())
+      .map((s) => {
+        const m = s.match(/^"([^"]*)"$/);
+        return m ? m[1] : "";
+      })
+      .filter((s) => s.length > 0);
+    permsBlob = list.join("\n");
+  }
+  storage.set(`sys/permissions/${packageId}`, enc.encode(permsBlob));
+
   // Resource values files are optional. If the dev-apps stage dir has
   // them, copy into OPFS alongside the manifest so the framework's
   // ResourceManager picks them up at boot. Either file may be absent;
