@@ -30,6 +30,7 @@ export const FIRE = Object.freeze({
   WT_CLOSE:                  0x000B,  // Stone 14.2
   NOTIFY_CLOSE:              0x000C,  // Stone 14.3
   VIBRATE:                   0x000D,  // Stone 14.5
+  SET_SURFACE_EFFECTS:       0x000E,  // Phase 15.4 — per-Activity blur/shadow/tint
 });
 
 export const IO = Object.freeze({

@@ -583,6 +583,56 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         Some((buf, rc_out))
     }
 
+    fn drain_all_surface_effects(&self) -> Vec<(akiva_framework::wasm_activity::AppHandle, [u8; 24])> {
+        // Two-phase drain. 256 bytes is enough for ~7 entries; very
+        // few activities push effects per frame in practice (sheets/
+        // dialogs that change visibility), so the first call almost
+        // always fits.
+        let mut buf = vec![0u8; 256];
+        let needed = unsafe {
+            host::hal_app_drain_all_surface_effects(buf.as_mut_ptr(), buf.len() as u32)
+        } as usize;
+        if needed == 0 {
+            return Vec::new();
+        }
+        if needed > buf.len() {
+            buf = vec![0u8; needed];
+            let got = unsafe {
+                host::hal_app_drain_all_surface_effects(buf.as_mut_ptr(), buf.len() as u32)
+            } as usize;
+            if got == 0 || got > buf.len() {
+                log::warn("drain_all_surface_effects: lost payload on retry");
+                return Vec::new();
+            }
+            buf.truncate(got);
+        } else {
+            buf.truncate(needed);
+        }
+        if buf.len() < 4 { return Vec::new(); }
+        // Decode `[count: u32 | (handle: u32 | 24 bytes){count}]`.
+        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let entry_size = 4 + 24;
+        let body = &buf[4..];
+        if body.len() < count * entry_size {
+            log::warn("drain_all_surface_effects: blob shorter than declared count");
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = i * entry_size;
+            let handle = u32::from_le_bytes([
+                body[off], body[off + 1], body[off + 2], body[off + 3],
+            ]);
+            let Some(handle) = akiva_framework::wasm_activity::AppHandle::new(handle) else {
+                continue;
+            };
+            let mut bytes = [0u8; 24];
+            bytes.copy_from_slice(&body[off + 4..off + 4 + 24]);
+            out.push((handle, bytes));
+        }
+        out
+    }
+
     fn drain_set_result(
         &self,
         handle: akiva_framework::wasm_activity::AppHandle,

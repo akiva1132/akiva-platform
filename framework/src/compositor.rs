@@ -68,6 +68,59 @@ impl Default for DropShadow {
     fn default() -> Self { Self::NONE }
 }
 
+/// Phase 15.4 — just the effect fields of `SurfaceDrawOpts` (blur,
+/// shadow, tint), without the per-frame animation fields. Stored by
+/// the framework per-surface and merged into `SurfaceDrawOpts` when
+/// a `CompositeSurface` is emitted. Wire format mirrors the SDK's
+/// `effects::SurfaceEffects::encode`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SurfaceEffectFields {
+    pub backdrop_blur_radius: f32,
+    pub drop_shadow: DropShadow,
+    pub tint: u32,
+}
+
+impl SurfaceEffectFields {
+    pub const NONE: Self = Self {
+        backdrop_blur_radius: 0.0,
+        drop_shadow: DropShadow::NONE,
+        tint: 0,
+    };
+
+    /// Decode the 24-byte SDK wire format (see
+    /// `akiva_sdk::effects::SurfaceEffects::encode`):
+    ///   [blur_radius:f32 | shadow.{ox,oy,blur,rgba} | tint:u32]
+    pub fn decode(bytes: &[u8; 24]) -> Self {
+        let f32_at = |o: usize| f32::from_le_bytes([
+            bytes[o], bytes[o+1], bytes[o+2], bytes[o+3],
+        ]);
+        let u32_at = |o: usize| u32::from_le_bytes([
+            bytes[o], bytes[o+1], bytes[o+2], bytes[o+3],
+        ]);
+        Self {
+            backdrop_blur_radius: f32_at(0),
+            drop_shadow: DropShadow {
+                offset_x:    f32_at(4),
+                offset_y:    f32_at(8),
+                blur_radius: f32_at(12),
+                rgba:        u32_at(16),
+            },
+            tint: u32_at(20),
+        }
+    }
+
+    /// Apply these effects on top of a base `SurfaceDrawOpts` (which
+    /// typically carries the per-frame animation values for opacity
+    /// / translate / scale). Effect fields overwrite their
+    /// counterparts in `base`.
+    pub fn merge_into(self, mut base: SurfaceDrawOpts) -> SurfaceDrawOpts {
+        base.backdrop_blur_radius = self.backdrop_blur_radius;
+        base.drop_shadow          = self.drop_shadow;
+        base.tint                 = self.tint;
+        base
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceDrawOpts {
     pub opacity: f32,

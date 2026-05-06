@@ -759,6 +759,15 @@ function dispatchFire(opKind, args) {
       postSideEffect(opKind, args);
       return 0;
     }
+    // Phase 15.4 — set per-Activity surface effects (backdrop blur,
+    // drop shadow, colour tint). No grant required: the handle
+    // belongs to the calling activity and the effects only apply
+    // to its own surface. Wire is `[handle:4 | 24 bytes effects]`.
+    case FIRE.SET_SURFACE_EFFECTS: {
+      if (args.length !== 4 + 24) return 1;
+      postSideEffect(opKind, args);
+      return 0;
+    }
     default:
       postLog("warn", `fire(0x${opKind.toString(16)}): unknown op_kind`);
       return 1;

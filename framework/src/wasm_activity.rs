@@ -200,6 +200,20 @@ pub trait WasmHost {
         None
     }
 
+    /// Phase 15.4 — bulk drain of every pending compositor surface
+    /// effect set by activities since the last frame. Returns
+    /// `(handle, 24-byte encoded effects)` tuples; the framework
+    /// looks up each handle's surface and stores the values in its
+    /// persistent surface-effects store, where `finalize_frame`
+    /// reads them on the next composite. Default empty vec keeps
+    /// in-process / mock hosts opt-out.
+    ///
+    /// The 24 bytes mirror `akiva_sdk::effects::SurfaceEffects::encode`:
+    /// `[blur_radius: f32 | shadow.{ox,oy,blur,rgba} | tint: u32]`.
+    fn drain_all_surface_effects(&self) -> Vec<(AppHandle, [u8; 24])> {
+        Vec::new()
+    }
+
     /// Stone 9.5 — deliver an `ActivityResult` to the caller activity.
     /// Fires `akiva_app_activity_result(handle, request_code, ptr, len)`
     /// on the real host.
@@ -378,6 +392,8 @@ impl WasmActivity {
 }
 
 impl Activity for WasmActivity {
+    fn app_handle(&self) -> Option<core::num::NonZeroU32> { Some(self.handle) }
+
     fn on_create(&mut self, ctx: &mut ActivityContext<'_>) {
         self.fire_lifecycle_sync(LifecycleTransition::Create);
         // Prime the app's slot with the live surface metrics right after

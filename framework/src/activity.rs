@@ -100,6 +100,14 @@ pub struct ActivityContext<'a> {
 /// [`render`], which activities must implement — there is no such thing as
 /// a paint-less activity in this OS.
 pub trait Activity: 'static {
+    /// Phase 15.4 — return the wasm-app handle this activity holds, if
+    /// any. Used by the framework to map handle-keyed messages
+    /// (currently just SET_SURFACE_EFFECTS) back to the activity's
+    /// `WindowManager` surface. Default `None` keeps non-wasm
+    /// in-kernel activities (test fixtures, the legacy in-kernel
+    /// Shell) opt-out without modification.
+    fn app_handle(&self) -> Option<core::num::NonZeroU32> { None }
+
     fn on_create(&mut self, ctx: &mut ActivityContext<'_>) { let _ = ctx; }
     fn on_start(&mut self, ctx: &mut ActivityContext<'_>) { let _ = ctx; }
     fn on_resume(&mut self, ctx: &mut ActivityContext<'_>) { let _ = ctx; }

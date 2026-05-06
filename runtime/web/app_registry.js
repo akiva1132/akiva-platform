@@ -87,6 +87,18 @@ export class AppRegistry {
     this._pendingStartForResult = new Map();
     /** Stone 9.5 — bytes the activity stashed via `set_result`. @type {Map<number, Uint8Array>} */
     this._pendingSetResult = new Map();
+    /**
+     * Phase 15.4 — pending compositor surface effects per activity
+     * handle. App calls `Context::set_surface_effects(...)` → fire
+     * SET_SURFACE_EFFECTS arrives as a side_effect; we stage the
+     * 24-byte payload here keyed by handle. Drained in bulk once
+     * per frame by `hal_app_drain_all_surface_effects` (the kernel
+     * iterates over every pending handle and pushes each into the
+     * framework's persistent surface-effects store). Overwriting an
+     * already-pending entry is fine — only the latest value matters.
+     * @type {Map<number, Uint8Array>}
+     */
+    this._pendingSurfaceEffects = new Map();
     /** @type {Set<string>} */
     this._debug = new Set();
     /**
@@ -499,6 +511,7 @@ export class AppRegistry {
     this._pendingIntent.delete(handle);
     this._pendingStartForResult.delete(handle);
     this._pendingSetResult.delete(handle);
+    this._pendingSurfaceEffects.delete(handle);
     // The worker is left running even when no slots reference it —
     // mirrors the pre-11.4c policy where one in-memory `WebAssembly.
     // Instance` survived per package. Stone 11.5 adds the GC pass.
@@ -532,6 +545,36 @@ export class AppRegistry {
     return bytes ?? null;
   }
   _consumeSetResult(handle) { this._pendingSetResult.delete(handle); }
+
+  /**
+   * Phase 15.4 — bulk drain of pending compositor surface effects.
+   * Encodes every `(handle, 24-byte effects)` pair into a flat blob:
+   *   `[count: u32 LE] [(handle: u32 LE | 24 bytes effects){count}]`
+   * and writes it into kernel memory at `outPtr` (capacity `outCap`).
+   * Returns the *needed* length so the kernel can size up and retry
+   * exactly once if the buffer was too small. Pending entries are
+   * cleared only when the copy actually fit, mirroring the
+   * trapped-packages drain semantics — no payload loss across a
+   * size-up retry.
+   */
+  drainAllSurfaceEffects(outPtr, outCap) {
+    const count = this._pendingSurfaceEffects.size;
+    const need = 4 + count * (4 + 24);
+    if (count === 0) return 0;
+    if (need > outCap) return need;
+    const mem = this._kernelMemory();
+    if (!mem) return 0;
+    const dv = new DataView(mem.buffer);
+    let off = outPtr;
+    dv.setUint32(off, count, true); off += 4;
+    for (const [handle, effects] of this._pendingSurfaceEffects) {
+      dv.setUint32(off, handle, true); off += 4;
+      new Uint8Array(mem.buffer, off, 24).set(effects);
+      off += 24;
+    }
+    this._pendingSurfaceEffects.clear();
+    return need;
+  }
 
   /**
    * Stone 11.5 — copy the LF-separated UTF-8 list of package_ids
@@ -1431,6 +1474,12 @@ export class AppRegistry {
         if (resultBytes.length === 0) return;
         this._pendingSetResult.set(handle, resultBytes);
         this._dbg("intent", `${packageId}: side_effect SET_RESULT handle=${handle} bytes=${resultBytes.length}`);
+        return;
+      }
+      case FIRE.SET_SURFACE_EFFECTS: {
+        // Wire shape pinned at 4-byte handle + 24-byte effects.
+        if (args.length !== 4 + 24) return;
+        this._pendingSurfaceEffects.set(handle, args.slice(4));
         return;
       }
       default:

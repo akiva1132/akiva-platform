@@ -644,6 +644,16 @@ function buildImports() {
     // a dead worker.
     hal_drain_trapped_packages: (outPtr, outCap) => apps.drainTrappedPackages(outPtr, outCap),
 
+    // Phase 15.4 — bulk drain of pending compositor surface effects.
+    // Each app worker calls `Context::set_surface_effects(...)` which
+    // arrives here as a side_effect, gets staged in
+    // `apps._pendingSurfaceEffects`, and is drained once per frame
+    // by the kernel before `finalize_frame` reads them and merges
+    // with animation opts. Two-phase: returns required size if the
+    // kernel's buffer was too small (kernel realloc + retry).
+    hal_app_drain_all_surface_effects: (outPtr, outCap) =>
+      apps.drainAllSurfaceEffects(outPtr, outCap),
+
     // Phase 12.1 — return the most recent
     // `WebAssembly.Memory.buffer.byteLength` the package's app-worker
     // reported on its last pong. The kernel walks the installed

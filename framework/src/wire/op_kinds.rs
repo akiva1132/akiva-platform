@@ -96,6 +96,14 @@ pub mod fire {
     /// (matches `navigator.vibrate(0)` semantics). Capability
     /// gated by `akiva.permission.VIBRATE`.
     pub const VIBRATE: u32 = 0x000D;
+
+    /// Phase 15.4 — set the compositor's per-Activity surface effects
+    /// (backdrop blur, drop shadow, colour tint). Args:
+    /// `[handle: u32 LE | 24 bytes effects]` = 28 bytes. Effects
+    /// persist on the framework side until the next call or until
+    /// the activity is destroyed. No grant required — the effects
+    /// only apply to the calling activity's own surface.
+    pub const SET_SURFACE_EFFECTS: u32 = 0x000E;
 }
 
 /// I/O operations — the app calls `akiva_host_io_start(op_kind, args…)`
@@ -486,6 +494,7 @@ mod tests {
             fire::WT_CLOSE_STREAM, fire::WT_CLOSE,
             fire::NOTIFY_CLOSE,
             fire::VIBRATE,
+            fire::SET_SURFACE_EFFECTS,
         ];
         let io = [
             io::TEXT_WIDTH, io::QUERY_PACKAGES,
@@ -518,6 +527,7 @@ mod tests {
             fire::WT_CLOSE_STREAM, fire::WT_CLOSE,
             fire::NOTIFY_CLOSE,
             fire::VIBRATE,
+            fire::SET_SURFACE_EFFECTS,
         ];
         for (i, a) in fire.iter().enumerate() {
             for b in &fire[i + 1..] {
@@ -565,6 +575,7 @@ mod tests {
         assert_eq!(fire::WT_CLOSE,                  sdk::fire::WT_CLOSE);
         assert_eq!(fire::NOTIFY_CLOSE,              sdk::fire::NOTIFY_CLOSE);
         assert_eq!(fire::VIBRATE,                   sdk::fire::VIBRATE);
+        assert_eq!(fire::SET_SURFACE_EFFECTS,       sdk::fire::SET_SURFACE_EFFECTS);
         assert_eq!(io::TEXT_WIDTH,                  sdk::io::TEXT_WIDTH);
         assert_eq!(io::QUERY_PACKAGES,              sdk::io::QUERY_PACKAGES);
         assert_eq!(io::STORAGE_GET,                 sdk::io::STORAGE_GET);

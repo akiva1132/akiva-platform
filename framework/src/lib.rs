@@ -134,6 +134,7 @@ pub fn boot(
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
             activity_surfaces: HashMap::new(),
+            surface_effects: HashMap::new(),
     };
 
     // Stone 10.1 — declare the MVP permission catalog before any
@@ -474,6 +475,14 @@ pub struct Framework {
     /// and `WindowManager::surfaces_in_z_order` becomes the source of
     /// truth for compositor ordering.
     activity_surfaces: HashMap<activity_manager::ActivityId, window_manager::SurfaceId>,
+    /// Phase 15.4 — per-surface compositor effects (backdrop blur,
+    /// drop shadow, colour tint). Activities push values via
+    /// `Context::set_surface_effects`; the kernel drains them once
+    /// per frame and the framework stores them keyed by surface id.
+    /// Persistent across frames until overwritten or cleared on
+    /// activity destruction. Read by `finalize_frame` to merge with
+    /// per-frame animation opts before emitting `CompositeSurface`.
+    surface_effects: HashMap<window_manager::SurfaceId, compositor::SurfaceEffectFields>,
 }
 
 /// P0 #1 — one in-flight `save_state` waiting on the worker. Lives in
@@ -658,6 +667,14 @@ impl Framework {
     /// transitions N times per frame.
     pub fn render_frame(&mut self, ts: f64) -> &FrameCommands {
         self.compositor.begin_frame();
+        // Phase 15.4 — pull pending surface-effect updates from the
+        // host before paint. Each entry is `(handle, 24-byte effects)`;
+        // we map handle → activity_id via the live ActivityManager
+        // instance (`Activity::app_handle`) → surface_id via
+        // `activity_surfaces`. Activities without a real handle
+        // (in-kernel test fixtures) are skipped silently — they can't
+        // raise SET_SURFACE_EFFECTS in the first place.
+        self.apply_pending_surface_effects();
         let foreground = self.stack.last().copied();
         // Foundation gap fix — paint into the foreground activity's
         // *real* WindowManager surface, not the legacy DEFAULT_SURFACE.
@@ -779,6 +796,11 @@ impl Framework {
             self.compositor.destroy_surface(surface);
             self.windows.destroy_surface(surface);
             self.animations.cancel(surface);
+            // Phase 15.4 — drop the per-surface effect record so a
+            // future surface that reuses this id (rare, but possible
+            // if the WindowManager recycles ids) doesn't inherit a
+            // ghost blur / shadow / tint from a destroyed activity.
+            self.surface_effects.remove(&surface);
         }
     }
 
@@ -795,6 +817,36 @@ impl Framework {
     /// `WindowManager::surfaces_in_z_order` walk; today's simpler
     /// shape keeps the only-foreground-paints invariant from the
     /// Trapped guard intact.
+    /// Phase 15.4 — drain the host's pending surface-effect updates
+    /// and apply each to `self.surface_effects`, keyed by surface id.
+    /// No-op when nothing is pending.
+    fn apply_pending_surface_effects(&mut self) {
+        let pending = self.host.drain_all_surface_effects();
+        if pending.is_empty() { return; }
+        // Build a one-shot handle → activity_id map so we don't run
+        // an O(N) scan per drained entry. Activities whose
+        // `Activity::app_handle()` returns None (mocks, in-kernel
+        // shells) are skipped — they can't raise the op anyway.
+        let mut handle_to_act: HashMap<wasm_activity::AppHandle, activity_manager::ActivityId> =
+            HashMap::new();
+        let activity_ids: Vec<_> = self.activity_surfaces.keys().copied().collect();
+        for act_id in activity_ids {
+            if let Some(Some(h)) = self.activities.with_instance_ret(act_id, |a| a.app_handle()) {
+                handle_to_act.insert(h, act_id);
+            }
+        }
+        for (handle, bytes) in pending {
+            let Some(act_id) = handle_to_act.get(&handle) else { continue; };
+            let Some(surface_id) = self.activity_surfaces.get(act_id).copied() else { continue; };
+            let effects = compositor::SurfaceEffectFields::decode(&bytes);
+            if effects == compositor::SurfaceEffectFields::NONE {
+                self.surface_effects.remove(&surface_id);
+            } else {
+                self.surface_effects.insert(surface_id, effects);
+            }
+        }
+    }
+
     fn finalize_frame(
         &mut self,
         foreground: Option<activity_manager::ActivityId>,
@@ -819,7 +871,7 @@ impl Framework {
                          id: window_manager::SurfaceId| -> window_manager::Rect {
             windows.surface(id).map(|s| s.bounds).unwrap_or(window_manager::Rect::ZERO)
         };
-        let fg_opts = if self.animations.is_animating(fg_surface) {
+        let fg_opts_base = if self.animations.is_animating(fg_surface) {
             let props = self.animations.props_for(
                 fg_surface, ts, self.metrics.width_px as f32,
             );
@@ -828,21 +880,28 @@ impl Framework {
                 translate_x: props.translate_x,
                 translate_y: 0.0,
                 scale: 1.0,
-                // 15.4.3 — animations don't blur today; sheets/dialogs
-                // that want blur set `backdrop_blur_radius` explicitly
-                // when they emit their own CompositeSurface (15.4.3+).
                 backdrop_blur_radius: 0.0,
-                // 15.4.4 — animations don't shadow either; surfaces
-                // that want a shadow set `drop_shadow` explicitly.
                 drop_shadow: compositor::DropShadow::NONE,
-                // 15.4.5 — animations don't tint by default. Surfaces
-                // (e.g. inactive activities during multitasking
-                // transitions) set `tint` explicitly.
                 tint: 0,
             }
         } else {
             compositor::SurfaceDrawOpts::IDENTITY
         };
+        // Phase 15.4 — merge per-surface effects (set by activities
+        // via `Context::set_surface_effects`) on top of the
+        // animation-driven base opts.
+        let merge_effects = |sid: window_manager::SurfaceId,
+                             base: compositor::SurfaceDrawOpts,
+                             surface_effects: &HashMap<
+                                window_manager::SurfaceId,
+                                compositor::SurfaceEffectFields,
+                             >| -> compositor::SurfaceDrawOpts {
+            match surface_effects.get(&sid) {
+                Some(eff) => eff.merge_into(base),
+                None => base,
+            }
+        };
+        let fg_opts = merge_effects(fg_surface, fg_opts_base, &self.surface_effects);
         if self.dialogs.open_dialogs().next().is_none() {
             let order = [(fg_surface, bounds_of(&self.windows, fg_surface), fg_opts)];
             return self.compositor.finish_frame_in_order(&order);
@@ -855,12 +914,12 @@ impl Framework {
         let mut overlays: Vec<window_manager::SurfaceId> =
             self.dialogs.open_dialogs().map(|d| d.surface).collect();
         overlays.sort();
-        order.extend(
-            overlays.into_iter().map(|id| (
-                id, bounds_of(&self.windows, id),
-                compositor::SurfaceDrawOpts::IDENTITY,
-            )),
-        );
+        for id in overlays {
+            let opts = merge_effects(
+                id, compositor::SurfaceDrawOpts::IDENTITY, &self.surface_effects,
+            );
+            order.push((id, bounds_of(&self.windows, id), opts));
+        }
         self.compositor.finish_frame_in_order(&order)
     }
 
@@ -2486,6 +2545,7 @@ mod tests {
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
             activity_surfaces: HashMap::new(),
+            surface_effects: HashMap::new(),
         }
     }
 
@@ -3677,6 +3737,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
             activity_surfaces: HashMap::new(),
+            surface_effects: HashMap::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -3783,6 +3844,7 @@ required = ["akiva.permission.QUERY_PACKAGES", "akiva.permission.LAUNCH_ANY_APP"
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
             activity_surfaces: HashMap::new(),
+            surface_effects: HashMap::new(),
         };
         fw.activities.register(
             "test.pkg",
@@ -4362,6 +4424,7 @@ optional = []
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
             activity_surfaces: HashMap::new(),
+            surface_effects: HashMap::new(),
         };
         // Push the entry by hand — the integration path lives in
         // `destroy_with_persist`; here we exercise `drive_pending_saves`
@@ -4481,6 +4544,7 @@ optional = []
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
             activity_surfaces: HashMap::new(),
+            surface_effects: HashMap::new(),
         };
         let host_for_factory = host.clone();
         fw.activities.register(
@@ -4625,6 +4689,7 @@ optional = []
             task_displays: HashMap::new(),
             pending_transitions: HashMap::new(),
             activity_surfaces: HashMap::new(),
+            surface_effects: HashMap::new(),
         };
         fw.drive_pending_saves();
         assert!(fw.pending_saves.is_empty(),

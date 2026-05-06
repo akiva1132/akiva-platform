@@ -19,6 +19,7 @@ pub mod canvas;
 pub mod clipboard;
 pub mod clock;
 pub mod dialog;
+pub mod effects;
 pub mod executor;
 pub mod geolocation;
 pub mod intent;
@@ -44,6 +45,7 @@ pub use activity::{
 pub use app::{App, AppContext};
 pub use canvas::Canvas;
 pub use dialog::{DialogFuture, DialogResult};
+pub use effects::{DropShadow, SurfaceEffects};
 pub use intent::{Intent, IntentBuilder};
 pub use result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
 

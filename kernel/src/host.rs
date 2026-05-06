@@ -330,6 +330,25 @@ extern "C" {
         out_cap: u32,
     ) -> u32;
 
+    // ── Phase 15.4 — surface effects (bulk drain) ──────────────────────────
+    //
+    // Activities call `Context::set_surface_effects(...)` from the SDK.
+    // Each call arrives at the kernel-worker as a side_effect and gets
+    // staged in `apps._pendingSurfaceEffects` keyed by handle. Once per
+    // frame the kernel pulls the entire pending map via this import,
+    // decodes each `(handle, 24 bytes)` entry, and feeds them into the
+    // framework's per-surface effects store.
+    //
+    // Wire format of the output blob:
+    //   [count: u32 LE]
+    //   repeat count: [handle: u32 LE | 24 bytes effects]
+    //
+    // Two-phase buffer (same shape as the other drain imports): if the
+    // return value exceeds `out_cap`, nothing is copied and the kernel
+    // retries with a larger buffer. Returning 0 means nothing pending —
+    // the kernel skips the decode without bumping anything.
+    pub fn hal_app_drain_all_surface_effects(out_ptr: *mut u8, out_cap: u32) -> u32;
+
     // ── Permission grants (Stone 10.3b) ───────────────────────────────────
     //
     // Push the list of permissions granted to `package_id` to the host so

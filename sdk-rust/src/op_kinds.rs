@@ -68,6 +68,15 @@ pub mod fire {
     /// pattern (`count == 0`) cancels any in-progress vibration.
     /// Capability gated by `akiva.permission.VIBRATE`.
     pub const VIBRATE: u32 = 0x000D;
+    /// Phase 15.4 — set the WebGPU compositor's per-Activity surface
+    /// effects (backdrop blur, drop shadow, colour tint). Args:
+    /// `[handle: u32 LE | SurfaceEffects::ENCODED_LEN bytes]` —
+    /// 4 + 24 = 28 bytes. The effects persist on the framework side
+    /// until the next call (or until the activity is destroyed); apps
+    /// don't need to re-set them every frame. Canvas2D backends
+    /// silently ignore. No grant required — the effects only apply
+    /// to the calling activity's own surface.
+    pub const SET_SURFACE_EFFECTS: u32 = 0x000E;
 }
 
 /// I/O operations. Range `0x0101..=0x01FF`.
@@ -321,6 +330,7 @@ mod tests {
         assert!(fire::WT_CLOSE <= 0x00FF);
         assert!(fire::NOTIFY_CLOSE <= 0x00FF);
         assert!(fire::VIBRATE <= 0x00FF);
+        assert!(fire::SET_SURFACE_EFFECTS <= 0x00FF);
         assert!(io::TEXT_WIDTH >= 0x0101 && io::TEXT_WIDTH <= 0x01FF);
         assert!(io::STORAGE_SET >= 0x0101 && io::STORAGE_SET <= 0x01FF);
         assert!(io::STORAGE_DELETE >= 0x0101 && io::STORAGE_DELETE <= 0x01FF);

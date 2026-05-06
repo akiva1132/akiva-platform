@@ -157,6 +157,25 @@ pub fn host_set_result(handle: u32, result: &ActivityResult) {
     }
 }
 
+/// Phase 15.4 — push the activity's surface effects (backdrop blur,
+/// drop shadow, colour tint) to the host. The framework stores them
+/// per-surface and merges with animation opts in `finalize_frame`.
+/// Persistent across frames until overwritten or the activity ends.
+pub fn host_set_surface_effects(handle: u32, effects: crate::effects::SurfaceEffects) {
+    let bytes = effects.encode();
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut args = Vec::with_capacity(4 + bytes.len());
+        args.extend_from_slice(&handle.to_le_bytes());
+        args.extend_from_slice(&bytes);
+        let _ = host_fire(op_kinds::fire::SET_SURFACE_EFFECTS, &args);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (handle, bytes);
+    }
+}
+
 // ── Unified-ABI thin wrappers around the wasm imports ──────────────────
 
 #[cfg(target_arch = "wasm32")]

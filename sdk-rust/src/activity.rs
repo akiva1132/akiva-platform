@@ -274,6 +274,32 @@ impl<'a> Context<'a> {
     ) -> crate::dialog::DialogFuture {
         crate::dialog::show_dialog_inner(self.handle, title, body, buttons)
     }
+
+    /// Phase 15.4 — set the compositor effects for this activity's
+    /// surface (backdrop blur, drop shadow, colour tint). The values
+    /// persist on the framework side until the next call or until the
+    /// activity is destroyed; apps that want a static effect set it
+    /// once in `on_create` and forget. Canvas2D backends silently
+    /// ignore — apps that depend on these effects should expect an
+    /// unstyled fallback on browsers without WebGPU.
+    ///
+    /// Synchronous from the app's perspective: the host stores the
+    /// new effects on the next frame's drain, and the next composite
+    /// reads them. No future to await.
+    ///
+    /// ```ignore
+    /// ctx.set_surface_effects(
+    ///     SurfaceEffects::default()
+    ///         .with_backdrop_blur(20.0)
+    ///         .with_drop_shadow(DropShadow {
+    ///             offset_y: 4.0, blur_radius: 16.0, rgba: 0x40_00_00_00,
+    ///             ..Default::default()
+    ///         }),
+    /// );
+    /// ```
+    pub fn set_surface_effects(&mut self, effects: crate::effects::SurfaceEffects) {
+        crate::runtime::host_set_surface_effects(self.handle, effects);
+    }
 }
 
 // ── The trait ─────────────────────────────────────────────────────────
