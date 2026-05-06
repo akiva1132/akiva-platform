@@ -242,16 +242,25 @@ pub fn boot(
         fw.resources.register(&id, table);
     }
 
-    // Register every installed package's entry activity as a
-    // `WasmActivity` factory. The host owns the wasm process (one per
-    // package); each `launch()` hands the framework a fresh handle
+    // Register every installed package's manifest-declared activities
+    // as `WasmActivity` factories. The host owns the wasm process (one
+    // per package); each `launch()` hands the framework a fresh handle
     // identifying one activity slot inside that process. Collecting
     // first avoids borrowing `fw.packages` while we mutate
     // `fw.activities`.
+    //
+    // Foundation gap fix — pre-this, the registration loop only walked
+    // `r.entry_class`, so a manifest with multiple `[[activities]]`
+    // could only ever launch one of them. `Intent::explicit(pkg, class)`
+    // for any non-entry class returned `UnknownActivity` and the launch
+    // silently dropped (apply_post is `if let Ok(...)` — error path is
+    // a no-op). Walk every declared activity here so multi-screen apps
+    // (Showcase, future Settings, future Files) just work.
     let entries: Vec<(String, String, LaunchMode)> = fw.packages.list()
-        .map(|r| {
-            let launch_mode = r.launch_mode_of(&r.entry_class).unwrap_or(LaunchMode::Standard);
-            (r.id.clone(), r.entry_class.clone(), launch_mode)
+        .flat_map(|r| {
+            let pkg_id = r.id.clone();
+            r.manifest.activities.iter()
+                .map(move |a| (pkg_id.clone(), a.class.clone(), a.launch_mode))
         })
         .collect();
     for (pkg, class, launch_mode) in entries {
