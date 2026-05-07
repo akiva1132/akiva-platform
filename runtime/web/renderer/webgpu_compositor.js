@@ -818,7 +818,14 @@ export class WebGPUCompositor {
     u[4]  = targetSize[0]; u[5]  = targetSize[1]; u[6]  = 0;             u[7]  = 0;
     u[8]  = opts[0];       u[9]  = opts[1];       u[10] = opts[2];       u[11] = opts[3];
     u[12] = srcUv[0];      u[13] = srcUv[1];      u[14] = srcUv[2];      u[15] = srcUv[3];
-    u[16] = blurDir[0];    u[17] = blurDir[1];    u[18] = 0;             u[19] = 0;
+    // `blur_dir` is overloaded across pipelines:
+    //   - blur.wgsl:        reads .xy (per-tap UV offset, .zw unused).
+    //   - identity.wgsl fs: reads .xyz (tint rgb) + .w (tint alpha mix).
+    //   - identity.wgsl fs_alpha_tint (shadow): same .xyz + .w as `fs`.
+    // So all four lanes must be written; an earlier 2-lane upload
+    // silently zero'd the tint alpha and rgb-blue, which neutered the
+    // tint pipeline and the shadow's silhouette colour.
+    u[16] = blurDir[0];    u[17] = blurDir[1];    u[18] = blurDir[2] ?? 0; u[19] = blurDir[3] ?? 0;
     const buf = this.device.createBuffer({
       size: UNIFORM_BUFFER_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
