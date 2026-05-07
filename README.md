@@ -48,6 +48,75 @@ Manager, Window Manager.
 
 ---
 
+## Running
+
+The `akiva` CLI lives in [`cli/`](cli/) and is the single entry
+point for every dev-loop task. Everything below assumes you have
+the `wasm32-unknown-unknown` target installed
+(`rustup target add wasm32-unknown-unknown`).
+
+### One-shot dev loop
+
+```bash
+# Build kernel wasm + every app under apps/, then serve.
+cargo run -p akiva -- run
+
+# Open the browser:
+#   http://127.0.0.1:4173
+# WebGPU compositor is auto-detected on desktop. Mobile UAs default
+# to Canvas2D (some mobile drivers black-screen WebGPU on
+# OffscreenCanvas); pass ?webgpu to force it back on:
+#   http://127.0.0.1:4173/?webgpu
+# `?canvas2d` does the inverse on desktop.
+```
+
+`akiva run` accepts:
+
+- `--no-build` — skip the kernel + apps build step (use the cached
+  staged copies under `runtime/web/`).
+- `--debug` — build apps with the `dev` cargo profile (faster
+  compile, larger wasm).
+- `--port PORT` / `--addr HOST:PORT` — change the listen address
+  (default `127.0.0.1:4173`).
+
+### Targeted commands
+
+```bash
+# Just the dev server — assumes everything is already staged.
+cargo run -p akiva -- devserver
+
+# Build the kernel + workspace.
+cargo build --workspace
+
+# Build a single app and stage it under runtime/web/dev-apps/<name>/.
+cargo run -p akiva -- build calculator
+cargo run -p akiva -- build              # every app under apps/
+
+# Scaffold a new app.
+cargo run -p akiva -- new my-app
+
+# Package + install (.akv archive).
+cargo run -p akiva -- package my-app
+cargo run -p akiva -- install path/to/my-app.akv
+
+# Open the SDK API reference (cargo doc + browser).
+cargo run -p akiva -- docs
+```
+
+### Tests
+
+```bash
+# Rust workspace (framework + sdk + wire + result).
+cargo test --workspace
+
+# JS host-side (worker, app_registry, paint decoder, compositor pipeline).
+cd runtime/web && npm test
+```
+
+Detailed strategy lives in [docs/testing.md](docs/testing.md).
+
+---
+
 ## Project layout
 
 ```
