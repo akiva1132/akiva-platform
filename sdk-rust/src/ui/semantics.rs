@@ -1,0 +1,330 @@
+//! Semantic tree — the test/inspector projection of the UI.
+//!
+//! Akiva renders to canvas, so the browser's a11y tree is empty and
+//! `document.querySelector` finds nothing. Without an external
+//! description of what's on screen, Playwright tests can only click by
+//! pixel coordinates and visual regression is the only option — both
+//! are brittle. This module is the runtime side of the introspection
+//! layer planned in [`docs/testing.md §7`](../../../../docs/testing.md)
+//! and [`ARCHITECTURE.md §16`](../../../../ARCHITECTURE.md).
+//!
+//! Pattern follows Flutter web: each frame the SDK builds a flat tree
+//! describing what the user sees (role + bounds + label/value + stable
+//! id), serialises it, and fires it at the host as a side-effect. The
+//! host (`runtime/web/inspector.js`) decodes the tree and exposes it
+//! as `window.__akiva` — a JS-only query API (`findById`, `findByRole`,
+//! `findByText`, `snapshot`) — so Playwright tests via `page.evaluate`
+//! can resolve canvas widgets without a DOM mirror. Same tree is the
+//! foundation for a future screen reader — no separate a11y wiring
+//! needed.
+//!
+//! ## Lifecycle
+//!
+//! - Always emitted (cheap — a few hundred bytes per frame for a
+//!   typical screen). The host filters at the projection layer:
+//!   tabs without `?inspector=1` ignore the message.
+//! - Built inside [`crate::ui::Ui::present`] from the same tree the
+//!   layout pass laid out. Roles are derived from the [`crate::ui::node::Node`]
+//!   variant; bounds come from the layout pass output.
+//! - One [`SemanticTree`] per Activity per frame. The activity handle
+//!   keys it on the host side; multiple activities composing on one
+//!   display each emit their own tree.
+//!
+//! ## Wire format (version 1, all little-endian)
+//!
+//! ```text
+//! [version: u8 = 1]
+//! [count: u32]
+//! repeat count:
+//!   [parent_idx: i32]   // -1 for the root; otherwise an index into this same blob
+//!   [role: u8]          // SemanticRole repr
+//!   [x: f32 | y: f32 | w: f32 | h: f32]   // physical pixels
+//!   [flags: u8]         // bit 0 has_id, bit 1 has_label, bit 2 has_value
+//!   [id_len: u16    | id: utf8 ]?         // present iff flags & 1
+//!   [label_len: u16 | label: utf8]?       // present iff flags & 2
+//!   [value_len: u16 | value: utf8]?       // present iff flags & 4
+//! ```
+//!
+//! The `parent_idx` channel is enough for a host to reconstruct the
+//! tree structure; a depth-first walk of the input naturally produces
+//! parents-before-children, but we don't rely on order — the host
+//! decoder can slot every node into `nodes[idx]` and link by parent.
+
+/// Semantic role of a UI element. Matches a small subset of ARIA
+/// roles plus a few platform extensions (`Rect`, `Spacer`) for
+/// completeness during the inspector phase. The host overlay
+/// translates these to ARIA roles when projecting to DOM.
+///
+/// Numbering is wire-stable. Add new variants by appending — never
+/// reorder.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticRole {
+    /// VStack, HStack, Frame, Grid — anything that lays out children.
+    /// Maps to ARIA `role="group"` in the DOM projection.
+    Group   = 0,
+    /// Static text. The text content lives in `label`. Maps to
+    /// `aria-label` + visible text content (no ARIA role — `text`
+    /// isn't a valid ARIA role, and the text content alone makes
+    /// the element findable via `getByText`).
+    Text    = 1,
+    /// Tappable button. `label` carries the visible text; `id`
+    /// carries the layout id; ARIA `role="button"`.
+    Button  = 2,
+    /// Bitmap. `id` if any; ARIA `role="img"` with `aria-label` set
+    /// from the source `@drawable/...` ref name (when available).
+    Image   = 3,
+    /// Decorative coloured rectangle. Skipped by the default DOM
+    /// projection (noise) but still emitted so a debug overlay can
+    /// show it. ARIA: none.
+    Rect    = 4,
+    /// Layout-only filler. Same projection treatment as `Rect`.
+    Spacer  = 5,
+}
+
+impl SemanticRole {
+    /// True for nodes the default DOM projection should skip. Decorative
+    /// rectangles and spacers add no information for tests; including
+    /// them in the ARIA tree would just dilute `getByRole("group")`
+    /// queries with noise. Inspector overlays that want the full tree
+    /// can still opt in by reading the wire format directly.
+    pub fn is_decorative(self) -> bool {
+        matches!(self, SemanticRole::Rect | SemanticRole::Spacer)
+    }
+}
+
+/// One node in a [`SemanticTree`]. `parent` is `None` for the root,
+/// `Some(idx)` for everything else where `idx` references an earlier
+/// position in the same tree's `nodes` vector.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticNode {
+    pub parent: Option<u32>,
+    pub role:   SemanticRole,
+    /// Physical-pixel rect in screen space. Same coordinate system as
+    /// pointer events — a Playwright click at `(x + w/2, y + h/2)`
+    /// reaches the same hit target the SDK would.
+    pub x:      f32,
+    pub y:      f32,
+    pub w:      f32,
+    pub h:      f32,
+    /// Stable string id from the AKML `id="..."` attribute or the
+    /// `Ui::button(id, ...)` argument. Test selector key — when set,
+    /// projects to `data-akiva-id="..."` on the DOM mirror. `None` for
+    /// nodes without an explicit id (decorative rects, spacers,
+    /// auto-laid-out containers).
+    pub id:     Option<String>,
+    /// Visible text or accessible name. For Text nodes this is the
+    /// text content; for Button nodes the visible label; for Image
+    /// nodes the drawable name (when known).
+    pub label:  Option<String>,
+    /// Live state value separate from the static label. Currently
+    /// unused — reserved for future widgets (Input field text,
+    /// Checkbox checked state, Slider position, etc.). Decoders that
+    /// don't recognise it ignore.
+    pub value:  Option<String>,
+}
+
+/// Flat semantic projection of one frame's worth of widget tree.
+/// `nodes[0]` is the root; nodes are indexed by `u32` to keep the
+/// wire format compact (a screen with 65k widgets is unrealistic).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SemanticTree {
+    pub nodes: Vec<SemanticNode>,
+}
+
+impl SemanticTree {
+    pub const WIRE_VERSION: u8 = 1;
+
+    pub fn new() -> Self { Self { nodes: Vec::new() } }
+
+    pub fn is_empty(&self) -> bool { self.nodes.is_empty() }
+
+    /// Append a node and return its index. Caller is responsible for
+    /// passing a `parent` index that already exists in `self.nodes`
+    /// (or `None` for the root). The first node pushed must have
+    /// `parent == None` — the host decoder uses that as a sentinel.
+    pub fn push(&mut self, node: SemanticNode) -> u32 {
+        let idx = self.nodes.len() as u32;
+        self.nodes.push(node);
+        idx
+    }
+
+    /// Encode to the v1 wire format. See module-level docs for the
+    /// byte layout.
+    pub fn encode(&self) -> Vec<u8> {
+        // Estimate: header (5) + per-node fixed (22) + each string
+        // (avg ~12). Over-reserve a little so we don't reallocate for
+        // typical screens.
+        let mut out = Vec::with_capacity(5 + self.nodes.len() * 32);
+        out.push(Self::WIRE_VERSION);
+        out.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
+        for n in &self.nodes {
+            let parent_idx: i32 = match n.parent {
+                Some(p) => p as i32,
+                None    => -1,
+            };
+            out.extend_from_slice(&parent_idx.to_le_bytes());
+            out.push(n.role as u8);
+            out.extend_from_slice(&n.x.to_le_bytes());
+            out.extend_from_slice(&n.y.to_le_bytes());
+            out.extend_from_slice(&n.w.to_le_bytes());
+            out.extend_from_slice(&n.h.to_le_bytes());
+            let mut flags: u8 = 0;
+            if n.id.is_some()    { flags |= 0b001; }
+            if n.label.is_some() { flags |= 0b010; }
+            if n.value.is_some() { flags |= 0b100; }
+            out.push(flags);
+            if let Some(s) = &n.id    { write_str(&mut out, s); }
+            if let Some(s) = &n.label { write_str(&mut out, s); }
+            if let Some(s) = &n.value { write_str(&mut out, s); }
+        }
+        out
+    }
+
+    /// Decode from the v1 wire format. Returns `None` on truncated /
+    /// malformed input — same loose contract as other SDK decoders.
+    /// Test-only today; the host has its own JS decoder. Kept for
+    /// round-trip tests that pin the wire shape.
+    #[allow(dead_code)]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut p = 0usize;
+        if bytes.get(p)? != &Self::WIRE_VERSION { return None; }
+        p += 1;
+        if bytes.len() < p + 4 { return None; }
+        let count = u32::from_le_bytes(bytes[p..p + 4].try_into().ok()?) as usize;
+        p += 4;
+        let mut tree = Self { nodes: Vec::with_capacity(count) };
+        for _ in 0..count {
+            if bytes.len() < p + 22 { return None; }
+            let parent_i32 = i32::from_le_bytes(bytes[p..p + 4].try_into().ok()?);
+            p += 4;
+            let parent = if parent_i32 < 0 { None } else { Some(parent_i32 as u32) };
+            let role = match bytes[p] {
+                0 => SemanticRole::Group,
+                1 => SemanticRole::Text,
+                2 => SemanticRole::Button,
+                3 => SemanticRole::Image,
+                4 => SemanticRole::Rect,
+                5 => SemanticRole::Spacer,
+                _ => return None,
+            };
+            p += 1;
+            let x = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+            let y = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+            let w = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+            let h = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+            let flags = bytes[p]; p += 1;
+            let id    = if flags & 0b001 != 0 { Some(read_str(bytes, &mut p)?) } else { None };
+            let label = if flags & 0b010 != 0 { Some(read_str(bytes, &mut p)?) } else { None };
+            let value = if flags & 0b100 != 0 { Some(read_str(bytes, &mut p)?) } else { None };
+            tree.nodes.push(SemanticNode { parent, role, x, y, w, h, id, label, value });
+        }
+        Some(tree)
+    }
+}
+
+fn write_str(out: &mut Vec<u8>, s: &str) {
+    // Cap at 64 KiB so a runaway label can't overflow the u16 length
+    // prefix. Realistic widget labels are well under that; the cap is
+    // a guard against fuzz cases, not a real product constraint.
+    let bytes = s.as_bytes();
+    let len = bytes.len().min(u16::MAX as usize) as u16;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&bytes[..len as usize]);
+}
+
+fn read_str(bytes: &[u8], p: &mut usize) -> Option<String> {
+    if bytes.len() < *p + 2 { return None; }
+    let len = u16::from_le_bytes(bytes[*p..*p + 2].try_into().ok()?) as usize;
+    *p += 2;
+    if bytes.len() < *p + len { return None; }
+    let s = core::str::from_utf8(&bytes[*p..*p + len]).ok()?.to_string();
+    *p += len;
+    Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_tree_round_trips() {
+        let t = SemanticTree::new();
+        let bytes = t.encode();
+        let back = SemanticTree::decode(&bytes).expect("decode");
+        assert_eq!(t, back);
+        assert_eq!(bytes, vec![1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn single_root_button_round_trips() {
+        let mut t = SemanticTree::new();
+        t.push(SemanticNode {
+            parent: None, role: SemanticRole::Button,
+            x: 10.0, y: 20.0, w: 100.0, h: 40.0,
+            id: Some("ok".into()), label: Some("OK".into()), value: None,
+        });
+        let bytes = t.encode();
+        let back = SemanticTree::decode(&bytes).expect("decode");
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn nested_tree_round_trips() {
+        let mut t = SemanticTree::new();
+        let root = t.push(SemanticNode {
+            parent: None, role: SemanticRole::Group,
+            x: 0.0, y: 0.0, w: 800.0, h: 600.0,
+            id: None, label: None, value: None,
+        });
+        t.push(SemanticNode {
+            parent: Some(root), role: SemanticRole::Text,
+            x: 16.0, y: 16.0, w: 200.0, h: 24.0,
+            id: None, label: Some("Hello".into()), value: None,
+        });
+        t.push(SemanticNode {
+            parent: Some(root), role: SemanticRole::Button,
+            x: 16.0, y: 60.0, w: 80.0, h: 36.0,
+            id: Some("go".into()), label: Some("Go".into()), value: None,
+        });
+        let bytes = t.encode();
+        let back = SemanticTree::decode(&bytes).expect("decode");
+        assert_eq!(t, back);
+        assert_eq!(back.nodes.len(), 3);
+        assert_eq!(back.nodes[0].parent, None);
+        assert_eq!(back.nodes[1].parent, Some(0));
+        assert_eq!(back.nodes[2].parent, Some(0));
+    }
+
+    #[test]
+    fn truncated_blob_returns_none() {
+        // Partial header — count missing.
+        assert!(SemanticTree::decode(&[1, 0, 0]).is_none());
+        // Header claims one node but the body is empty.
+        assert!(SemanticTree::decode(&[1, 1, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn unknown_role_returns_none() {
+        // version=1, count=1, parent=-1, role=99, ...
+        let mut bytes = vec![1u8, 1, 0, 0, 0];
+        bytes.extend_from_slice(&(-1i32).to_le_bytes());
+        bytes.push(99);  // bad role
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.push(0);
+        assert!(SemanticTree::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn role_decorative_classification() {
+        assert!(SemanticRole::Rect.is_decorative());
+        assert!(SemanticRole::Spacer.is_decorative());
+        assert!(!SemanticRole::Button.is_decorative());
+        assert!(!SemanticRole::Text.is_decorative());
+        assert!(!SemanticRole::Group.is_decorative());
+        assert!(!SemanticRole::Image.is_decorative());
+    }
+}

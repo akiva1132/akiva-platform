@@ -176,6 +176,28 @@ pub fn host_set_surface_effects(handle: u32, effects: crate::effects::SurfaceEff
     }
 }
 
+/// Test-infra phase — publish the activity's semantic tree. The host
+/// (AppRegistry → leader tab) projects the bytes into hidden ARIA-
+/// decorated DOM when the tab was started with `?inspector=1`; other
+/// tabs ignore the message. Always-on by design — encoding cost for a
+/// typical screen is a few hundred bytes per frame, the host short-
+/// circuits at a `Map.set`, and ungating means tests never have to
+/// flip a flag to see live state. `bytes` is the output of
+/// [`crate::ui::semantics::SemanticTree::encode`].
+pub fn host_publish_semantics(handle: u32, bytes: &[u8]) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut args = Vec::with_capacity(4 + bytes.len());
+        args.extend_from_slice(&handle.to_le_bytes());
+        args.extend_from_slice(bytes);
+        let _ = host_fire(op_kinds::fire::PUBLISH_SEMANTICS, &args);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (handle, bytes);
+    }
+}
+
 // ── Unified-ABI thin wrappers around the wasm imports ──────────────────
 
 #[cfg(target_arch = "wasm32")]

@@ -77,6 +77,15 @@ pub mod fire {
     /// silently ignore. No grant required — the effects only apply
     /// to the calling activity's own surface.
     pub const SET_SURFACE_EFFECTS: u32 = 0x000E;
+    /// Test-infra phase — publish the activity's semantic tree for
+    /// inspector / Playwright projection. Args:
+    /// `[handle: u32 LE | SemanticTree::encode bytes...]`. Cheap
+    /// short-circuit on the host (a `Map.set`) so always-on is the
+    /// shipped default; tabs project to hidden ARIA-decorated DOM only
+    /// when `?inspector=1` is set in the URL. No grant required — a
+    /// package can only describe its own widget tree, which is its
+    /// own paint stream from a different angle.
+    pub const PUBLISH_SEMANTICS: u32 = 0x000F;
 }
 
 /// I/O operations. Range `0x0101..=0x01FF`.
@@ -331,6 +340,7 @@ mod tests {
         assert!(fire::NOTIFY_CLOSE <= 0x00FF);
         assert!(fire::VIBRATE <= 0x00FF);
         assert!(fire::SET_SURFACE_EFFECTS <= 0x00FF);
+        assert!(fire::PUBLISH_SEMANTICS <= 0x00FF);
         assert!(io::TEXT_WIDTH >= 0x0101 && io::TEXT_WIDTH <= 0x01FF);
         assert!(io::STORAGE_SET >= 0x0101 && io::STORAGE_SET <= 0x01FF);
         assert!(io::STORAGE_DELETE >= 0x0101 && io::STORAGE_DELETE <= 0x01FF);

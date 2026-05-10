@@ -74,6 +74,7 @@
 pub mod node;
 pub mod layout;
 pub mod paint;
+pub mod semantics;
 
 use std::collections::HashMap;
 
@@ -228,6 +229,12 @@ pub struct Ui<'s, 'c, 'b> {
     /// it doesn't care about.
     attrs: Vec<NodeAttr>,
     presented: bool,
+    /// Activity handle the host registered for the calling slot. Used
+    /// only by [`Self::present`] to address the `PUBLISH_SEMANTICS`
+    /// fire op at the right activity on the inspector / Playwright
+    /// path. `0` is the in-process / test-fixture sentinel — emission
+    /// is suppressed in that case (no host to receive the bytes).
+    handle: u32,
 }
 
 impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
@@ -255,6 +262,7 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             nodes: Vec::new(),
             attrs: Vec::new(),
             presented: false,
+            handle: ctx.handle,
         }
     }
 
@@ -465,6 +473,20 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         }
 
         paint::paint(&self.nodes, root, &rects, &self.state.current_clicks, self.canvas);
+
+        // Test-infra phase — publish the semantic projection of this
+        // frame's tree. The host's AppRegistry forwards the bytes to
+        // the leader tab, which projects to hidden ARIA-decorated DOM
+        // only when `?inspector=1` is set in the URL. `handle == 0`
+        // is the in-process / test fixture sentinel — skip emission
+        // there since there's no host to receive it.
+        if self.handle != 0 {
+            let tree = build_semantic_tree(&self.nodes, root, &rects);
+            if !tree.is_empty() {
+                let bytes = tree.encode();
+                crate::runtime::host_publish_semantics(self.handle, &bytes);
+            }
+        }
     }
 
     /// True if the widget registered with `id` was pressed during this
@@ -483,6 +505,80 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
     pub fn was_triggered(&self, action: &str) -> bool {
         self.state.current_actions.iter().any(|s| s == action)
     }
+}
+
+/// Walk the laid-out widget tree depth-first and project it into a
+/// [`semantics::SemanticTree`]. Every reachable node lands in the
+/// tree, including decorative `Rect`/`Spacer` — the host overlay
+/// filters those at projection time so an inspector overlay can still
+/// see them if it wants. Skipped silently: nodes that have no entry
+/// in `rects` (out-of-tree leftovers from earlier construction) — the
+/// layout pass only populates `rects` for nodes reachable from the
+/// presented root.
+fn build_semantic_tree(
+    nodes: &[Node],
+    root: NodeId,
+    rects: &HashMap<NodeId, Rect>,
+) -> semantics::SemanticTree {
+    use semantics::{SemanticNode, SemanticRole, SemanticTree};
+    let mut tree = SemanticTree::new();
+    fn visit(
+        nodes: &[Node],
+        rects: &HashMap<NodeId, Rect>,
+        tree: &mut SemanticTree,
+        node_id: NodeId,
+        parent: Option<u32>,
+    ) {
+        let Some(rect) = rects.get(&node_id).copied() else { return; };
+        let Some(node) = nodes.get(node_id) else { return; };
+        let (role, id, label) = match node {
+            Node::VStack { .. } | Node::HStack { .. } | Node::Frame { .. } | Node::Grid { .. } => {
+                (SemanticRole::Group, None, None)
+            }
+            Node::Text { text, .. } => (SemanticRole::Text, None, Some(text.clone())),
+            Node::Button { id, label, .. } => {
+                (SemanticRole::Button, Some(id.clone()), Some(label.clone()))
+            }
+            Node::Image { drawable_id, .. } => {
+                // No label resolution today — drawable name lives at
+                // the call site (`res::drawable("name")`), not on the
+                // Node. Surface the numeric id as the value so a
+                // future inspector can correlate; that channel is
+                // already separate from `label` so a real name added
+                // later won't conflict.
+                let _ = drawable_id;
+                (SemanticRole::Image, None, None)
+            }
+            Node::Rect    { .. } => (SemanticRole::Rect,   None, None),
+            Node::Spacer  { .. } => (SemanticRole::Spacer, None, None),
+        };
+        let value = if let Node::Image { drawable_id, .. } = node {
+            Some(format!("{drawable_id}"))
+        } else {
+            None
+        };
+        let idx = tree.push(SemanticNode {
+            parent, role,
+            x: rect.x, y: rect.y, w: rect.w, h: rect.h,
+            id, label, value,
+        });
+        // Recurse into containers. Order matches paint order so the
+        // semantic tree's z-order reflects what's on screen — useful
+        // when an inspector wants to highlight the topmost hit.
+        match node {
+            Node::VStack { children, .. }
+            | Node::HStack { children, .. }
+            | Node::Frame  { children, .. }
+            | Node::Grid   { children, .. } => {
+                for c in children {
+                    visit(nodes, rects, tree, *c, Some(idx));
+                }
+            }
+            _ => {}
+        }
+    }
+    visit(nodes, rects, &mut tree, root, None);
+    tree
 }
 
 #[cfg(test)]
