@@ -768,6 +768,17 @@ function dispatchFire(opKind, args) {
       postSideEffect(opKind, args);
       return 0;
     }
+    // Test-infra phase — publish the activity's semantic tree to the
+    // host's inspector overlay. No grant required: the tree is the
+    // app's own widget hierarchy from a different angle, no different
+    // from emitting paint ops. Wire is `[handle:4 | tree bytes...]`;
+    // we only validate the handle prefix here and let AppRegistry
+    // (kernel-worker) decode the rest.
+    case FIRE.PUBLISH_SEMANTICS: {
+      if (args.length < 4) return 1;
+      postSideEffect(opKind, args);
+      return 0;
+    }
     default:
       postLog("warn", `fire(0x${opKind.toString(16)}): unknown op_kind`);
       return 1;

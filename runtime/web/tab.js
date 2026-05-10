@@ -25,6 +25,7 @@
 import { Session } from "./leader.js";
 import { Canvas2DBackend } from "./renderer/canvas2d.js";
 import { applyPaintStream } from "./paint_decoder.mjs";
+import { Inspector, inspectorEnabled } from "./inspector.js";
 
 const KERNEL_URL = "./akiva-kernel.wasm";
 const WORKER_URL = new URL("./worker.js", import.meta.url);
@@ -112,6 +113,17 @@ const session = new Session({
 session.addEventListener("role", (e) => onRoleChange(e.detail));
 session.addEventListener("message", (e) => onKernelMessage(e.detail));
 session.addEventListener("panic", (e) => onPanic(e.detail.text));
+
+// Inspector — JS-only window into the SDK's semantic stream. Off by
+// default; mounts only when `?inspector=1` is set (or
+// `localStorage.akivaInspector === "1"`). When mounted, exposes
+// `window.__akiva` with `findById`/`findByRole`/`findByText`/`snapshot`
+// for tests + devtools. No DOM is projected — see runtime/web/inspector.js
+// for the rationale.
+const inspector = inspectorEnabled() ? new Inspector({}) : null;
+if (inspector) {
+  console.log("[akiva] inspector enabled — window.__akiva exposes the live semantic tree");
+}
 
 // Input + resize forwarding are hooked exactly once. The Session takes
 // care of routing to the right place based on its current role.
@@ -247,6 +259,15 @@ function onKernelMessage(msg) {
   switch (msg?.type) {
     case "boot_ok":
       bootEl.classList.add("hidden");
+      // Test infra — flip a body class so e2e helpers have a single
+      // unambiguous "kernel ready" signal. Pre-this the boot splash's
+      // `.hidden` class doubled as a readiness marker, but `.hidden`
+      // gets added on role assignment (which happens BEFORE the
+      // worker even spawns the wasm), so a Playwright wait on it
+      // returned long before the kernel could route input. With
+      // `body.akiva-booted` flipped on `boot_ok` we get the first
+      // moment the kernel can answer dispatches.
+      document.body.classList.add("akiva-booted");
       break;
     case "log":
       console.log(`[kernel ${msg.level}] ${msg.text}`);
@@ -301,6 +322,12 @@ function onKernelMessage(msg) {
     // Stone 14.6 — Geolocation.
     case "geo_get_position":
       handleGeoGetPosition(msg);
+      break;
+    // Test-infra phase — semantic-tree projection. Always emitted by
+    // the SDK; ignored unless the inspector is mounted (gated by
+    // `?inspector=1`). See runtime/web/inspector.js.
+    case "semantics":
+      inspector?.apply(msg);
       break;
   }
 }

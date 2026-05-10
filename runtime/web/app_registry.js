@@ -1482,6 +1482,23 @@ export class AppRegistry {
         this._pendingSurfaceEffects.set(handle, args.slice(4));
         return;
       }
+      case FIRE.PUBLISH_SEMANTICS: {
+        // Test-infra phase — forward the activity's semantic tree
+        // straight to the leader tab. The framework / kernel never
+        // see this; AppRegistry is the only host-side stop and it
+        // does the bare minimum: handle ownership check (already
+        // done above) + repackage with the package id so the tab
+        // can demux multiple activities composing one display.
+        // Tabs without `?inspector=1` ignore the message.
+        const treeBytes = args.slice(4);
+        if (treeBytes.length === 0) return;
+        this._sendToTab({
+          type: "semantics",
+          packageId, handle,
+          tree: treeBytes,
+        });
+        return;
+      }
       default:
         this._log("warn", `[${packageId}] unknown side_effect op_kind=0x${(msg.op_kind ?? 0).toString(16)}`);
     }

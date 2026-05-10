@@ -31,6 +31,7 @@ export const FIRE = Object.freeze({
   NOTIFY_CLOSE:              0x000C,  // Stone 14.3
   VIBRATE:                   0x000D,  // Stone 14.5
   SET_SURFACE_EFFECTS:       0x000E,  // Phase 15.4 — per-Activity blur/shadow/tint
+  PUBLISH_SEMANTICS:         0x000F,  // Test-infra — semantic-tree projection (inspector / Playwright)
 });
 
 export const IO = Object.freeze({
