@@ -181,19 +181,11 @@ export async function launchCalculator(page: Page, opts: { timeoutMs?: number } 
     position: { x: 320, y: 148 }, force: true,
   });
   // First-paint signal — d2 is a digit button the calculator publishes
-  // on its very first frame.
+  // on its very first frame. The inspector applies the framework's
+  // composite transform (translate / scale / opacity) to every rect
+  // it returns, so taps land on the visually-correct pixel even
+  // mid-animation — no need to wait for the push transition to settle.
   await waitForId(page, "d2", { timeoutMs });
-  // Push transition is 250 ms — during the slide-in the calculator's
-  // surface composites with a non-zero `translate_x`, so the canvas
-  // paint of d7 lives ~180 px right of where the SDK's layout (and
-  // therefore the inspector's bounds) reports it. Clicks via mouse
-  // would land on the canvas at the inspector's coordinates and miss
-  // the visually-correct button. Waiting past the transition is a
-  // temporary fix; the durable fix is for the inspector to consume
-  // the surface's `SurfaceDrawOpts` (translate / scale / opacity) and
-  // apply them to the rect it returns, so the cursor always lands on
-  // the painted content. Tracked in the testing roadmap.
-  await page.waitForTimeout(400);
 }
 
 /** Clear OPFS + localStorage on the current origin. Use in
