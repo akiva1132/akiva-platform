@@ -35,6 +35,28 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? "github" : [["list"], ["html", { open: "never" }]],
+  // Visual-regression knobs. The semantic suite (`*.spec.ts`) ignores
+  // these; the visual suite (`visual/*.visual.spec.ts`) calls
+  // `expect(page).toHaveScreenshot()` and these settle the diff
+  // tolerance. Some anti-aliasing wobble is unavoidable across kernel
+  // builds — `maxDiffPixels: 200` over a 1280×800 frame is ~0.02 % of
+  // pixels, generous enough to absorb font-hinting drift but tight
+  // enough that a missing shadow (~10K pixels) trips the test.
+  expect: {
+    toHaveScreenshot: {
+      // Per-pixel tolerance for sub-pixel anti-aliasing. 0.2 means
+      // "two channels can disagree by up to ~50/255" — Chromium's
+      // Canvas2D text rasteriser slips by less than that across runs.
+      threshold: 0.2,
+      maxDiffPixels: 200,
+      // Animations play at frame-precise timing; tests should
+      // explicitly settle them (`waitForId` + composite-aware rects).
+      // We don't `disable` animations because a paused-animation
+      // golden hides regressions where the SDK forgot to drive the
+      // animation loop at all.
+      animations: "allow",
+    },
+  },
   use: {
     baseURL: BASE_URL,
     // Force the inspector overlay on for every test. Tests that want

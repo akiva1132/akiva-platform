@@ -233,6 +233,45 @@ canvas that paints the inspector's reported bounds in real time
 flaking and you want to confirm the SDK and the inspector agree on
 "where d7 is" before diving into helper coordinate math.
 
+### 7.5 Visual regression — `tests/e2e/visual/`
+
+Semantic queries verify that the SDK *thinks* a button labelled "7"
+exists at a given rect. They do **not** verify that the button is
+painted with the right colour, the right corner radius, the right
+shadow, or the right anti-aliasing. A regression that drops a
+WebGPU shader uniform or off-by-one in the layout pass leaves the
+semantic tree intact and the visual frame broken — exactly the
+class of bug a screen-reader bridge would also miss.
+
+Visual goldens close that gap. Each `*.visual.spec.ts` calls
+`expect(page).toHaveScreenshot("name.png")`; the first run writes
+the PNG to `<spec>.visual.spec.ts-snapshots/`, every subsequent
+run diffs against it. The Playwright config sets a tolerance of
+`maxDiffPixels: 200` (≈ 0.02 % of a 1280×800 frame) — enough to
+absorb font-hinting drift across kernel builds, tight enough that
+a missing drop-shadow trips the check.
+
+```bash
+npm run test:e2e                    # diff against goldens, fail on drift
+npm run test:e2e:update-snapshots   # regenerate after intentional design change
+```
+
+Goldens are platform-scoped (`<name>-chromium-linux.png`); macOS
+and Windows runs would generate their own. CI pins to the Linux
+baseline. Commit the regenerated PNGs alongside the source change
+that justified them — review surfaces both the code diff and the
+visual diff in one PR.
+
+**What to put under visual coverage.** Activities whose layout is
+load-bearing for the platform contract (calculator: keypad
+geometry, display panel framing). Per-feature demo apps in
+`apps/dev-*` (added stage-by-stage as new SDK primitives land —
+each feature gets its own minimal app + visual baselines).
+**Not** under visual coverage: the Shell while it still paints
+with raw canvas primitives (its layout is owned in JS, not the
+SDK; visual diffing it would lock in the pre-migration look and
+break the moment Stone 16 ships).
+
 ## 8. CI
 
 Today, the only enforced job is local: `cargo test --workspace` +
