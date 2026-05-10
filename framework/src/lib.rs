@@ -902,15 +902,26 @@ impl Framework {
             }
         };
         let fg_opts = merge_effects(fg_surface, fg_opts_base, &self.surface_effects);
+        // Inspector handle for the foreground activity. Looked up once
+        // and threaded into the compositor order so the
+        // `SetInspectorTransform` op the compositor emits before each
+        // CompositeSurface carries the right activity. `0` is the
+        // sentinel "no associated handle" (no foreground, mock activity
+        // without `app_handle`); the compositor skips emit for those.
+        let fg_handle: u32 = foreground
+            .and_then(|aid| self.activities.with_instance_ret(aid, |a| a.app_handle()).flatten())
+            .map(|h| h.get())
+            .unwrap_or(0);
         if self.dialogs.open_dialogs().next().is_none() {
-            let order = [(fg_surface, bounds_of(&self.windows, fg_surface), fg_opts)];
-            return self.compositor.finish_frame_in_order(&order);
+            let order = [(fg_surface, bounds_of(&self.windows, fg_surface), fg_opts, fg_handle)];
+            return self.compositor.finish_frame_in_order_with_handles(&order);
         }
         let mut order: Vec<(
             window_manager::SurfaceId,
             window_manager::Rect,
             compositor::SurfaceDrawOpts,
-        )> = vec![(fg_surface, bounds_of(&self.windows, fg_surface), fg_opts)];
+            u32,
+        )> = vec![(fg_surface, bounds_of(&self.windows, fg_surface), fg_opts, fg_handle)];
         let mut overlays: Vec<window_manager::SurfaceId> =
             self.dialogs.open_dialogs().map(|d| d.surface).collect();
         overlays.sort();
@@ -918,9 +929,14 @@ impl Framework {
             let opts = merge_effects(
                 id, compositor::SurfaceDrawOpts::IDENTITY, &self.surface_effects,
             );
-            order.push((id, bounds_of(&self.windows, id), opts));
+            // Dialog overlays don't carry their own SDK semantic tree
+            // (the activity hosts the dialog content via its existing
+            // handle), so handle=0 keeps the compositor from emitting a
+            // SetInspectorTransform for them — the foreground emit
+            // already covers the visible widget set.
+            order.push((id, bounds_of(&self.windows, id), opts, 0));
         }
-        self.compositor.finish_frame_in_order(&order)
+        self.compositor.finish_frame_in_order_with_handles(&order)
     }
 
     /// Stone 13.2 — paint every open dialog owned by the foreground

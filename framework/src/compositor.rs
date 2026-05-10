@@ -271,6 +271,30 @@ pub enum PaintOp {
     /// because some test fixtures destroy a surface that never
     /// rendered.
     DestroySurface { id: u32 },
+    /// Test-infra — publish the current composite transform (translate,
+    /// scale, opacity) for activity `handle` so the host's inspector
+    /// can return post-composite rects from `findById` / `findByRole`.
+    ///
+    /// The semantic tree the SDK publishes is in surface-local space —
+    /// the activity's `Ui` lays out widgets without seeing the
+    /// compositor's per-frame translate (push/pop transitions, sheet
+    /// drags, modal scale-in). Without this op the inspector would
+    /// hand tests stale coords during animations and Playwright clicks
+    /// would land on the canvas where the SDK *thought* the widget was,
+    /// not where it currently paints.
+    ///
+    /// Emitted by [`Compositor::finish_frame_in_order`] before each
+    /// surface's `CompositeSurface`. Production tabs without
+    /// `?inspector=1` see the HAL call land in `worker.js` and a
+    /// no-op message dropped on the floor — overhead is ~5 floats
+    /// passed once per active surface per frame.
+    SetInspectorTransform {
+        handle: u32,
+        opacity: f32,
+        translate_x: f32,
+        translate_y: f32,
+        scale: f32,
+    },
 }
 
 impl FrameCommands {
@@ -323,6 +347,11 @@ pub trait DrawHal {
         opts: SurfaceDrawOpts,
     );
     fn destroy_surface(&mut self, id: u32);
+    /// Test-infra — see [`PaintOp::SetInspectorTransform`]. The
+    /// production HAL no-ops when the host's inspector isn't mounted.
+    fn inspector_set_transform(
+        &mut self, handle: u32, opacity: f32, translate_x: f32, translate_y: f32, scale: f32,
+    );
 }
 
 /// Dispatch one paint op to a `DrawHal`. Exhaustive `match` so a new
@@ -364,6 +393,9 @@ pub fn dispatch_paint_op<H: DrawHal + ?Sized>(hal: &mut H, op: &PaintOp) {
             hal.composite_surface(*id, *x, *y, *w, *h, *opts);
         }
         PaintOp::DestroySurface { id } => hal.destroy_surface(*id),
+        PaintOp::SetInspectorTransform {
+            handle, opacity, translate_x, translate_y, scale,
+        } => hal.inspector_set_transform(*handle, *opacity, *translate_x, *translate_y, *scale),
     }
 }
 
@@ -512,6 +544,29 @@ impl Compositor {
     pub fn finish_frame_in_order(
         &mut self, order: &[(SurfaceId, Rect, SurfaceDrawOpts)],
     ) -> &FrameCommands {
+        // Re-enter the handle-aware version with handle=0 (the
+        // "no associated activity" sentinel that suppresses the
+        // SetInspectorTransform emit). Existing callers and tests stay
+        // green; only `Framework::finalize_frame` uses the with-handles
+        // variant where the inspector transforms come from.
+        let widened: Vec<(SurfaceId, Rect, SurfaceDrawOpts, u32)> =
+            order.iter().map(|(s, r, o)| (*s, *r, *o, 0u32)).collect();
+        self.finish_frame_in_order_with_handles(&widened)
+    }
+
+    /// Same shape as [`Self::finish_frame_in_order`] plus an Activity
+    /// handle per entry. When a handle is non-zero the compositor
+    /// emits a [`PaintOp::SetInspectorTransform`] before that surface's
+    /// `CompositeSurface` op so the host's inspector can return
+    /// post-composite rects from `findById` / `findByRole` /
+    /// `findByText`. Handles of `0` (decorations, surfaces with no
+    /// owning Activity, test fixtures) skip the emit — production
+    /// frames cost ~5 floats per active surface per frame, off-by-default
+    /// in production tabs that don't mount the inspector.
+    pub fn finish_frame_in_order_with_handles(
+        &mut self,
+        order: &[(SurfaceId, Rect, SurfaceDrawOpts, u32)],
+    ) -> &FrameCommands {
         self.flat.clear();
         // Per-surface paint passes. Phase 15.2 — emit Begin/End only
         // when the surface has fresh ops this frame. An empty buffer
@@ -528,7 +583,7 @@ impl Compositor {
         // frame, so `fc.ops.is_empty()` reliably distinguishes "didn't
         // paint" from "painted, even if just a clear" — a paint always
         // produces at least one op.
-        for (id, bounds, _opts) in order {
+        for (id, bounds, _opts, _handle) in order {
             if let Some(fc) = self.surfaces.get(id) {
                 if fc.ops.is_empty() { continue; }
                 self.flat.ops.push(PaintOp::BeginSurface {
@@ -550,7 +605,22 @@ impl Compositor {
         // screen (the renderer's backing canvas retains the previous
         // frame's content). That's the load-bearing robustness
         // property of 15.1.
-        for (id, bounds, opts) in order {
+        for (id, bounds, opts, handle) in order {
+            // Test-infra — publish the current composite transform for
+            // this Activity's handle so the host inspector can return
+            // post-composite rects. Handle `0` is the "no Activity"
+            // sentinel (decorations, fallback surfaces, test fixtures);
+            // skip the emit so the inspector doesn't accumulate phantom
+            // entries. See `PaintOp::SetInspectorTransform`.
+            if *handle != 0 {
+                self.flat.ops.push(PaintOp::SetInspectorTransform {
+                    handle: *handle,
+                    opacity: opts.opacity,
+                    translate_x: opts.translate_x,
+                    translate_y: opts.translate_y,
+                    scale: opts.scale,
+                });
+            }
             self.flat.ops.push(PaintOp::CompositeSurface {
                 id: id.0, x: bounds.x, y: bounds.y,
                 w: bounds.w, h: bounds.h,
@@ -857,6 +927,13 @@ mod tests {
         }
         fn destroy_surface(&mut self, id: u32) {
             self.trace.push(format!("destroy_surface({id})"));
+        }
+        fn inspector_set_transform(
+            &mut self, handle: u32, opacity: f32, translate_x: f32, translate_y: f32, scale: f32,
+        ) {
+            self.trace.push(format!(
+                "inspector_set_transform({handle},opacity={opacity},tx={translate_x},ty={translate_y},scale={scale})"
+            ));
         }
     }
 

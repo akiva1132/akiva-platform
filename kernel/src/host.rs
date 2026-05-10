@@ -106,6 +106,16 @@ extern "C" {
     );
     pub fn hal_destroy_surface(id: u32);
 
+    /// Test-infra — publish the current composite transform for activity
+    /// `handle` so the host's inspector can return post-composite rects.
+    /// Production tabs without `?inspector=1` ignore the call (the JS
+    /// side branches on whether the inspector is mounted). See
+    /// `framework::compositor::PaintOp::SetInspectorTransform` for the
+    /// rationale.
+    pub fn hal_inspector_set_transform(
+        handle: u32, opacity: f32, translate_x: f32, translate_y: f32, scale: f32,
+    );
+
     // ── Storage ───────────────────────────────────────────────────────────
     // Backed by OPFS + SyncAccessHandle inside the worker. MVP uses string
     // keys / byte values; see docs/observability.md and ARCHITECTURE.md

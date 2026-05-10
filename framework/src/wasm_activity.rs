@@ -623,6 +623,10 @@ pub mod opcode {
     pub const COMPOSITE_SURFACE: u8 = 16;
     /// `DestroySurface { id }` — 5 bytes.
     pub const DESTROY_SURFACE:   u8 = 17;
+    /// `SetInspectorTransform { handle, opacity, translate_x, translate_y, scale }`
+    /// — 21 bytes (opcode + u32 + 4×f32). Test/inspector-only; production
+    /// tabs without `?inspector=1` decode it and drop it on the floor.
+    pub const SET_INSPECTOR_TRANSFORM: u8 = 18;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -779,6 +783,16 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
         PaintOp::DestroySurface { id } => {
             out.push(opcode::DESTROY_SURFACE);
             out.extend_from_slice(&id.to_le_bytes());
+        }
+        PaintOp::SetInspectorTransform {
+            handle, opacity, translate_x, translate_y, scale,
+        } => {
+            out.push(opcode::SET_INSPECTOR_TRANSFORM);
+            out.extend_from_slice(&handle.to_le_bytes());
+            out.extend_from_slice(&opacity.to_le_bytes());
+            out.extend_from_slice(&translate_x.to_le_bytes());
+            out.extend_from_slice(&translate_y.to_le_bytes());
+            out.extend_from_slice(&scale.to_le_bytes());
         }
     }
 }
@@ -944,6 +958,16 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
             opcode::DESTROY_SURFACE => {
                 let id = read_u32(&mut bytes)?;
                 out.push(PaintOp::DestroySurface { id });
+            }
+            opcode::SET_INSPECTOR_TRANSFORM => {
+                let handle      = read_u32(&mut bytes)?;
+                let opacity     = read_f32(&mut bytes)?;
+                let translate_x = read_f32(&mut bytes)?;
+                let translate_y = read_f32(&mut bytes)?;
+                let scale       = read_f32(&mut bytes)?;
+                out.push(PaintOp::SetInspectorTransform {
+                    handle, opacity, translate_x, translate_y, scale,
+                });
             }
             other => return Err(DecodeError::UnknownOp(other)),
         }

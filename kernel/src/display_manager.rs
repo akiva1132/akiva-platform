@@ -121,6 +121,13 @@ impl DrawHal for ExternDrawHal {
     fn destroy_surface(&mut self, id: u32) {
         unsafe { host::hal_destroy_surface(id) }
     }
+    fn inspector_set_transform(
+        &mut self, handle: u32, opacity: f32, translate_x: f32, translate_y: f32, scale: f32,
+    ) {
+        unsafe {
+            host::hal_inspector_set_transform(handle, opacity, translate_x, translate_y, scale)
+        }
+    }
 }
 
 pub type DisplayId = u32;
