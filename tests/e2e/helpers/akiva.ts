@@ -68,16 +68,7 @@ export async function tapId(page: Page, id: string) {
   const w = await findById(page, id);
   if (!w) throw new Error(`tapId: no widget with id="${id}" — current snapshot:\n${await snapshotDump(page)}`);
   const { x, y } = await widgetCenter(page, w);
-  await page.mouse.click(x, y);
-  // Akiva's input pipeline crosses an async boundary (tab → worker
-  // postMessage → kernel dispatch → Activity::on_pointer). Back-to-back
-  // Playwright clicks fired with no gap can outpace the dispatcher:
-  // the second click's pointerdown lands while the first is still
-  // working its way through, the calc's "operator pending" flag never
-  // flips, and digits concatenate instead of starting a new entry.
-  // Yielding one frame after each tap is enough to let the worker
-  // ack the previous event before we send the next.
-  await page.waitForTimeout(50);
+  await tapAndAwait(page, x, y, w.handle);
 }
 
 /** Click the first widget with the given role + accessible name
@@ -88,9 +79,41 @@ export async function tapRole(page: Page, role: string, name: string) {
   const w = await findByRole(page, role, name);
   if (!w) throw new Error(`tapRole: no ${role} named "${name}" — current snapshot:\n${await snapshotDump(page)}`);
   const { x, y } = await widgetCenter(page, w);
-  await page.mouse.click(x, y);
-  // See the comment in `tapId` — same async-pipeline gap.
-  await page.waitForTimeout(50);
+  await tapAndAwait(page, x, y, w.handle);
+}
+
+/** Click at a viewport coord by dispatching real PointerEvents on
+ *  the canvas via `page.evaluate`. We don't use `page.mouse.click`
+ *  because Playwright's CDP-synthesised mouse events generate
+ *  pointer events that race with the worker dispatch under load —
+ *  see `docs/testing.md §10.1`. Direct `surf.dispatchEvent` runs in
+ *  the page context, so each pointerdown/pointerup pair lands as a
+ *  paired DOM event the canvas listener picks up synchronously
+ *  (still async to the worker, but the *order* across taps is
+ *  preserved by the postMessage channel). The activity-frame poll
+ *  afterwards waits for the activity to publish at least one new
+ *  semantic tree — confirming the dispatch round-trip completed. */
+async function tapAndAwait(page: Page, x: number, y: number, _handle: number) {
+  // DispatchEvent (not page.mouse.click) so the pointerdown/up pair
+  // reach the canvas listener in the same task — Playwright's CDP
+  // mouse machinery raced the worker postMessage queue under load.
+  // The post-tap wait covers the asynchronous tail:
+  //   tab → worker postMessage → kernel → Activity::on_pointer.
+  // 150 ms holds even with all dev apps registered (boot cost grew
+  // when clip-shapes joined the launcher). Tracked as "use a real
+  // ack signal" in docs/testing.md §10.1 — the kernel-tick frame
+  // counter doesn't distinguish input frames from idle ones.
+  await page.evaluate(({ x, y }) => {
+    const surf = document.getElementById("akiva-surface")!;
+    const opts: PointerEventInit = {
+      bubbles: true, cancelable: true, clientX: x, clientY: y,
+      pointerType: "mouse", isPrimary: true, button: 0, buttons: 1,
+    };
+    surf.dispatchEvent(new PointerEvent("pointerdown", opts));
+    surf.dispatchEvent(new PointerEvent("pointerup",
+      { ...opts, buttons: 0 }));
+  }, { x, y });
+  await page.waitForTimeout(150);
 }
 
 /** Wait until the inspector reports a widget with the given id, or
@@ -101,6 +124,72 @@ export async function waitForId(page: Page, id: string, opts: { timeoutMs?: numb
   await page.waitForFunction(
     (id) => !!(window as any).__akiva?.findById(id),
     id,
+    { timeout: timeoutMs },
+  );
+}
+
+/** Wait until the inspector reports the same rect for a given query
+ *  across two consecutive samples — the activity has stopped moving
+ *  (push transitions / sheet drags / spring overshoot all settle).
+ *
+ *  Why this helper exists. The inspector applies the framework's
+ *  composite transform when it returns rects, but the transform
+ *  travels via the kernel's PaintOp side-channel and the semantic
+ *  tree travels via the SDK's wire op — two channels, two latencies.
+ *  Mid-animation, a `findByText` lookup can return rects that match
+ *  *one* channel's snapshot but not the canvas paint frame Playwright
+ *  is about to screenshot. Polling for two-sample stability gates the
+ *  visual + geometric tests on a frame where both channels agree. */
+export async function waitForStableLayout(
+  page: Page, opts: { timeoutMs?: number; stableFrames?: number } = {},
+) {
+  const timeoutMs = opts.timeoutMs ?? 3_000;
+  const need = opts.stableFrames ?? 8;
+  // Stability = every active activity's composite transform is
+  // identity for `stableFrames` consecutive published frames.
+  //
+  // A single-frame check ("transform reads identity right now") races
+  // the *initial* frame of a push transition: the framework's first
+  // `SetInspectorTransform` for a fresh activity reports identity
+  // before the animation kicks in, then jumps to `tx=screen_width`
+  // for the slide-in. Polling in JS lands somewhere in that window
+  // 1-in-3 times. Requiring 8 consecutive identity frames (≈130 ms
+  // at 60 Hz) is wider than the longest transition (250 ms slide)
+  // overlaps with so a settled animation passes immediately while a
+  // mid-transition reading flips back to non-identity within a frame
+  // and resets the streak.
+  await page.evaluate(() => { (window as any).__akivaStreak = 0; });
+  await page.waitForFunction(
+    (need) => {
+      const a = (window as any).__akiva;
+      if (!a) return false;
+      const list = a.list();
+      if (list.length === 0) return false;
+      for (const e of list) {
+        const t = a.transformOf(e.handle);
+        if (!t) {
+          (window as any).__akivaStreak = 0;
+          return false;
+        }
+        if (t.tx !== 0 || t.ty !== 0 || t.scale !== 1 || t.opacity !== 1) {
+          (window as any).__akivaStreak = 0;
+          return false;
+        }
+      }
+      // Tied to the activity's frame counter so we count *published*
+      // identity frames, not just polling cycles. A frozen activity
+      // that stops painting still wins this check (its frame stays
+      // pinned and the streak inches up across polls), which is what
+      // we want for tests that intentionally pause the activity.
+      const total = list.reduce((acc: number, e: any) => acc + e.frame, 0);
+      const last = (window as any).__akivaStreakFrame ?? -1;
+      if (total !== last) {
+        (window as any).__akivaStreak = ((window as any).__akivaStreak || 0) + 1;
+        (window as any).__akivaStreakFrame = total;
+      }
+      return ((window as any).__akivaStreak || 0) >= need;
+    },
+    need,
     { timeout: timeoutMs },
   );
 }
@@ -151,6 +240,47 @@ export async function bootAkiva(page: Page, opts: { timeoutMs?: number } = {}) {
   await page.waitForFunction(() => !!(window as any).__akiva, { timeout: timeoutMs });
 }
 
+/** Constants from `apps/shell/src/lib.rs`. The Shell paints its
+ *  launcher rows with raw canvas primitives (not Ui widgets), so we
+ *  can't query them through the inspector — clicks here use
+ *  coordinates derived from these values. The list is sorted
+ *  alphabetically by package id; row indices are assigned in that
+ *  order. When the Shell migrates to the SDK widget toolkit this
+ *  function disappears in favour of `tapRole(page, "button", appName)`.
+ *  Apps under `apps/` whose package ids in alphabetical order
+ *  determine the row index — `com.akiva.calculator` (0),
+ *  `com.akiva.clipshapes` (1), `com.akiva.hello` (2), etc. */
+const SHELL_ROW_X = 320;
+const SHELL_LIST_TOP = 120;
+const SHELL_ROW_HEIGHT = 56;
+const SHELL_ROW_GAP = 8;
+
+function shellRowY(rowIndex: number): number {
+  return SHELL_LIST_TOP + (SHELL_ROW_HEIGHT + SHELL_ROW_GAP) * rowIndex + SHELL_ROW_HEIGHT / 2;
+}
+
+/** Click the Shell's launcher row at `rowIndex` (alphabetical). The
+ *  caller must have already booted Akiva — `bootAkiva` is the
+ *  natural prerequisite. Returns when the click has been dispatched;
+ *  follow with a `waitForId`/`waitForText` to gate on the launched
+ *  activity's first paint. */
+async function clickShellLauncherRow(page: Page, rowIndex: number) {
+  await page.locator("#akiva-surface").click({
+    position: { x: SHELL_ROW_X, y: shellRowY(rowIndex) }, force: true,
+  });
+}
+
+/** Boot Akiva, then click the clip-shapes launcher row. Returns once
+ *  the demo's first frame has published — gated on the title text
+ *  showing up in the inspector. Row index 1 because clip-shapes sits
+ *  alphabetically after calculator. */
+export async function launchClipShapes(page: Page, opts: { timeoutMs?: number } = {}) {
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  await bootAkiva(page, { timeoutMs });
+  await clickShellLauncherRow(page, 1);
+  await waitForText(page, "Clip Shapes", { timeoutMs });
+}
+
 /** Boot Akiva, then click the calculator's launcher row in the Shell.
  *  Returns once the calculator's first `PUBLISH_SEMANTICS` lands —
  *  i.e. when its semantic tree shows up in the inspector and the
@@ -168,18 +298,7 @@ export async function bootAkiva(page: Page, opts: { timeoutMs?: number } = {}) {
 export async function launchCalculator(page: Page, opts: { timeoutMs?: number } = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   await bootAkiva(page, { timeoutMs });
-  // Click the first launcher row's centre. With deviceScaleFactor=1
-  // (pinned in playwright.config.ts) CSS pixels match canvas physical
-  // pixels, so coords from the Shell's Rust-side constants apply
-  // directly. y = LIST_TOP + ROW_HEIGHT/2 = 120 + 28 = 148.
-  // `force: true` to bypass Playwright's "intercepted by other
-  // element" check — there's no DOM overlay above the canvas any
-  // more, but the actionability heuristic still occasionally trips
-  // on the boot splash if the calculator launches before splash hide
-  // settles.
-  await page.locator("#akiva-surface").click({
-    position: { x: 320, y: 148 }, force: true,
-  });
+  await clickShellLauncherRow(page, 0);
   // First-paint signal — d2 is a digit button the calculator publishes
   // on its very first frame. The inspector applies the framework's
   // composite transform (translate / scale / opacity) to every rect

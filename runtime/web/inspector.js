@@ -159,24 +159,28 @@ export class Inspector {
       return;
     }
     const key = `${packageId}#${handle}`;
+    const prev = this._activities.get(key);
     this._activities.set(key, {
       packageId, handle,
       nodes: decoded.nodes,
       lastSeenMs: performance.now(),
+      // Monotonic per-activity frame counter. Tests use this to wait
+      // for "the activity has at least re-rendered once since I tapped"
+      // without an arbitrary `waitForTimeout`. Rolls over at 2^53;
+      // practically never during a session.
+      frame: (prev?.frame ?? 0) + 1,
     });
   }
 
   /** Apply a composite transform from the framework's compositor pass.
    *  See `framework/src/compositor.rs::PaintOp::SetInspectorTransform`.
-   *  Identity transforms are removed from the map (no entry == identity)
-   *  so common-case rect lookups don't pay the apply cost. */
+   *  We always store something, even at identity, so tests can
+   *  distinguish "framework has reported a transform" (entry exists,
+   *  may be identity) from "no entry yet, may still be transitioning"
+   *  (used by `waitForStableLayout` to gate on the post-launch settle).
+   *  The fast path in `makeMatch` checks for identity and skips the
+   *  add — the storage cost is one Map entry per active activity. */
   applyTransform({ handle, opacity, translate_x, translate_y, scale }) {
-    const isIdentity =
-      opacity === 1 && translate_x === 0 && translate_y === 0 && scale === 1;
-    if (isIdentity) {
-      this._transforms.delete(handle);
-      return;
-    }
     this._transforms.set(handle, {
       opacity, tx: translate_x, ty: translate_y, scale,
     });
@@ -228,7 +232,32 @@ export class Inspector {
           handle: a.handle,
           nodeCount: a.nodes.length,
           lastSeenMs: a.lastSeenMs,
+          frame: a.frame,
         }));
+      },
+      /** Per-activity monotonic frame counter — used by tests to gate
+       *  on "the activity has re-rendered since I tapped" without
+       *  an arbitrary timeout. Returns 0 for unknown handles so
+       *  test code can take `prev = frameOf(h)` then poll
+       *  `frameOf(h) > prev` even before the activity has published
+       *  its first frame. */
+      frameOf(handle) {
+        for (const a of self._activities.values()) {
+          if (a.handle === handle) return a.frame;
+        }
+        return 0;
+      },
+      /** Per-activity composite transform — `null` if the framework
+       *  has not yet reported any transform for `handle` (early in
+       *  the activity's lifecycle), otherwise the latest values.
+       *  `waitForStableLayout` distinguishes "no transform reported"
+       *  from "reported and identity" so it doesn't false-positive
+       *  during the gap between the activity's first
+       *  `PUBLISH_SEMANTICS` and the framework's first
+       *  `SetInspectorTransform`. */
+      transformOf(handle) {
+        const t = self._transforms.get(handle);
+        return t ? { ...t } : null;
       },
       /** Find first node across all activities whose id matches.
        *  Returns null when no widget by that id has published yet. */
@@ -282,7 +311,14 @@ function makeMatch(a, n, transform) {
   // would hand tests stale coords. Order matches the GPU shader's:
   // scale around the surface origin, then translate.
   let { x, y, w, h } = n;
-  if (transform) {
+  // Identity transforms get a fast path — `applyTransform` always
+  // stores something so the wait helpers can distinguish "framework
+  // hasn't reported yet" from "reported and identity", but the apply
+  // cost is bounded.
+  if (transform && (
+    transform.tx !== 0 || transform.ty !== 0 ||
+    transform.scale !== 1 || transform.opacity !== 1
+  )) {
     x = x * transform.scale + transform.tx;
     y = y * transform.scale + transform.ty;
     w = w * transform.scale;

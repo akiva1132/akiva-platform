@@ -99,9 +99,13 @@ const browser = await chromium.launch({
   headless: false,
   args: ["--auto-open-devtools-for-tabs"],   // open DevTools so the user can poke
 });
+// dev:open uses 2× device scale so rounded-shape AA renders at the
+// fidelity a modern retina/HiDPI screen would show. Tests keep DPR=1
+// for golden determinism (CI runners aren't retina); this script is
+// for visual inspection by a human.
 const context = await browser.newContext({
   viewport: { width: 1280, height: 800 },
-  deviceScaleFactor: 1,
+  deviceScaleFactor: 2,
 });
 
 const page = await context.newPage();
