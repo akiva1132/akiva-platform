@@ -63,7 +63,13 @@ export class Canvas2DBackend {
       this.screenCtx = canvas.getContext("2d", { alpha: false });
       if (!this.screenCtx) throw new Error("Canvas2D context unavailable");
       this.screenCtx.imageSmoothingEnabled = true;
-      this.screenCtx.textBaseline = "top";
+      // SDK's paint pass passes the *baseline* y to drawText (the
+      // formula is `rect.y + size * 0.8` — see sdk-rust/src/ui/paint.rs).
+      // Canvas2D defaults to `alphabetic` (baseline-relative); we set
+      // it explicitly so any future render-context recreation can't
+      // silently flip it to "top" and break vertical centering of
+      // labels inside pills, cards, and buttons.
+      this.screenCtx.textBaseline = "alphabetic";
       this.ctx = this.screenCtx;
     } else {
       this.screenCanvas = null;
@@ -79,7 +85,13 @@ export class Canvas2DBackend {
     this.screenCanvas.height = height_px;
     // The context is reset when the canvas is resized; re-apply defaults.
     if (this.screenCtx) {
-      this.screenCtx.textBaseline = "top";
+      // SDK's paint pass passes the *baseline* y to drawText (the
+      // formula is `rect.y + size * 0.8` — see sdk-rust/src/ui/paint.rs).
+      // Canvas2D defaults to `alphabetic` (baseline-relative); we set
+      // it explicitly so any future render-context recreation can't
+      // silently flip it to "top" and break vertical centering of
+      // labels inside pills, cards, and buttons.
+      this.screenCtx.textBaseline = "alphabetic";
       this.screenCtx.imageSmoothingEnabled = true;
     }
     // Per-Activity surfaces don't auto-resize; the framework will
@@ -186,6 +198,31 @@ export class Canvas2DBackend {
     this.ctx.save();
     this.ctx.beginPath();
     this.ctx.rect(x, y, w, h);
+    this.ctx.clip();
+  }
+
+  // Same shape as `pushClip`, but the clip path is a rounded
+  // rectangle. Canvas2D's `roundRect` is Baseline 2023 — every
+  // browser we target ships it. Used for circular avatars
+  // (radius = w/2 = h/2), pill cards (radius = h/2), and
+  // generally the case "clip an Image to a rounded shape" so the
+  // bitmap doesn't leak past the corners. `radius <= 0` falls
+  // through to the sharp-corner path (matches the compositor's
+  // own fast-path discipline).
+  pushRoundClip(x, y, w, h, radius) {
+    if (!this.ctx) return;
+    this.ctx.save();
+    if (radius <= 0) {
+      this.ctx.beginPath();
+      this.ctx.rect(x, y, w, h);
+    } else {
+      // Browser caps the radius at min(w/2, h/2) automatically, but
+      // we clamp here so the path math behaves the same on
+      // implementations that don't.
+      const r = Math.min(radius, w / 2, h / 2);
+      this.ctx.beginPath();
+      this.ctx.roundRect(x, y, w, h, r);
+    }
     this.ctx.clip();
   }
 
@@ -355,7 +392,7 @@ export class Canvas2DBackend {
         return;
       }
       ctx.imageSmoothingEnabled = true;
-      ctx.textBaseline = "top";
+      ctx.textBaseline = "alphabetic";
       entry = { canvas, ctx, w: canvas.width, h: canvas.height, version: 0 };
       this._surfaces.set(id, entry);
     } else if (entry.w !== (w | 0) || entry.h !== (h | 0)) {
@@ -367,7 +404,7 @@ export class Canvas2DBackend {
       entry.w = entry.canvas.width;
       entry.h = entry.canvas.height;
       entry.ctx.imageSmoothingEnabled = true;
-      entry.ctx.textBaseline = "top";
+      entry.ctx.textBaseline = "alphabetic";
     } else {
       // Same size — clear before re-paint. Activity ops are always a
       // full re-paint (compositor::begin_frame clears their FrameCommands
