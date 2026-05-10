@@ -1030,9 +1030,31 @@ otherwise non-DOM development quickly becomes "blind".
 
 ### MVP vs. future
 
-Today we **do not** implement introspection. This section is an
-architectural anchor that prevents us from adding ad-hoc debug
-APIs that pollute the ABI. The actual implementation will land
-when the Shell starts hosting more than "kernel: boot" — likely
-around the introspection-overlay phase, when the widget tree is
-complex enough to justify an inspector.
+The introspection layer landed in May 2026 in its first form —
+sufficient for E2E tests, screen-reader-friendly, expandable to a
+DevTools panel. Its scope today:
+
+- Each frame the SDK's `Ui::present` builds a flat semantic tree
+  of the activity's widget set (role, surface-local bounds, label,
+  optional stable id) and fires it at the host via
+  `PUBLISH_SEMANTICS = 0x000F`. See
+  [`sdk-rust/src/ui/semantics.rs`](sdk-rust/src/ui/semantics.rs).
+- The framework's compositor publishes per-handle composite
+  transforms (translate / scale / opacity) via
+  `PaintOp::SetInspectorTransform` so the host can return rects in
+  post-composite screen space. See
+  [`framework/src/compositor.rs`](framework/src/compositor.rs).
+- The host's [`runtime/web/inspector.js`](runtime/web/inspector.js)
+  decodes both streams and exposes them on `window.__akiva`
+  (`findById` / `findByRole` / `findByText` / `snapshot` / `list` /
+  `queryAll`). Mounted only when `?inspector=1` is set; production
+  tabs receive the bytes and drop them.
+- No DOM mirror. The host stays canvas-only; tests interact through
+  the same JS protocol any future native shell, screen-reader
+  bridge, or DevTools extension would consume.
+
+Detailed protocol shape and test infrastructure live in
+[`docs/testing.md §7`](docs/testing.md). What's still missing
+relative to the original vision (event trace, activity-stack view,
+resource-resolution log, frame timing) lands incrementally as the
+Shell grows; the framework→host wire path is now the pattern.

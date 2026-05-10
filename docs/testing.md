@@ -1,14 +1,15 @@
 # Testing Strategy
 
-> **Implementation status (May 2026):** the **unit** layer is fully
-> live (~600 Rust unit tests across `framework`, `kernel`, `wire`,
-> `sdk-rust`; 181 vitest cases across `runtime/web/__tests__/`). The
-> **component** layer overlaps with unit tests today — fakes /
-> in-memory storage are passed directly into struct constructors
-> rather than dispatched via a separate harness. The **integration**
-> (wasm-bindgen) and **E2E** (Playwright) layers from the original
-> design **do not exist yet** — they are deferred to v0.3+ and
-> tracked in §9.
+> **Implementation status (May 2026):** **unit** + **component** + **E2E**
+> layers are live. The **unit** layer covers ~600 Rust tests across
+> `framework`, `kernel`, `wire`, `sdk-rust` and 235 vitest cases
+> across `runtime/web/__tests__/`. The **component** layer overlaps
+> with unit tests today — fakes / in-memory storage are passed
+> directly into struct constructors rather than dispatched via a
+> separate harness. The **E2E** layer is a 6-test Playwright suite
+> driven through a JS-only inspector (`window.__akiva`); see §7.
+> The **integration** (wasm-bindgen) layer is the only one still
+> deferred, tracked in §5.
 
 ## 1. Purpose
 
@@ -20,7 +21,7 @@ Testing decisions made early save weeks of pain across the roadmap.
 
 ```
 ┌────────────────────────────────────────────────────┐
-│ E2E (Playwright)                                    │  ← full boot, real browser  (deferred)
+│ E2E (Playwright)                                    │  ← full boot, real browser  (LIVE — see §7)
 ├────────────────────────────────────────────────────┤
 │ Integration (wasm32 in headless browser)            │  ← kernel + framework + WIT (deferred)
 ├────────────────────────────────────────────────────┤
@@ -140,47 +141,97 @@ These tests stand in for both unit and component layers on the JS
 side. They mock OPFS / `postMessage` / `OffscreenCanvas` rather than
 spinning up a real browser.
 
-## 7. E2E tests (Playwright) — deferred
+## 7. E2E tests (Playwright) — LIVE
 
-**Goal.** Validate full boot, real interaction, and multi-tab flows
-through a real browser.
+**Goal.** Validate full boot, real interaction, and (eventually)
+multi-tab flows through a real browser.
 
-**Status.** Not in tree. The hand-test today is "open the dev
-server, click around the bundled apps." That is fine for the
-present cadence; E2E will land once shipping cadence requires
-regression coverage that matches the manual test surface.
-
-Planned shape:
+**Status.** Live as of May 2026. Six tests in `tests/e2e/` cover the
+boot smoke path and the calculator end-to-end. Run with
+`npm run test:e2e` (headless), `npm run test:e2e:headed` (visible
+browser), or `npm run test:e2e:ui` (interactive Playwright UI with
+time-travel). The dev server is auto-started by Playwright's
+`webServer` config.
 
 ```
 tests/e2e/
 ├── playwright.config.ts
-├── boot.spec.ts
-├── multi_tab.spec.ts
-└── calculator.spec.ts
+├── helpers/
+│   └── akiva.ts             — bootAkiva, launchCalculator, tapId, tapRole, waitForText
+├── boot.spec.ts             — dev server alive + inspector mount/unmount
+├── calculator.spec.ts       — 2+3=5, 7×8=56, every-digit-published
+└── open.mjs                 — `npm run dev:open` headed Chromium with debug overlay
 ```
 
-Example sketch:
+### 7.1 Inspector — `window.__akiva`
+
+Akiva renders to canvas, so `document.querySelector` finds nothing
+useful and Playwright's `getByRole`/`getByText`/`toMatchAriaSnapshot`
+can't see widgets. Each frame the SDK publishes a flat semantic tree
+(see [`sdk-rust/src/ui/semantics.rs`](../sdk-rust/src/ui/semantics.rs))
+of what's on screen — role, surface-local bounds, label, optional
+stable id. The host's `runtime/web/inspector.js` decodes that stream
+and exposes the latest tree on `window.__akiva`:
 
 ```typescript
-test("calculator adds 2 + 3 = 5", async ({ page }) => {
-    await page.goto("http://localhost:4173/");
-    await page.locator('[data-testid="app-icon-calculator"]').click();
-    await page.locator('[data-akiva-widget-tag="2"]').click();
-    await page.locator('[data-akiva-widget-tag="plus"]').click();
-    await page.locator('[data-akiva-widget-tag="3"]').click();
-    await page.locator('[data-akiva-widget-tag="equals"]').click();
-    await expect(page.locator('[data-akiva-widget-id="display"]'))
-        .toHaveText("5");
+window.__akiva.findById("d7")              // → { rect, role, label, ... } | null
+window.__akiva.findByRole("button", { name: "+" })
+window.__akiva.findByText("56")
+window.__akiva.queryAll({ role: "button" })
+window.__akiva.snapshot()                  // every active activity + nodes
+window.__akiva.list()                      // packageId/handle directory
+```
+
+The inspector mounts only when `?inspector=1` is set (or
+`localStorage.akivaInspector === "1"` for sticky dev sessions);
+production tabs receive the bytes and silently drop them. **No DOM
+mirror** — an earlier draft projected the tree into hidden
+ARIA-decorated divs so `getByRole` would work, but that coupled the
+OS to a browser-only fallback path Akiva will run without on native
+shells, and ran a 60 Hz DOM rebuild on every paint. The pure-JS form
+is faster and decouples the platform from the browser DOM entirely.
+
+### 7.2 Composite-aware rects
+
+The SDK publishes bounds in surface-local coordinates. The
+framework's compositor applies translate / scale / opacity per frame
+during push transitions, sheet drags, and modal scale-ins. The
+inspector applies the current transform to every rect it returns
+via a per-frame `PaintOp::SetInspectorTransform` op routed through
+the `DrawHal` trait — see
+[`framework/src/compositor.rs`](../framework/src/compositor.rs)
+and the `applyTransform` method in
+[`runtime/web/inspector.js`](../runtime/web/inspector.js). Tests can
+therefore tap mid-animation and land on the visually-correct pixel.
+
+### 7.3 Helpers (`tests/e2e/helpers/akiva.ts`)
+
+```typescript
+test("calculator: 2 + 3 = 5", async ({ page }) => {
+    await launchCalculator(page);             // boot + click Shell launcher + wait for first paint
+    await tapId(page, "d2");                  // by stable id
+    await tapRole(page, "button", "+");       // by role + accessible name
+    await tapId(page, "d3");
+    await tapRole(page, "button", "=");
+    await waitForText(page, "5");             // matches a text-role node's visible content
 });
 ```
 
-**Hit-testing.** Since Akiva renders to canvas, not the DOM, the Tab
-HAL will need to maintain an invisible overlay of `data-*` elements
-keyed by widget id/tag for tests to target. The overlay is gated
-behind a build flag — disabled in production, enabled in dev / CI.
-That overlay is also the foundation for accessibility tooling
-(screen-reader bridge), so the work has long-term value beyond E2E.
+Each tap dispatches a real `PointerEvent` on the canvas at the
+widget's reported centre — same input pipeline a human user takes.
+A 50 ms gap follows each tap to let the worker ack the previous
+event before the next one arrives; without it, back-to-back clicks
+outpace the kernel's dispatcher and the second one's pointerdown
+lands while the first is still working its way through, dropping
+operators between digits. See §10 for the durable fix.
+
+### 7.4 Visual debugging — `npm run dev:open`
+
+Launches a headed Chromium with DevTools open and a debug-overlay
+canvas that paints the inspector's reported bounds in real time
+(blue: buttons, yellow: text, green: groups). Useful when a test is
+flaking and you want to confirm the SDK and the inspector agree on
+"where d7 is" before diving into helper coordinate math.
 
 ## 8. CI
 
@@ -193,10 +244,10 @@ target, not the current state:
 2. `cargo test --workspace` (native)
 3. `wasm-pack test --headless --chrome kernel/` *(deferred)*
 4. `cargo build --target wasm32-unknown-unknown --release` (kernel +
-   every app crate)
+   every app crate) — or, equivalently, `cargo run -p akiva -- build`
 5. `wasm-opt -O3` on every built wasm
 6. `npx vitest run`
-7. `playwright test` *(deferred — needs the E2E surface)*
+7. `npx playwright test --config tests/e2e/playwright.config.ts`
 
 GitHub Actions wiring lands when we have external contributors;
 until then the manual run is sufficient.
@@ -220,10 +271,38 @@ When `tests/fixtures/` lands:
 - Visual regression (screenshot diffing) — easy to bolt onto
   Playwright once Shell is stable.
 - Chaos / crash-recovery automation.
+- Multi-tab E2E (leader-election, follower paint, promotion
+  on-close). The single-tab smoke + calculator suite is the only
+  E2E coverage today; multi-tab needs a fixture that drives two
+  pages against the same dev server.
 
-All of these are v0.3+ work. The MVP coverage today is unit + JS
-unit + manual E2E of `boot + hello + calculator + tic-tac-toe +
-network`.
+All of these are v0.3+ work.
+
+### 10.1 Known E2E debt
+
+Two workarounds in [`tests/e2e/helpers/akiva.ts`](../tests/e2e/helpers/akiva.ts)
+that are tracked rather than fixed:
+
+1. **Coordinate click on the Shell launcher** — `launchCalculator`
+   clicks `(320, 148)` to open the calculator, derived from the
+   Shell's Rust-side `LIST_TOP=120, ROW_HEIGHT=56` constants. The
+   Shell paints with raw canvas primitives (`c.fill_rect`,
+   `c.draw_text`), not `Ui::button`, so it doesn't show up in the
+   inspector. **Fix:** migrate the Shell's launcher rows to the SDK
+   widget toolkit; the helper then becomes
+   `tapRole(page, "button", "Calculator")` and the constants
+   disappear. Tracked alongside the Phase 16 Shell rewrite.
+
+2. **50 ms gap between consecutive taps** — `tapId`/`tapRole` end
+   with `await page.waitForTimeout(50)` to let the kernel-worker ack
+   each event before the next pointerdown arrives. Back-to-back
+   clicks faster than that outpace the
+   `tab → worker postMessage → kernel dispatch → Activity::on_pointer`
+   pipeline, dropping the operator between digits in a `2 + 3` press
+   sequence. **Fix:** expose a frame-counter or per-handle
+   "pending events" field on `__akiva.snapshot()` and have the
+   helper poll for it instead of timing out. Cosmetic until the
+   pipeline gets faster anyway.
 
 ## 11. Coverage required before any "v0.2 ship" milestone
 
@@ -236,8 +315,11 @@ network`.
       navigation. **Done — Stones 9.1–9.6 land matching tests.**
 - [ ] Integration test: `WasmLoader` instantiates a stub app inside
       wasm. **Pending — see §5.**
-- [ ] E2E: `boot → Shell → open calculator → 2+3=5 → back → Shell`.
-      **Pending — see §7.**
+- [x] E2E: `boot → Shell → open calculator → 2+3=5 → back → Shell`.
+      **Done — `tests/e2e/calculator.spec.ts` covers `2+3=5` and
+      `7×8=56` via the `window.__akiva` inspector. The `back → Shell`
+      step is not yet asserted (calculator stays foreground); add
+      when the back-button helper lands.**
 - [ ] E2E: 2 tabs, both show Shell, calc opens in tab 1, tab 2
       stays on Shell, close tab 1, tab 2 promotes to leader, calc
-      state preserved. **Pending — same.**
+      state preserved. **Pending — needs a multi-page fixture.**

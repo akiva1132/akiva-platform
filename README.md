@@ -109,8 +109,14 @@ cargo run -p akiva -- docs
 # Rust workspace (framework + sdk + wire + result).
 cargo test --workspace
 
-# JS host-side (worker, app_registry, paint decoder, compositor pipeline).
-cd runtime/web && npm test
+# JS host-side (worker, app_registry, paint decoder, inspector).
+npm test
+
+# Playwright E2E — boot smoke + calculator end-to-end.
+npm run test:e2e            # headless
+npm run test:e2e:headed     # visible browser
+npm run test:e2e:ui         # interactive Playwright UI
+npm run dev:open            # headed Chromium with inspector debug overlay
 ```
 
 Detailed strategy lives in [docs/testing.md](docs/testing.md).

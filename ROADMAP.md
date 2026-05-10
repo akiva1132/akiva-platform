@@ -624,9 +624,10 @@ Not blocking Phase 12 / 13. Add when a real app demands them:
 - 🟡 **Multi-key storage atomicity:** OPFS does not expose
   transactions. Recommendation: never; apps either pack into
   a single `on_save_state` blob or use an index-file pattern.
-- 🟡 **CI / GitHub Actions:** 600+ Rust + 181 vitest tests run
-  locally. No pre-merge gate. Add `.github/workflows/test.yml`
-  when the codebase opens to external contributors.
+- 🟡 **CI / GitHub Actions:** 600+ Rust + 235 vitest + 6 Playwright
+  E2E tests run locally. No pre-merge gate. Add
+  `.github/workflows/test.yml` when the codebase opens to external
+  contributors.
 
 ---
 
@@ -659,7 +660,10 @@ Thin **in depth**, not in completeness:
 - ❌ Multi-threading inside an app (wasm single-threaded).
 - ❌ Inter-app storage sharing.
 - ❌ Hot reload (proper).
-- ❌ Debugger / inspector.
+- 🟡 Debugger / inspector. The semantic-tree introspection layer
+  (`window.__akiva` — see
+  [`docs/testing.md §7`](docs/testing.md)) is live for tests +
+  screen-readers; an interactive DevTools panel is post-MVP.
 - ❌ PendingIntent + Broadcast receivers (see
   [`docs/intents.md §13–14`](docs/intents.md)).
 - 🟡 Notifications: ✅ browser API (Stone 14.3); Shell-side
@@ -697,7 +701,10 @@ v0.2 focused on the **system contract with apps**, not UI. See
 - 🟡 Animations (✅ slide+fade with ease-out cubic).
 - 🟡 Themes / sophisticated layouts.
 - ✅ Network API (Phase 14.1+); ❌ keyboard input / IME.
-- ❌ Code signing, hot reload, debugger / inspector.
+- ❌ Code signing, hot reload.
+- 🟡 Debugger / inspector — `window.__akiva` semantic-tree
+  introspection live (drives Playwright E2E + a screen-reader bridge
+  later); interactive DevTools panel post-MVP.
 - ❌ Non-Rust SDKs, multi-threading, inter-app storage
   sharing.
 - ❌ Hebrew / RTL / BiDi.
@@ -734,7 +741,9 @@ Before starting:
 - `wasm-opt` (from binaryen) for production builds.
 - Node.js 20+ (Playwright in CI; an axum-based dev server is
   optional in dev).
-- Playwright (`npm i -D @playwright/test`) for E2E (deferred —
-  see [`docs/testing.md §7`](docs/testing.md)).
+- Playwright (`npm i -D @playwright/test`) + happy-dom for
+  vitest's DOM-environment cases — both already in
+  `package.json`. Run with `npm run test:e2e` (or `:headed` /
+  `:ui`); see [`docs/testing.md §7`](docs/testing.md).
 - Browser: Chrome ≥ 119, Firefox ≥ 120, Safari ≥ 18.2 (because
   of WasmGC + Web Locks + OPFS SyncAccessHandle).
