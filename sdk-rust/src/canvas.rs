@@ -33,6 +33,10 @@ const OP_DRAW_IMAGE:        u8 = 11;
 // renderer's foreign-drawable cache is populated when each package's
 // `_loadDrawableBitmaps` runs.
 const OP_DRAW_FOREIGN_IMAGE: u8 = 12;
+// Stage 2a — rounded clip. Same wire shape as OP_PUSH_CLIP plus a
+// trailing `radius: f32`. Shares the clip stack with the sharp
+// variant, popped by the same OP_POP_CLIP.
+const OP_PUSH_ROUND_CLIP:   u8 = 19;
 
 /// Paint surface handed to `Activity::on_render`. All coordinates are in
 /// dp (density-independent pixels); colors are **`0xAARRGGBB`** — alpha
@@ -110,6 +114,24 @@ impl<'a> Canvas<'a> {
         self.buf.extend_from_slice(&y.to_le_bytes());
         self.buf.extend_from_slice(&w.to_le_bytes());
         self.buf.extend_from_slice(&h.to_le_bytes());
+    }
+
+    /// Push a rounded-corner clip. Shares the clip stack with
+    /// [`Self::push_clip`] — popped by the same [`Self::pop_clip`].
+    /// `radius` is in dp; the renderer constructs a rounded-rect
+    /// path internally. Useful for circular avatars
+    /// (`radius == w/2 == h/2`), pill cards (`radius == h/2`), and
+    /// any "clip an Image to a rounded shape" pattern. Activities
+    /// that want a sharp clip stay on `push_clip`; `radius == 0.0`
+    /// here works but takes the slower rounded-path code path on
+    /// the renderer.
+    pub fn push_round_clip(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32) {
+        self.buf.push(OP_PUSH_ROUND_CLIP);
+        self.buf.extend_from_slice(&x.to_le_bytes());
+        self.buf.extend_from_slice(&y.to_le_bytes());
+        self.buf.extend_from_slice(&w.to_le_bytes());
+        self.buf.extend_from_slice(&h.to_le_bytes());
+        self.buf.extend_from_slice(&radius.to_le_bytes());
     }
 
     pub fn pop_clip(&mut self) {

@@ -106,6 +106,13 @@ extern "C" {
     );
     pub fn hal_destroy_surface(id: u32);
 
+    /// Push a rounded-corner clip rectangle onto the renderer's clip
+    /// stack. Stacks identically to `hal_draw_push_clip` and pops via
+    /// the same `hal_draw_pop_clip` — the renderer's clip-state stack
+    /// doesn't distinguish sharp vs. round at pop time. `radius` is
+    /// in dp; the renderer constructs a rounded-rect path internally.
+    pub fn hal_draw_push_round_clip(x: f32, y: f32, w: f32, h: f32, radius: f32);
+
     /// Test-infra — publish the current composite transform for activity
     /// `handle` so the host's inspector can return post-composite rects.
     /// Production tabs without `?inspector=1` ignore the call (the JS

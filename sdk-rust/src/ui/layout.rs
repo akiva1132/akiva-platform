@@ -103,7 +103,7 @@ fn measure_node(
             }
             (sum_w + padding.1 + padding.3, max_h + padding.0 + padding.2)
         }
-        Node::Frame { children, padding } => {
+        Node::Frame { children, padding, .. } => {
             // Z-stack: children overlap, so intrinsic = max child size on
             // each axis (not sum). Padding adds to both sides like stacks.
             let inner_avail = (
@@ -252,7 +252,7 @@ fn place(
                 sizes, out,
             );
         }
-        Node::Frame { children, padding } => {
+        Node::Frame { children, padding, .. } => {
             // Z-stack: every child gets the same slot (the frame's inner
             // rect) and is stretched on both axes. That makes "<Rect>
             // background fills behind content" fall out for free, and
@@ -437,7 +437,7 @@ mod tests {
         Node::HStack { children, gap, padding: (0.0, 0.0, 0.0, 0.0), main, cross }
     }
     fn frame(children: Vec<NodeId>, padding: (f32, f32, f32, f32)) -> Node {
-        Node::Frame { children, padding }
+        Node::Frame { children, padding, clip_radius: 0.0 }
     }
     /// Default attrs for a tree of `n` nodes — no grow anywhere. Used by
     /// every test that doesn't exercise grow specifically.

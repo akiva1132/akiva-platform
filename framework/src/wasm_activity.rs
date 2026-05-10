@@ -627,6 +627,9 @@ pub mod opcode {
     /// — 21 bytes (opcode + u32 + 4×f32). Test/inspector-only; production
     /// tabs without `?inspector=1` decode it and drop it on the floor.
     pub const SET_INSPECTOR_TRANSFORM: u8 = 18;
+    /// `PushRoundClip { x, y, w, h, radius }` — 21 bytes (opcode + 5×f32).
+    /// Stacks alongside `PushClip`; popped by the same `PopClip`.
+    pub const PUSH_ROUND_CLIP: u8 = 19;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -667,6 +670,14 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             let bytes = text.as_bytes();
             out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             out.extend_from_slice(bytes);
+        }
+        PaintOp::PushRoundClip { x, y, w, h, radius } => {
+            out.push(opcode::PUSH_ROUND_CLIP);
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+            out.extend_from_slice(&w.to_le_bytes());
+            out.extend_from_slice(&h.to_le_bytes());
+            out.extend_from_slice(&radius.to_le_bytes());
         }
         PaintOp::PushClip { x, y, w, h } => {
             out.push(opcode::PUSH_CLIP);
@@ -829,6 +840,14 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                     .map_err(|_| DecodeError::BadUtf8)?
                     .to_string();
                 out.push(PaintOp::DrawText { x, y, size, rgba, text });
+            }
+            opcode::PUSH_ROUND_CLIP => {
+                let x = read_f32(&mut bytes)?;
+                let y = read_f32(&mut bytes)?;
+                let w = read_f32(&mut bytes)?;
+                let h = read_f32(&mut bytes)?;
+                let radius = read_f32(&mut bytes)?;
+                out.push(PaintOp::PushRoundClip { x, y, w, h, radius });
             }
             opcode::PUSH_CLIP => {
                 let x = read_f32(&mut bytes)?;

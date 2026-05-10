@@ -105,6 +105,7 @@ export class CompositingPipeline {
   pushTransform(dx, dy, scale)                       { this.paint?.pushTransform(dx, dy, scale); }
   popTransform()                                     { this.paint?.popTransform(); }
   pushClip(x, y, w, h)                               { this.paint?.pushClip(x, y, w, h); }
+  pushRoundClip(x, y, w, h, radius)                  { this.paint?.pushRoundClip(x, y, w, h, radius); }
   popClip()                                          { this.paint?.popClip(); }
   setGlobalAlpha(alpha)                              { this.paint?.setGlobalAlpha(alpha); }
 

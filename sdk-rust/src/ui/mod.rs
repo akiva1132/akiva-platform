@@ -76,11 +76,15 @@ pub mod layout;
 pub mod paint;
 pub mod semantics;
 
+// Re-export the most-used identifier so callers don't have to write
+// `akiva_sdk::ui::node::NodeId` for every builder return type.
+pub use node::NodeId;
+
 use std::collections::HashMap;
 
 use crate::activity::{Context, PointerEvent, PointerPhase};
 use crate::canvas::Canvas;
-use node::{Node, NodeId};
+use node::Node;
 
 /// How a stack distributes its children along the main axis.
 ///

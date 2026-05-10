@@ -87,6 +87,9 @@ impl DrawHal for ExternDrawHal {
     fn pop_transform(&mut self) {
         unsafe { host::hal_draw_pop_transform() }
     }
+    fn push_round_clip(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32) {
+        unsafe { host::hal_draw_push_round_clip(x, y, w, h, radius) }
+    }
     fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
         unsafe { host::hal_draw_push_clip(x, y, w, h) }
     }

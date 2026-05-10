@@ -64,6 +64,16 @@ pub enum Node {
     Frame {
         children: Vec<NodeId>,
         padding: (f32, f32, f32, f32),
+        /// Optional rounded clip applied around the frame's content.
+        /// `0.0` (the default) is no clip — children paint without
+        /// masking, identical to the pre-clip Frame. Positive values
+        /// emit `push_round_clip` before children and `pop_clip`
+        /// after, so a circular avatar is `Frame::clip_radius(r/2)`
+        /// containing an `Image`. Stacks naturally with intermediate
+        /// padding: the clip rect is the frame's outer box (after
+        /// layout, before padding), matching CSS's `border-radius`
+        /// + `overflow: hidden` shape.
+        clip_radius: f32,
     },
     /// Fixed-dimension grid. `cols × rows` cells laid out in row-major
     /// order; every cell is the same size. Extra children past
@@ -223,11 +233,12 @@ pub struct FrameBuilder<'u, 's, 'c, 'b> {
     children: Vec<NodeId>,
     padding: (f32, f32, f32, f32),
     grow: f32,
+    clip_radius: f32,
 }
 
 impl<'u, 's, 'c, 'b> FrameBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, children: Vec<NodeId>) -> Self {
-        Self { ui, children, padding: (0.0, 0.0, 0.0, 0.0), grow: 0.0 }
+        Self { ui, children, padding: (0.0, 0.0, 0.0, 0.0), grow: 0.0, clip_radius: 0.0 }
     }
     /// Uniform padding on all four sides.
     pub fn padding(mut self, p: f32) -> Self {
@@ -239,10 +250,20 @@ impl<'u, 's, 'c, 'b> FrameBuilder<'u, 's, 'c, 'b> {
     /// Main-axis grow factor for when this frame is itself a child of a
     /// stack — same semantics as the equivalent builder on `StackBuilder`.
     pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
+    /// Apply a rounded clip around this frame's content. `radius` is
+    /// in dp. Common values: `r/2` for a circle when the frame is
+    /// square (avatars), `h/2` for a pill (chips, primary buttons),
+    /// `8.0`–`14.0` for a card. `0.0` disables the clip and matches
+    /// the pre-`clip_radius` Frame behaviour exactly.
+    pub fn clip_radius(mut self, radius: f32) -> Self {
+        self.clip_radius = radius.max(0.0);
+        self
+    }
     pub fn build(self) -> NodeId {
         let id = self.ui.push(Node::Frame {
             children: self.children,
             padding: self.padding,
+            clip_radius: self.clip_radius,
         });
         self.ui.set_grow(id, self.grow);
         id

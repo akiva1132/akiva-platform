@@ -77,16 +77,31 @@ fn paint_node(
                 label,
             );
         }
+        Node::Frame { children, clip_radius, .. } => {
+            // Document order = paint order. Frame: earlier children
+            // paint first (bottom of z-stack), later overlay them —
+            // mirrors Android FrameLayout / SwiftUI ZStack.
+            //
+            // `clip_radius > 0`: wrap children in a rounded clip so
+            // bitmaps, gradients, or stripe patterns get masked to
+            // a rounded rect / pill / circle without changing their
+            // own paint. Cheaper than per-leaf clip discipline; the
+            // renderer's save/restore pair is one save() per frame.
+            let push_clip = *clip_radius > 0.0;
+            if push_clip {
+                canvas.push_round_clip(rect.x, rect.y, rect.w, rect.h, *clip_radius);
+            }
+            for c in children { paint_node(nodes, *c, rects, clicked_ids, canvas); }
+            if push_clip {
+                canvas.pop_clip();
+            }
+        }
         Node::VStack { children, .. }
         | Node::HStack { children, .. }
-        | Node::Frame { children, .. }
         | Node::Grid { children, .. } => {
-            // Document order = paint order. For Frame this means earlier
-            // children paint first (bottom of the z-stack) and later
-            // children overlay them — mirrors Android FrameLayout and
-            // SwiftUI ZStack. Grid uses the same traversal: layout gives
-            // non-overlapping cell rects, so document order is just
-            // row-major paint order.
+            // Document order = paint order. Grid uses the same
+            // traversal: layout gives non-overlapping cell rects, so
+            // document order is just row-major paint order.
             for c in children { paint_node(nodes, *c, rects, clicked_ids, canvas); }
         }
     }

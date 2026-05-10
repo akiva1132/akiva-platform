@@ -35,6 +35,8 @@ const OP_BEGIN_SURFACE      = 14;
 const OP_END_SURFACE        = 15;
 const OP_COMPOSITE_SURFACE  = 16;
 const OP_DESTROY_SURFACE    = 17;
+const OP_SET_INSPECTOR_TRANSFORM = 18;   // test-infra; followers ignore
+const OP_PUSH_ROUND_CLIP    = 19;
 
 const decoder = new TextDecoder("utf-8");
 
@@ -108,8 +110,20 @@ export function applyPaintStream(bytes, backend) {
         backend.pushClip(x, y, w, h);
         break;
       }
+      case OP_PUSH_ROUND_CLIP: {
+        const x = readF32(), y = readF32(), w = readF32(), h = readF32();
+        const r = readF32();
+        backend.pushRoundClip?.(x, y, w, h, r);
+        break;
+      }
       case OP_POP_CLIP: {
         backend.popClip();
+        break;
+      }
+      case OP_SET_INSPECTOR_TRANSFORM: {
+        // Test-infra only — followers don't host an inspector, so
+        // skip the payload (u32 + 4×f32 = 20 bytes) and move on.
+        p += 20;
         break;
       }
       case OP_PUSH_TRANSFORM: {

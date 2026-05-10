@@ -19,6 +19,7 @@ pub trait PaintTarget {
     fn fill_round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32);
     fn draw_text(&mut self, x: f32, y: f32, size: f32, rgba: u32, text: &str);
     fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32);
+    fn push_round_clip(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32);
     fn pop_clip(&mut self);
 }
 
@@ -185,6 +186,15 @@ pub enum PaintOp {
     FillRoundRect { x: f32, y: f32, w: f32, h: f32, radius: f32, rgba: u32 },
     DrawText { x: f32, y: f32, size: f32, rgba: u32, text: String },
     PushClip { x: f32, y: f32, w: f32, h: f32 },
+    /// Same as [`PushClip`] but with rounded corners. The renderer
+    /// constructs a rounded-rect path and clips subsequent paint ops
+    /// to it — useful for circular avatars (`radius == w/2 == h/2`),
+    /// pill cards (`radius == h/2`), and modern card lists in
+    /// general. `radius == 0.0` collapses to a sharp clip; the
+    /// compositor pass that emits these ops should pick `PushClip`
+    /// in that case to keep the renderer on the cheaper path.
+    /// Stacks the same way as `PushClip` — popped by `PopClip`.
+    PushRoundClip { x: f32, y: f32, w: f32, h: f32, radius: f32 },
     PopClip,
     PushTransform { dx: f32, dy: f32, scale: f32 },
     PopTransform,
@@ -336,6 +346,7 @@ pub trait DrawHal {
     fn push_transform(&mut self, dx: f32, dy: f32, scale: f32);
     fn pop_transform(&mut self);
     fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32);
+    fn push_round_clip(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32);
     fn pop_clip(&mut self);
     fn set_global_alpha(&mut self, alpha: f32);
     // Phase 15.1 — per-Activity surface ops. See PaintOp variants for
@@ -385,6 +396,9 @@ pub fn dispatch_paint_op<H: DrawHal + ?Sized>(hal: &mut H, op: &PaintOp) {
         PaintOp::PushTransform { dx, dy, scale } => hal.push_transform(*dx, *dy, *scale),
         PaintOp::PopTransform => hal.pop_transform(),
         PaintOp::PushClip { x, y, w, h } => hal.push_clip(*x, *y, *w, *h),
+        PaintOp::PushRoundClip { x, y, w, h, radius } => {
+            hal.push_round_clip(*x, *y, *w, *h, *radius);
+        }
         PaintOp::PopClip => hal.pop_clip(),
         PaintOp::SetGlobalAlpha { alpha } => hal.set_global_alpha(*alpha),
         PaintOp::BeginSurface { id, x, y, w, h } => hal.begin_surface(*id, *x, *y, *w, *h),
@@ -413,6 +427,9 @@ impl PaintTarget for FrameCommands {
     }
     fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
         self.ops.push(PaintOp::PushClip { x, y, w, h });
+    }
+    fn push_round_clip(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32) {
+        self.ops.push(PaintOp::PushRoundClip { x, y, w, h, radius });
     }
     fn pop_clip(&mut self) {
         self.ops.push(PaintOp::PopClip);
@@ -905,6 +922,9 @@ mod tests {
         fn pop_transform(&mut self) { self.trace.push("pop_transform".into()); }
         fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32) {
             self.trace.push(format!("push_clip({x},{y},{w},{h})"));
+        }
+        fn push_round_clip(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32) {
+            self.trace.push(format!("push_round_clip({x},{y},{w},{h},{radius})"));
         }
         fn pop_clip(&mut self) { self.trace.push("pop_clip".into()); }
         fn set_global_alpha(&mut self, alpha: f32) {
