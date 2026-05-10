@@ -136,6 +136,13 @@ export class Inspector {
     this._global = global;
     /** @type {Map<string, { packageId: string, handle: number, nodes: SemanticNode[], lastSeenMs: number }>} */
     this._activities = new Map();
+    /** Per-handle composite transform — last value posted by the
+     *  framework's compositor. Applied to every rect returned from
+     *  the query API so tests don't see surface-local coords during
+     *  animations. Identity transform = no entry (cheaper than
+     *  storing IDENTITY for every handle).
+     *  @type {Map<number, {opacity:number, tx:number, ty:number, scale:number}>} */
+    this._transforms = new Map();
     this._gcTimer = setInterval(() => this._gcStale(), 1000);
     this._installApi();
   }
@@ -159,11 +166,31 @@ export class Inspector {
     });
   }
 
+  /** Apply a composite transform from the framework's compositor pass.
+   *  See `framework/src/compositor.rs::PaintOp::SetInspectorTransform`.
+   *  Identity transforms are removed from the map (no entry == identity)
+   *  so common-case rect lookups don't pay the apply cost. */
+  applyTransform({ handle, opacity, translate_x, translate_y, scale }) {
+    const isIdentity =
+      opacity === 1 && translate_x === 0 && translate_y === 0 && scale === 1;
+    if (isIdentity) {
+      this._transforms.delete(handle);
+      return;
+    }
+    this._transforms.set(handle, {
+      opacity, tx: translate_x, ty: translate_y, scale,
+    });
+  }
+
   _gcStale() {
     const now = performance.now();
     for (const [key, entry] of this._activities) {
       if (now - entry.lastSeenMs > this._staleMs) {
         this._activities.delete(key);
+        // Drop the transform too — without an active activity it has
+        // no consumer, and a stale value would offset a future
+        // re-spawn that gets the same handle.
+        this._transforms.delete(entry.handle);
       }
     }
   }
@@ -230,7 +257,7 @@ export class Inspector {
   _findFirst(pred) {
     for (const a of this._activities.values()) {
       for (const n of a.nodes) {
-        if (pred(n)) return makeMatch(a, n);
+        if (pred(n)) return makeMatch(a, n, this._transforms.get(a.handle));
       }
     }
     return null;
@@ -240,14 +267,27 @@ export class Inspector {
     const out = [];
     for (const a of this._activities.values()) {
       for (const n of a.nodes) {
-        if (pred(n)) out.push(makeMatch(a, n));
+        if (pred(n)) out.push(makeMatch(a, n, this._transforms.get(a.handle)));
       }
     }
     return out;
   }
 }
 
-function makeMatch(a, n) {
+function makeMatch(a, n, transform) {
+  // Apply the activity's current composite transform (if any) so the
+  // rect is in post-composite screen coordinates. The SDK publishes
+  // surface-local bounds; the compositor applies translate/scale
+  // during the screen draw. Without this, mid-animation queries
+  // would hand tests stale coords. Order matches the GPU shader's:
+  // scale around the surface origin, then translate.
+  let { x, y, w, h } = n;
+  if (transform) {
+    x = x * transform.scale + transform.tx;
+    y = y * transform.scale + transform.ty;
+    w = w * transform.scale;
+    h = h * transform.scale;
+  }
   return {
     packageId: a.packageId,
     handle: a.handle,
@@ -255,7 +295,7 @@ function makeMatch(a, n) {
     id: n.id,
     label: n.label,
     value: n.value,
-    rect: { x: n.x, y: n.y, w: n.w, h: n.h },
+    rect: { x, y, w, h },
   };
 }
 

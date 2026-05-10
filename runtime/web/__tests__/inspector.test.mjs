@@ -282,6 +282,92 @@ describe("Inspector", () => {
     insp.destroy();
     expect(g.__akiva).toBeUndefined();
   });
+
+  // --- composite transform application -------------------------------------
+
+  it("returns surface-local rects when no transform was published", () => {
+    insp.apply({
+      packageId: "p", handle: 1,
+      tree: encodeTree([encodeNode({ role: 2, x: 100, y: 200, w: 50, h: 30, id: "btn", label: "B" })]),
+    });
+    expect(g.__akiva.findById("btn").rect).toEqual({ x: 100, y: 200, w: 50, h: 30 });
+  });
+
+  it("applies translate transforms to returned rects (push-transition shape)", () => {
+    insp.apply({
+      packageId: "p", handle: 7,
+      tree: encodeTree([encodeNode({ role: 2, x: 100, y: 200, w: 50, h: 30, id: "btn", label: "B" })]),
+    });
+    insp.applyTransform({
+      handle: 7, opacity: 1, translate_x: 540, translate_y: 0, scale: 1,
+    });
+    expect(g.__akiva.findById("btn").rect).toEqual({
+      x: 100 + 540, y: 200, w: 50, h: 30,
+    });
+  });
+
+  it("applies scale transforms (modal sheet zoom-in shape)", () => {
+    insp.apply({
+      packageId: "p", handle: 7,
+      tree: encodeTree([encodeNode({ role: 2, x: 100, y: 200, w: 80, h: 40, id: "btn", label: "B" })]),
+    });
+    insp.applyTransform({
+      handle: 7, opacity: 1, translate_x: 0, translate_y: 0, scale: 0.5,
+    });
+    expect(g.__akiva.findById("btn").rect).toEqual({
+      x: 50, y: 100, w: 40, h: 20,
+    });
+  });
+
+  it("identity transforms are dropped from the map (no apply cost)", () => {
+    insp.apply({
+      packageId: "p", handle: 7,
+      tree: encodeTree([encodeNode({ role: 2, x: 100, y: 200, w: 50, h: 30, id: "btn", label: "B" })]),
+    });
+    insp.applyTransform({
+      handle: 7, opacity: 1, translate_x: 100, translate_y: 0, scale: 1,
+    });
+    expect(g.__akiva.findById("btn").rect.x).toBe(200);
+    // Settle to identity: should clear the offset.
+    insp.applyTransform({
+      handle: 7, opacity: 1, translate_x: 0, translate_y: 0, scale: 1,
+    });
+    expect(g.__akiva.findById("btn").rect.x).toBe(100);
+  });
+
+  it("transforms isolate per handle", () => {
+    insp.apply({
+      packageId: "a", handle: 1,
+      tree: encodeTree([encodeNode({ role: 2, x: 0, y: 0, w: 10, h: 10, id: "a", label: "A" })]),
+    });
+    insp.apply({
+      packageId: "b", handle: 2,
+      tree: encodeTree([encodeNode({ role: 2, x: 0, y: 0, w: 10, h: 10, id: "b", label: "B" })]),
+    });
+    insp.applyTransform({ handle: 1, opacity: 1, translate_x: 50, translate_y: 0, scale: 1 });
+    expect(g.__akiva.findById("a").rect.x).toBe(50);
+    expect(g.__akiva.findById("b").rect.x).toBe(0);
+  });
+
+  it("transform is forgotten when its activity ages out", () => {
+    const fast = new Inspector({ staleMs: 5, global: {} });
+    fast.apply({
+      packageId: "p", handle: 9,
+      tree: encodeTree([encodeNode({ role: 2, x: 0, y: 0, w: 10, h: 10, id: "x", label: "X" })]),
+    });
+    fast.applyTransform({ handle: 9, opacity: 1, translate_x: 99, translate_y: 0, scale: 1 });
+    // Internal access — the cleanest assertion the transform actually
+    // got purged with the activity.
+    return new Promise((resolve) => setTimeout(() => {
+      // _gcStale runs on a 1 s timer; force one manually.
+      // eslint-disable-next-line no-underscore-dangle
+      fast._gcStale();
+      // eslint-disable-next-line no-underscore-dangle
+      expect(fast._transforms.has(9)).toBe(false);
+      fast.destroy();
+      resolve(undefined);
+    }, 20));
+  });
 });
 
 describe("inspectorEnabled", () => {

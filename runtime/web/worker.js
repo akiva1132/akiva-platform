@@ -606,6 +606,21 @@ function buildImports() {
       ),
     hal_destroy_surface: (id) => backend?.destroySurfaceCanvas(id >>> 0),
 
+    // Test-infra — forward the framework's per-frame composite transform
+    // (translate / scale / opacity) for activity `handle` to the tab so
+    // the inspector can apply it when computing widget rects. Posted
+    // unconditionally; the tab's inspector mounts only with
+    // `?inspector=1`, otherwise this is a one-message-per-active-surface-
+    // per-frame allocation that fizzles in the tab message handler.
+    // See framework/src/compositor.rs::PaintOp::SetInspectorTransform.
+    hal_inspector_set_transform: (handle, opacity, tx, ty, scale) => {
+      self.postMessage({
+        type: "surface_transform",
+        handle: handle >>> 0,
+        opacity, translate_x: tx, translate_y: ty, scale,
+      });
+    },
+
     hal_storage_read:   (kptr, klen, outLenPtr) => halStorageRead(kptr, klen, outLenPtr),
     hal_storage_write:  (kptr, klen, vptr, vlen) => halStorageWrite(kptr, klen, vptr, vlen),
     hal_storage_delete: (kptr, klen) => halStorageDelete(kptr, klen),

@@ -329,6 +329,14 @@ function onKernelMessage(msg) {
     case "semantics":
       inspector?.apply(msg);
       break;
+    // Test-infra — per-frame composite transform for an activity
+    // handle. The inspector applies this to rects returned from
+    // findById/findByRole/findByText so tests get post-composite
+    // coordinates even mid-animation. Production tabs (no inspector)
+    // discard the message.
+    case "surface_transform":
+      inspector?.applyTransform(msg);
+      break;
   }
 }
 
