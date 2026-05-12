@@ -387,6 +387,15 @@ export class AppRegistry {
   _loadAllDrawables() {
     const blob = this._packagesBlob;
     if (blob.length < 4) return;
+    // Layout owned by `wire/src/pkgs.rs`. Per entry:
+    //   [u16 id_len][id][u16 class_len][class]
+    //   [u16 name_len][name][u16 icon_len][icon]
+    // Pre-this all four fields had to be walked or the next entry's
+    // `id_len` was read from the middle of the previous entry's icon
+    // field — the early three-field reader silently drifted by
+    // `2 + icon_len` bytes per package, so any package after the first
+    // missed its drawable decode. `_warmupWorkers` walks all four; we
+    // mirror that here.
     const decoder = this._decoder;
     const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
     const count = view.getUint32(0, true);
@@ -401,6 +410,8 @@ export class AppRegistry {
       const classLen = view.getUint16(off, true); off += 2 + classLen;
       if (off + 2 > blob.length) return;
       const nameLen = view.getUint16(off, true); off += 2 + nameLen;
+      if (off + 2 > blob.length) return;
+      const iconLen = view.getUint16(off, true); off += 2 + iconLen;
       // Fire-and-forget; failures inside log + skip.
       this._loadDrawableBitmaps(id).catch((err) =>
         this._log("warn", `[${id}] drawable decode pass failed: ${err?.message ?? err}`));
