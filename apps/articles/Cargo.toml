@@ -1,0 +1,21 @@
+[package]
+name = "akiva-app-articles"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Akiva Team"]
+license = "MIT OR Apache-2.0"
+description = "SDK demo: multi-line text — wrap, max_lines, ellipsis truncation."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+akiva-sdk = { path = "../../sdk-rust" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
