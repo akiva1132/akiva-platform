@@ -222,20 +222,24 @@ fn measure_node(
             }
             (sum_w + padding.1 + padding.3, max_h + padding.0 + padding.2)
         }
-        Node::Scroll { child, viewport_w, viewport_h, .. } => {
+        Node::Scroll { child, viewport_w, viewport_h, axis, .. } => {
             // The scroll measures itself as its locked viewport size
             // (or the slot, when unspecified). The child is measured
-            // against unlimited vertical space so its intrinsic height
-            // becomes the scroll *content height* — that's what
-            // `place` reads back to position the child at `-scroll_y`
-            // and the inspector reads back to publish `content_height`.
+            // against unlimited *main-axis* space so its intrinsic
+            // extent along that axis becomes the scroll's content
+            // length — that's what `place` reads back to position
+            // the child at `-scroll_y` and the inspector reads back
+            // to publish `content_height`.
             //
-            // Width is the viewport width either way — content wider
-            // than the viewport gets clipped, same as Android's
-            // ScrollView (no horizontal scroll in this stage).
+            // The cross-axis dimension is the viewport's — content
+            // wider/taller than the viewport on the cross axis gets
+            // clipped (Android ScrollView semantics).
             let outer_w = viewport_w.unwrap_or(avail.0);
             let outer_h = viewport_h.unwrap_or(avail.1);
-            let child_avail = (outer_w, f32::MAX);
+            let child_avail = match axis {
+                crate::ui::ScrollAxis::Vertical => (outer_w, f32::MAX),
+                crate::ui::ScrollAxis::Horizontal => (f32::MAX, outer_h),
+            };
             let _ = measure_node(nodes, *child, child_avail, text_width, out);
             (outer_w, outer_h)
         }
@@ -455,28 +459,34 @@ fn place(
                 );
             }
         }
-        Node::Scroll { child, key, .. } => {
-            // The child's slot is the viewport *shifted up by scroll_y*
-            // and stretched to content_h. Descendants of the child
-            // inherit this y-offset naturally because `place` puts them
-            // relative to their parent's rect — no canvas transform
-            // needed at paint time. The viewport clip is what stops
-            // them from painting outside `rect`.
+        Node::Scroll { child, key, axis, .. } => {
+            // The child's slot is the viewport *shifted along the
+            // main axis by -scroll_y* and stretched to content
+            // extent on that axis. Descendants inherit the offset
+            // naturally (relative to parent rect) — no canvas
+            // transform needed. The viewport clip stops them from
+            // painting outside `rect`.
             let scroll_y = scroll_offsets.get(key).copied().unwrap_or(0.0);
-            let (_cw, content_h) = sizes.get(child).copied().unwrap_or((0.0, 0.0));
-            let child_slot = Rect {
-                x: rect.x,
-                y: rect.y - scroll_y,
-                w: rect.w,
-                h: content_h,
+            let (cw, ch) = sizes.get(child).copied().unwrap_or((0.0, 0.0));
+            let (child_slot, stretch_w, stretch_h) = match axis {
+                crate::ui::ScrollAxis::Vertical => (
+                    Rect { x: rect.x, y: rect.y - scroll_y, w: rect.w, h: ch },
+                    // Stretch on width so a v_stack inside Scroll
+                    // fills the viewport edge-to-edge; height is
+                    // the content's intrinsic.
+                    true, false,
+                ),
+                crate::ui::ScrollAxis::Horizontal => (
+                    Rect { x: rect.x - scroll_y, y: rect.y, w: cw, h: rect.h },
+                    // Stretch on height (cross axis) so an h_stack
+                    // inside Scroll fills the viewport top-to-
+                    // bottom; width is the content's intrinsic.
+                    false, true,
+                ),
             };
-            // Child stretched on width so a v_stack inside Scroll fills
-            // the viewport edge-to-edge; height is the content's
-            // intrinsic and we don't want it shrinking against the
-            // viewport's smaller slot.
             place(
                 nodes, attrs, *child, child_slot,
-                /*stretch_w=*/ true, /*stretch_h=*/ false,
+                stretch_w, stretch_h,
                 sizes, scroll_offsets, out,
             );
         }
@@ -934,7 +944,11 @@ mod tests {
     fn scroll_with_no_size_inherits_slot() {
         let nodes = vec![
             rect(200.0, 1000.0),
-            Node::Scroll { child: 0, key: "x".to_string(), viewport_w: None, viewport_h: None },
+            Node::Scroll {
+                child: 0, key: "x".to_string(),
+                viewport_w: None, viewport_h: None,
+                axis: crate::ui::ScrollAxis::Vertical,
+            },
         ];
         let attrs = default_attrs(nodes.len());
         let sizes = measure(&nodes, 1, (800.0, 600.0), 1.0, &estimate_text_width);
@@ -983,6 +997,7 @@ mod tests {
         Node::Scroll {
             child, key: key.to_string(),
             viewport_w: Some(w), viewport_h: Some(h),
+            axis: crate::ui::ScrollAxis::Vertical,
         }
     }
     /// Default attrs for a tree of `n` nodes — no grow anywhere. Used by

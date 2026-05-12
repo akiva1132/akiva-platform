@@ -174,26 +174,61 @@ impl Rect {
     }
 }
 
+/// Which axis a scroll region scrolls along. Stage 2c shipped vertical
+/// only; Stage 2d added horizontal as a runtime-selected variant
+/// (compose `Orientation` shape). Default `Vertical` preserves
+/// pre-2d behaviour for every existing call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollAxis {
+    /// y-axis main, x-axis cross — `LazyColumn`, `Ui::scroll(...)`.
+    #[default]
+    Vertical,
+    /// x-axis main, y-axis cross — `LazyRow`, `Ui::scroll_h(...)`.
+    Horizontal,
+}
+
 /// Persistent state for one scroll region. Lives in
 /// [`UiState::scroll_states`] keyed by the caller-supplied
 /// `ScrollBuilder::key`. Survives across frames so scroll position
 /// doesn't reset on every rebuild — the same pattern as
 /// [`UiState::hit_rects`], applied to scroll instead of clicks.
+///
+/// **Naming caveat for horizontal cells (Stage 2d, plan §3.2).** The
+/// fields are named after the vertical case but mean "main-axis"
+/// quantities for the cell's `axis`:
+///   - `scroll_y` is the offset along the main axis (= y for
+///     vertical, = x for horizontal).
+///   - `content_h` is the content extent along the main axis (= total
+///     height for vertical, total width for horizontal).
+///   - `viewport_h` is the viewport size along the main axis.
+///   - `viewport_w` is the viewport size along the cross axis.
+/// The published wire (`ScrollSemantic`) keeps the same names; the
+/// inspector exposes a separate `axis` field so callers that need to
+/// be precise can read it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScrollCell {
-    /// How far the content has been scrolled past the top of the
-    /// viewport, in physical pixels. `0` = content top aligned with
-    /// viewport top; positive values move the content *up* on screen.
+    /// Which axis this cell scrolls along. Set by the present pass
+    /// from the `Node::Scroll` / `Node::LazyColumn` / `Node::LazyRow`
+    /// declaration; never flipped after creation (see plan §3.1).
+    pub axis: ScrollAxis,
+    /// Main-axis offset, in physical pixels. `0` = content top/left
+    /// aligned with viewport top/left; positive values move content
+    /// "up" (Vertical) or "left" (Horizontal) on screen.
     pub scroll_y: f32,
     /// Pixels-per-frame velocity for active flings. Set on
     /// pointer-up after a drag (Stage 2c.4); decays to 0 each tick.
     /// Programmatic `scroll_to` zeroes it.
     pub velocity: f32,
-    /// Last-measured intrinsic height of the child (the scroll's
-    /// content). Updated every present pass; used to clamp `scroll_y`
-    /// against `max = (content_h - viewport_h).max(0)`.
+    /// Main-axis extent of the content (the scroll's "length"). For
+    /// vertical: total height; for horizontal: total width. Updated
+    /// every present pass; used to clamp `scroll_y` against
+    /// `max = (content_h - viewport_h).max(0)`.
     pub content_h: f32,
+    /// Cross-axis size of the viewport (width for vertical scrolls,
+    /// height for horizontal scrolls).
     pub viewport_w: f32,
+    /// Main-axis size of the viewport (height for vertical scrolls,
+    /// width for horizontal scrolls).
     pub viewport_h: f32,
     /// Viewport rect in screen coordinates from the most recent
     /// present pass. Used by [`Ui::feed_wheel`] in Stage 2c.3 to
@@ -261,14 +296,21 @@ pub struct UiState {
 
 /// In-flight drag state. See [`UiState::drag_gesture`] for the
 /// lifecycle. `key` identifies the scroll region the gesture started
-/// inside; `started_y` is the y of the down event (for slop
-/// thresholding); `last_y` is the y of the most recent Move (for
-/// per-frame deltas).
+/// inside; `started_at` is the (x, y) of the down event (for
+/// slop thresholding); `last_main` is the *main-axis* projection of
+/// the most recent Move (y for vertical scrolls, x for horizontal —
+/// matches the cell's `axis`).
 #[derive(Debug, Clone)]
 pub(crate) struct DragGesture {
     pub(crate) key: String,
+    /// Axis of the scroll region this drag started inside. Cached at
+    /// Down time so Move events don't have to re-look-up the cell.
+    pub(crate) axis: ScrollAxis,
     pub(crate) started_at: (f32, f32),
-    pub(crate) last_y: f32,
+    /// Main-axis position of the most recent Move event (y if
+    /// `axis == Vertical`, x otherwise). Per-frame deltas are
+    /// `last_main - new_main` (positive = content scrolls forward).
+    pub(crate) last_main: f32,
     pub(crate) is_dragging: bool,
 }
 
@@ -327,10 +369,21 @@ impl UiState {
                 // immediately (preserves the pre-2c.3 tap latency for
                 // every button in the app).
                 if let Some(key) = self.scroll_region_at(ev.x, ev.y) {
+                    // Cache the axis at Down so Move events project
+                    // the same way regardless of where the finger
+                    // wanders — a near-horizontal swipe inside a
+                    // vertical scroll stays a tap, not an axis steal.
+                    let axis = self.scroll_states.get(&key)
+                        .map(|c| c.axis).unwrap_or_default();
+                    let last_main = match axis {
+                        ScrollAxis::Vertical => ev.y,
+                        ScrollAxis::Horizontal => ev.x,
+                    };
                     self.drag_gesture = Some(DragGesture {
                         key,
+                        axis,
                         started_at: (ev.x, ev.y),
-                        last_y: ev.y,
+                        last_main,
                         is_dragging: false,
                     });
                 } else {
@@ -339,29 +392,39 @@ impl UiState {
             }
             PointerPhase::Move => {
                 if let Some(g) = self.drag_gesture.as_mut() {
-                    // Total Y travel from down. Below slop: gesture
-                    // still candidate-tap. Past slop: switch to drag.
-                    let total_dy = (ev.y - g.started_at.1).abs();
-                    if !g.is_dragging && total_dy >= DRAG_SLOP {
+                    // Project event position onto the main axis. Slop
+                    // is measured along main only, so a sideways
+                    // wobble inside a vertical scroll (and vice
+                    // versa) stays a tap.
+                    let (cur_main, started_main) = match g.axis {
+                        ScrollAxis::Vertical =>
+                            (ev.y, g.started_at.1),
+                        ScrollAxis::Horizontal =>
+                            (ev.x, g.started_at.0),
+                    };
+                    let total_main = (cur_main - started_main).abs();
+                    if !g.is_dragging && total_main >= DRAG_SLOP {
                         g.is_dragging = true;
                     }
                     if g.is_dragging {
-                        // Positive delta_y = finger moved up =
-                        // content scrolls down (scroll_y increases).
-                        let delta_y = g.last_y - ev.y;
+                        // Positive delta = finger moved against the
+                        // axis = content scrolls forward (scroll_y
+                        // increases). `last_main - cur_main` gives
+                        // that sign for both axes.
+                        let delta = g.last_main - cur_main;
                         // Capture before-update for borrow split.
                         let key = g.key.clone();
                         let cell = self.scroll_states.entry(key).or_default();
                         let max = (cell.content_h - cell.viewport_h).max(0.0);
-                        cell.scroll_y = (cell.scroll_y + delta_y).clamp(0.0, max);
+                        cell.scroll_y = (cell.scroll_y + delta).clamp(0.0, max);
                         // EMA velocity in px/frame. Used by Stage
                         // 2c.4's fling animator at pointer-up. Half-
                         // life ≈ 1 sample with the 0.5 / 0.5 weights;
                         // bump the new-sample weight if drags feel
                         // sticky.
-                        cell.velocity = 0.5 * cell.velocity + 0.5 * delta_y;
+                        cell.velocity = 0.5 * cell.velocity + 0.5 * delta;
                     }
-                    g.last_y = ev.y;
+                    g.last_main = cur_main;
                 }
             }
             PointerPhase::Up => {
@@ -391,12 +454,22 @@ impl UiState {
     /// from `feed_pointer`. No-op if no pointer event has been seen
     /// yet (e.g. wheel before any cursor entry) or no scroll region
     /// is under the cursor.
+    ///
+    /// Axis-aware: a vertical scroll consumes `ev.dy` and drops
+    /// `ev.dx`; a horizontal scroll consumes `ev.dx` and drops
+    /// `ev.dy`. No "axis stealing" — diagonal trackpad swipes are
+    /// projected onto the cell's main axis, with the cross
+    /// component ignored.
     pub fn feed_wheel(&mut self, ev: super::activity::WheelEvent) {
         let Some((px, py)) = self.last_pointer else { return; };
         let Some(key) = self.scroll_region_at(px, py) else { return; };
         let cell = self.scroll_states.entry(key).or_default();
+        let delta = match cell.axis {
+            ScrollAxis::Vertical => ev.dy,
+            ScrollAxis::Horizontal => ev.dx,
+        };
         let max = (cell.content_h - cell.viewport_h).max(0.0);
-        cell.scroll_y = (cell.scroll_y + ev.dy).clamp(0.0, max);
+        cell.scroll_y = (cell.scroll_y + delta).clamp(0.0, max);
         // Wheel input is an explicit user override; kill any active
         // fling so the two don't fight.
         cell.velocity = 0.0;
@@ -677,12 +750,23 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         node::GridBuilder::new(self, children.to_vec(), cols, rows)
     }
 
-    /// Single-child scroll viewport. Chain `.key(...)` to address the
-    /// region across frames (so the scroll position persists), then
-    /// `.size(w, h)` or `.height(h)` if you want to lock the viewport
-    /// to a specific size rather than inheriting from the slot.
+    /// Single-child vertical scroll viewport. Chain `.key(...)` to
+    /// address the region across frames (so the scroll position
+    /// persists), then `.size(w, h)` or `.height(h)` if you want to
+    /// lock the viewport to a specific size rather than inheriting
+    /// from the slot. For horizontal scrolling, use [`Self::scroll_h`].
     pub fn scroll(&mut self, child: NodeId) -> node::ScrollBuilder<'_, 's, 'c, 'b> {
         node::ScrollBuilder::new(self, child)
+    }
+
+    /// Single-child horizontal scroll viewport — the carousel-style
+    /// counterpart of [`Self::scroll`]. Same builder surface; the
+    /// child measures against unlimited *width* (its intrinsic
+    /// width becomes the scroll content extent) and paints with a
+    /// `-scroll_y` x-offset (the field name lies for horizontal
+    /// scrolls — see `ScrollCell` docs).
+    pub fn scroll_h(&mut self, child: NodeId) -> node::ScrollBuilder<'_, 's, 'c, 'b> {
+        node::ScrollBuilder::new_with_axis(self, child, ScrollAxis::Horizontal)
     }
 
     /// Programmatic scroll. Clamps `y` to `[0, content_h - viewport_h]`
@@ -789,10 +873,17 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         // programmatic `scroll_to` called before any present() honours
         // the same default until the cell catches up.
         for (id, node) in self.nodes.iter().enumerate() {
-            let (key, content_h) = match node {
-                Node::Scroll { child, key, .. } => {
-                    let (_cw, ch) = sizes.get(child).copied().unwrap_or((0.0, 0.0));
-                    (key, ch)
+            let (key, content_main, axis) = match node {
+                Node::Scroll { child, key, axis, .. } => {
+                    let (cw, ch) = sizes.get(child).copied().unwrap_or((0.0, 0.0));
+                    // Main-axis extent of the content: child's
+                    // height for vertical scrolls, width for
+                    // horizontal scrolls.
+                    let content = match axis {
+                        ScrollAxis::Vertical => ch,
+                        ScrollAxis::Horizontal => cw,
+                    };
+                    (key, content, *axis)
                 }
                 Node::LazyColumn { key, count, item_h, gap, padding, .. } => {
                     // Content height is `count * item_h + (count-1) *
@@ -805,15 +896,29 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
                     } else {
                         n * item_h + (n - 1.0) * gap + padding.0 + padding.2
                     };
-                    (key, ch)
+                    (key, ch, ScrollAxis::Vertical)
                 }
                 _ => continue,
             };
             let viewport_rect = rects.get(&id).copied().unwrap_or_default();
             let cell = self.state.scroll_states.entry(key.clone()).or_default();
-            cell.content_h = content_h;
-            cell.viewport_w = viewport_rect.w;
-            cell.viewport_h = viewport_rect.h;
+            cell.axis = axis;
+            cell.content_h = content_main;
+            // viewport_w / viewport_h follow the convention in
+            // `ScrollCell`: `viewport_h` = main-axis size,
+            // `viewport_w` = cross-axis size. For vertical scrolls
+            // those map straight onto rect.w / rect.h; for
+            // horizontal they swap.
+            match axis {
+                ScrollAxis::Vertical => {
+                    cell.viewport_w = viewport_rect.w;
+                    cell.viewport_h = viewport_rect.h;
+                }
+                ScrollAxis::Horizontal => {
+                    cell.viewport_w = viewport_rect.h;
+                    cell.viewport_h = viewport_rect.w;
+                }
+            }
             cell.last_rect = viewport_rect;
             let max = (cell.content_h - cell.viewport_h).max(0.0);
             if cell.scroll_y > max { cell.scroll_y = max; }
@@ -1362,18 +1467,39 @@ mod tests {
         state: &mut UiState, key: &str,
         rect: Rect, content_h: f32, scroll_y: f32,
     ) {
+        seed_scroll_cell_axis(state, key, rect, content_h, scroll_y,
+            ScrollAxis::Vertical);
+    }
+
+    /// Variant of `seed_scroll_cell` that lets the test pick the
+    /// scroll axis. Vertical cells follow the pre-2d field
+    /// convention (`viewport_w` = rect.w, `viewport_h` = rect.h);
+    /// horizontal cells swap those (see `ScrollCell` docs).
+    fn seed_scroll_cell_axis(
+        state: &mut UiState, key: &str,
+        rect: Rect, content_h: f32, scroll_y: f32, axis: ScrollAxis,
+    ) {
+        let (vw, vh) = match axis {
+            ScrollAxis::Vertical => (rect.w, rect.h),
+            ScrollAxis::Horizontal => (rect.h, rect.w),
+        };
         state.scroll_states.insert(key.to_string(), ScrollCell {
+            axis,
             scroll_y,
             velocity: 0.0,
             content_h,
-            viewport_w: rect.w,
-            viewport_h: rect.h,
+            viewport_w: vw,
+            viewport_h: vh,
             last_rect: rect,
         });
     }
 
     fn wheel(dy: f32) -> crate::activity::WheelEvent {
         crate::activity::WheelEvent { dx: 0.0, dy }
+    }
+
+    fn wheel_xy(dx: f32, dy: f32) -> crate::activity::WheelEvent {
+        crate::activity::WheelEvent { dx, dy }
     }
 
     #[test]
@@ -2203,6 +2329,7 @@ mod tests {
             Node::Scroll {
                 child: 0, key: "feed".to_string(),
                 viewport_w: Some(200.0), viewport_h: Some(400.0),
+                axis: ScrollAxis::Vertical,
             },
         ];
         let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
@@ -2284,6 +2411,7 @@ mod tests {
             Node::Scroll {
                 child: 0, key: "feed".to_string(),
                 viewport_w: Some(200.0), viewport_h: Some(400.0),
+                axis: ScrollAxis::Vertical,
             },
         ];
         let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
@@ -2301,5 +2429,203 @@ mod tests {
         assert_eq!(rects[&0].y, -250.0);
         // Child height is the content_h (1000), not the viewport.
         assert_eq!(rects[&0].h, 1000.0);
+    }
+
+    // ── Stage 2d.1: ScrollAxis routing ────────────────────────────────
+
+    #[test]
+    fn scroll_axis_default_is_vertical() {
+        // ScrollCell + ScrollAxis defaults must round-trip to
+        // Vertical so every pre-2d call site behaves identically.
+        let c = ScrollCell::default();
+        assert_eq!(c.axis, ScrollAxis::Vertical);
+        let a = ScrollAxis::default();
+        assert_eq!(a, ScrollAxis::Vertical);
+    }
+
+    #[test]
+    fn horizontal_wheel_advances_horizontal_scroll() {
+        // A horizontal cell consumes wheel `dx` and ignores `dy`.
+        // Cross-axis components must drop on the floor — no axis
+        // stealing (plan §3.6).
+        let mut state = UiState::new();
+        seed_scroll_cell_axis(
+            &mut state, "row",
+            Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 },
+            1000.0, 0.0, ScrollAxis::Horizontal,
+        );
+        state.feed_pointer(pointer(200.0, 100.0, PointerPhase::Move));
+        // dx=120, dy=300 — only dx applies.
+        state.feed_wheel(wheel_xy(120.0, 300.0));
+        assert_eq!(state.scroll_states["row"].scroll_y, 120.0);
+        // Reverse: dy alone on a horizontal cell is a no-op.
+        state.feed_wheel(wheel_xy(0.0, 500.0));
+        assert_eq!(state.scroll_states["row"].scroll_y, 120.0);
+    }
+
+    #[test]
+    fn vertical_wheel_ignores_dx() {
+        // Mirror of the above — a vertical cell consumes only dy.
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "col",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 0.0,
+        );
+        state.feed_pointer(pointer(100.0, 200.0, PointerPhase::Move));
+        state.feed_wheel(wheel_xy(400.0, 50.0));
+        // Only the 50 dy lands.
+        assert_eq!(state.scroll_states["col"].scroll_y, 50.0);
+    }
+
+    #[test]
+    fn horizontal_drag_past_slop_advances_scroll_x() {
+        // Pointer-drag along x inside a horizontal scroll updates
+        // scroll_y (the "main-axis offset" field). Slop is measured
+        // along the main axis only.
+        let mut state = UiState::new();
+        seed_scroll_cell_axis(
+            &mut state, "row",
+            Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 },
+            1000.0, 0.0, ScrollAxis::Horizontal,
+        );
+        // Down inside the row.
+        state.feed_pointer(pointer(200.0, 100.0, PointerPhase::Down));
+        // Drag 100 px left — well past slop. Three Moves so the
+        // total delta lands.
+        state.feed_pointer(pointer(170.0, 100.0, PointerPhase::Move));
+        state.feed_pointer(pointer(140.0, 100.0, PointerPhase::Move));
+        state.feed_pointer(pointer(100.0, 100.0, PointerPhase::Move));
+        // last_main reset doesn't matter — final scroll_y is the
+        // accumulated delta = 200 - 100 = 100.
+        assert!(state.scroll_states["row"].scroll_y >= 90.0);
+        state.feed_pointer(pointer(100.0, 100.0, PointerPhase::Up));
+        // No tap got promoted (the gesture crossed slop).
+        assert!(state.pending_clicks.is_empty());
+    }
+
+    #[test]
+    fn cross_axis_drag_inside_horizontal_stays_tap() {
+        // A 20px y-drag inside a horizontal scroll never crosses
+        // main-axis slop, so it resolves as a tap at Up. (Sideways
+        // wobble in a horizontal carousel must not eat clicks on
+        // buttons under the finger.)
+        let mut state = UiState::new();
+        seed_scroll_cell_axis(
+            &mut state, "row",
+            Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 },
+            1000.0, 0.0, ScrollAxis::Horizontal,
+        );
+        state.feed_pointer(pointer(200.0, 100.0, PointerPhase::Down));
+        // Drag 20 px down — well past slop on the *cross* axis,
+        // zero main-axis component.
+        state.feed_pointer(pointer(200.0, 120.0, PointerPhase::Move));
+        state.feed_pointer(pointer(200.0, 130.0, PointerPhase::Move));
+        state.feed_pointer(pointer(200.0, 120.0, PointerPhase::Up));
+        // scroll_y unchanged (no main-axis movement) and the Up
+        // promoted the gesture to a tap.
+        assert_eq!(state.scroll_states["row"].scroll_y, 0.0);
+        assert_eq!(state.pending_clicks.len(), 1);
+    }
+
+    #[test]
+    fn horizontal_drag_seeds_horizontal_velocity_for_fling() {
+        // A fast left-drag inside a horizontal scroll feeds the
+        // velocity EMA so the 2c.4 fling animator picks it up at
+        // Up time. The sign convention matches vertical: positive
+        // delta = forward (scroll_y increases).
+        let mut state = UiState::new();
+        seed_scroll_cell_axis(
+            &mut state, "row",
+            Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 },
+            1000.0, 0.0, ScrollAxis::Horizontal,
+        );
+        state.feed_pointer(pointer(300.0, 100.0, PointerPhase::Down));
+        // Fast swipe left: 4 Moves at 50 px each.
+        for x in [250.0, 200.0, 150.0, 100.0] {
+            state.feed_pointer(pointer(x, 100.0, PointerPhase::Move));
+        }
+        let v = state.scroll_states["row"].velocity;
+        assert!(v > 30.0, "expected positive forward velocity, got {v}");
+        state.feed_pointer(pointer(100.0, 100.0, PointerPhase::Up));
+        // Velocity preserved at Up so tick_animations can fling.
+        assert!(state.scroll_states["row"].velocity > 30.0);
+    }
+
+    #[test]
+    fn horizontal_scroll_clamps_at_content_end() {
+        // A horizontal cell with content_h=1000 viewport_h=400 has
+        // max=600; trying to scroll past it pins to 600.
+        let mut state = UiState::new();
+        seed_scroll_cell_axis(
+            &mut state, "row",
+            Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 },
+            1000.0, 0.0, ScrollAxis::Horizontal,
+        );
+        state.feed_pointer(pointer(200.0, 100.0, PointerPhase::Move));
+        state.feed_wheel(wheel_xy(2000.0, 0.0));
+        assert_eq!(state.scroll_states["row"].scroll_y, 600.0);
+        // Negative dx at scroll=0 pins to 0.
+        state.scroll_states.get_mut("row").unwrap().scroll_y = 0.0;
+        state.feed_wheel(wheel_xy(-2000.0, 0.0));
+        assert_eq!(state.scroll_states["row"].scroll_y, 0.0);
+    }
+
+    #[test]
+    fn ui_scroll_h_builds_horizontal_node() {
+        // The Ui::scroll_h factory must mark the produced Node and
+        // the persisted ScrollCell as horizontal. We check the cell
+        // via has_hit_rect-style inspection (after present) — the
+        // cell exists with axis=Horizontal.
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let r = ui.rect(0xff112233).size(2000.0, 200.0).build();
+        let s = ui.scroll_h(r).key("strip").size(400.0, 200.0).build();
+        ui.present(s);
+        // Cell registered, axis=Horizontal, content_h carries the
+        // child's *width* (the lying field name — see ScrollCell
+        // docstring). content=2000, viewport=400 → max=1600.
+        let cell = state.scroll_states.get("strip").expect("cell present");
+        assert_eq!(cell.axis, ScrollAxis::Horizontal);
+        assert_eq!(cell.content_h, 2000.0);
+        assert_eq!(cell.viewport_h, 400.0);
+        assert_eq!(cell.viewport_w, 200.0);
+    }
+
+    #[test]
+    fn horizontal_scroll_paints_child_with_negative_x_offset() {
+        // After scroll_to(N), a horizontal Scroll places its child
+        // at x = viewport.x - N. The vertical twin of this test
+        // (`scrolled_offset_shifts_child_rect_upward`) covers the
+        // y-axis case.
+        let nodes = vec![
+            Node::Rect { color: 0xff00ffff, min: (2000.0, 200.0), radius: 0.0 },
+            Node::Scroll {
+                child: 0, key: "strip".to_string(),
+                viewport_w: Some(400.0), viewport_h: Some(200.0),
+                axis: ScrollAxis::Horizontal,
+            },
+        ];
+        let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
+        let sizes = layout::measure(&nodes, 1, (800.0, 600.0), 1.0,
+            &layout::estimate_text_width);
+        let mut scroll_offsets: HashMap<String, f32> = HashMap::new();
+        scroll_offsets.insert("strip".to_string(), 250.0);
+        let mut rects: HashMap<NodeId, Rect> = HashMap::new();
+        layout::layout(
+            &nodes, &attrs, 1,
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            &sizes, &scroll_offsets, &mut rects,
+        );
+        // Scroll viewport at x=0; child rect at x = 0 - 250.
+        assert_eq!(rects[&1].x, 0.0);
+        assert_eq!(rects[&0].x, -250.0);
+        // Child width is the content extent (2000), not the viewport.
+        assert_eq!(rects[&0].w, 2000.0);
+        // y unchanged — horizontal scroll doesn't shift y.
+        assert_eq!(rects[&0].y, 0.0);
     }
 }

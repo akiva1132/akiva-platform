@@ -6,7 +6,7 @@
 //! and returns its id. Keeping nodes flat-and-enum (rather than `Box<dyn
 //! Widget>`) avoids heap traffic in `on_render`, which runs every frame.
 
-use super::{CrossAxis, MainAxis, Ui};
+use super::{CrossAxis, MainAxis, ScrollAxis, Ui};
 
 /// Index into the flat node vec inside a [`Ui`]. Valid only for the frame
 /// on which it was issued; stale ids from previous frames panic on use.
@@ -135,6 +135,12 @@ pub enum Node {
         key: String,
         viewport_w: Option<f32>,
         viewport_h: Option<f32>,
+        /// Which axis the viewport scrolls along. Stage 2c shipped
+        /// `Vertical` only; Stage 2d added `Horizontal` for
+        /// carousel-style layouts. The default
+        /// (`ScrollAxis::Vertical`) keeps every pre-2d call site
+        /// behaving identically.
+        axis: ScrollAxis,
     },
     /// Virtualised list — Android `RecyclerView` / Compose `LazyColumn`
     /// in shape. Caller declares `count` items at a uniform `item_h`;
@@ -362,6 +368,7 @@ pub struct ScrollBuilder<'u, 's, 'c, 'b> {
     key: String,
     viewport_w: Option<f32>,
     viewport_h: Option<f32>,
+    axis: ScrollAxis,
     grow: f32,
 }
 
@@ -369,7 +376,20 @@ impl<'u, 's, 'c, 'b> ScrollBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, child: NodeId) -> Self {
         Self {
             ui, child, key: String::new(),
-            viewport_w: None, viewport_h: None, grow: 0.0,
+            viewport_w: None, viewport_h: None,
+            axis: ScrollAxis::Vertical, grow: 0.0,
+        }
+    }
+    /// Internal constructor used by `Ui::scroll_h` — seed the builder
+    /// already on the horizontal axis. The public API uses
+    /// [`Self::axis`] / the `Ui::scroll`+`Ui::scroll_h` factories.
+    pub(crate) fn new_with_axis(
+        ui: &'u mut Ui<'s, 'c, 'b>, child: NodeId, axis: ScrollAxis,
+    ) -> Self {
+        Self {
+            ui, child, key: String::new(),
+            viewport_w: None, viewport_h: None,
+            axis, grow: 0.0,
         }
     }
     /// Caller-stable identifier the SDK persists scroll position under
@@ -390,6 +410,18 @@ impl<'u, 's, 'c, 'b> ScrollBuilder<'u, 's, 'c, 'b> {
         self.viewport_h = Some(h.max(0.0));
         self
     }
+    /// Lock the viewport width only — symmetric with [`Self::height`].
+    /// Useful for horizontal scrolls inside an `HStack { cross:
+    /// Stretch }`.
+    pub fn width(mut self, w: f32) -> Self {
+        self.viewport_w = Some(w.max(0.0));
+        self
+    }
+    /// Switch the scroll axis. `Vertical` (the default) scrolls along
+    /// y; `Horizontal` scrolls along x. Prefer the [`Ui::scroll_h`]
+    /// factory for new horizontal scrolls — it's the same effect
+    /// with one less builder call.
+    pub fn axis(mut self, axis: ScrollAxis) -> Self { self.axis = axis; self }
     pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
     pub fn build(self) -> NodeId {
         let id = self.ui.push(Node::Scroll {
@@ -397,6 +429,7 @@ impl<'u, 's, 'c, 'b> ScrollBuilder<'u, 's, 'c, 'b> {
             key: self.key,
             viewport_w: self.viewport_w,
             viewport_h: self.viewport_h,
+            axis: self.axis,
         });
         self.ui.set_grow(id, self.grow);
         id
