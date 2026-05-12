@@ -141,10 +141,11 @@ export async function waitForId(page: Page, id: string, opts: { timeoutMs?: numb
  *  is about to screenshot. Polling for two-sample stability gates the
  *  visual + geometric tests on a frame where both channels agree. */
 export async function waitForStableLayout(
-  page: Page, opts: { timeoutMs?: number; stableFrames?: number } = {},
+  page: Page, opts: { timeoutMs?: number; stableFrames?: number; minFrames?: number } = {},
 ) {
   const timeoutMs = opts.timeoutMs ?? 3_000;
   const need = opts.stableFrames ?? 8;
+  const min = opts.minFrames ?? 30;
   // Stability = every active activity's composite transform is
   // identity for `stableFrames` consecutive published frames.
   //
@@ -160,11 +161,23 @@ export async function waitForStableLayout(
   // and resets the streak.
   await page.evaluate(() => { (window as any).__akivaStreak = 0; });
   await page.waitForFunction(
-    (need) => {
+    ({ need, min }) => {
       const a = (window as any).__akiva;
       if (!a) return false;
       const list = a.list();
       if (list.length === 0) return false;
+      // Drawable resources (@drawable/*) are resolved asynchronously
+      // — the first few `present` calls may render with `drawable_id
+      // = 0` (magenta placeholder) before the bitmap cache warms.
+      // Requiring at least `minFrames` published frames per active
+      // handle gives the resolve loop time to land before the
+      // visual snapshot fires.
+      for (const e of list) {
+        if (e.frame < min) {
+          (window as any).__akivaStreak = 0;
+          return false;
+        }
+      }
       for (const e of list) {
         const t = a.transformOf(e.handle);
         if (!t) {
@@ -176,11 +189,6 @@ export async function waitForStableLayout(
           return false;
         }
       }
-      // Tied to the activity's frame counter so we count *published*
-      // identity frames, not just polling cycles. A frozen activity
-      // that stops painting still wins this check (its frame stays
-      // pinned and the streak inches up across polls), which is what
-      // we want for tests that intentionally pause the activity.
       const total = list.reduce((acc: number, e: any) => acc + e.frame, 0);
       const last = (window as any).__akivaStreakFrame ?? -1;
       if (total !== last) {
@@ -189,7 +197,7 @@ export async function waitForStableLayout(
       }
       return ((window as any).__akivaStreak || 0) >= need;
     },
-    need,
+    { need, min },
     { timeout: timeoutMs },
   );
 }
@@ -273,12 +281,21 @@ async function clickShellLauncherRow(page: Page, rowIndex: number) {
 /** Boot Akiva, then click the clip-shapes launcher row. Returns once
  *  the demo's first frame has published — gated on the title text
  *  showing up in the inspector. Row index 1 because clip-shapes sits
- *  alphabetically after calculator. */
+ *  alphabetically after `articles` and `calculator`. */
 export async function launchClipShapes(page: Page, opts: { timeoutMs?: number } = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   await bootAkiva(page, { timeoutMs });
-  await clickShellLauncherRow(page, 1);
+  await clickShellLauncherRow(page, 2);   // articles, calculator, clipshapes
   await waitForText(page, "Clip Shapes", { timeoutMs });
+}
+
+/** Boot Akiva, then click the articles launcher row (row 0 —
+ *  alphabetically first among all dev apps). */
+export async function launchArticles(page: Page, opts: { timeoutMs?: number } = {}) {
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  await bootAkiva(page, { timeoutMs });
+  await clickShellLauncherRow(page, 0);
+  await waitForText(page, "Articles", { timeoutMs });
 }
 
 /** Boot Akiva, then click the calculator's launcher row in the Shell.
@@ -298,7 +315,7 @@ export async function launchClipShapes(page: Page, opts: { timeoutMs?: number } 
 export async function launchCalculator(page: Page, opts: { timeoutMs?: number } = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   await bootAkiva(page, { timeoutMs });
-  await clickShellLauncherRow(page, 0);
+  await clickShellLauncherRow(page, 1);   // articles, calculator
   // First-paint signal — d2 is a digit button the calculator publishes
   // on its very first frame. The inspector applies the framework's
   // composite transform (translate / scale / opacity) to every rect

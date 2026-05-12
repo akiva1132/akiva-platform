@@ -22,14 +22,17 @@
 // then commit the new PNGs alongside the source change.
 
 import { test, expect } from "@playwright/test";
-import { launchCalculator, tapId, tapRole, waitForText } from "../helpers/akiva";
+import { launchCalculator, tapId, tapRole, waitForText, waitForStableLayout } from "../helpers/akiva";
 
 test("calculator: idle state matches golden", async ({ page }) => {
   await launchCalculator(page);
-  // Hide the inspector debug overlay if some future test mode adds
-  // one — the canvas is the source of truth for visual tests.
-  // Animation isn't running here (push transition completed during
-  // launchCalculator), so the frame is stable; no need to mask.
+  // Gate on a settled frame: `launchCalculator` returns as soon as
+  // `d2` is queryable, which is the calculator's first PUBLISH_SEMANTICS
+  // — drawables (the @drawable/icon PNG → ImageBitmap path) decode
+  // asynchronously off-thread and may land a few frames later. Without
+  // this wait the screenshot occasionally captures the magenta
+  // missing-drawable placeholder instead of the orange icon.
+  await waitForStableLayout(page);
   await expect(page).toHaveScreenshot("calc-idle.png");
 });
 
@@ -40,5 +43,6 @@ test("calculator: 7 × 8 = 56 result frame matches golden", async ({ page }) => 
   await tapId(page, "d8");
   await tapRole(page, "button", "=");
   await waitForText(page, "56");
+  await waitForStableLayout(page);
   await expect(page).toHaveScreenshot("calc-7x8-equals-56.png");
 });
