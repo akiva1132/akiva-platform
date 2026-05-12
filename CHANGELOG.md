@@ -10,6 +10,57 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [Unreleased] — Stage 2d (horizontal scroll, LazyRow, snap, carousel)
+
+No ABI bump — Stage 2d is pure SDK-internal. Apps continue to require
+`min_abi_version = "0.13.0"`. The inspector wire format
+(`SemanticTree::WIRE_VERSION`) bumps 2 → 3 with a 1-byte axis enum
+on the optional scroll payload; v2 decoders default to `Vertical`,
+so a rolling upgrade across runtime and inspector is graceful.
+
+- **Added — `ScrollAxis` enum (Stage 2d.1).**
+  `ScrollAxis::{Vertical, Horizontal}` (Default = Vertical). Threaded
+  through `ScrollCell.axis`, `Node::Scroll.axis`, `ScrollBuilder
+  ::axis(...)`, `Ui::scroll_h(child)` factory. `feed_wheel`/`feed_
+  pointer` project deltas + slop onto the cell's main axis; no axis
+  stealing (cross-axis components drop on the floor).
+- **Added — `Node::LazyRow` + shared realisation helper (Stage 2d.2).**
+  Horizontal twin of `Node::LazyColumn` with `item_w` taking
+  `item_h`'s role. Both builders share
+  `node::realise_window(stride, viewport_main, scroll, padding_start,
+  overscan, count)` for the visible-range math.
+  - New: `Ui::lazy_row(count)` factory, `LazyRowBuilder` (mirror of
+    `LazyColumnBuilder`).
+  - Internal: `Ui::scroll_cell_viewport_h` renamed to
+    `scroll_cell_viewport_main` to reflect axis-neutral use.
+- **Added — `SnapMode` + cubic-out snap animation (Stage 2d.3).**
+  `SnapMode::{None, Item, Page}` (Default = None). Both lazy
+  builders gain `.snap(mode)`. `ScrollCell` adds `snap_mode`,
+  `item_stride`, `snap_origin`, `snap_target`, `snap_elapsed_ms`,
+  `snap_pending`. `tick_animations` becomes a three-phase machine
+  (fling decay → snap entry → snap advance); snap targets the
+  nearest stride (`Item`) or viewport-page (`Page`) and glides over
+  250 ms with `cubic_out(p) = 1 - (1 - p)^3` easing. User input
+  cancels in-flight snap so the touch always wins.
+- **Inspector wire v2 → v3 (Stage 2d.4).**
+  The optional scroll payload grows 28 → 29 bytes with a trailing
+  axis byte (0 = Vertical, 1 = Horizontal). Rust + JS decoders both
+  accept v2 input and default axis to Vertical.
+  - JS: `__akiva.scrollOf(key)` returns `axis: "vertical" |
+    "horizontal"`.
+  - e2e helper: `ScrollSemantic.axis` typed accordingly.
+- **Demo — `apps/carousel/` (Stage 2d.5).**
+  12-card horizontal pager using `LazyRow + SnapMode::Page +
+  item_w = viewport_w`. Indicator strip below the row reads
+  `Ui::scroll_offset("carousel")` and divides by viewport width to
+  render "n / 12". 12 distinct card palettes; centred 16-dp side
+  gutters so adjacent rounded surfaces never touch screen edges.
+- **Tests (Stage 2d, cumulative).**
+  - sdk-rust lib: 321 → 360 (+39 in 2d.1, .2, .3, .4).
+  - vitest (web): 240 → 244 (+4 inspector v3 / scrollOf axis).
+  - Playwright e2e: 51 → 63 (+12 carousel).
+  - Visual goldens: 5 → 6 (+ `carousel-idle-chromium-linux.png`).
+
 ## [0.13.0] — 2026-05 (Stage 2c.1 — wheel input pipeline)
 
 **MINOR** — additive: 1 new HAL event kind (`EVENT_WHEEL = 6`), 1 new

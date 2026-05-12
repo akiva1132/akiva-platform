@@ -1,6 +1,8 @@
 # Stage 2d — horizontal scroll, LazyRow, snap, carousel demo
 
-> **Status:** Planning. Builds on Stage 2c (scroll-lazycolumn-plan.md).
+> **Status:** Done (2026-05-13). All seven sub-stones landed; carousel
+> demo + 12 e2e + visual golden green. Builds on Stage 2c
+> (scroll-lazycolumn-plan.md).
 > **Owner:** Claude × akiva1132. **Target:** 5-7 commits, ~25 new tests.
 > **Why a follow-up:** Stage 2c shipped vertical-only by deliberate
 > design (smaller test surface, one moving piece at a time). Stage 2d
