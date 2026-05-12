@@ -324,12 +324,13 @@ async function clickShellLauncherRow(page: Page, rowIndex: number) {
 
 /** Boot Akiva, then click the clip-shapes launcher row. Returns once
  *  the demo's first frame has published — gated on the title text
- *  showing up in the inspector. Row index 1 because clip-shapes sits
- *  alphabetically after `articles` and `calculator`. */
+ *  showing up in the inspector. With carousel installed (Stage 2d),
+ *  the alphabetical order is articles, calculator, carousel,
+ *  clipshapes — so clipshapes sits at row 3. */
 export async function launchClipShapes(page: Page, opts: { timeoutMs?: number } = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   await bootAkiva(page, { timeoutMs });
-  await clickShellLauncherRow(page, 2);   // articles, calculator, clipshapes
+  await clickShellLauncherRow(page, 3);
   await waitForText(page, "Clip Shapes", { timeoutMs });
 }
 
@@ -342,14 +343,29 @@ export async function launchArticles(page: Page, opts: { timeoutMs?: number } = 
   await waitForText(page, "Articles", { timeoutMs });
 }
 
-/** Boot Akiva, then click the feed launcher row. Alphabetically
- *  `com.akiva.feed` sits between `com.akiva.clipshapes` (row 2) and
- *  `com.akiva.hello` (row 4), so it lands at row 3. First-paint
+/** Boot Akiva, then click the carousel launcher row. `com.akiva.carousel`
+ *  sorts between `com.akiva.calculator` (row 1) and `com.akiva.clipshapes`
+ *  (row 3), so it lands at row 2. First-paint signal is the inspector
+ *  reporting the "carousel" scroll region with axis=horizontal. */
+export async function launchCarousel(page: Page, opts: { timeoutMs?: number } = {}) {
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  await bootAkiva(page, { timeoutMs });
+  await clickShellLauncherRow(page, 2);
+  await page.waitForFunction(
+    () => (window as any).__akiva?.scrollOf("carousel") !== null,
+    null,
+    { timeout: timeoutMs },
+  );
+}
+
+/** Boot Akiva, then click the feed launcher row. With carousel
+ *  installed the alphabetical order is articles, calculator,
+ *  carousel, clipshapes, feed — so feed sits at row 4. First-paint
  *  signal is the inspector reporting the "feed" scroll region. */
 export async function launchFeed(page: Page, opts: { timeoutMs?: number } = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   await bootAkiva(page, { timeoutMs });
-  await clickShellLauncherRow(page, 3);
+  await clickShellLauncherRow(page, 4);
   await page.waitForFunction(
     () => (window as any).__akiva?.scrollOf("feed") !== null,
     null,

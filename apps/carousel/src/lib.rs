@@ -79,8 +79,14 @@ impl Activity for CarouselMain {
         let indicator_text = format!("{} / {}", page + 1, ITEM_COUNT);
         let indicator = ui.text(&indicator_text)
             .size(13.0).color(0xff15172a).build();
+        // Centred indicator strip — wrap the text in an HStack with
+        // main: Center so it sits at the bottom-centre of the
+        // viewport, not jammed against the left edge by the
+        // outer VStack's CrossAxis::Stretch.
+        let indicator_row = ui.h_stack(&[indicator])
+            .main(MainAxis::Center).build();
 
-        let root = ui.v_stack(&[title, subtitle, row, indicator])
+        let root = ui.v_stack(&[title, subtitle, row, indicator_row])
             .gap(6.0).padding_trbl(20.0, 0.0, 16.0, 0.0)
             .cross(CrossAxis::Stretch)
             .build();
