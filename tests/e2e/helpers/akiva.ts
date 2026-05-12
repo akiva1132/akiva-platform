@@ -42,6 +42,11 @@ export type ScrollSemantic = {
   firstVisibleIndex: number | null;
   lastVisibleIndex: number | null;
   itemCount: number | null;
+  /** Stage 2d.4 — scroll orientation. `"vertical"` for
+   *  `LazyColumn`/`Ui::scroll`; `"horizontal"` for
+   *  `LazyRow`/`Ui::scroll_h`. v2 wire input defaults to
+   *  `"vertical"`. */
+  axis: "vertical" | "horizontal";
 };
 
 /** Result of `scrollOf(page, "feed")` — same shape as

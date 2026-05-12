@@ -1260,6 +1260,7 @@ fn build_semantic_tree(
                     first_visible: None,
                     last_visible: None,
                     item_count: None,
+                    axis: cell.axis,
                 })
             }
             Node::LazyColumn { key, count, realized, .. }
@@ -1280,6 +1281,7 @@ fn build_semantic_tree(
                     first_visible: first,
                     last_visible: last,
                     item_count: Some(*count),
+                    axis: cell.axis,
                 })
             }
             _ => None,

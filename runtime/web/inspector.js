@@ -23,12 +23,15 @@
 // sessions). Production tabs receive the messages but ignore them, so
 // a forgotten flag is a perf miss not a correctness bug.
 //
-// Wire decoder pinned to v2 of the SDK's encode (`SemanticTree::encode`).
-// v2 adds an optional 28-byte `scroll` payload per node, gated by flag
-// bit 3, for `SemanticRole::Scroll` nodes. v1 readers won't see scroll
-// metadata but the basic node fields are otherwise identical.
-// A version mismatch is logged at warn level and the message is dropped
-// — easier to diagnose than a half-decoded tree.
+// Wire decoder pinned to v3 of the SDK's encode (`SemanticTree::encode`).
+// History:
+//   v1 — base format (parent / role / bounds / flags + id/label/value).
+//   v2 — added optional 28-byte `scroll` payload, gated by flag bit 3.
+//   v3 — `scroll` payload grew to 29 bytes with a trailing axis enum
+//        (0 = Vertical, 1 = Horizontal).
+// The decoder reads v2 and v3 cleanly; v2 input defaults axis to
+// "vertical". A version mismatch is logged at warn level and the
+// message dropped — easier to diagnose than a half-decoded tree.
 
 /** @typedef {object} SemanticNode
  *  @property {number|null} parent  Index of parent in `nodes`, or null for root.
@@ -52,7 +55,10 @@
  *  @property {{x:number,y:number,w:number,h:number}} rect  Canvas-space bounds.
  */
 
-const WIRE_VERSION = 2;
+const WIRE_VERSION = 3;
+// Single-byte enum from the SDK's `ScrollAxis` repr — must stay in
+// sync with `sdk-rust/src/ui/mod.rs::ScrollAxis`.
+const SCROLL_AXIS_NAMES = ["vertical", "horizontal"];
 
 // Stable role table — byte values pinned in the SDK's `SemanticRole`
 // enum. Translate to short strings so consumers can branch on names.
@@ -88,11 +94,10 @@ export function decodeTree(bytes) {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let p = 0;
   const version = dv.getUint8(p); p += 1;
-  // Accept v1 (legacy) and v2 (current). v1 readers see flags as
-  // `id/label/value` only — bit 3 (scroll) is impossible there, so
-  // the decoder skips the scroll branch naturally. v2 adds the
-  // optional scroll payload on `SemanticRole::Scroll` nodes.
-  if (version !== 1 && version !== WIRE_VERSION) return null;
+  // Accept v1 (legacy: no scroll flag), v2 (28-byte scroll payload
+  // without axis byte — back-compat path for rolling upgrades),
+  // and v3 (current: 29-byte scroll payload with axis trailing byte).
+  if (version !== 1 && version !== 2 && version !== WIRE_VERSION) return null;
   const count = dv.getUint32(p, true); p += 4;
   const nodes = new Array(count);
   for (let i = 0; i < count; i++) {
@@ -123,6 +128,18 @@ export function decodeTree(bytes) {
       const firstU32   = dv.getUint32(p, true);  p += 4;
       const lastU32    = dv.getUint32(p, true);  p += 4;
       const countU32   = dv.getUint32(p, true);  p += 4;
+      // v3 carries an axis enum byte; v2 input has no byte here so we
+      // default to "vertical" (the pre-2d behaviour every v2 emitter
+      // produced). Reject unknown axis values rather than silently
+      // mapping to a default — a decoder that lies hides bugs.
+      let axis = "vertical";
+      if (version >= 3) {
+        if (p + 1 > bytes.byteLength) return null;
+        const axisByte = dv.getUint8(p); p += 1;
+        const name = SCROLL_AXIS_NAMES[axisByte];
+        if (!name) return null;
+        axis = name;
+      }
       const nullable = (v) => (v === SCROLL_NULL_U32 ? null : v);
       scroll = {
         scrollY,
@@ -132,6 +149,7 @@ export function decodeTree(bytes) {
         firstVisibleIndex: nullable(firstU32),
         lastVisibleIndex:  nullable(lastU32),
         itemCount:         nullable(countU32),
+        axis,
       };
     }
     nodes[i] = {
@@ -333,6 +351,9 @@ export class Inspector {
           firstVisibleIndex: node.scroll.firstVisibleIndex,
           lastVisibleIndex:  node.scroll.lastVisibleIndex,
           itemCount: node.scroll.itemCount,
+          // v2 inputs default to "vertical" (see decodeTree); v3+
+          // carries the real axis. Carousel tests read this.
+          axis: node.scroll.axis ?? "vertical",
           rect: { x: node.rect.x, y: node.rect.y, w: node.rect.w, h: node.rect.h },
         };
       },

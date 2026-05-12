@@ -129,6 +129,66 @@ function encodeTreeV2(nodes) {
   return out;
 }
 
+/** Stage 2d.4 — encode one node with the v3 scroll payload (29 bytes
+ *  with a trailing axis enum). `axis` is the raw byte (0=vertical,
+ *  1=horizontal, anything else is the test triggering invalid-axis
+ *  rejection). */
+function encodeNodeV3({ parent = -1, role, x, y, w, h, id = null, scroll, axis = 0 }) {
+  const parts = [];
+  const pBuf = new ArrayBuffer(4);
+  new DataView(pBuf).setInt32(0, parent, true);
+  parts.push(new Uint8Array(pBuf));
+  parts.push(new Uint8Array([role]));
+  const rectBuf = new ArrayBuffer(16);
+  const rectDv = new DataView(rectBuf);
+  rectDv.setFloat32(0, x, true);
+  rectDv.setFloat32(4, y, true);
+  rectDv.setFloat32(8, w, true);
+  rectDv.setFloat32(12, h, true);
+  parts.push(new Uint8Array(rectBuf));
+  let flags = 0;
+  if (id !== null) flags |= 0b0001;
+  if (scroll)      flags |= 0b1000;
+  parts.push(new Uint8Array([flags]));
+  if (id !== null) {
+    const b = new TextEncoder().encode(id);
+    const lenBuf = new ArrayBuffer(2);
+    new DataView(lenBuf).setUint16(0, b.byteLength, true);
+    parts.push(new Uint8Array(lenBuf));
+    parts.push(b);
+  }
+  if (scroll) {
+    const sBuf = new ArrayBuffer(28);
+    const sDv = new DataView(sBuf);
+    sDv.setFloat32(0,  scroll.scrollY,    true);
+    sDv.setFloat32(4,  scroll.contentH,   true);
+    sDv.setFloat32(8,  scroll.viewportH,  true);
+    sDv.setFloat32(12, scroll.viewportW,  true);
+    sDv.setUint32(16,  scroll.firstVisible ?? 0xFFFFFFFF, true);
+    sDv.setUint32(20,  scroll.lastVisible  ?? 0xFFFFFFFF, true);
+    sDv.setUint32(24,  scroll.itemCount    ?? 0xFFFFFFFF, true);
+    parts.push(new Uint8Array(sBuf));
+    parts.push(new Uint8Array([axis]));
+  }
+  const total = parts.reduce((n, p) => n + p.byteLength, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.byteLength; }
+  return out;
+}
+
+function encodeTreeV3(nodes) {
+  const header = new Uint8Array(5);
+  header[0] = 3;
+  new DataView(header.buffer).setUint32(1, nodes.length, true);
+  const total = 5 + nodes.reduce((n, b) => n + b.byteLength, 0);
+  const out = new Uint8Array(total);
+  out.set(header, 0);
+  let off = 5;
+  for (const b of nodes) { out.set(b, off); off += b.byteLength; }
+  return out;
+}
+
 describe("decodeTree", () => {
   it("returns null on empty/short input", () => {
     expect(decodeTree(new Uint8Array(0))).toBeNull();
@@ -199,6 +259,8 @@ describe("decodeTree", () => {
     });
     const out = decodeTree(encodeTreeV2([node]));
     expect(out.version).toBe(2);
+    // v2 input → axis defaults to "vertical" (the only orientation
+    // the wire could express pre-Stage 2d).
     expect(out.nodes[0]).toEqual({
       parent: null, role: "scroll",
       x: 0, y: 0, w: 200, h: 400,
@@ -206,6 +268,7 @@ describe("decodeTree", () => {
       scroll: {
         scrollY: 312.5, contentHeight: 8400, viewportHeight: 400, viewportWidth: 200,
         firstVisibleIndex: 8, lastVisibleIndex: 17, itemCount: 80,
+        axis: "vertical",
       },
     });
   });
@@ -225,6 +288,7 @@ describe("decodeTree", () => {
     expect(s.firstVisibleIndex).toBeNull();
     expect(s.lastVisibleIndex).toBeNull();
     expect(s.itemCount).toBeNull();
+    expect(s.axis).toBe("vertical");
   });
 
   it("rejects v2 node with scroll flag but no payload", () => {
@@ -236,6 +300,49 @@ describe("decodeTree", () => {
     buf[26] = 0b1000;  // flag claims scroll payload follows…
     // …but no 28 bytes follow.
     expect(decodeTree(buf)).toBeNull();
+  });
+
+  it("decodes a v3 horizontal scroll node (LazyRow shape)", () => {
+    // Stage 2d.4 — the 29th byte carries axis (0=vertical, 1=horizontal).
+    const node = encodeNodeV3({
+      role: 6,
+      x: 0, y: 0, w: 400, h: 200,
+      id: "carousel",
+      scroll: {
+        scrollY: 800, contentH: 4800, viewportH: 400, viewportW: 200,
+        firstVisible: 2, lastVisible: 4, itemCount: 12,
+      },
+      axis: 1, // horizontal
+    });
+    const out = decodeTree(encodeTreeV3([node]));
+    expect(out.version).toBe(3);
+    expect(out.nodes[0].scroll.axis).toBe("horizontal");
+    expect(out.nodes[0].scroll.scrollY).toBe(800);
+    expect(out.nodes[0].scroll.itemCount).toBe(12);
+  });
+
+  it("rejects v3 node missing the axis byte", () => {
+    // v3 header + scroll flag + 28 of the 29 payload bytes —
+    // trailing axis byte missing, decoder must refuse.
+    const buf = new Uint8Array(5 + 4 + 1 + 16 + 1 + 28);
+    buf[0] = 3;
+    new DataView(buf.buffer).setUint32(1, 1, true);
+    new DataView(buf.buffer).setInt32(5, -1, true);
+    buf[9] = 6; // Scroll role
+    buf[26] = 0b1000;
+    // 28 zero bytes follow; no axis byte.
+    expect(decodeTree(buf)).toBeNull();
+  });
+
+  it("rejects v3 node with invalid axis byte", () => {
+    const node = encodeNodeV3({
+      role: 6,
+      x: 0, y: 0, w: 200, h: 400,
+      id: "x",
+      scroll: { scrollY: 0, contentH: 0, viewportH: 0, viewportW: 0 },
+      axis: 99,
+    });
+    expect(decodeTree(encodeTreeV3([node]))).toBeNull();
   });
 });
 
@@ -502,6 +609,8 @@ describe("Inspector", () => {
       firstVisibleIndex: 8,
       lastVisibleIndex: 17,
       itemCount: 80,
+      // v2 fixture → axis defaults to "vertical".
+      axis: "vertical",
       rect: { x: 0, y: 100, w: 200, h: 400 },
     });
     i.destroy();
@@ -511,6 +620,31 @@ describe("Inspector", () => {
     const fake = {};
     const i = new Inspector({ global: fake });
     expect(fake.__akiva.scrollOf("never-built")).toBeNull();
+    i.destroy();
+  });
+
+  it("scrollOf surfaces axis='horizontal' for LazyRow (v3 wire)", () => {
+    // The 2d.4 wire bump carries axis on the scroll payload; tests
+    // gate carousel behaviour on this field.
+    const fake = {};
+    const i = new Inspector({ global: fake });
+    const tree = encodeTreeV3([
+      encodeNodeV3({
+        role: 6,
+        x: 0, y: 100, w: 400, h: 200,
+        id: "carousel",
+        scroll: {
+          scrollY: 800, contentH: 4800, viewportH: 400, viewportW: 200,
+          firstVisible: 2, lastVisible: 4, itemCount: 12,
+        },
+        axis: 1,
+      }),
+    ]);
+    i.apply({ packageId: "pkg", handle: 7, tree });
+    const s = fake.__akiva.scrollOf("carousel");
+    expect(s.axis).toBe("horizontal");
+    expect(s.itemCount).toBe(12);
+    expect(s.scrollY).toBe(800);
     i.destroy();
   });
 });
