@@ -30,20 +30,30 @@
 //!   keys it on the host side; multiple activities composing on one
 //!   display each emit their own tree.
 //!
-//! ## Wire format (version 1, all little-endian)
+//! ## Wire format (version 2, all little-endian)
 //!
 //! ```text
-//! [version: u8 = 1]
+//! [version: u8 = 2]
 //! [count: u32]
 //! repeat count:
 //!   [parent_idx: i32]   // -1 for the root; otherwise an index into this same blob
 //!   [role: u8]          // SemanticRole repr
 //!   [x: f32 | y: f32 | w: f32 | h: f32]   // physical pixels
-//!   [flags: u8]         // bit 0 has_id, bit 1 has_label, bit 2 has_value
+//!   [flags: u8]         // bit 0 has_id, bit 1 has_label, bit 2 has_value,
+//!                       // bit 3 has_scroll
 //!   [id_len: u16    | id: utf8 ]?         // present iff flags & 1
 //!   [label_len: u16 | label: utf8]?       // present iff flags & 2
 //!   [value_len: u16 | value: utf8]?       // present iff flags & 4
+//!   [scroll: 28 bytes]?                   // present iff flags & 8
+//!     scroll = scroll_y: f32 | content_h: f32 | viewport_h: f32 | viewport_w: f32
+//!            | first_visible: u32 (or 0xFFFFFFFF = null)
+//!            | last_visible:  u32 (or 0xFFFFFFFF = null)
+//!            | item_count:    u32 (or 0xFFFFFFFF = null)
 //! ```
+//!
+//! Version bump from 1 → 2 adds the `scroll` optional payload. Old
+//! decoders reading v1 bytes still work; v2 emitters only set bit 3
+//! for [`SemanticRole::Scroll`] nodes that carry scroll state.
 //!
 //! The `parent_idx` channel is enough for a host to reconstruct the
 //! tree structure; a depth-first walk of the input naturally produces
@@ -100,6 +110,21 @@ impl SemanticRole {
     }
 }
 
+/// Scroll-region metadata published alongside a [`SemanticRole::Scroll`]
+/// node. `first_visible` / `last_visible` / `item_count` are `None`
+/// for plain `Node::Scroll` (only meaningful for virtualised lists);
+/// `Node::LazyColumn` populates all three.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollSemantic {
+    pub scroll_y:      f32,
+    pub content_h:     f32,
+    pub viewport_h:    f32,
+    pub viewport_w:    f32,
+    pub first_visible: Option<u32>,
+    pub last_visible:  Option<u32>,
+    pub item_count:    Option<u32>,
+}
+
 /// One node in a [`SemanticTree`]. `parent` is `None` for the root,
 /// `Some(idx)` for everything else where `idx` references an earlier
 /// position in the same tree's `nodes` vector.
@@ -129,6 +154,11 @@ pub struct SemanticNode {
     /// Checkbox checked state, Slider position, etc.). Decoders that
     /// don't recognise it ignore.
     pub value:  Option<String>,
+    /// Stage 2c.6 — scroll-region metadata, present iff this node is
+    /// a [`SemanticRole::Scroll`]. Surfaces scroll position +
+    /// content extent + visible-range so tests can assert "scroll_y
+    /// in [380, 420] after wheel(400)" without sampling pixels.
+    pub scroll: Option<ScrollSemantic>,
 }
 
 /// Flat semantic projection of one frame's worth of widget tree.
@@ -139,8 +169,13 @@ pub struct SemanticTree {
     pub nodes: Vec<SemanticNode>,
 }
 
+/// Sentinel u32 written for optional `first_visible`/`last_visible`/
+/// `item_count` fields when the source value is `None`. Picked at
+/// `u32::MAX` because a real count / index would never reach there.
+const SCROLL_NULL_U32: u32 = 0xFFFF_FFFF;
+
 impl SemanticTree {
-    pub const WIRE_VERSION: u8 = 1;
+    pub const WIRE_VERSION: u8 = 2;
 
     pub fn new() -> Self { Self { nodes: Vec::new() } }
 
@@ -177,13 +212,23 @@ impl SemanticTree {
             out.extend_from_slice(&n.w.to_le_bytes());
             out.extend_from_slice(&n.h.to_le_bytes());
             let mut flags: u8 = 0;
-            if n.id.is_some()    { flags |= 0b001; }
-            if n.label.is_some() { flags |= 0b010; }
-            if n.value.is_some() { flags |= 0b100; }
+            if n.id.is_some()    { flags |= 0b0001; }
+            if n.label.is_some() { flags |= 0b0010; }
+            if n.value.is_some() { flags |= 0b0100; }
+            if n.scroll.is_some() { flags |= 0b1000; }
             out.push(flags);
             if let Some(s) = &n.id    { write_str(&mut out, s); }
             if let Some(s) = &n.label { write_str(&mut out, s); }
             if let Some(s) = &n.value { write_str(&mut out, s); }
+            if let Some(s) = &n.scroll {
+                out.extend_from_slice(&s.scroll_y.to_le_bytes());
+                out.extend_from_slice(&s.content_h.to_le_bytes());
+                out.extend_from_slice(&s.viewport_h.to_le_bytes());
+                out.extend_from_slice(&s.viewport_w.to_le_bytes());
+                out.extend_from_slice(&s.first_visible.unwrap_or(SCROLL_NULL_U32).to_le_bytes());
+                out.extend_from_slice(&s.last_visible.unwrap_or(SCROLL_NULL_U32).to_le_bytes());
+                out.extend_from_slice(&s.item_count.unwrap_or(SCROLL_NULL_U32).to_le_bytes());
+            }
         }
         out
     }
@@ -222,10 +267,29 @@ impl SemanticTree {
             let w = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
             let h = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
             let flags = bytes[p]; p += 1;
-            let id    = if flags & 0b001 != 0 { Some(read_str(bytes, &mut p)?) } else { None };
-            let label = if flags & 0b010 != 0 { Some(read_str(bytes, &mut p)?) } else { None };
-            let value = if flags & 0b100 != 0 { Some(read_str(bytes, &mut p)?) } else { None };
-            tree.nodes.push(SemanticNode { parent, role, x, y, w, h, id, label, value });
+            let id    = if flags & 0b0001 != 0 { Some(read_str(bytes, &mut p)?) } else { None };
+            let label = if flags & 0b0010 != 0 { Some(read_str(bytes, &mut p)?) } else { None };
+            let value = if flags & 0b0100 != 0 { Some(read_str(bytes, &mut p)?) } else { None };
+            let scroll = if flags & 0b1000 != 0 {
+                if bytes.len() < p + 28 { return None; }
+                let scroll_y   = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+                let content_h  = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+                let viewport_h = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+                let viewport_w = f32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+                let fv = u32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+                let lv = u32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+                let ic = u32::from_le_bytes(bytes[p..p + 4].try_into().ok()?); p += 4;
+                let null_if_max = |v: u32| if v == SCROLL_NULL_U32 { None } else { Some(v) };
+                Some(ScrollSemantic {
+                    scroll_y, content_h, viewport_h, viewport_w,
+                    first_visible: null_if_max(fv),
+                    last_visible:  null_if_max(lv),
+                    item_count:    null_if_max(ic),
+                })
+            } else {
+                None
+            };
+            tree.nodes.push(SemanticNode { parent, role, x, y, w, h, id, label, value, scroll });
         }
         Some(tree)
     }
@@ -261,7 +325,7 @@ mod tests {
         let bytes = t.encode();
         let back = SemanticTree::decode(&bytes).expect("decode");
         assert_eq!(t, back);
-        assert_eq!(bytes, vec![1, 0, 0, 0, 0]);
+        assert_eq!(bytes, vec![2, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -271,6 +335,7 @@ mod tests {
             parent: None, role: SemanticRole::Button,
             x: 10.0, y: 20.0, w: 100.0, h: 40.0,
             id: Some("ok".into()), label: Some("OK".into()), value: None,
+            scroll: None,
         });
         let bytes = t.encode();
         let back = SemanticTree::decode(&bytes).expect("decode");
@@ -283,17 +348,18 @@ mod tests {
         let root = t.push(SemanticNode {
             parent: None, role: SemanticRole::Group,
             x: 0.0, y: 0.0, w: 800.0, h: 600.0,
-            id: None, label: None, value: None,
+            id: None, label: None, value: None, scroll: None,
         });
         t.push(SemanticNode {
             parent: Some(root), role: SemanticRole::Text,
             x: 16.0, y: 16.0, w: 200.0, h: 24.0,
-            id: None, label: Some("Hello".into()), value: None,
+            id: None, label: Some("Hello".into()), value: None, scroll: None,
         });
         t.push(SemanticNode {
             parent: Some(root), role: SemanticRole::Button,
             x: 16.0, y: 60.0, w: 80.0, h: 36.0,
             id: Some("go".into()), label: Some("Go".into()), value: None,
+            scroll: None,
         });
         let bytes = t.encode();
         let back = SemanticTree::decode(&bytes).expect("decode");
@@ -305,17 +371,60 @@ mod tests {
     }
 
     #[test]
+    fn scroll_node_round_trips_with_metadata() {
+        let mut t = SemanticTree::new();
+        t.push(SemanticNode {
+            parent: None, role: SemanticRole::Scroll,
+            x: 0.0, y: 0.0, w: 200.0, h: 400.0,
+            id: Some("feed".into()), label: None, value: None,
+            scroll: Some(ScrollSemantic {
+                scroll_y: 312.5, content_h: 8400.0,
+                viewport_h: 400.0, viewport_w: 200.0,
+                first_visible: Some(8),
+                last_visible:  Some(17),
+                item_count:    Some(80),
+            }),
+        });
+        let bytes = t.encode();
+        let back = SemanticTree::decode(&bytes).expect("decode");
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn scroll_node_with_null_index_fields() {
+        // Plain Scroll (non-LazyColumn) has null first/last/count.
+        let mut t = SemanticTree::new();
+        t.push(SemanticNode {
+            parent: None, role: SemanticRole::Scroll,
+            x: 0.0, y: 0.0, w: 200.0, h: 400.0,
+            id: Some("body".into()), label: None, value: None,
+            scroll: Some(ScrollSemantic {
+                scroll_y: 50.0, content_h: 1000.0,
+                viewport_h: 400.0, viewport_w: 200.0,
+                first_visible: None, last_visible: None, item_count: None,
+            }),
+        });
+        let bytes = t.encode();
+        let back = SemanticTree::decode(&bytes).expect("decode");
+        assert_eq!(t, back);
+        let s = back.nodes[0].scroll.unwrap();
+        assert_eq!(s.first_visible, None);
+        assert_eq!(s.last_visible, None);
+        assert_eq!(s.item_count, None);
+    }
+
+    #[test]
     fn truncated_blob_returns_none() {
         // Partial header — count missing.
-        assert!(SemanticTree::decode(&[1, 0, 0]).is_none());
+        assert!(SemanticTree::decode(&[2, 0, 0]).is_none());
         // Header claims one node but the body is empty.
-        assert!(SemanticTree::decode(&[1, 1, 0, 0, 0]).is_none());
+        assert!(SemanticTree::decode(&[2, 1, 0, 0, 0]).is_none());
     }
 
     #[test]
     fn unknown_role_returns_none() {
-        // version=1, count=1, parent=-1, role=99, ...
-        let mut bytes = vec![1u8, 1, 0, 0, 0];
+        // version=2, count=1, parent=-1, role=99, ...
+        let mut bytes = vec![2u8, 1, 0, 0, 0];
         bytes.extend_from_slice(&(-1i32).to_le_bytes());
         bytes.push(99);  // bad role
         bytes.extend_from_slice(&0f32.to_le_bytes());
@@ -323,6 +432,21 @@ mod tests {
         bytes.extend_from_slice(&0f32.to_le_bytes());
         bytes.extend_from_slice(&0f32.to_le_bytes());
         bytes.push(0);
+        assert!(SemanticTree::decode(&bytes).is_none());
+    }
+
+    #[test]
+    fn truncated_scroll_payload_returns_none() {
+        // version=2 + 1 node + scroll flag set but no 28-byte payload.
+        let mut bytes = vec![2u8, 1, 0, 0, 0];
+        bytes.extend_from_slice(&(-1i32).to_le_bytes());
+        bytes.push(6); // Scroll role
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        bytes.push(0b1000);  // flag says scroll payload follows…
+        // …but it doesn't.
         assert!(SemanticTree::decode(&bytes).is_none());
     }
 

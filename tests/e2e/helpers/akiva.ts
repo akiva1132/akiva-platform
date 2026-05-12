@@ -27,6 +27,29 @@ export type Widget = {
   label: string | null;
   value: string | null;
   rect: { x: number; y: number; w: number; h: number };
+  scroll?: ScrollSemantic | null;
+};
+
+/** Stage 2c.6 — scroll-region state surfaced by the inspector.
+ *  `firstVisibleIndex` / `lastVisibleIndex` / `itemCount` are null
+ *  for plain `Node::Scroll`; `Node::LazyColumn` populates the trio
+ *  so tests can assert "visible range advanced by 5 rows". */
+export type ScrollSemantic = {
+  scrollY: number;
+  contentHeight: number;
+  viewportHeight: number;
+  viewportWidth: number;
+  firstVisibleIndex: number | null;
+  lastVisibleIndex: number | null;
+  itemCount: number | null;
+};
+
+/** Result of `scrollOf(page, "feed")` — same shape as
+ *  `__akiva.scrollOf` returns. `null` when no scroll region by that
+ *  key has published in the most recent frame. */
+export type ScrollSnapshot = ScrollSemantic & {
+  key: string;
+  rect: { x: number; y: number; w: number; h: number };
 };
 
 /** Centre of a widget in CSS-pixel page coordinates, ready for
@@ -199,6 +222,22 @@ export async function waitForStableLayout(
     },
     { need, min },
     { timeout: timeoutMs },
+  );
+}
+
+/** Stage 2c.6 — scroll-region introspection. Returns
+ *  `__akiva.scrollOf(key)`, the most recent scroll state the SDK
+ *  published for `key`, or `null` when no `Node::Scroll` /
+ *  `Node::LazyColumn` with that key has been built in the latest
+ *  frame. Typical use:
+ *    const s = await scrollOf(page, "feed");
+ *    expect(s?.scrollY).toBeGreaterThan(0);
+ *    expect(s?.firstVisibleIndex).toBe(5);
+ */
+export async function scrollOf(page: Page, key: string): Promise<ScrollSnapshot | null> {
+  return page.evaluate(
+    (key) => (window as any).__akiva?.scrollOf(key) ?? null,
+    key,
   );
 }
 

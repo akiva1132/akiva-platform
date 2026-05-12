@@ -71,6 +71,64 @@ function encodeTree(nodes) {
   return out;
 }
 
+/** Stage 2c.6 — encode one node with the optional scroll payload (v2).
+ *  `scroll` has shape `{scrollY, contentH, viewportH, viewportW,
+ *  firstVisible|null, lastVisible|null, itemCount|null}`. */
+function encodeNodeV2({ parent = -1, role, x, y, w, h, id = null, scroll }) {
+  const parts = [];
+  const pBuf = new ArrayBuffer(4);
+  new DataView(pBuf).setInt32(0, parent, true);
+  parts.push(new Uint8Array(pBuf));
+  parts.push(new Uint8Array([role]));
+  const rectBuf = new ArrayBuffer(16);
+  const rectDv = new DataView(rectBuf);
+  rectDv.setFloat32(0, x, true);
+  rectDv.setFloat32(4, y, true);
+  rectDv.setFloat32(8, w, true);
+  rectDv.setFloat32(12, h, true);
+  parts.push(new Uint8Array(rectBuf));
+  let flags = 0;
+  if (id !== null) flags |= 0b0001;
+  if (scroll)      flags |= 0b1000;
+  parts.push(new Uint8Array([flags]));
+  if (id !== null) {
+    const b = new TextEncoder().encode(id);
+    const lenBuf = new ArrayBuffer(2);
+    new DataView(lenBuf).setUint16(0, b.byteLength, true);
+    parts.push(new Uint8Array(lenBuf));
+    parts.push(b);
+  }
+  if (scroll) {
+    const sBuf = new ArrayBuffer(28);
+    const sDv = new DataView(sBuf);
+    sDv.setFloat32(0,  scroll.scrollY,    true);
+    sDv.setFloat32(4,  scroll.contentH,   true);
+    sDv.setFloat32(8,  scroll.viewportH,  true);
+    sDv.setFloat32(12, scroll.viewportW,  true);
+    sDv.setUint32(16,  scroll.firstVisible ?? 0xFFFFFFFF, true);
+    sDv.setUint32(20,  scroll.lastVisible  ?? 0xFFFFFFFF, true);
+    sDv.setUint32(24,  scroll.itemCount    ?? 0xFFFFFFFF, true);
+    parts.push(new Uint8Array(sBuf));
+  }
+  const total = parts.reduce((n, p) => n + p.byteLength, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.byteLength; }
+  return out;
+}
+
+function encodeTreeV2(nodes) {
+  const header = new Uint8Array(5);
+  header[0] = 2;
+  new DataView(header.buffer).setUint32(1, nodes.length, true);
+  const total = 5 + nodes.reduce((n, b) => n + b.byteLength, 0);
+  const out = new Uint8Array(total);
+  out.set(header, 0);
+  let off = 5;
+  for (const b of nodes) { out.set(b, off); off += b.byteLength; }
+  return out;
+}
+
 describe("decodeTree", () => {
   it("returns null on empty/short input", () => {
     expect(decodeTree(new Uint8Array(0))).toBeNull();
@@ -97,7 +155,7 @@ describe("decodeTree", () => {
     expect(out.nodes[0]).toEqual({
       parent: null, role: "button",
       x: 10, y: 20, w: 100, h: 40,
-      id: "ok", label: "OK", value: null,
+      id: "ok", label: "OK", value: null, scroll: null,
     });
   });
 
@@ -127,6 +185,57 @@ describe("decodeTree", () => {
   it("rejects unknown role byte", () => {
     const bad = encodeNode({ role: 99, x: 0, y: 0, w: 0, h: 0 });
     expect(decodeTree(encodeTree([bad]))).toBeNull();
+  });
+
+  it("decodes a v2 scroll node with full metadata (LazyColumn shape)", () => {
+    const node = encodeNodeV2({
+      role: 6,
+      x: 0, y: 0, w: 200, h: 400,
+      id: "feed",
+      scroll: {
+        scrollY: 312.5, contentH: 8400, viewportH: 400, viewportW: 200,
+        firstVisible: 8, lastVisible: 17, itemCount: 80,
+      },
+    });
+    const out = decodeTree(encodeTreeV2([node]));
+    expect(out.version).toBe(2);
+    expect(out.nodes[0]).toEqual({
+      parent: null, role: "scroll",
+      x: 0, y: 0, w: 200, h: 400,
+      id: "feed", label: null, value: null,
+      scroll: {
+        scrollY: 312.5, contentHeight: 8400, viewportHeight: 400, viewportWidth: 200,
+        firstVisibleIndex: 8, lastVisibleIndex: 17, itemCount: 80,
+      },
+    });
+  });
+
+  it("decodes a v2 scroll node with null index fields (plain Scroll shape)", () => {
+    const node = encodeNodeV2({
+      role: 6,
+      x: 0, y: 0, w: 200, h: 400,
+      id: "body",
+      scroll: {
+        scrollY: 50, contentH: 1000, viewportH: 400, viewportW: 200,
+        // first/last/count null = 0xFFFFFFFF on the wire
+      },
+    });
+    const out = decodeTree(encodeTreeV2([node]));
+    const s = out.nodes[0].scroll;
+    expect(s.firstVisibleIndex).toBeNull();
+    expect(s.lastVisibleIndex).toBeNull();
+    expect(s.itemCount).toBeNull();
+  });
+
+  it("rejects v2 node with scroll flag but no payload", () => {
+    const buf = new Uint8Array(5 + 4 + 1 + 16 + 1);
+    buf[0] = 2;
+    new DataView(buf.buffer).setUint32(1, 1, true);
+    new DataView(buf.buffer).setInt32(5, -1, true);
+    buf[9] = 6; // Scroll role
+    buf[26] = 0b1000;  // flag claims scroll payload follows…
+    // …but no 28 bytes follow.
+    expect(decodeTree(buf)).toBeNull();
   });
 });
 
@@ -367,6 +476,42 @@ describe("Inspector", () => {
       fast.destroy();
       resolve(undefined);
     }, 20));
+  });
+
+  it("scrollOf returns the named scroll region's full state", () => {
+    const fake = {};
+    const i = new Inspector({ global: fake });
+    const tree = encodeTreeV2([
+      encodeNodeV2({
+        role: 6, x: 0, y: 100, w: 200, h: 400,
+        id: "feed",
+        scroll: {
+          scrollY: 600, contentH: 8400, viewportH: 400, viewportW: 200,
+          firstVisible: 8, lastVisible: 17, itemCount: 80,
+        },
+      }),
+    ]);
+    i.apply({ packageId: "pkg", handle: 5, tree });
+    const s = fake.__akiva.scrollOf("feed");
+    expect(s).toEqual({
+      key: "feed",
+      scrollY: 600,
+      contentHeight: 8400,
+      viewportHeight: 400,
+      viewportWidth: 200,
+      firstVisibleIndex: 8,
+      lastVisibleIndex: 17,
+      itemCount: 80,
+      rect: { x: 0, y: 100, w: 200, h: 400 },
+    });
+    i.destroy();
+  });
+
+  it("scrollOf returns null for unknown key", () => {
+    const fake = {};
+    const i = new Inspector({ global: fake });
+    expect(fake.__akiva.scrollOf("never-built")).toBeNull();
+    i.destroy();
   });
 });
 

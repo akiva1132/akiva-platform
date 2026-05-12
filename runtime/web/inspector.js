@@ -23,7 +23,10 @@
 // sessions). Production tabs receive the messages but ignore them, so
 // a forgotten flag is a perf miss not a correctness bug.
 //
-// Wire decoder pinned to v1 of the SDK's encode (`SemanticTree::encode`).
+// Wire decoder pinned to v2 of the SDK's encode (`SemanticTree::encode`).
+// v2 adds an optional 28-byte `scroll` payload per node, gated by flag
+// bit 3, for `SemanticRole::Scroll` nodes. v1 readers won't see scroll
+// metadata but the basic node fields are otherwise identical.
 // A version mismatch is logged at warn level and the message is dropped
 // — easier to diagnose than a half-decoded tree.
 
@@ -49,11 +52,16 @@
  *  @property {{x:number,y:number,w:number,h:number}} rect  Canvas-space bounds.
  */
 
-const WIRE_VERSION = 1;
+const WIRE_VERSION = 2;
 
 // Stable role table — byte values pinned in the SDK's `SemanticRole`
 // enum. Translate to short strings so consumers can branch on names.
-const ROLE_NAMES = ["group", "text", "button", "image", "rect", "spacer"];
+const ROLE_NAMES = ["group", "text", "button", "image", "rect", "spacer", "scroll"];
+
+// `0xFFFFFFFF` is the SDK's sentinel for "this index field is null"
+// (plain `Node::Scroll` populates first_visible / last_visible /
+// item_count as `None`; `Node::LazyColumn` populates them).
+const SCROLL_NULL_U32 = 0xFFFFFFFF;
 
 /** True iff the inspector should mount on this page load. Honours
  *  both the URL flag (`?inspector=1`) and a sticky localStorage
@@ -80,7 +88,11 @@ export function decodeTree(bytes) {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let p = 0;
   const version = dv.getUint8(p); p += 1;
-  if (version !== WIRE_VERSION) return null;
+  // Accept v1 (legacy) and v2 (current). v1 readers see flags as
+  // `id/label/value` only — bit 3 (scroll) is impossible there, so
+  // the decoder skips the scroll branch naturally. v2 adds the
+  // optional scroll payload on `SemanticRole::Scroll` nodes.
+  if (version !== 1 && version !== WIRE_VERSION) return null;
   const count = dv.getUint32(p, true); p += 4;
   const nodes = new Array(count);
   for (let i = 0; i < count; i++) {
@@ -94,18 +106,39 @@ export function decodeTree(bytes) {
     const flags = dv.getUint8(p); p += 1;
     const role = ROLE_NAMES[roleByte];
     if (!role) return null;
-    const hasId    = !!(flags & 0b001);
-    const hasLabel = !!(flags & 0b010);
-    const hasValue = !!(flags & 0b100);
-    let id = null, label = null, value = null;
+    const hasId     = !!(flags & 0b0001);
+    const hasLabel  = !!(flags & 0b0010);
+    const hasValue  = !!(flags & 0b0100);
+    const hasScroll = !!(flags & 0b1000);
+    let id = null, label = null, value = null, scroll = null;
     if (hasId)    { const r = readStr(bytes, dv, p); if (!r) return null; id    = r.s; p = r.p; }
     if (hasLabel) { const r = readStr(bytes, dv, p); if (!r) return null; label = r.s; p = r.p; }
     if (hasValue) { const r = readStr(bytes, dv, p); if (!r) return null; value = r.s; p = r.p; }
+    if (hasScroll) {
+      if (p + 28 > bytes.byteLength) return null;
+      const scrollY    = dv.getFloat32(p, true); p += 4;
+      const contentH   = dv.getFloat32(p, true); p += 4;
+      const viewportH  = dv.getFloat32(p, true); p += 4;
+      const viewportW  = dv.getFloat32(p, true); p += 4;
+      const firstU32   = dv.getUint32(p, true);  p += 4;
+      const lastU32    = dv.getUint32(p, true);  p += 4;
+      const countU32   = dv.getUint32(p, true);  p += 4;
+      const nullable = (v) => (v === SCROLL_NULL_U32 ? null : v);
+      scroll = {
+        scrollY,
+        contentHeight: contentH,
+        viewportHeight: viewportH,
+        viewportWidth: viewportW,
+        firstVisibleIndex: nullable(firstU32),
+        lastVisibleIndex:  nullable(lastU32),
+        itemCount:         nullable(countU32),
+      };
+    }
     nodes[i] = {
       parent: parentI32 < 0 ? null : parentI32,
       role,
       x, y, w, h,
-      id, label, value,
+      id, label, value, scroll,
     };
   }
   return { version, nodes };
@@ -279,6 +312,30 @@ export class Inspector {
       },
       /** Return every match for a structured query. */
       queryAll(q = {}) { return self._findAll((n) => matchesQuery(n, q)); },
+      /** Stage 2c.6 — scroll-region introspection. Returns a snapshot
+       *  of the named scroll region's persistent state, or null when
+       *  no `Node::Scroll` / `Node::LazyColumn` with that key has
+       *  published in the most recent frame. Useful for tests:
+       *    await page.evaluate(() => __akiva.scrollOf("feed").scrollY)
+       *  Plain `Node::Scroll` has null firstVisibleIndex /
+       *  lastVisibleIndex / itemCount; `Node::LazyColumn` populates
+       *  the index range so a test can assert "visible window
+       *  advanced by 5 rows after scroll". */
+      scrollOf(key) {
+        const node = self._findFirst((n) => n.role === "scroll" && n.id === key);
+        if (!node || !node.scroll) return null;
+        return {
+          key,
+          scrollY: node.scroll.scrollY,
+          contentHeight: node.scroll.contentHeight,
+          viewportHeight: node.scroll.viewportHeight,
+          viewportWidth: node.scroll.viewportWidth,
+          firstVisibleIndex: node.scroll.firstVisibleIndex,
+          lastVisibleIndex:  node.scroll.lastVisibleIndex,
+          itemCount: node.scroll.itemCount,
+          rect: { x: node.rect.x, y: node.rect.y, w: node.rect.w, h: node.rect.h },
+        };
+      },
     };
     if (this._global) this._global.__akiva = this._api;
   }
@@ -332,6 +389,11 @@ function makeMatch(a, n, transform) {
     label: n.label,
     value: n.value,
     rect: { x, y, w, h },
+    // Stage 2c.6 — scroll metadata threaded straight through so
+    // `__akiva.scrollOf(key)` can read it off a match without a
+    // second lookup. `null` for non-scroll roles, populated for
+    // SemanticRole::Scroll (both plain Scroll and LazyColumn).
+    scroll: n.scroll ?? null,
   };
 }
 

@@ -861,7 +861,9 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         // is the in-process / test fixture sentinel — skip emission
         // there since there's no host to receive it.
         if self.handle != 0 {
-            let tree = build_semantic_tree(&self.nodes, root, &rects);
+            let tree = build_semantic_tree(
+                &self.nodes, root, &rects, &self.state.scroll_states,
+            );
             if !tree.is_empty() {
                 let bytes = tree.encode();
                 crate::runtime::host_publish_semantics(self.handle, &bytes);
@@ -899,12 +901,14 @@ fn build_semantic_tree(
     nodes: &[Node],
     root: NodeId,
     rects: &HashMap<NodeId, Rect>,
+    scroll_states: &HashMap<String, ScrollCell>,
 ) -> semantics::SemanticTree {
-    use semantics::{SemanticNode, SemanticRole, SemanticTree};
+    use semantics::{ScrollSemantic, SemanticNode, SemanticRole, SemanticTree};
     let mut tree = SemanticTree::new();
     fn visit(
         nodes: &[Node],
         rects: &HashMap<NodeId, Rect>,
+        scroll_states: &HashMap<String, ScrollCell>,
         tree: &mut SemanticTree,
         node_id: NodeId,
         parent: Option<u32>,
@@ -941,10 +945,49 @@ fn build_semantic_tree(
         } else {
             None
         };
+        // Stage 2c.6 — pack scroll-region metadata into the semantic
+        // node so the inspector can publish scroll_y, content_h, the
+        // visible index range, etc. without an out-of-band channel.
+        // Plain `Node::Scroll` has null first/last/count; only
+        // virtualisers populate the index trio.
+        let scroll = match node {
+            Node::Scroll { key, .. } => {
+                let cell = scroll_states.get(key).copied().unwrap_or_default();
+                Some(ScrollSemantic {
+                    scroll_y: cell.scroll_y,
+                    content_h: cell.content_h,
+                    viewport_h: cell.viewport_h,
+                    viewport_w: cell.viewport_w,
+                    first_visible: None,
+                    last_visible: None,
+                    item_count: None,
+                })
+            }
+            Node::LazyColumn { key, count, realized, .. } => {
+                let cell = scroll_states.get(key).copied().unwrap_or_default();
+                let (first, last) = if let (Some((f, _)), Some((l, _))) =
+                    (realized.first(), realized.last())
+                {
+                    (Some(*f), Some(*l))
+                } else {
+                    (None, None)
+                };
+                Some(ScrollSemantic {
+                    scroll_y: cell.scroll_y,
+                    content_h: cell.content_h,
+                    viewport_h: cell.viewport_h,
+                    viewport_w: cell.viewport_w,
+                    first_visible: first,
+                    last_visible: last,
+                    item_count: Some(*count),
+                })
+            }
+            _ => None,
+        };
         let idx = tree.push(SemanticNode {
             parent, role,
             x: rect.x, y: rect.y, w: rect.w, h: rect.h,
-            id, label, value,
+            id, label, value, scroll,
         });
         // Recurse into containers. Order matches paint order so the
         // semantic tree's z-order reflects what's on screen — useful
@@ -955,21 +998,21 @@ fn build_semantic_tree(
             | Node::Frame  { children, .. }
             | Node::Grid   { children, .. } => {
                 for c in children {
-                    visit(nodes, rects, tree, *c, Some(idx));
+                    visit(nodes, rects, scroll_states, tree, *c, Some(idx));
                 }
             }
             Node::Scroll { child, .. } => {
-                visit(nodes, rects, tree, *child, Some(idx));
+                visit(nodes, rects, scroll_states, tree, *child, Some(idx));
             }
             Node::LazyColumn { realized, .. } => {
                 for (_, c) in realized {
-                    visit(nodes, rects, tree, *c, Some(idx));
+                    visit(nodes, rects, scroll_states, tree, *c, Some(idx));
                 }
             }
             _ => {}
         }
     }
-    visit(nodes, rects, &mut tree, root, None);
+    visit(nodes, rects, scroll_states, &mut tree, root, None);
     tree
 }
 
@@ -1905,7 +1948,7 @@ mod tests {
             Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
             &sizes, &HashMap::new(), &mut rects,
         );
-        let tree = build_semantic_tree(&nodes, 1, &rects);
+        let tree = build_semantic_tree(&nodes, 1, &rects, &HashMap::new());
         let root = &tree.nodes[0];
         assert_eq!(root.role, semantics::SemanticRole::Scroll);
         assert_eq!(root.id.as_deref(), Some("feed"));
@@ -2172,7 +2215,7 @@ mod tests {
             Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
             &sizes, &scroll_offsets, &mut rects,
         );
-        let tree = build_semantic_tree(&nodes, 1, &rects);
+        let tree = build_semantic_tree(&nodes, 1, &rects, &HashMap::new());
         assert!(!tree.nodes.is_empty());
         let root = &tree.nodes[0];
         assert_eq!(root.role, semantics::SemanticRole::Scroll);
