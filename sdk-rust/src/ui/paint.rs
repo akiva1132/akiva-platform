@@ -128,11 +128,11 @@ fn paint_node(
             paint_node(nodes, *child, rects, clicked_ids, text_width, canvas);
             canvas.pop_clip();
         }
-        Node::LazyColumn { realized, .. } => {
+        Node::LazyColumn { realized, .. } | Node::LazyRow { realized, .. } => {
             // Same viewport-clip shape as Scroll. Items in `realized`
             // already have their post-scroll rects placed; we paint
             // them in index order (which matches paint order — bottom-
-            // index = top of screen content).
+            // index = leading edge content).
             canvas.push_clip(rect.x, rect.y, rect.w, rect.h);
             for (_, c) in realized {
                 paint_node(nodes, *c, rects, clicked_ids, text_width, canvas);

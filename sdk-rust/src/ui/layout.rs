@@ -257,6 +257,19 @@ fn measure_node(
             }
             (outer_w, outer_h)
         }
+        Node::LazyRow { viewport_w, viewport_h, padding, item_w, realized, .. } => {
+            // Horizontal twin: viewport from locked size or slot,
+            // item slot is `(item_w, inner_h)` so cards inside have
+            // a well-defined height to fill on the cross axis.
+            let outer_w = viewport_w.unwrap_or(avail.0);
+            let outer_h = viewport_h.unwrap_or(avail.1);
+            let inner_h = (outer_h - padding.0 - padding.2).max(0.0);
+            let item_avail = (*item_w, inner_h);
+            for (_, child) in realized {
+                let _ = measure_node(nodes, *child, item_avail, text_width, out);
+            }
+            (outer_w, outer_h)
+        }
         Node::Frame { children, padding, size, .. } => {
             // Z-stack: children overlap, so intrinsic = max child size on
             // each axis (not sum). Padding adds to both sides like stacks.
@@ -404,6 +417,10 @@ fn place(
             w = viewport_w.unwrap_or(slot.w);
             h = viewport_h.unwrap_or(slot.h);
         }
+        Node::LazyRow { viewport_w, viewport_h, .. } => {
+            w = viewport_w.unwrap_or(slot.w);
+            h = viewport_h.unwrap_or(slot.h);
+        }
         _ => {}
     }
     let rect = Rect { x: slot.x, y: slot.y, w, h };
@@ -504,6 +521,26 @@ fn place(
             for (idx, child) in realized {
                 let y = inner_y_origin + (*idx as f32) * stride;
                 let item_slot = Rect { x: inner_x, y, w: inner_w, h: *item_h };
+                place(
+                    nodes, attrs, *child, item_slot,
+                    /*stretch_w=*/ true, /*stretch_h=*/ true,
+                    sizes, scroll_offsets, out,
+                );
+            }
+        }
+        Node::LazyRow { key, item_w, gap, padding, realized, .. } => {
+            // Horizontal twin: each realised item sits at column-x
+            // in content coords, shifted left by scroll (the main
+            // axis is x; the cell's `scroll_y` field is the x-offset
+            // — see ScrollCell docs).
+            let scroll = scroll_offsets.get(key).copied().unwrap_or(0.0);
+            let stride = *item_w + *gap;
+            let inner_y = rect.y + padding.0;
+            let inner_h = (rect.h - padding.0 - padding.2).max(0.0);
+            let inner_x_origin = rect.x + padding.3 - scroll;
+            for (idx, child) in realized {
+                let x = inner_x_origin + (*idx as f32) * stride;
+                let item_slot = Rect { x, y: inner_y, w: *item_w, h: inner_h };
                 place(
                     nodes, attrs, *child, item_slot,
                     /*stretch_w=*/ true, /*stretch_h=*/ true,

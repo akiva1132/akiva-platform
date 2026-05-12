@@ -161,6 +161,24 @@ pub enum Node {
         viewport_h: Option<f32>,
         realized: Vec<(u32, NodeId)>,
     },
+    /// Horizontal twin of `LazyColumn` — Compose `LazyRow` / Android
+    /// `RecyclerView` with `HORIZONTAL` orientation. Uniform
+    /// `item_w`; items in `[first - overscan, last + overscan]` of
+    /// the visible x-band are realised.
+    ///
+    /// Same `realized: Vec<(u32, NodeId)>` shape as LazyColumn; the
+    /// builder differs only in `item_w` vs `item_h` and which axis
+    /// the realisation window is computed on.
+    LazyRow {
+        key: String,
+        count: u32,
+        item_w: f32,
+        gap: f32,
+        padding: (f32, f32, f32, f32),
+        viewport_w: Option<f32>,
+        viewport_h: Option<f32>,
+        realized: Vec<(u32, NodeId)>,
+    },
     Button {
         id: String,
         /// Semantic action fired on click, separate from `id`. When set,
@@ -465,6 +483,45 @@ pub(crate) const DEFAULT_OVERSCAN: u32 = 2;
 /// virtualisation.
 pub(crate) const LAZY_COLD_START_CAP: u32 = 30;
 
+/// Pure-function realisation window: returns the `[start, end)`
+/// index range that LazyColumn / LazyRow should materialise this
+/// frame. Shared by both builders so the off-by-one risk only
+/// lives in one place.
+///
+/// - `stride` = item main-axis size + gap (must be `> 0` for the
+///   normal path; otherwise falls back to cold-start).
+/// - `viewport_main` = viewport size along the scroll axis (height
+///   for LazyColumn, width for LazyRow). `≤ 0` triggers cold-start.
+/// - `scroll` = current main-axis offset.
+/// - `padding_start` = padding at the leading edge along the main
+///   axis (`padding.0` for LazyColumn / vertical, `padding.3` for
+///   LazyRow / horizontal).
+pub(crate) fn realise_window(
+    count: u32, stride: f32, viewport_main: f32, scroll: f32,
+    padding_start: f32, overscan: u32,
+) -> (u32, u32) {
+    if count == 0 {
+        return (0, 0);
+    }
+    if viewport_main <= 0.0 || stride <= 0.0 {
+        // Cold start — no measurement yet. Realise a bounded slice
+        // so first paint shows something.
+        return (0, count.min(LAZY_COLD_START_CAP));
+    }
+    // Visible band runs from `scroll` to `scroll + viewport_main`
+    // (in content coords). First fully-or-partly visible item:
+    //   first = floor((scroll - padding_start) / stride)
+    // Last partly visible:
+    //   last  = floor((scroll + viewport_main - padding_start) / stride)
+    let band_lo = (scroll - padding_start).max(0.0);
+    let band_hi = (scroll + viewport_main - padding_start).max(0.0);
+    let first = (band_lo / stride).floor() as i64;
+    let last = (band_hi / stride).floor() as i64;
+    let s = (first - overscan as i64).max(0) as u32;
+    let e = ((last + overscan as i64).max(0) as u32 + 1).min(count);
+    (s, e)
+}
+
 impl<'u, 's, 'c, 'b> LazyColumnBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, count: u32) -> Self {
         Self {
@@ -517,38 +574,18 @@ impl<'u, 's, 'c, 'b> LazyColumnBuilder<'u, 's, 'c, 'b> {
 
         // Pick viewport_h: explicit `.size(_, h)` / `.height(h)` first,
         // then last frame's cached cell, else 0 (cold-start fallback).
-        let cached_viewport_h = ui.scroll_cell_viewport_h(&key);
-        let cached_scroll_y = ui.scroll_offset(&key);
+        let cached_viewport_h = ui.scroll_cell_viewport_main(&key);
+        let cached_scroll = ui.scroll_offset(&key);
         let resolved_vh = viewport_h.unwrap_or(cached_viewport_h);
-        let (top, _right, _bottom, _left) = padding;
 
         // Item stride (item_h + gap). One row of N items takes
         // N*(item_h+gap) - gap height in the content; the start of
-        // index i sits at `top + i * stride`.
+        // index i sits at `padding.top + i * stride`.
         let stride = item_h + gap;
-
-        let (start_idx, end_idx) = if count == 0 {
-            (0u32, 0u32)
-        } else if resolved_vh <= 0.0 || stride <= 0.0 {
-            // Cold start: viewport unknown / item_h missing →
-            // realise the first cap items so the first paint at
-            // least shows something.
-            (0u32, count.min(LAZY_COLD_START_CAP))
-        } else {
-            // Visible band runs from scroll_y to scroll_y + viewport_h
-            // (in content coords). First fully-or-partly visible item:
-            //   first = floor((scroll_y - top) / stride)   (clamped ≥ 0)
-            // Last partly visible:
-            //   last  = floor((scroll_y + viewport_h - top) / stride)
-            let scroll_y = cached_scroll_y;
-            let band_top = (scroll_y - top).max(0.0);
-            let band_bot = (scroll_y + resolved_vh - top).max(0.0);
-            let first = (band_top / stride).floor() as i64;
-            let last = (band_bot / stride).floor() as i64;
-            let s = (first - overscan as i64).max(0) as u32;
-            let e = ((last + overscan as i64).max(0) as u32 + 1).min(count);
-            (s, e)
-        };
+        let (start_idx, end_idx) = realise_window(
+            count, stride, resolved_vh, cached_scroll,
+            padding.0 /* top */, overscan,
+        );
 
         // Materialise visible items via the caller's closure.
         let mut realized: Vec<(u32, NodeId)> = Vec::with_capacity(
@@ -561,6 +598,101 @@ impl<'u, 's, 'c, 'b> LazyColumnBuilder<'u, 's, 'c, 'b> {
 
         let id = ui.push(Node::LazyColumn {
             key, count, item_h, gap, padding,
+            viewport_w, viewport_h, realized,
+        });
+        ui.set_grow(id, grow);
+        id
+    }
+}
+
+/// Builder for [`Node::LazyRow`]. Mirror of [`LazyColumnBuilder`]
+/// with `item_w` taking `item_h`'s role and the realisation window
+/// computed along the x-axis. Terminating method is `.items()`.
+pub struct LazyRowBuilder<'u, 's, 'c, 'b> {
+    ui: &'u mut Ui<'s, 'c, 'b>,
+    key: String,
+    count: u32,
+    item_w: f32,
+    gap: f32,
+    padding: (f32, f32, f32, f32),
+    viewport_w: Option<f32>,
+    viewport_h: Option<f32>,
+    overscan: u32,
+    grow: f32,
+}
+
+impl<'u, 's, 'c, 'b> LazyRowBuilder<'u, 's, 'c, 'b> {
+    pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, count: u32) -> Self {
+        Self {
+            ui, key: String::new(), count,
+            item_w: 0.0, gap: 0.0,
+            padding: (0.0, 0.0, 0.0, 0.0),
+            viewport_w: None, viewport_h: None,
+            overscan: DEFAULT_OVERSCAN, grow: 0.0,
+        }
+    }
+    pub fn key(mut self, key: impl Into<String>) -> Self { self.key = key.into(); self }
+    /// Required — every item is exactly this wide.
+    pub fn item_w(mut self, w: f32) -> Self { self.item_w = w.max(0.0); self }
+    pub fn gap(mut self, g: f32) -> Self { self.gap = g.max(0.0); self }
+    pub fn padding(mut self, p: f32) -> Self { self.padding = (p, p, p, p); self }
+    pub fn padding_trbl(mut self, t: f32, r: f32, b: f32, l: f32) -> Self {
+        self.padding = (t, r, b, l); self
+    }
+    /// Lock the viewport size. Without this the row inherits its
+    /// slot — typical when sitting inside an `HStack { cross:
+    /// Stretch }` or a `VStack` that handles vertical sizing.
+    pub fn size(mut self, w: f32, h: f32) -> Self {
+        self.viewport_w = Some(w.max(0.0));
+        self.viewport_h = Some(h.max(0.0));
+        self
+    }
+    pub fn width(mut self, w: f32) -> Self {
+        self.viewport_w = Some(w.max(0.0));
+        self
+    }
+    pub fn height(mut self, h: f32) -> Self {
+        self.viewport_h = Some(h.max(0.0));
+        self
+    }
+    pub fn overscan(mut self, n: u32) -> Self { self.overscan = n; self }
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
+
+    /// Build the LazyRow by invoking `item_fn(ui, i)` for each
+    /// realised index, pushing the `Node::LazyRow`, and returning
+    /// its NodeId. Same shape as `LazyColumnBuilder::items` — the
+    /// closure runs synchronously in the build pass.
+    pub fn items<F>(self, mut item_fn: F) -> NodeId
+    where
+        F: FnMut(&mut Ui<'s, 'c, 'b>, u32) -> NodeId,
+    {
+        let LazyRowBuilder {
+            ui, key, count, item_w, gap, padding,
+            viewport_w, viewport_h, overscan, grow,
+        } = self;
+
+        // Main-axis viewport for a LazyRow is the row's *width*
+        // (the cell's `viewport_h` field — see ScrollCell docs).
+        let cached_viewport_main = ui.scroll_cell_viewport_main(&key);
+        let cached_scroll = ui.scroll_offset(&key);
+        let resolved_vw = viewport_w.unwrap_or(cached_viewport_main);
+
+        let stride = item_w + gap;
+        let (start_idx, end_idx) = realise_window(
+            count, stride, resolved_vw, cached_scroll,
+            padding.3 /* left */, overscan,
+        );
+
+        let mut realized: Vec<(u32, NodeId)> = Vec::with_capacity(
+            end_idx.saturating_sub(start_idx) as usize
+        );
+        for i in start_idx..end_idx {
+            let id = item_fn(ui, i);
+            realized.push((i, id));
+        }
+
+        let id = ui.push(Node::LazyRow {
+            key, count, item_w, gap, padding,
             viewport_w, viewport_h, realized,
         });
         ui.set_grow(id, grow);
