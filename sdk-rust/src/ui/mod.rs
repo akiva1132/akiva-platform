@@ -187,6 +187,39 @@ pub enum ScrollAxis {
     Horizontal,
 }
 
+/// Snap behaviour after a fling settles. Compose
+/// `HorizontalPager` shape — three modes covering the common
+/// "stops at a grid line" gestures.
+///
+/// Snap is item-/page-aware: `Item` rounds scroll position to the
+/// nearest item stride (item size + gap), `Page` rounds to the
+/// nearest viewport-page. `None` leaves the scroll wherever the
+/// fling settles (pre-2d behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapMode {
+    /// No snap. Scroll lands wherever the fling settles. Default.
+    #[default]
+    None,
+    /// Snap to nearest item edge after settle. Stride = item
+    /// main-axis size + gap, picked up from
+    /// `ScrollCell::item_stride` each present pass.
+    Item,
+    /// Snap to nearest page edge after settle. Page size = the
+    /// viewport's main-axis size.
+    Page,
+}
+
+/// Duration of one snap animation, in ms. Compose `HorizontalPager`
+/// defaults to ~300 ms; iOS `UIPageView` snaps in ~250 ms. We split
+/// the difference at 250 — feels snappy on touch + isn't too quick
+/// for the eye to track.
+pub(crate) const SNAP_DURATION_MS: f32 = 250.0;
+
+/// Pixel tolerance for "already at the snap target" — below this,
+/// we don't kick off a snap animation. Avoids a 1-frame
+/// micro-animation when the fling happened to settle on the grid.
+pub(crate) const SNAP_THRESHOLD: f32 = 0.5;
+
 /// Persistent state for one scroll region. Lives in
 /// [`UiState::scroll_states`] keyed by the caller-supplied
 /// `ScrollBuilder::key`. Survives across frames so scroll position
@@ -235,6 +268,36 @@ pub struct ScrollCell {
     /// hit-test wheel/pointer events against the topmost scroll
     /// region under the cursor.
     pub last_rect: Rect,
+    /// Snap behaviour after a fling settles. Refreshed from the
+    /// `LazyColumn::snap` / `LazyRow::snap` builder declaration
+    /// each present pass; defaults to `SnapMode::None` for
+    /// plain `Node::Scroll`. See [`SnapMode`].
+    pub snap_mode: SnapMode,
+    /// Item stride along the main axis (item size + gap). Used
+    /// by `SnapMode::Item` to compute the nearest grid offset.
+    /// Set each present pass by LazyColumn (item_h + gap) or
+    /// LazyRow (item_w + gap). `0` (the default) disables item
+    /// snap — `SnapMode::Item` falls back to no-op.
+    pub item_stride: f32,
+    /// Where the current snap animation started, in main-axis px.
+    /// Only meaningful while `snap_target.is_some()`.
+    pub snap_origin: f32,
+    /// Active snap target. `Some` while a snap animation is in
+    /// flight; cleared when the animation completes or the user
+    /// takes back control (Down inside the region, wheel, or
+    /// `scroll_to`).
+    pub snap_target: Option<f32>,
+    /// Milliseconds elapsed in the current snap. Advanced by
+    /// `tick_animations`; lerp progress is
+    /// `(elapsed / SNAP_DURATION_MS).clamp(0, 1)` with cubic-out
+    /// easing on top.
+    pub snap_elapsed_ms: f32,
+    /// Marked `true` by `feed_pointer` on a drag-Up inside a
+    /// snap-enabled cell — even a slow drag that didn't seed any
+    /// fling velocity must still trigger the snap. Consumed by
+    /// `tick_animations` when the snap kicks off, or cleared by
+    /// any user-input interruption.
+    pub snap_pending: bool,
 }
 
 /// App-owned UI state. Carry one in your `Activity` struct (usually via
@@ -340,6 +403,40 @@ pub(crate) const FLING_STOP_VELOCITY: f32 = 0.5;
 /// + position advance — see [`FLING_DECAY_PER_FRAME`].
 pub(crate) const FRAME_MS: f32 = 1000.0 / 60.0;
 
+/// Cubic-out easing on `[0, 1]`. Decelerating curve (steep at the
+/// start, flat at the end) — matches Android's
+/// `OvershootInterpolator`/`DecelerateInterpolator` family. Used
+/// by snap animations so a card stops at its grid line without an
+/// abrupt freeze.
+pub(crate) fn cubic_out(p: f32) -> f32 {
+    let clamped = p.clamp(0.0, 1.0);
+    1.0 - (1.0 - clamped).powi(3)
+}
+
+/// Compute the snap target for a cell given its current
+/// `scroll_y`, `snap_mode`, `item_stride`, and main-axis viewport.
+/// Returns `None` if the cell has no snap or the snap math is
+/// degenerate (stride/page ≤ 0). The result is clamped to
+/// `[0, content_h - viewport_h]` so a snap can't try to scroll
+/// past the end.
+pub(crate) fn compute_snap_target(cell: &ScrollCell) -> Option<f32> {
+    let max = (cell.content_h - cell.viewport_h).max(0.0);
+    let raw = match cell.snap_mode {
+        SnapMode::None => return None,
+        SnapMode::Item => {
+            if cell.item_stride <= 0.0 { return None; }
+            (cell.scroll_y / cell.item_stride).round() * cell.item_stride
+        }
+        SnapMode::Page => {
+            // Page = viewport along main axis (= cell.viewport_h
+            // per the field-name convention; see ScrollCell docs).
+            if cell.viewport_h <= 0.0 { return None; }
+            (cell.scroll_y / cell.viewport_h).round() * cell.viewport_h
+        }
+    };
+    Some(raw.clamp(0.0, max))
+}
+
 impl UiState {
     /// Empty UI state. Equivalent to `UiState::default()`; the explicit
     /// constructor exists so call-sites can read as
@@ -379,6 +476,13 @@ impl UiState {
                         ScrollAxis::Vertical => ev.y,
                         ScrollAxis::Horizontal => ev.x,
                     };
+                    // User is taking control back — cancel any
+                    // in-flight snap so the touch wins over the
+                    // animator. snap_pending stays false until Up.
+                    if let Some(cell) = self.scroll_states.get_mut(&key) {
+                        cell.snap_target = None;
+                        cell.snap_pending = false;
+                    }
                     self.drag_gesture = Some(DragGesture {
                         key,
                         axis,
@@ -434,9 +538,18 @@ impl UiState {
                         // buttons inside the scroll region still
                         // work.
                         self.pending_clicks.push(g.started_at);
+                    } else {
+                        // Drag-end: cell.velocity already carries the
+                        // EMA; 2c.4 picks it up to drive fling.
+                        // If the cell has a snap mode, also flag
+                        // snap_pending — slow drags that didn't
+                        // seed velocity still snap on release.
+                        if let Some(cell) = self.scroll_states.get_mut(&g.key) {
+                            if cell.snap_mode != SnapMode::None {
+                                cell.snap_pending = true;
+                            }
+                        }
                     }
-                    // Drag-end: cell.velocity already carries the
-                    // EMA; 2c.4 picks it up to drive fling.
                 }
             }
             PointerPhase::Cancel => {
@@ -471,8 +584,12 @@ impl UiState {
         let max = (cell.content_h - cell.viewport_h).max(0.0);
         cell.scroll_y = (cell.scroll_y + delta).clamp(0.0, max);
         // Wheel input is an explicit user override; kill any active
-        // fling so the two don't fight.
+        // fling and any pending/active snap so the user can wheel to
+        // a non-grid position and leave it there (Compose
+        // `HorizontalPager` doesn't snap wheel events either).
         cell.velocity = 0.0;
+        cell.snap_target = None;
+        cell.snap_pending = false;
     }
 
     /// Advance every active fling by `dt_ms`. `Ui::present` calls this
@@ -495,31 +612,74 @@ impl UiState {
         if dt_ms <= 0.0 { return; }
         let frames_dt = (dt_ms / FRAME_MS).clamp(0.0, 4.0);
         for cell in self.scroll_states.values_mut() {
-            if cell.velocity == 0.0 { continue; }
-            cell.velocity *= FLING_DECAY_PER_FRAME.powf(frames_dt);
-            let new_y = cell.scroll_y + cell.velocity * frames_dt;
-            let max = (cell.content_h - cell.viewport_h).max(0.0);
-            let clamped = new_y.clamp(0.0, max);
-            if clamped != new_y {
-                // Hit an edge — kill velocity rather than perpetually
-                // try to scroll past it.
-                cell.velocity = 0.0;
+            // ── Phase 1: fling decay ──────────────────────────────
+            let had_velocity = cell.velocity != 0.0;
+            if had_velocity {
+                cell.velocity *= FLING_DECAY_PER_FRAME.powf(frames_dt);
+                let new_y = cell.scroll_y + cell.velocity * frames_dt;
+                let max = (cell.content_h - cell.viewport_h).max(0.0);
+                let clamped = new_y.clamp(0.0, max);
+                if clamped != new_y {
+                    // Hit an edge — kill velocity rather than
+                    // perpetually try to scroll past it.
+                    cell.velocity = 0.0;
+                }
+                cell.scroll_y = clamped;
+                if cell.velocity.abs() < FLING_STOP_VELOCITY {
+                    cell.velocity = 0.0;
+                }
             }
-            cell.scroll_y = clamped;
-            if cell.velocity.abs() < FLING_STOP_VELOCITY {
-                cell.velocity = 0.0;
+            // ── Phase 2: snap entry ───────────────────────────────
+            // Kick off a snap iff (a) the fling has fully settled
+            // (velocity == 0) AND (b) the fling either just settled
+            // this frame OR a drag-Up flagged snap_pending, AND
+            // there's no snap already in flight, AND the cell has
+            // a snap mode set. The `velocity == 0` gate means
+            // snap_pending stays patiently true while the fling
+            // continues — snap fires only after the glide stops.
+            //
+            // We don't auto-enter on long-idle cells — wheel events
+            // explicitly do *not* set snap_pending, so the user
+            // can wheel to a non-grid position and leave it.
+            let just_settled = had_velocity && cell.velocity == 0.0;
+            if cell.velocity == 0.0
+                && (just_settled || cell.snap_pending)
+                && cell.snap_target.is_none()
+                && cell.snap_mode != SnapMode::None
+            {
+                cell.snap_pending = false;
+                if let Some(target) = compute_snap_target(cell) {
+                    if (target - cell.scroll_y).abs() > SNAP_THRESHOLD {
+                        cell.snap_origin = cell.scroll_y;
+                        cell.snap_target = Some(target);
+                        cell.snap_elapsed_ms = 0.0;
+                    }
+                }
+            }
+            // ── Phase 3: snap advance ─────────────────────────────
+            if let Some(target) = cell.snap_target {
+                cell.snap_elapsed_ms += dt_ms;
+                let progress = (cell.snap_elapsed_ms / SNAP_DURATION_MS).clamp(0.0, 1.0);
+                let eased = cubic_out(progress);
+                cell.scroll_y = cell.snap_origin + (target - cell.snap_origin) * eased;
+                if progress >= 1.0 {
+                    cell.scroll_y = target;
+                    cell.snap_target = None;
+                    cell.snap_elapsed_ms = 0.0;
+                }
             }
         }
     }
 
-    /// True iff any scroll cell has a non-zero velocity right now.
-    /// Useful for activities (or the framework) that want to keep
-    /// requesting frames while a fling is in flight. Today the
-    /// runtime renders every rAF regardless, so this is documentary
-    /// — but it gives a future "render-on-demand" optimisation a
-    /// clean predicate to gate on.
+    /// True iff any scroll cell is animating — fling in flight or
+    /// snap glide active. Useful for activities (or the framework)
+    /// that want to keep requesting frames while motion is on
+    /// screen. Today the runtime renders every rAF regardless, so
+    /// this is documentary — but it gives a future "render-on-
+    /// demand" optimisation a clean predicate to gate on.
     pub fn has_active_animation(&self) -> bool {
-        self.scroll_states.values().any(|c| c.velocity != 0.0)
+        self.scroll_states.values()
+            .any(|c| c.velocity != 0.0 || c.snap_target.is_some())
     }
 
     /// Find the topmost scroll region whose viewport rect contains
@@ -780,6 +940,11 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         let max = (cell.content_h - cell.viewport_h).max(0.0);
         cell.scroll_y = y.clamp(0.0, max);
         cell.velocity = 0.0;
+        // Programmatic scroll is exact — never snap on top of a
+        // `scroll_to`. Callers that want a snap can target an
+        // already-aligned offset.
+        cell.snap_target = None;
+        cell.snap_pending = false;
     }
 
     /// Current scroll position for `key`. Returns `0.0` if no scroll
@@ -882,7 +1047,12 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         // programmatic `scroll_to` called before any present() honours
         // the same default until the cell catches up.
         for (id, node) in self.nodes.iter().enumerate() {
-            let (key, content_main, axis) = match node {
+            // Per-node side-info packed into a 5-tuple:
+            //   (key, content_main, axis, snap_mode, item_stride)
+            // `item_stride = item_main_size + gap` for lazy lists;
+            // 0 for plain Scroll (which has no item granularity, so
+            // SnapMode::Item degenerates to no-op there).
+            let (key, content_main, axis, snap_mode, item_stride) = match node {
                 Node::Scroll { child, key, axis, .. } => {
                     let (cw, ch) = sizes.get(child).copied().unwrap_or((0.0, 0.0));
                     // Main-axis extent of the content: child's
@@ -892,9 +1062,9 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
                         ScrollAxis::Vertical => ch,
                         ScrollAxis::Horizontal => cw,
                     };
-                    (key, content, *axis)
+                    (key, content, *axis, SnapMode::None, 0.0)
                 }
-                Node::LazyColumn { key, count, item_h, gap, padding, .. } => {
+                Node::LazyColumn { key, count, item_h, gap, padding, snap, .. } => {
                     // Content height is `count * item_h + (count-1) *
                     // gap + padding_v`, regardless of which items are
                     // realised — virtualisation must not change the
@@ -905,9 +1075,9 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
                     } else {
                         n * item_h + (n - 1.0) * gap + padding.0 + padding.2
                     };
-                    (key, ch, ScrollAxis::Vertical)
+                    (key, ch, ScrollAxis::Vertical, *snap, item_h + gap)
                 }
-                Node::LazyRow { key, count, item_w, gap, padding, .. } => {
+                Node::LazyRow { key, count, item_w, gap, padding, snap, .. } => {
                     // Mirror of LazyColumn on the x-axis. Main-axis
                     // extent uses padding_left + padding_right.
                     let n = *count as f32;
@@ -916,13 +1086,15 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
                     } else {
                         n * item_w + (n - 1.0) * gap + padding.3 + padding.1
                     };
-                    (key, cw, ScrollAxis::Horizontal)
+                    (key, cw, ScrollAxis::Horizontal, *snap, item_w + gap)
                 }
                 _ => continue,
             };
             let viewport_rect = rects.get(&id).copied().unwrap_or_default();
             let cell = self.state.scroll_states.entry(key.clone()).or_default();
             cell.axis = axis;
+            cell.snap_mode = snap_mode;
+            cell.item_stride = item_stride;
             cell.content_h = content_main;
             // viewport_w / viewport_h follow the convention in
             // `ScrollCell`: `viewport_h` = main-axis size,
@@ -1514,6 +1686,7 @@ mod tests {
             viewport_w: vw,
             viewport_h: vh,
             last_rect: rect,
+            ..Default::default()
         });
     }
 
@@ -2086,6 +2259,7 @@ mod tests {
                 padding: (0.0, 0.0, 0.0, 0.0),
                 viewport_w: Some(200.0), viewport_h: Some(400.0),
                 realized: vec![(0, 0)],
+                snap: SnapMode::None,
             },
         ];
         let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
@@ -2117,6 +2291,7 @@ mod tests {
                 padding: (16.0, 16.0, 16.0, 16.0),
                 viewport_w: Some(200.0), viewport_h: Some(400.0),
                 realized: vec![(0, 0), (1, 1)],
+                snap: SnapMode::None,
             },
         ];
         let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
@@ -2778,6 +2953,7 @@ mod tests {
                 padding: (0.0, 0.0, 0.0, 32.0),
                 viewport_w: Some(400.0), viewport_h: Some(200.0),
                 realized: vec![(0, 0), (1, 1)],
+                snap: SnapMode::None,
             },
         ];
         let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
@@ -2811,6 +2987,7 @@ mod tests {
                 padding: (0.0, 0.0, 0.0, 0.0),
                 viewport_w: Some(400.0), viewport_h: Some(200.0),
                 realized: vec![(0, 0)],
+                snap: SnapMode::None,
             },
         ];
         let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
@@ -2852,5 +3029,269 @@ mod tests {
         let (s, e) = node::realise_window(80, 100.0, 400.0, 250.0, 0.0, 2);
         assert_eq!(s, 0);
         assert_eq!(e, 9);
+    }
+
+    // ── Stage 2d.3: SnapMode + cubic-out snap animation ──────────────
+
+    fn snap_cell(
+        snap_mode: SnapMode, item_stride: f32, viewport_main: f32,
+        content: f32, scroll: f32,
+    ) -> ScrollCell {
+        ScrollCell {
+            axis: ScrollAxis::Horizontal,
+            scroll_y: scroll,
+            content_h: content,
+            viewport_w: 200.0,
+            viewport_h: viewport_main,
+            snap_mode, item_stride,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cubic_out_is_monotonic_zero_to_one() {
+        assert!((cubic_out(0.0) - 0.0).abs() < 1e-6);
+        assert!((cubic_out(1.0) - 1.0).abs() < 1e-6);
+        // Decelerating: 0.5 should land well past 0.5 on the curve.
+        let half = cubic_out(0.5);
+        assert!(half > 0.7, "cubic_out(0.5) = {half}, expected > 0.7");
+        // Strictly monotonic over 10 samples.
+        let mut last = -1.0;
+        for i in 0..=10 {
+            let v = cubic_out(i as f32 / 10.0);
+            assert!(v > last, "cubic_out not monotonic at {i}");
+            last = v;
+        }
+    }
+
+    #[test]
+    fn cubic_out_clamps_outside_unit_interval() {
+        assert_eq!(cubic_out(-1.0), 0.0);
+        assert_eq!(cubic_out(2.0), 1.0);
+    }
+
+    #[test]
+    fn snap_target_item_rounds_to_nearest_stride() {
+        // stride=100, scroll=180 → nearest is 200.
+        let cell = snap_cell(SnapMode::Item, 100.0, 400.0, 2000.0, 180.0);
+        let t = compute_snap_target(&cell).expect("Item snap target");
+        assert_eq!(t, 200.0);
+        // scroll=140 (under halfway) → 100.
+        let cell = snap_cell(SnapMode::Item, 100.0, 400.0, 2000.0, 140.0);
+        let t = compute_snap_target(&cell).expect("Item snap target");
+        assert_eq!(t, 100.0);
+    }
+
+    #[test]
+    fn snap_target_page_rounds_to_viewport_size() {
+        // viewport=400, scroll=620 → nearest page is 800 (round half-up).
+        let cell = snap_cell(SnapMode::Page, 0.0, 400.0, 4000.0, 620.0);
+        let t = compute_snap_target(&cell).expect("Page snap target");
+        assert_eq!(t, 800.0);
+        // scroll=180 → 0.
+        let cell = snap_cell(SnapMode::Page, 0.0, 400.0, 4000.0, 180.0);
+        let t = compute_snap_target(&cell).expect("Page snap target");
+        assert_eq!(t, 0.0);
+    }
+
+    #[test]
+    fn snap_target_clamps_to_content_end() {
+        // viewport=400, content=1000 → max = 600. Rounded 800 clamps to 600.
+        let cell = snap_cell(SnapMode::Page, 0.0, 400.0, 1000.0, 620.0);
+        let t = compute_snap_target(&cell).expect("Page snap target");
+        assert_eq!(t, 600.0);
+    }
+
+    #[test]
+    fn snap_target_none_returns_none() {
+        let cell = snap_cell(SnapMode::None, 100.0, 400.0, 2000.0, 180.0);
+        assert!(compute_snap_target(&cell).is_none());
+    }
+
+    #[test]
+    fn snap_target_degenerate_stride_returns_none() {
+        // SnapMode::Item with stride=0 must not divide by zero.
+        let cell = snap_cell(SnapMode::Item, 0.0, 400.0, 2000.0, 180.0);
+        assert!(compute_snap_target(&cell).is_none());
+    }
+
+    #[test]
+    fn fling_settle_triggers_snap_when_mode_is_item() {
+        // Velocity decays to 0, then snap kicks in to glide toward
+        // the nearest item edge. After enough ticks, scroll_y
+        // lands at the target.
+        let mut state = UiState::new();
+        state.scroll_states.insert("row".to_string(), ScrollCell {
+            axis: ScrollAxis::Horizontal,
+            scroll_y: 180.0, velocity: 0.5,
+            content_h: 2000.0,
+            viewport_w: 200.0, viewport_h: 400.0,
+            snap_mode: SnapMode::Item, item_stride: 100.0,
+            ..Default::default()
+        });
+        state.tick_animations(FRAME_MS);
+        assert_eq!(state.scroll_states["row"].velocity, 0.0);
+        assert!(state.scroll_states["row"].snap_target.is_some());
+        let target = state.scroll_states["row"].snap_target.unwrap();
+        assert_eq!(target, 200.0);
+        for _ in 0..20 { state.tick_animations(FRAME_MS); }
+        assert_eq!(state.scroll_states["row"].scroll_y, 200.0);
+        assert!(state.scroll_states["row"].snap_target.is_none());
+    }
+
+    #[test]
+    fn snap_does_not_fire_when_already_at_target() {
+        let mut state = UiState::new();
+        // scroll_y starts exactly at a grid line (200 = 2*100).
+        // The 0.5 px/frame velocity decays to 0 within one tick
+        // and advances scroll_y by < 0.5 px — within SNAP_THRESHOLD
+        // of the target, so no snap kicks off.
+        state.scroll_states.insert("row".to_string(), ScrollCell {
+            axis: ScrollAxis::Horizontal,
+            scroll_y: 200.0, velocity: 0.5,
+            content_h: 2000.0,
+            viewport_w: 200.0, viewport_h: 400.0,
+            snap_mode: SnapMode::Item, item_stride: 100.0,
+            ..Default::default()
+        });
+        state.tick_animations(FRAME_MS);
+        assert_eq!(state.scroll_states["row"].velocity, 0.0);
+        assert!(state.scroll_states["row"].snap_target.is_none(),
+            "snap should not fire when scroll_y is already at the grid");
+        // scroll_y drifted by the residual velocity (~0.46 px) but
+        // stayed within SNAP_THRESHOLD of the grid line.
+        let y = state.scroll_states["row"].scroll_y;
+        assert!((y - 200.0).abs() < SNAP_THRESHOLD,
+            "scroll_y={y} should stay within SNAP_THRESHOLD of 200");
+    }
+
+    #[test]
+    fn drag_up_seeds_snap_pending_with_snap_mode_set() {
+        let mut state = UiState::new();
+        state.scroll_states.insert("row".to_string(), ScrollCell {
+            axis: ScrollAxis::Horizontal,
+            scroll_y: 0.0, velocity: 0.0,
+            content_h: 2000.0,
+            viewport_w: 200.0, viewport_h: 400.0,
+            last_rect: Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 },
+            snap_mode: SnapMode::Page,
+            ..Default::default()
+        });
+        state.feed_pointer(pointer(200.0, 100.0, PointerPhase::Down));
+        for x in [180.0, 130.0, 80.0, 30.0] {
+            state.feed_pointer(pointer(x, 100.0, PointerPhase::Move));
+        }
+        state.feed_pointer(pointer(30.0, 100.0, PointerPhase::Up));
+        assert!(state.scroll_states["row"].snap_pending,
+            "snap_pending must be set on Up in a snap-enabled cell");
+        // Tick until both fling and snap finish (or sanity bail
+        // after a generous frame budget). 4 s of simulated time
+        // is far more than either phase can need.
+        for _ in 0..240 {
+            state.tick_animations(FRAME_MS);
+            if !state.has_active_animation() { break; }
+        }
+        assert!(!state.has_active_animation(),
+            "animations should finish within budget");
+        let final_y = state.scroll_states["row"].scroll_y;
+        // Final scroll_y must be at a page edge (0 / 400 / 800
+        // / ...). Tolerance: nothing — snap completion sets
+        // scroll_y = target exactly.
+        let page = 400.0;
+        let n = (final_y / page).round();
+        assert!((final_y - n * page).abs() < 0.001,
+            "snap should land on a page edge, got {final_y}");
+        assert!(!state.scroll_states["row"].snap_pending);
+    }
+
+    #[test]
+    fn pointer_down_cancels_active_snap() {
+        let mut state = UiState::new();
+        state.scroll_states.insert("row".to_string(), ScrollCell {
+            axis: ScrollAxis::Horizontal,
+            scroll_y: 100.0, velocity: 0.0,
+            content_h: 2000.0,
+            viewport_w: 200.0, viewport_h: 400.0,
+            last_rect: Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 },
+            snap_mode: SnapMode::Page,
+            snap_target: Some(0.0), snap_origin: 100.0, snap_elapsed_ms: 50.0,
+            ..Default::default()
+        });
+        state.feed_pointer(pointer(200.0, 100.0, PointerPhase::Down));
+        let cell = &state.scroll_states["row"];
+        assert!(cell.snap_target.is_none());
+        assert!(!cell.snap_pending);
+    }
+
+    #[test]
+    fn wheel_cancels_active_snap() {
+        let mut state = UiState::new();
+        state.scroll_states.insert("row".to_string(), ScrollCell {
+            axis: ScrollAxis::Horizontal,
+            scroll_y: 100.0, velocity: 0.0,
+            content_h: 2000.0,
+            viewport_w: 200.0, viewport_h: 400.0,
+            last_rect: Rect { x: 0.0, y: 0.0, w: 400.0, h: 200.0 },
+            snap_mode: SnapMode::Page,
+            snap_target: Some(0.0), snap_origin: 100.0, snap_elapsed_ms: 50.0,
+            ..Default::default()
+        });
+        state.feed_pointer(pointer(200.0, 100.0, PointerPhase::Move));
+        state.feed_wheel(wheel_xy(50.0, 0.0));
+        assert!(state.scroll_states["row"].snap_target.is_none());
+    }
+
+    #[test]
+    fn scroll_to_cancels_active_snap() {
+        let mut state = UiState::new();
+        state.scroll_states.insert("row".to_string(), ScrollCell {
+            axis: ScrollAxis::Horizontal,
+            scroll_y: 100.0, velocity: 0.0,
+            content_h: 2000.0,
+            viewport_w: 200.0, viewport_h: 400.0,
+            snap_mode: SnapMode::Page,
+            snap_target: Some(0.0), snap_origin: 100.0, snap_elapsed_ms: 50.0,
+            ..Default::default()
+        });
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        ui.scroll_to("row", 50.0);
+        assert_eq!(state.scroll_states["row"].scroll_y, 50.0);
+        assert!(state.scroll_states["row"].snap_target.is_none());
+    }
+
+    #[test]
+    fn has_active_animation_includes_snap() {
+        let mut state = UiState::new();
+        state.scroll_states.insert("row".to_string(), ScrollCell {
+            snap_target: Some(400.0), snap_origin: 100.0, snap_elapsed_ms: 50.0,
+            ..Default::default()
+        });
+        assert!(state.has_active_animation(),
+            "Active snap counts as an active animation");
+        state.scroll_states.get_mut("row").unwrap().snap_target = None;
+        assert!(!state.has_active_animation());
+    }
+
+    #[test]
+    fn lazy_row_snap_mode_threads_into_cell_via_present() {
+        // `.snap(SnapMode::Page)` on the builder must land on the
+        // cell after present so tick_animations sees it.
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let lr = ui.lazy_row(12)
+            .key("carousel").item_w(360.0).gap(16.0)
+            .size(400.0, 200.0)
+            .snap(SnapMode::Page)
+            .items(|ui, _i| ui.rect(0xff00ffff).build());
+        ui.present(lr);
+        let cell = state.scroll_states.get("carousel").expect("cell present");
+        assert_eq!(cell.snap_mode, SnapMode::Page);
+        assert_eq!(cell.item_stride, 360.0 + 16.0);
     }
 }

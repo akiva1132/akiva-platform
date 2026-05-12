@@ -6,7 +6,7 @@
 //! and returns its id. Keeping nodes flat-and-enum (rather than `Box<dyn
 //! Widget>`) avoids heap traffic in `on_render`, which runs every frame.
 
-use super::{CrossAxis, MainAxis, ScrollAxis, Ui};
+use super::{CrossAxis, MainAxis, ScrollAxis, SnapMode, Ui};
 
 /// Index into the flat node vec inside a [`Ui`]. Valid only for the frame
 /// on which it was issued; stale ids from previous frames panic on use.
@@ -160,6 +160,12 @@ pub enum Node {
         viewport_w: Option<f32>,
         viewport_h: Option<f32>,
         realized: Vec<(u32, NodeId)>,
+        /// Snap behaviour after a fling settles. `SnapMode::None`
+        /// (the default) preserves the pre-2d "land wherever the
+        /// fling stops" feel; `Item` rounds to the item grid;
+        /// `Page` rounds to the viewport grid (rare for vertical
+        /// feeds — there mainly for symmetry with LazyRow).
+        snap: SnapMode,
     },
     /// Horizontal twin of `LazyColumn` — Compose `LazyRow` / Android
     /// `RecyclerView` with `HORIZONTAL` orientation. Uniform
@@ -178,6 +184,9 @@ pub enum Node {
         viewport_w: Option<f32>,
         viewport_h: Option<f32>,
         realized: Vec<(u32, NodeId)>,
+        /// Snap behaviour after a fling settles. Carousels use
+        /// `SnapMode::Page` (one item per page = viewport width).
+        snap: SnapMode,
     },
     Button {
         id: String,
@@ -468,6 +477,7 @@ pub struct LazyColumnBuilder<'u, 's, 'c, 'b> {
     viewport_w: Option<f32>,
     viewport_h: Option<f32>,
     overscan: u32,
+    snap: SnapMode,
     grow: f32,
 }
 
@@ -529,9 +539,18 @@ impl<'u, 's, 'c, 'b> LazyColumnBuilder<'u, 's, 'c, 'b> {
             item_h: 0.0, gap: 0.0,
             padding: (0.0, 0.0, 0.0, 0.0),
             viewport_w: None, viewport_h: None,
-            overscan: DEFAULT_OVERSCAN, grow: 0.0,
+            overscan: DEFAULT_OVERSCAN,
+            snap: SnapMode::None,
+            grow: 0.0,
         }
     }
+    /// Pick a snap behaviour. Default: `SnapMode::None` (no snap,
+    /// fling settles wherever decay finishes). Set to
+    /// `SnapMode::Item` for a list that always lands on a card
+    /// edge; `SnapMode::Page` for vertical "page swipe" lists
+    /// (rare; horizontal carousels are the common case — see
+    /// `LazyRowBuilder::snap`).
+    pub fn snap(mut self, mode: SnapMode) -> Self { self.snap = mode; self }
     pub fn key(mut self, key: impl Into<String>) -> Self { self.key = key.into(); self }
     /// Required — every item is exactly this tall.
     pub fn item_h(mut self, h: f32) -> Self { self.item_h = h.max(0.0); self }
@@ -569,7 +588,7 @@ impl<'u, 's, 'c, 'b> LazyColumnBuilder<'u, 's, 'c, 'b> {
     {
         let LazyColumnBuilder {
             ui, key, count, item_h, gap, padding,
-            viewport_w, viewport_h, overscan, grow,
+            viewport_w, viewport_h, overscan, snap, grow,
         } = self;
 
         // Pick viewport_h: explicit `.size(_, h)` / `.height(h)` first,
@@ -598,7 +617,7 @@ impl<'u, 's, 'c, 'b> LazyColumnBuilder<'u, 's, 'c, 'b> {
 
         let id = ui.push(Node::LazyColumn {
             key, count, item_h, gap, padding,
-            viewport_w, viewport_h, realized,
+            viewport_w, viewport_h, realized, snap,
         });
         ui.set_grow(id, grow);
         id
@@ -618,6 +637,7 @@ pub struct LazyRowBuilder<'u, 's, 'c, 'b> {
     viewport_w: Option<f32>,
     viewport_h: Option<f32>,
     overscan: u32,
+    snap: SnapMode,
     grow: f32,
 }
 
@@ -628,9 +648,16 @@ impl<'u, 's, 'c, 'b> LazyRowBuilder<'u, 's, 'c, 'b> {
             item_w: 0.0, gap: 0.0,
             padding: (0.0, 0.0, 0.0, 0.0),
             viewport_w: None, viewport_h: None,
-            overscan: DEFAULT_OVERSCAN, grow: 0.0,
+            overscan: DEFAULT_OVERSCAN,
+            snap: SnapMode::None,
+            grow: 0.0,
         }
     }
+    /// Pick a snap behaviour. `SnapMode::Page` makes the row
+    /// behave like Compose's `HorizontalPager` — one item per
+    /// page (page size = viewport width); `SnapMode::Item`
+    /// snaps to each card edge instead.
+    pub fn snap(mut self, mode: SnapMode) -> Self { self.snap = mode; self }
     pub fn key(mut self, key: impl Into<String>) -> Self { self.key = key.into(); self }
     /// Required — every item is exactly this wide.
     pub fn item_w(mut self, w: f32) -> Self { self.item_w = w.max(0.0); self }
@@ -668,7 +695,7 @@ impl<'u, 's, 'c, 'b> LazyRowBuilder<'u, 's, 'c, 'b> {
     {
         let LazyRowBuilder {
             ui, key, count, item_w, gap, padding,
-            viewport_w, viewport_h, overscan, grow,
+            viewport_w, viewport_h, overscan, snap, grow,
         } = self;
 
         // Main-axis viewport for a LazyRow is the row's *width*
@@ -693,7 +720,7 @@ impl<'u, 's, 'c, 'b> LazyRowBuilder<'u, 's, 'c, 'b> {
 
         let id = ui.push(Node::LazyRow {
             key, count, item_w, gap, padding,
-            viewport_w, viewport_h, realized,
+            viewport_w, viewport_h, realized, snap,
         });
         ui.set_grow(id, grow);
         id
