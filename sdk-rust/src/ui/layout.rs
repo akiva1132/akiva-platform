@@ -222,6 +222,23 @@ fn measure_node(
             }
             (sum_w + padding.1 + padding.3, max_h + padding.0 + padding.2)
         }
+        Node::Scroll { child, viewport_w, viewport_h, .. } => {
+            // The scroll measures itself as its locked viewport size
+            // (or the slot, when unspecified). The child is measured
+            // against unlimited vertical space so its intrinsic height
+            // becomes the scroll *content height* — that's what
+            // `place` reads back to position the child at `-scroll_y`
+            // and the inspector reads back to publish `content_height`.
+            //
+            // Width is the viewport width either way — content wider
+            // than the viewport gets clipped, same as Android's
+            // ScrollView (no horizontal scroll in this stage).
+            let outer_w = viewport_w.unwrap_or(avail.0);
+            let outer_h = viewport_h.unwrap_or(avail.1);
+            let child_avail = (outer_w, f32::MAX);
+            let _ = measure_node(nodes, *child, child_avail, text_width, out);
+            (outer_w, outer_h)
+        }
         Node::Frame { children, padding, size, .. } => {
             // Z-stack: children overlap, so intrinsic = max child size on
             // each axis (not sum). Padding adds to both sides like stacks.
@@ -296,9 +313,14 @@ pub fn layout(
     root: NodeId,
     viewport: Rect,
     sizes: &HashMap<NodeId, (f32, f32)>,
+    scroll_offsets: &HashMap<String, f32>,
     out: &mut HashMap<NodeId, Rect>,
 ) {
-    place(nodes, attrs, root, viewport, /*stretch_w=*/ false, /*stretch_h=*/ false, sizes, out);
+    place(
+        nodes, attrs, root, viewport,
+        /*stretch_w=*/ false, /*stretch_h=*/ false,
+        sizes, scroll_offsets, out,
+    );
 }
 
 /// Place `id` inside `slot`. Stacks with non-`Start` alignment expand to
@@ -314,6 +336,7 @@ fn place(
     stretch_w: bool,
     stretch_h: bool,
     sizes: &HashMap<NodeId, (f32, f32)>,
+    scroll_offsets: &HashMap<String, f32>,
     out: &mut HashMap<NodeId, Rect>,
 ) {
     let (mw, mh) = *sizes.get(&id).expect("measured before layout");
@@ -350,6 +373,14 @@ fn place(
             w = slot.w;
             h = slot.h;
         }
+        Node::Scroll { viewport_w, viewport_h, .. } => {
+            // Scroll viewports lock to their declared size when given,
+            // otherwise expand to the slot — content overflow is what
+            // scrolling is *for*, so intrinsic-based shrinking would
+            // defeat the primitive.
+            w = viewport_w.unwrap_or(slot.w);
+            h = viewport_h.unwrap_or(slot.h);
+        }
         _ => {}
     }
     let rect = Rect { x: slot.x, y: slot.y, w, h };
@@ -370,7 +401,7 @@ fn place(
                 nodes, attrs, children, *gap, *main, *cross,
                 /*vertical=*/ true,
                 inner_x, inner_y, inner_w, inner_h,
-                sizes, out,
+                sizes, scroll_offsets, out,
             );
         }
         Node::HStack { children, gap, padding, main, cross } => {
@@ -382,7 +413,7 @@ fn place(
                 nodes, attrs, children, *gap, *main, *cross,
                 /*vertical=*/ false,
                 inner_x, inner_y, inner_w, inner_h,
-                sizes, out,
+                sizes, scroll_offsets, out,
             );
         }
         Node::Frame { children, padding, .. } => {
@@ -398,8 +429,37 @@ fn place(
                 h: (rect.h - padding.0 - padding.2).max(0.0),
             };
             for c in children {
-                place(nodes, attrs, *c, child_slot, /*stretch_w=*/ true, /*stretch_h=*/ true, sizes, out);
+                place(
+                    nodes, attrs, *c, child_slot,
+                    /*stretch_w=*/ true, /*stretch_h=*/ true,
+                    sizes, scroll_offsets, out,
+                );
             }
+        }
+        Node::Scroll { child, key, .. } => {
+            // The child's slot is the viewport *shifted up by scroll_y*
+            // and stretched to content_h. Descendants of the child
+            // inherit this y-offset naturally because `place` puts them
+            // relative to their parent's rect — no canvas transform
+            // needed at paint time. The viewport clip is what stops
+            // them from painting outside `rect`.
+            let scroll_y = scroll_offsets.get(key).copied().unwrap_or(0.0);
+            let (_cw, content_h) = sizes.get(child).copied().unwrap_or((0.0, 0.0));
+            let child_slot = Rect {
+                x: rect.x,
+                y: rect.y - scroll_y,
+                w: rect.w,
+                h: content_h,
+            };
+            // Child stretched on width so a v_stack inside Scroll fills
+            // the viewport edge-to-edge; height is the content's
+            // intrinsic and we don't want it shrinking against the
+            // viewport's smaller slot.
+            place(
+                nodes, attrs, *child, child_slot,
+                /*stretch_w=*/ true, /*stretch_h=*/ false,
+                sizes, scroll_offsets, out,
+            );
         }
         Node::Grid { children, cols, rows, gap_x, gap_y, padding } => {
             // Inner rect after padding; cells are equal-sized pieces of
@@ -426,7 +486,11 @@ fn place(
                     w: cell_w,
                     h: cell_h,
                 };
-                place(nodes, attrs, *c, child_slot, /*stretch_w=*/ true, /*stretch_h=*/ true, sizes, out);
+                place(
+                    nodes, attrs, *c, child_slot,
+                    /*stretch_w=*/ true, /*stretch_h=*/ true,
+                    sizes, scroll_offsets, out,
+                );
             }
         }
     }
@@ -451,6 +515,7 @@ fn place_stack(
     inner_w: f32,
     inner_h: f32,
     sizes: &HashMap<NodeId, (f32, f32)>,
+    scroll_offsets: &HashMap<String, f32>,
     out: &mut HashMap<NodeId, Rect>,
 ) {
     let (inner_main, inner_cross) = if vertical { (inner_h, inner_w) } else { (inner_w, inner_h) };
@@ -526,7 +591,11 @@ fn place_stack(
         } else {
             (stretch_main, stretch_cross)
         };
-        place(nodes, attrs, *c, child_slot, child_stretch_w, child_stretch_h, sizes, out);
+        place(
+            nodes, attrs, *c, child_slot,
+            child_stretch_w, child_stretch_h,
+            sizes, scroll_offsets, out,
+        );
 
         cursor += child_main;
         if i + 1 < n { cursor += gap + between; }
@@ -738,6 +807,110 @@ mod tests {
         assert!(text_w <= 90.0,
             "text inside padded sized frame should wrap within inner 90-wide box, got {text_w}");
     }
+    // ── Stage 2c.2: Scroll measure + place ───────────────────────────
+
+    #[test]
+    fn scroll_measure_locks_viewport_regardless_of_child_height() {
+        // Child intrinsically 200×1000; scroll viewport 200×400.
+        // measure_node reports the *viewport* size for the scroll
+        // node, not the child's tall content.
+        let nodes = vec![
+            rect(200.0, 1000.0),
+            scroll_sized(0, "feed", 200.0, 400.0),
+        ];
+        let mut sizes = HashMap::new();
+        let (w, h) = measure_node(&nodes, 1, (800.0, 600.0), &estimate_text_width, &mut sizes);
+        assert_eq!((w, h), (200.0, 400.0));
+        // The child must still be measured so layout has its size on
+        // hand to use as content_h.
+        assert_eq!(*sizes.get(&0).unwrap(), (200.0, 1000.0));
+    }
+
+    #[test]
+    fn scroll_child_measured_against_unlimited_height() {
+        // Even when the parent's avail height is small, the scroll
+        // child is measured against unlimited vertical space — that's
+        // what makes `content_h` meaningful for clamping.
+        // Use a multi-line text whose intrinsic height depends on the
+        // avail height we hand to it.
+        let nodes = vec![
+            text_wrap(
+                "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor",
+                10.0, u32::MAX,
+            ),
+            scroll_sized(0, "feed", 60.0, 30.0),
+        ];
+        let mut sizes = HashMap::new();
+        let _ = measure_node(&nodes, 1, (60.0, 30.0), &estimate_text_width, &mut sizes);
+        // 60-wide wrap forces several lines — content_h must exceed
+        // viewport_h (30). If we'd measured against (60, 30) the
+        // text might have over-wrapped or truncated — neither is what
+        // we want for the scroll's `content_h` purpose.
+        let (_, ch) = sizes[&0];
+        assert!(ch > 30.0, "child must be measured tall, got {ch}");
+    }
+
+    #[test]
+    fn scroll_place_shifts_child_up_by_scroll_y() {
+        let nodes = vec![
+            rect(200.0, 1000.0),
+            scroll_sized(0, "feed", 200.0, 400.0),
+        ];
+        let attrs = default_attrs(nodes.len());
+        let sizes = measure(&nodes, 1, (800.0, 600.0), 1.0, &estimate_text_width);
+        let mut offsets: HashMap<String, f32> = HashMap::new();
+        offsets.insert("feed".to_string(), 250.0);
+        let mut rects = HashMap::new();
+        layout(
+            &nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            &sizes, &offsets, &mut rects,
+        );
+        // Scroll viewport at y=0; child placed at y = -scroll_y.
+        assert_eq!(rects[&1].y, 0.0);
+        assert_eq!(rects[&0].y, -250.0);
+        // Child takes content_h, not viewport_h.
+        assert_eq!(rects[&0].h, 1000.0);
+        // Child width matches viewport (stretched to fill).
+        assert_eq!(rects[&0].w, 200.0);
+    }
+
+    #[test]
+    fn scroll_place_with_zero_offset_aligns_child_top_with_viewport() {
+        let nodes = vec![
+            rect(200.0, 1000.0),
+            scroll_sized(0, "feed", 200.0, 400.0),
+        ];
+        let attrs = default_attrs(nodes.len());
+        let sizes = measure(&nodes, 1, (800.0, 600.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout(
+            &nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            &sizes, &HashMap::new(), &mut rects,
+        );
+        assert_eq!(rects[&0].y, 0.0);
+    }
+
+    #[test]
+    fn scroll_with_no_size_inherits_slot() {
+        let nodes = vec![
+            rect(200.0, 1000.0),
+            Node::Scroll { child: 0, key: "x".to_string(), viewport_w: None, viewport_h: None },
+        ];
+        let attrs = default_attrs(nodes.len());
+        let sizes = measure(&nodes, 1, (800.0, 600.0), 1.0, &estimate_text_width);
+        let mut rects = HashMap::new();
+        layout(
+            &nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 320.0, h: 240.0 },
+            &sizes, &HashMap::new(), &mut rects,
+        );
+        // Scroll inherits the 320×240 slot when no size is locked.
+        assert_eq!(rects[&1].w, 320.0);
+        assert_eq!(rects[&1].h, 240.0);
+        // Child stretched to scroll width, tall to content_h.
+        assert_eq!(rects[&0].w, 320.0);
+        assert_eq!(rects[&0].h, 1000.0);
+    }
+
     fn rect(w: f32, h: f32) -> Node {
         Node::Rect { color: 0, min: (w, h), radius: 0.0 }
     }
@@ -766,6 +939,12 @@ mod tests {
     fn frame_sized(children: Vec<NodeId>, padding: (f32, f32, f32, f32), w: f32, h: f32) -> Node {
         Node::Frame { children, padding, clip_radius: 0.0, size: Some((w, h)) }
     }
+    fn scroll_sized(child: NodeId, key: &str, w: f32, h: f32) -> Node {
+        Node::Scroll {
+            child, key: key.to_string(),
+            viewport_w: Some(w), viewport_h: Some(h),
+        }
+    }
     /// Default attrs for a tree of `n` nodes — no grow anywhere. Used by
     /// every test that doesn't exercise grow specifically.
     fn default_attrs(n: usize) -> Vec<NodeAttr> {
@@ -781,7 +960,8 @@ mod tests {
         out: &mut HashMap<NodeId, Rect>,
     ) {
         let attrs = default_attrs(nodes.len());
-        layout(nodes, &attrs, root, viewport, sizes, out);
+        let scroll_offsets: HashMap<String, f32> = HashMap::new();
+        layout(nodes, &attrs, root, viewport, sizes, &scroll_offsets, out);
     }
 
     // ── Measure ──────────────────────────────────────────────────────
@@ -1108,7 +1288,7 @@ mod tests {
         attrs[0].grow = 1.0;
         let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &HashMap::new(), &mut rects);
         // Stack filled by grow: h = slot.h = 100.
         assert!(approx(rects[&1].h, 100.0));
         // Child got intrinsic (10) + leftover (90) = 100.
@@ -1127,7 +1307,7 @@ mod tests {
         attrs[1].grow = 1.0;
         let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 2, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 2, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &HashMap::new(), &mut rects);
         assert!(approx(rects[&0].h, 50.0));
         assert!(approx(rects[&1].h, 50.0));
         // Positions: first at y=0; second starts where first ended.
@@ -1147,7 +1327,7 @@ mod tests {
         attrs[1].grow = 3.0;
         let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 2, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 2, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &HashMap::new(), &mut rects);
         assert!(approx(rects[&0].h, 25.0));
         assert!(approx(rects[&1].h, 75.0));
     }
@@ -1164,7 +1344,7 @@ mod tests {
         attrs[1].grow = 1.0;
         let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 2, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 2, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &HashMap::new(), &mut rects);
         assert!(approx(rects[&0].h, 20.0));
         assert!(approx(rects[&1].h, 80.0));
         assert!(approx(rects[&1].y, 20.0));
@@ -1183,7 +1363,7 @@ mod tests {
         attrs[1].grow = 1.0;
         let sizes = measure(&nodes, 2, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 2, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 2, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &HashMap::new(), &mut rects);
         assert!(approx(rects[&0].h, 45.0));
         assert!(approx(rects[&1].h, 45.0));
         assert!(approx(rects[&1].y, 55.0)); // 45 + 10 gap
@@ -1202,7 +1382,7 @@ mod tests {
         attrs[0].grow = 1.0;
         let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &HashMap::new(), &mut rects);
         assert!(approx(rects[&0].y, 0.0));
         assert!(approx(rects[&0].h, 100.0));
     }
@@ -1221,7 +1401,7 @@ mod tests {
         attrs[1].grow = 1.0;
         let sizes = measure(&nodes, 3, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 3, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 3, Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, &sizes, &HashMap::new(), &mut rects);
         // First rect at y=0; spacer consumes 100-10-10 = 80; last rect
         // lands at y = 10 + 80 = 90.
         assert!(approx(rects[&0].y, 0.0));
@@ -1239,7 +1419,7 @@ mod tests {
         attrs[0].grow = 1.0; attrs[1].grow = 1.0; attrs[2].grow = 1.0;
         let sizes = measure(&nodes, 3, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 3, Rect { x: 0.0, y: 0.0, w: 300.0, h: 100.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 3, Rect { x: 0.0, y: 0.0, w: 300.0, h: 100.0 }, &sizes, &HashMap::new(), &mut rects);
         // Three equal-grow children split 300px evenly: 100 each.
         assert!(approx(rects[&0].w, 100.0) && approx(rects[&0].x, 0.0));
         assert!(approx(rects[&1].w, 100.0) && approx(rects[&1].x, 100.0));
@@ -1265,7 +1445,7 @@ mod tests {
         attrs[1].grow = 1.0;
         let sizes = measure(&nodes, 3, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 3, Rect { x: 0.0, y: 0.0, w: 200.0, h: 80.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 3, Rect { x: 0.0, y: 0.0, w: 200.0, h: 80.0 }, &sizes, &HashMap::new(), &mut rects);
         // Inner VStack fills outer: w=200, h=80 (Stretch on cross).
         assert!(approx(rects[&2].w, 200.0));
         assert!(approx(rects[&2].h, 80.0));
@@ -1340,7 +1520,7 @@ mod tests {
         attrs[0].grow = 1.0;
         let sizes = measure(&nodes, 1, (1000.0, 1000.0), 1.0, &estimate_text_width);
         let mut rects = HashMap::new();
-        layout(&nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 200.0, h: 150.0 }, &sizes, &mut rects);
+        layout(&nodes, &attrs, 1, Rect { x: 0.0, y: 0.0, w: 200.0, h: 150.0 }, &sizes, &HashMap::new(), &mut rects);
         assert!(approx(rects[&1].w, 200.0) && approx(rects[&1].h, 150.0));
         assert!(approx(rects[&0].w, 200.0) && approx(rects[&0].h, 150.0));
     }

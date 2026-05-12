@@ -117,6 +117,25 @@ pub enum Node {
         gap_y: f32,
         padding: (f32, f32, f32, f32),
     },
+    /// Single-child scroll viewport. The child is measured against
+    /// unlimited vertical space (so its intrinsic height becomes the
+    /// scroll *content height*) and painted with a `-scroll_y` y-offset
+    /// inside a clip rect the viewport size. `key` is the caller-stable
+    /// identifier the SDK uses to persist scroll position across frames
+    /// in `UiState::scroll_states`; pick a string that won't drift
+    /// between rebuilds (`"feed"`, `"settings-body"`, …).
+    ///
+    /// Without `viewport_w`/`viewport_h`, the scroll inherits its slot
+    /// size (typical inside a `VStack` with `cross: Stretch`); setting
+    /// them locks the viewport exactly the way `Frame::size` locks a
+    /// card — useful when the parent slot is bigger than the area you
+    /// actually want scrolling to live in.
+    Scroll {
+        child: NodeId,
+        key: String,
+        viewport_w: Option<f32>,
+        viewport_h: Option<f32>,
+    },
     Button {
         id: String,
         /// Semantic action fired on click, separate from `id`. When set,
@@ -312,6 +331,53 @@ impl<'u, 's, 'c, 'b> FrameBuilder<'u, 's, 'c, 'b> {
             padding: self.padding,
             clip_radius: self.clip_radius,
             size: self.size,
+        });
+        self.ui.set_grow(id, self.grow);
+        id
+    }
+}
+
+pub struct ScrollBuilder<'u, 's, 'c, 'b> {
+    ui: &'u mut Ui<'s, 'c, 'b>,
+    child: NodeId,
+    key: String,
+    viewport_w: Option<f32>,
+    viewport_h: Option<f32>,
+    grow: f32,
+}
+
+impl<'u, 's, 'c, 'b> ScrollBuilder<'u, 's, 'c, 'b> {
+    pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, child: NodeId) -> Self {
+        Self {
+            ui, child, key: String::new(),
+            viewport_w: None, viewport_h: None, grow: 0.0,
+        }
+    }
+    /// Caller-stable identifier the SDK persists scroll position under
+    /// in `UiState::scroll_states`. The same string in the next frame
+    /// looks up the same cell. Defaults to empty — anonymous scrolls
+    /// still work (each frame starts at scroll_y=0) but tests can't
+    /// address them via `__akiva.scrollOf(key)`.
+    pub fn key(mut self, key: impl Into<String>) -> Self { self.key = key.into(); self }
+    /// Lock the viewport size. Skip to inherit from the slot.
+    pub fn size(mut self, w: f32, h: f32) -> Self {
+        self.viewport_w = Some(w.max(0.0));
+        self.viewport_h = Some(h.max(0.0));
+        self
+    }
+    /// Lock the viewport height only — useful when the scroll lives
+    /// inside a `VStack { cross: Stretch }` that handles width.
+    pub fn height(mut self, h: f32) -> Self {
+        self.viewport_h = Some(h.max(0.0));
+        self
+    }
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
+    pub fn build(self) -> NodeId {
+        let id = self.ui.push(Node::Scroll {
+            child: self.child,
+            key: self.key,
+            viewport_w: self.viewport_w,
+            viewport_h: self.viewport_h,
         });
         self.ui.set_grow(id, self.grow);
         id

@@ -80,6 +80,13 @@ pub enum SemanticRole {
     Rect    = 4,
     /// Layout-only filler. Same projection treatment as `Rect`.
     Spacer  = 5,
+    /// Scroll viewport — `Node::Scroll` / `Node::LazyColumn`. The
+    /// caller-supplied key lives in `id`; the inspector publishes
+    /// scroll position + content/viewport dimensions on a separate
+    /// wire extension (added in the inspector polish stone).
+    /// ARIA: `role="region"` with a `data-akiva-scroll` flag the
+    /// projection layer reads to decorate scrolling regions.
+    Scroll  = 6,
 }
 
 impl SemanticRole {
@@ -206,6 +213,7 @@ impl SemanticTree {
                 3 => SemanticRole::Image,
                 4 => SemanticRole::Rect,
                 5 => SemanticRole::Spacer,
+                6 => SemanticRole::Scroll,
                 _ => return None,
             };
             p += 1;

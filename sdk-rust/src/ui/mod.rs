@@ -174,6 +174,34 @@ impl Rect {
     }
 }
 
+/// Persistent state for one scroll region. Lives in
+/// [`UiState::scroll_states`] keyed by the caller-supplied
+/// `ScrollBuilder::key`. Survives across frames so scroll position
+/// doesn't reset on every rebuild — the same pattern as
+/// [`UiState::hit_rects`], applied to scroll instead of clicks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrollCell {
+    /// How far the content has been scrolled past the top of the
+    /// viewport, in physical pixels. `0` = content top aligned with
+    /// viewport top; positive values move the content *up* on screen.
+    pub scroll_y: f32,
+    /// Pixels-per-frame velocity for active flings. Set on
+    /// pointer-up after a drag (Stage 2c.4); decays to 0 each tick.
+    /// Programmatic `scroll_to` zeroes it.
+    pub velocity: f32,
+    /// Last-measured intrinsic height of the child (the scroll's
+    /// content). Updated every present pass; used to clamp `scroll_y`
+    /// against `max = (content_h - viewport_h).max(0)`.
+    pub content_h: f32,
+    pub viewport_w: f32,
+    pub viewport_h: f32,
+    /// Viewport rect in screen coordinates from the most recent
+    /// present pass. Used by [`Ui::feed_wheel`] in Stage 2c.3 to
+    /// hit-test wheel/pointer events against the topmost scroll
+    /// region under the cursor.
+    pub last_rect: Rect,
+}
+
 /// App-owned UI state. Carry one in your `Activity` struct (usually via
 /// `#[derive(Default)]`). Feed pointer events from `on_pointer`;
 /// `Ui::new` + `present()` handle everything else.
@@ -201,6 +229,12 @@ pub struct UiState {
     /// and `current_actions` (via action) — that's intended, so apps
     /// can mix the two dispatch styles during migration.
     current_actions: Vec<String>,
+    /// Per-`Node::Scroll` persistent cells, keyed by the
+    /// `ScrollBuilder::key` string. Each cell tracks scroll_y across
+    /// frames so a rebuild doesn't reset the scroll position; the
+    /// present pass refreshes the cached content / viewport dimensions
+    /// each frame.
+    scroll_states: HashMap<String, ScrollCell>,
 }
 
 impl UiState {
@@ -422,6 +456,45 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         node::GridBuilder::new(self, children.to_vec(), cols, rows)
     }
 
+    /// Single-child scroll viewport. Chain `.key(...)` to address the
+    /// region across frames (so the scroll position persists), then
+    /// `.size(w, h)` or `.height(h)` if you want to lock the viewport
+    /// to a specific size rather than inheriting from the slot.
+    pub fn scroll(&mut self, child: NodeId) -> node::ScrollBuilder<'_, 's, 'c, 'b> {
+        node::ScrollBuilder::new(self, child)
+    }
+
+    /// Programmatic scroll. Clamps `y` to `[0, content_h - viewport_h]`
+    /// against the last-measured content height (so calling before the
+    /// first `present()` simply records 0 and the first paint will
+    /// honour it once measurement catches up). Zeroes any active
+    /// fling velocity — programmatic scroll is "user intent
+    /// overrides physics", same as Android.
+    pub fn scroll_to(&mut self, key: &str, y: f32) {
+        let cell = self.state.scroll_states.entry(key.to_string()).or_default();
+        let max = (cell.content_h - cell.viewport_h).max(0.0);
+        cell.scroll_y = y.clamp(0.0, max);
+        cell.velocity = 0.0;
+    }
+
+    /// Current scroll position for `key`. Returns `0.0` if no scroll
+    /// region by that key has ever been built — cheaper than panicking
+    /// on first-frame reads.
+    pub fn scroll_offset(&self, key: &str) -> f32 {
+        self.state.scroll_states.get(key).map(|c| c.scroll_y).unwrap_or(0.0)
+    }
+
+    /// Most recent measured content / viewport dimensions for `key`,
+    /// as `(content_h, viewport_h)`. Both are `0.0` until the first
+    /// present pass measures the scroll. Useful for tests and for
+    /// activities that want to know whether a scroll can advance
+    /// any further.
+    pub fn scroll_extent(&self, key: &str) -> (f32, f32) {
+        self.state.scroll_states.get(key)
+            .map(|c| (c.content_h, c.viewport_h))
+            .unwrap_or((0.0, 0.0))
+    }
+
     // ── Present ──────────────────────────────────────────────────────
 
     /// Measure, lay out and paint the tree rooted at `root`. Consumes
@@ -441,12 +514,44 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             &self.nodes, root, self.viewport, self.density,
             &|text, size| crate::runtime::text_width(text, size),
         );
+
+        // Snapshot the persistent scroll offsets so the layout pass
+        // can apply them to `Node::Scroll` children without needing
+        // a mutable handle to `UiState`. The cache itself updates
+        // *after* layout — clamping the just-read offset against the
+        // new content/viewport heights — so a content shrink doesn't
+        // strand `scroll_y` past the new end.
+        let scroll_offsets: HashMap<String, f32> = self.state.scroll_states
+            .iter().map(|(k, c)| (k.clone(), c.scroll_y)).collect();
+
         let mut rects: HashMap<NodeId, Rect> = HashMap::new();
         layout::layout(
             &self.nodes, &self.attrs, root,
             Rect { x: 0.0, y: 0.0, w: self.viewport.0, h: self.viewport.1 },
-            &sizes, &mut rects,
+            &sizes, &scroll_offsets, &mut rects,
         );
+
+        // Refresh every Scroll cell with this frame's measured
+        // content/viewport sizes + viewport rect, then clamp scroll_y
+        // against the fresh max. A node's first frame initialises the
+        // cell at scroll_y=0 (the default) so the very first paint
+        // shows the top of the content — programmatic `scroll_to`
+        // called before any present() honours the same default until
+        // the cell catches up.
+        for (id, node) in self.nodes.iter().enumerate() {
+            if let Node::Scroll { child, key, .. } = node {
+                let viewport_rect = rects.get(&id).copied().unwrap_or_default();
+                let (_cw, ch) = sizes.get(child).copied().unwrap_or((0.0, 0.0));
+                let cell = self.state.scroll_states.entry(key.clone()).or_default();
+                cell.content_h = ch;
+                cell.viewport_w = viewport_rect.w;
+                cell.viewport_h = viewport_rect.h;
+                cell.last_rect = viewport_rect;
+                let max = (cell.content_h - cell.viewport_h).max(0.0);
+                if cell.scroll_y > max { cell.scroll_y = max; }
+                if cell.scroll_y < 0.0 { cell.scroll_y = 0.0; }
+            }
+        }
 
         // Record hit rects + actions for buttons before paint, so
         // `was_clicked` / `was_triggered` queries that come after
@@ -543,6 +648,10 @@ fn build_semantic_tree(
             Node::VStack { .. } | Node::HStack { .. } | Node::Frame { .. } | Node::Grid { .. } => {
                 (SemanticRole::Group, None, None)
             }
+            Node::Scroll { key, .. } => {
+                let id = if key.is_empty() { None } else { Some(key.clone()) };
+                (SemanticRole::Scroll, id, None)
+            }
             Node::Text { text, .. } => (SemanticRole::Text, None, Some(text.clone())),
             Node::Button { id, label, .. } => {
                 (SemanticRole::Button, Some(id.clone()), Some(label.clone()))
@@ -581,6 +690,9 @@ fn build_semantic_tree(
                 for c in children {
                     visit(nodes, rects, tree, *c, Some(idx));
                 }
+            }
+            Node::Scroll { child, .. } => {
+                visit(nodes, rects, tree, *child, Some(idx));
             }
             _ => {}
         }
@@ -939,5 +1051,293 @@ mod tests {
         assert!(!r.contains(40.0, 20.0));  // just past the right edge
         assert!(!r.contains(10.0, 60.0));  // just past the bottom edge
         assert!(!r.contains(9.9, 20.0));
+    }
+
+    // ── Stage 2c.2: Node::Scroll ──────────────────────────────────────
+
+    /// Build a Scroll containing a 200×1000 rect, present it, then run
+    /// `body` against the resulting `UiState` (which now has the scroll
+    /// cell populated). Viewport is 200×400 unless overridden.
+    fn with_scroll_state<F: FnOnce(&UiState)>(
+        viewport_w: f32, viewport_h: f32,
+        content_w: f32, content_h: f32,
+        key: &str,
+        prep: impl FnOnce(&mut UiState),
+        body: F,
+    ) {
+        let mut state = UiState::new();
+        prep(&mut state);
+        let c = ctx("scroll-test");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let rect_id = ui.rect(0xff00ffff).size(content_w, content_h).build();
+        let scroll = ui.scroll(rect_id).key(key).size(viewport_w, viewport_h).build();
+        ui.present(scroll);
+        body(&state);
+    }
+
+    #[test]
+    fn scroll_state_starts_at_zero_then_persists_after_first_present() {
+        with_scroll_state(200.0, 400.0, 200.0, 1000.0, "feed", |_| {}, |state| {
+            let cell = state.scroll_states.get("feed").expect("cell present");
+            assert_eq!(cell.scroll_y, 0.0, "first frame starts at top");
+            assert_eq!(cell.content_h, 1000.0);
+            assert_eq!(cell.viewport_h, 400.0);
+            assert_eq!(cell.viewport_w, 200.0);
+            assert_eq!(cell.last_rect.w, 200.0);
+            assert_eq!(cell.last_rect.h, 400.0);
+        });
+    }
+
+    #[test]
+    fn scroll_to_clamps_within_content() {
+        // Programmatic scroll_to before any present uses default
+        // content/viewport (both 0), so it gets clamped to 0. The
+        // first present then refreshes the dims; a second present
+        // round with a manually-set offset shows the clamp works.
+        let mut state = UiState::new();
+        // Manually pre-populate so scroll_to has dims to clamp against.
+        state.scroll_states.insert("feed".to_string(), ScrollCell {
+            content_h: 1000.0, viewport_h: 400.0, ..Default::default()
+        });
+        // Out-of-range high → clamped to (1000 - 400) = 600.
+        {
+            let c = ctx("t");
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            ui.scroll_to("feed", 1_000_000.0);
+            assert_eq!(ui.scroll_offset("feed"), 600.0);
+        }
+        // Negative → clamped to 0.
+        {
+            let c = ctx("t");
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            ui.scroll_to("feed", -50.0);
+            assert_eq!(ui.scroll_offset("feed"), 0.0);
+        }
+    }
+
+    #[test]
+    fn scroll_to_zeroes_velocity() {
+        // Stage 2c.4 sets velocity from a drag-release; 2c.2 just
+        // pins the contract — `scroll_to` is a hard override, not a
+        // gentle nudge.
+        let mut state = UiState::new();
+        state.scroll_states.insert("feed".to_string(), ScrollCell {
+            content_h: 1000.0, viewport_h: 400.0, velocity: 25.0,
+            ..Default::default()
+        });
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        ui.scroll_to("feed", 100.0);
+        assert_eq!(state.scroll_states["feed"].velocity, 0.0);
+    }
+
+    #[test]
+    fn scroll_offset_returns_zero_for_unknown_key() {
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let ui = Ui::new(&mut state, &c, &mut canvas);
+        assert_eq!(ui.scroll_offset("never-built"), 0.0);
+        assert_eq!(ui.scroll_extent("never-built"), (0.0, 0.0));
+    }
+
+    #[test]
+    fn scroll_position_persists_across_frames() {
+        // Frame 1: present + scroll_to(200). Frame 2: rebuild same
+        // Scroll node; scroll_y should still be 200.
+        let mut state = UiState::new();
+        // Frame 1
+        {
+            let c = ctx("t");
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let r = ui.rect(0xff00ffff).size(200.0, 1000.0).build();
+            let s = ui.scroll(r).key("feed").size(200.0, 400.0).build();
+            ui.present(s);
+            ui.scroll_to("feed", 200.0);
+        }
+        // Frame 2 — same key, but a wholly new builder.
+        {
+            let c = ctx("t");
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let r = ui.rect(0xff00ffff).size(200.0, 1000.0).build();
+            let s = ui.scroll(r).key("feed").size(200.0, 400.0).build();
+            ui.present(s);
+            assert_eq!(ui.scroll_offset("feed"), 200.0);
+        }
+    }
+
+    #[test]
+    fn scroll_content_shrink_re_clamps_existing_offset() {
+        // Frame 1: tall content + offset near the bottom. Frame 2:
+        // content shrinks → present() must clamp the cached offset
+        // against the new (smaller) max. Without re-clamp, the
+        // viewport would point past the end and paint backdrop.
+        let mut state = UiState::new();
+        {
+            let c = ctx("t");
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let r = ui.rect(0xff00ffff).size(200.0, 1000.0).build();
+            let s = ui.scroll(r).key("feed").size(200.0, 400.0).build();
+            ui.present(s);
+            ui.scroll_to("feed", 500.0); // valid against 1000-400=600 max
+        }
+        // Frame 2: child shrinks to 300 tall, so max scroll = 0.
+        {
+            let c = ctx("t");
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let r = ui.rect(0xff00ffff).size(200.0, 300.0).build();
+            let s = ui.scroll(r).key("feed").size(200.0, 400.0).build();
+            ui.present(s);
+            assert_eq!(
+                ui.scroll_offset("feed"), 0.0,
+                "shrinking content past viewport must clamp existing offset",
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_with_viewport_taller_than_content_pins_offset_to_zero() {
+        // Content fits in viewport: max = (200 - 400).max(0) = 0.
+        let mut state = UiState::new();
+        state.scroll_states.insert("feed".to_string(), ScrollCell {
+            scroll_y: 50.0, ..Default::default()
+        });
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let r = ui.rect(0xff00ffff).size(200.0, 200.0).build();
+        let s = ui.scroll(r).key("feed").size(200.0, 400.0).build();
+        ui.present(s);
+        assert_eq!(ui.scroll_offset("feed"), 0.0);
+    }
+
+    #[test]
+    fn scroll_publishes_scroll_role_with_key_as_id() {
+        // The semantic projection emits `SemanticRole::Scroll` and
+        // surfaces the caller's key as the node's `id` so tests can
+        // address the region via `findById`. We build the tree
+        // bottom-up by hand here because present()'s emission path
+        // skips when handle=0 (test fixture default).
+        let nodes = vec![
+            Node::Rect { color: 0xff00ffff, min: (200.0, 1000.0), radius: 0.0 },
+            Node::Scroll {
+                child: 0, key: "feed".to_string(),
+                viewport_w: Some(200.0), viewport_h: Some(400.0),
+            },
+        ];
+        let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
+        let sizes = layout::measure(&nodes, 1, (800.0, 600.0), 1.0,
+            &layout::estimate_text_width);
+        let scroll_offsets: HashMap<String, f32> = HashMap::new();
+        let mut rects: HashMap<NodeId, Rect> = HashMap::new();
+        layout::layout(
+            &nodes, &attrs, 1,
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            &sizes, &scroll_offsets, &mut rects,
+        );
+        let tree = build_semantic_tree(&nodes, 1, &rects);
+        assert!(!tree.nodes.is_empty());
+        let root = &tree.nodes[0];
+        assert_eq!(root.role, semantics::SemanticRole::Scroll);
+        assert_eq!(root.id.as_deref(), Some("feed"));
+    }
+
+    #[test]
+    fn scroll_paint_pushes_clip_around_child() {
+        // Paint emits a push_clip(viewport) → child paint → pop_clip,
+        // so off-screen child paint can't bleed onto other widgets.
+        // Canvas op tag bytes are wire-stable (see canvas.rs:
+        // `OP_PUSH_CLIP = 3`, `OP_POP_CLIP = 4`); the byte-search
+        // avoids exposing the constants publicly just for the test.
+        const OP_PUSH_CLIP: u8 = 3;
+        const OP_POP_CLIP:  u8 = 4;
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        {
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let r = ui.rect(0xff00ffff).size(200.0, 1000.0).build();
+            let s = ui.scroll(r).key("feed").size(200.0, 400.0).build();
+            ui.present(s);
+        }
+        // Byte-scan: any occurrence of the op tag byte is "an op of
+        // that kind was emitted". We don't have to skip per-op
+        // payloads — false matches against payload bytes are
+        // possible but vanishingly unlikely with rect coords like
+        // 0/200/400. The test is good-enough sentinel for "clip is
+        // there at all".
+        assert!(buf.iter().any(|&b| b == OP_PUSH_CLIP),
+            "Scroll must emit push_clip around its child");
+        assert!(buf.iter().any(|&b| b == OP_POP_CLIP),
+            "Scroll must emit a matching pop_clip");
+    }
+
+    #[test]
+    fn scrolled_offset_shifts_child_rect_upward() {
+        // After scroll_to(N), the child's placed rect should be at
+        // `y = viewport.y - N`. We seed the scroll cell, then present
+        // once to let the layout pass shift the child slot. The Rect
+        // child fully renders at the shifted y; descendants of a
+        // VStack/Frame inside Scroll would inherit the same origin
+        // naturally, so this single-child case is the load-bearing
+        // geometric check.
+        let mut state = UiState::new();
+        state.scroll_states.insert("feed".to_string(), ScrollCell {
+            content_h: 1000.0, viewport_h: 400.0, scroll_y: 250.0,
+            ..Default::default()
+        });
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let r = ui.rect(0xff00ffff).size(200.0, 1000.0).build();
+        let s = ui.scroll(r).key("feed").size(200.0, 400.0).build();
+        ui.present(s);
+        // Re-read rects via the state's last_rect for the Scroll,
+        // and inspect the child rect via a fresh layout pass that
+        // mirrors what present() did internally.
+        let scroll_offsets: HashMap<String, f32> =
+            state.scroll_states.iter().map(|(k, c)| (k.clone(), c.scroll_y)).collect();
+        let nodes = vec![
+            Node::Rect { color: 0xff00ffff, min: (200.0, 1000.0), radius: 0.0 },
+            Node::Scroll {
+                child: 0, key: "feed".to_string(),
+                viewport_w: Some(200.0), viewport_h: Some(400.0),
+            },
+        ];
+        let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
+        let sizes = layout::measure(&nodes, 1, (800.0, 600.0), 1.0,
+            &layout::estimate_text_width);
+        let mut rects: HashMap<NodeId, Rect> = HashMap::new();
+        layout::layout(
+            &nodes, &attrs, 1,
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            &sizes, &scroll_offsets, &mut rects,
+        );
+
+        // Scroll viewport sits at y=0; child rect is at y = 0 - 250.
+        assert_eq!(rects[&1].y, 0.0);
+        assert_eq!(rects[&0].y, -250.0);
+        // Child height is the content_h (1000), not the viewport.
+        assert_eq!(rects[&0].h, 1000.0);
     }
 }

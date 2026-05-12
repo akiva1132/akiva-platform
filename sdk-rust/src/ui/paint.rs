@@ -117,6 +117,17 @@ fn paint_node(
                 canvas.pop_clip();
             }
         }
+        Node::Scroll { child, .. } => {
+            // The child's rect already has `-scroll_y` baked in by
+            // `layout::place` (see `Node::Scroll` arm there), so
+            // descendant leaves paint at the scrolled positions
+            // naturally — no canvas transform needed. We just clip
+            // to the viewport so off-screen content above/below
+            // doesn't bleed onto neighbouring widgets.
+            canvas.push_clip(rect.x, rect.y, rect.w, rect.h);
+            paint_node(nodes, *child, rects, clicked_ids, text_width, canvas);
+            canvas.pop_clip();
+        }
         Node::VStack { children, .. }
         | Node::HStack { children, .. }
         | Node::Grid { children, .. } => {
