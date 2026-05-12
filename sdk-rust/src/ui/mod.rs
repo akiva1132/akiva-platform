@@ -235,7 +235,44 @@ pub struct UiState {
     /// present pass refreshes the cached content / viewport dimensions
     /// each frame.
     scroll_states: HashMap<String, ScrollCell>,
+    /// Last-known pointer position from `feed_pointer` (any phase) or
+    /// from a hover. Wheel events carry no `(x, y)` of their own, so
+    /// `feed_wheel` hit-tests against this cached position to find
+    /// the topmost scroll region under the cursor. `None` until the
+    /// first pointer event arrives.
+    last_pointer: Option<(f32, f32)>,
+    /// Currently-tracked drag gesture, or `None`. Lifecycle:
+    ///   Down inside a scroll region  → seeded (is_dragging=false)
+    ///   Move past DRAG_SLOP           → is_dragging flips to true
+    ///   Move while dragging          → applies delta to scroll_y +
+    ///                                  updates velocity EMA
+    ///   Up                            → taken out; if never dragged,
+    ///                                  the original Down promotes
+    ///                                  to a tap (pending_clicks)
+    ///   Cancel                        → dropped silently
+    drag_gesture: Option<DragGesture>,
 }
+
+/// In-flight drag state. See [`UiState::drag_gesture`] for the
+/// lifecycle. `key` identifies the scroll region the gesture started
+/// inside; `started_y` is the y of the down event (for slop
+/// thresholding); `last_y` is the y of the most recent Move (for
+/// per-frame deltas).
+#[derive(Debug, Clone)]
+pub(crate) struct DragGesture {
+    pub(crate) key: String,
+    pub(crate) started_at: (f32, f32),
+    pub(crate) last_y: f32,
+    pub(crate) is_dragging: bool,
+}
+
+/// Drag-detection threshold in dp. Pointer-down + move below this
+/// distance still resolves as a tap (so a button inside a scroll
+/// region keeps working); past it, the gesture switches to scroll-
+/// drag and the original Down does *not* fire as a click.
+/// Matches Android `ViewConfiguration.getScaledTouchSlop()` (8 dp on
+/// most devices, 6 dp on a few); 6 is a good cross-platform median.
+pub(crate) const DRAG_SLOP: f32 = 6.0;
 
 impl UiState {
     /// Empty UI state. Equivalent to `UiState::default()`; the explicit
@@ -243,13 +280,120 @@ impl UiState {
     /// `UiState::new()` rather than reaching for `Default`.
     pub fn new() -> Self { Self::default() }
 
-    /// Feed pointer events so `Ui::was_clicked` can correlate presses to
-    /// widgets. Call this unconditionally from your `on_pointer` — it
-    /// filters to `Down` internally and costs ~nothing otherwise.
+    /// Feed pointer events so `Ui::was_clicked` and `Node::Scroll`
+    /// drag-detection see them. Call this unconditionally from your
+    /// `on_pointer` — `UiState` filters by phase internally.
+    ///
+    /// Down/Move/Up/Cancel together resolve a gesture as one of:
+    ///   - **tap** — Down + Up with cumulative movement < `DRAG_SLOP`.
+    ///     Click queued for the next `present()` (existing behaviour).
+    ///   - **scroll-drag** — Down inside a scroll region + Move past
+    ///     `DRAG_SLOP`. Subsequent Moves shift `scroll_y` directly;
+    ///     the original Down does *not* fire as a tap, so a button
+    ///     accidentally pressed during the start of a drag doesn't
+    ///     spuriously trigger.
+    /// Tracking is per-gesture (Down…Up) — nothing crosses frames.
     pub fn feed_pointer(&mut self, ev: PointerEvent) {
-        if matches!(ev.phase, PointerPhase::Down) {
-            self.pending_clicks.push((ev.x, ev.y));
+        self.last_pointer = Some((ev.x, ev.y));
+        match ev.phase {
+            PointerPhase::Down => {
+                // Defer click resolution iff this Down landed inside a
+                // scroll region — that gesture might still become a
+                // drag. Outside any scroll region, fire the click
+                // immediately (preserves the pre-2c.3 tap latency for
+                // every button in the app).
+                if let Some(key) = self.scroll_region_at(ev.x, ev.y) {
+                    self.drag_gesture = Some(DragGesture {
+                        key,
+                        started_at: (ev.x, ev.y),
+                        last_y: ev.y,
+                        is_dragging: false,
+                    });
+                } else {
+                    self.pending_clicks.push((ev.x, ev.y));
+                }
+            }
+            PointerPhase::Move => {
+                if let Some(g) = self.drag_gesture.as_mut() {
+                    // Total Y travel from down. Below slop: gesture
+                    // still candidate-tap. Past slop: switch to drag.
+                    let total_dy = (ev.y - g.started_at.1).abs();
+                    if !g.is_dragging && total_dy >= DRAG_SLOP {
+                        g.is_dragging = true;
+                    }
+                    if g.is_dragging {
+                        // Positive delta_y = finger moved up =
+                        // content scrolls down (scroll_y increases).
+                        let delta_y = g.last_y - ev.y;
+                        // Capture before-update for borrow split.
+                        let key = g.key.clone();
+                        let cell = self.scroll_states.entry(key).or_default();
+                        let max = (cell.content_h - cell.viewport_h).max(0.0);
+                        cell.scroll_y = (cell.scroll_y + delta_y).clamp(0.0, max);
+                        // EMA velocity in px/frame. Used by Stage
+                        // 2c.4's fling animator at pointer-up. Half-
+                        // life ≈ 1 sample with the 0.5 / 0.5 weights;
+                        // bump the new-sample weight if drags feel
+                        // sticky.
+                        cell.velocity = 0.5 * cell.velocity + 0.5 * delta_y;
+                    }
+                    g.last_y = ev.y;
+                }
+            }
+            PointerPhase::Up => {
+                if let Some(g) = self.drag_gesture.take() {
+                    if !g.is_dragging {
+                        // Never crossed slop — promote to a tap so
+                        // buttons inside the scroll region still
+                        // work.
+                        self.pending_clicks.push(g.started_at);
+                    }
+                    // Drag-end: cell.velocity already carries the
+                    // EMA; 2c.4 picks it up to drive fling.
+                }
+            }
+            PointerPhase::Cancel => {
+                // Drop any candidate / active drag silently. Don't
+                // promote to a tap — Cancel is the OS saying "this
+                // gesture is invalid", not "Up".
+                self.drag_gesture = None;
+            }
         }
+    }
+
+    /// Feed wheel events so `Node::Scroll` advances under mouse-wheel
+    /// or trackpad two-finger swipe. Wheels carry no `(x, y)` of
+    /// their own; we hit-test against the last-known pointer position
+    /// from `feed_pointer`. No-op if no pointer event has been seen
+    /// yet (e.g. wheel before any cursor entry) or no scroll region
+    /// is under the cursor.
+    pub fn feed_wheel(&mut self, ev: super::activity::WheelEvent) {
+        let Some((px, py)) = self.last_pointer else { return; };
+        let Some(key) = self.scroll_region_at(px, py) else { return; };
+        let cell = self.scroll_states.entry(key).or_default();
+        let max = (cell.content_h - cell.viewport_h).max(0.0);
+        cell.scroll_y = (cell.scroll_y + ev.dy).clamp(0.0, max);
+        // Wheel input is an explicit user override; kill any active
+        // fling so the two don't fight.
+        cell.velocity = 0.0;
+    }
+
+    /// Find the topmost scroll region whose viewport rect contains
+    /// `(x, y)`. For nested scrolls, the innermost wins (smallest-
+    /// area rect among those that contain the point). `None` if no
+    /// scroll region has ever been built or none is under the
+    /// cursor. Cheap — scroll regions are O(handful) per activity.
+    fn scroll_region_at(&self, x: f32, y: f32) -> Option<String> {
+        let mut best: Option<(String, f32)> = None;
+        for (key, cell) in &self.scroll_states {
+            if cell.last_rect.contains(x, y) {
+                let area = cell.last_rect.w * cell.last_rect.h;
+                if best.as_ref().is_none_or(|(_, a)| area < *a) {
+                    best = Some((key.clone(), area));
+                }
+            }
+        }
+        best.map(|(k, _)| k)
     }
 }
 
@@ -1037,6 +1181,260 @@ mod tests {
         ui.present(btn);
         // Nothing crashed; button laid out at intrinsic.
         assert!(ui.state.hit_rects.contains_key("g"));
+    }
+
+    // ── Stage 2c.3: feed_wheel + drag-as-scroll ───────────────────────
+
+    /// Pre-seed a scroll cell so `scroll_region_at` has a viewport rect
+    /// to hit-test against without running a full present pass.
+    fn seed_scroll_cell(
+        state: &mut UiState, key: &str,
+        rect: Rect, content_h: f32, scroll_y: f32,
+    ) {
+        state.scroll_states.insert(key.to_string(), ScrollCell {
+            scroll_y,
+            velocity: 0.0,
+            content_h,
+            viewport_w: rect.w,
+            viewport_h: rect.h,
+            last_rect: rect,
+        });
+    }
+
+    fn wheel(dy: f32) -> crate::activity::WheelEvent {
+        crate::activity::WheelEvent { dx: 0.0, dy }
+    }
+
+    #[test]
+    fn feed_wheel_in_region_updates_scroll_y() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 0.0,
+        );
+        // Hover the pointer over the region first — wheel needs
+        // last_pointer to hit-test.
+        state.feed_pointer(pointer(100.0, 200.0, PointerPhase::Move));
+        state.feed_wheel(wheel(100.0));
+        assert_eq!(state.scroll_states["feed"].scroll_y, 100.0);
+    }
+
+    #[test]
+    fn feed_wheel_outside_region_is_ignored() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 50.0,
+        );
+        state.feed_pointer(pointer(500.0, 500.0, PointerPhase::Move));
+        state.feed_wheel(wheel(100.0));
+        // No change — pointer was outside the region.
+        assert_eq!(state.scroll_states["feed"].scroll_y, 50.0);
+    }
+
+    #[test]
+    fn feed_wheel_clamps_at_bottom() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            500.0, 50.0,
+        );
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Move));
+        // 500 - 400 = 100 max; ask for far past the end.
+        state.feed_wheel(wheel(10_000.0));
+        assert_eq!(state.scroll_states["feed"].scroll_y, 100.0);
+    }
+
+    #[test]
+    fn feed_wheel_clamps_at_top() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 30.0,
+        );
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Move));
+        state.feed_wheel(wheel(-1_000.0));
+        assert_eq!(state.scroll_states["feed"].scroll_y, 0.0);
+    }
+
+    #[test]
+    fn feed_wheel_zeroes_velocity() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 0.0,
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = 12.5;
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Move));
+        state.feed_wheel(wheel(10.0));
+        assert_eq!(state.scroll_states["feed"].velocity, 0.0,
+            "wheel kills active fling so the two don't fight");
+    }
+
+    #[test]
+    fn feed_wheel_without_pointer_history_is_noop() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 25.0,
+        );
+        // No prior feed_pointer — last_pointer is None.
+        state.feed_wheel(wheel(100.0));
+        assert_eq!(state.scroll_states["feed"].scroll_y, 25.0);
+    }
+
+    #[test]
+    fn pointer_down_outside_scroll_is_immediate_tap() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 100.0, y: 100.0, w: 200.0, h: 200.0 },
+            1000.0, 0.0,
+        );
+        // Down at (500, 500) — outside the scroll region. Should
+        // fire as a click immediately (preserve pre-2c.3 behaviour).
+        state.feed_pointer(pointer(500.0, 500.0, PointerPhase::Down));
+        assert_eq!(state.pending_clicks, vec![(500.0, 500.0)]);
+        // No drag candidate was seeded.
+        assert!(state.drag_gesture.is_none());
+    }
+
+    #[test]
+    fn pointer_down_inside_scroll_defers_click_seeds_drag_candidate() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 0.0,
+        );
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Down));
+        // No click queued yet — gesture might still become a drag.
+        assert!(state.pending_clicks.is_empty());
+        let g = state.drag_gesture.as_ref().expect("drag gesture seeded");
+        assert_eq!(g.key, "feed");
+        assert!(!g.is_dragging);
+    }
+
+    #[test]
+    fn pointer_up_below_slop_promotes_to_tap() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 0.0,
+        );
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Down));
+        // Move within slop (DRAG_SLOP = 6.0).
+        state.feed_pointer(pointer(52.0, 54.0, PointerPhase::Move));
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Up));
+        // Tap promoted: the original (down) position is the click.
+        assert_eq!(state.pending_clicks, vec![(50.0, 50.0)]);
+        // Scroll didn't move.
+        assert_eq!(state.scroll_states["feed"].scroll_y, 0.0);
+        // Drag state cleared.
+        assert!(state.drag_gesture.is_none());
+    }
+
+    #[test]
+    fn pointer_move_past_slop_starts_dragging_no_tap_on_up() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 0.0,
+        );
+        state.feed_pointer(pointer(50.0, 100.0, PointerPhase::Down));
+        // Move past slop (50 > 6).
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Move));
+        // scroll_y should have increased — finger went up by 50, so
+        // content scrolls up by 50.
+        assert_eq!(state.scroll_states["feed"].scroll_y, 50.0);
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Up));
+        // No tap (the gesture was a drag).
+        assert!(state.pending_clicks.is_empty());
+        // Drag cleared.
+        assert!(state.drag_gesture.is_none());
+    }
+
+    #[test]
+    fn drag_velocity_ema_accumulates_from_move_deltas() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 0.0,
+        );
+        state.feed_pointer(pointer(50.0, 100.0, PointerPhase::Down));
+        // Cross slop and a couple more moves to accumulate velocity.
+        state.feed_pointer(pointer(50.0, 80.0, PointerPhase::Move));   // delta +20
+        state.feed_pointer(pointer(50.0, 60.0, PointerPhase::Move));   // delta +20
+        state.feed_pointer(pointer(50.0, 40.0, PointerPhase::Move));   // delta +20
+        state.feed_pointer(pointer(50.0, 40.0, PointerPhase::Up));
+        let v = state.scroll_states["feed"].velocity;
+        // Three +20 samples through EMA(0.5/0.5): 10 → 15 → 17.5.
+        assert!(v > 0.0, "velocity should be positive after upward drag, got {v}");
+        assert!(v <= 20.0,
+            "velocity capped by latest sample (EMA can't exceed input), got {v}");
+    }
+
+    #[test]
+    fn cancel_drops_gesture_without_tap() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            1000.0, 0.0,
+        );
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Down));
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Cancel));
+        assert!(state.pending_clicks.is_empty());
+        assert!(state.drag_gesture.is_none());
+    }
+
+    #[test]
+    fn nested_scroll_innermost_wins_for_wheel_routing() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "outer",
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            10_000.0, 0.0,
+        );
+        seed_scroll_cell(
+            &mut state, "inner",
+            Rect { x: 100.0, y: 100.0, w: 300.0, h: 200.0 },
+            5_000.0, 0.0,
+        );
+        // Point lands inside both viewport rects; inner has smaller
+        // area so wheel routes there.
+        state.feed_pointer(pointer(200.0, 200.0, PointerPhase::Move));
+        state.feed_wheel(wheel(80.0));
+        assert_eq!(state.scroll_states["inner"].scroll_y, 80.0);
+        assert_eq!(state.scroll_states["outer"].scroll_y, 0.0);
+        // Point outside inner but inside outer routes to outer.
+        state.feed_pointer(pointer(600.0, 400.0, PointerPhase::Move));
+        state.feed_wheel(wheel(50.0));
+        assert_eq!(state.scroll_states["outer"].scroll_y, 50.0);
+    }
+
+    #[test]
+    fn drag_outside_scroll_region_still_clicks() {
+        // Pre-2c.3 invariant: a click on a button that isn't inside a
+        // scroll region must still register on Down. Drag tracking
+        // only kicks in for Downs inside a scroll region.
+        let mut state = UiState::new();
+        // No scroll states at all.
+        state.feed_pointer(pointer(50.0, 50.0, PointerPhase::Down));
+        // Wiggle around — these are Move events outside any scroll.
+        state.feed_pointer(pointer(60.0, 60.0, PointerPhase::Move));
+        state.feed_pointer(pointer(60.0, 60.0, PointerPhase::Up));
+        // Click fired on Down (preserve pre-2c.3 timing).
+        assert_eq!(state.pending_clicks, vec![(50.0, 50.0)]);
     }
 
     #[test]
