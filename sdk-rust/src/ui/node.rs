@@ -136,6 +136,25 @@ pub enum Node {
         viewport_w: Option<f32>,
         viewport_h: Option<f32>,
     },
+    /// Virtualised list — Android `RecyclerView` / Compose `LazyColumn`
+    /// in shape. Caller declares `count` items at a uniform `item_h`;
+    /// only items in the viewport (+ overscan) are realised. Memory is
+    /// bounded by viewport, not item count — a 10 000-row feed costs
+    /// the same as a 50-row one.
+    ///
+    /// `realized` is `(index, NodeId)` for each realised item, in
+    /// index order. Layout/paint walk `realized`; index gaps are the
+    /// virtualised items the SDK skipped on purpose.
+    LazyColumn {
+        key: String,
+        count: u32,
+        item_h: f32,
+        gap: f32,
+        padding: (f32, f32, f32, f32),
+        viewport_w: Option<f32>,
+        viewport_h: Option<f32>,
+        realized: Vec<(u32, NodeId)>,
+    },
     Button {
         id: String,
         /// Semantic action fired on click, separate from `id`. When set,
@@ -380,6 +399,138 @@ impl<'u, 's, 'c, 'b> ScrollBuilder<'u, 's, 'c, 'b> {
             viewport_h: self.viewport_h,
         });
         self.ui.set_grow(id, self.grow);
+        id
+    }
+}
+
+/// Builder for [`Node::LazyColumn`]. Terminating method is `.items()`
+/// rather than `.build()` because the body closure is the load-bearing
+/// half of the contract — callers don't get to lazy-evaluate items
+/// otherwise.
+pub struct LazyColumnBuilder<'u, 's, 'c, 'b> {
+    ui: &'u mut Ui<'s, 'c, 'b>,
+    key: String,
+    count: u32,
+    item_h: f32,
+    gap: f32,
+    padding: (f32, f32, f32, f32),
+    viewport_w: Option<f32>,
+    viewport_h: Option<f32>,
+    overscan: u32,
+    grow: f32,
+}
+
+/// Default per-side overscan (items realised past the visible edge).
+/// Smooth-scroll glides one extra item in/out without showing
+/// backdrop at the edges; bump if you see pop-in at 60fps scroll.
+pub(crate) const DEFAULT_OVERSCAN: u32 = 2;
+
+/// First-frame fallback cap: when the viewport height is unknown
+/// (no `.size(_, h)` and no cached cell), the SDK realises the first
+/// `LAZY_COLD_START_CAP` items so a first-paint has something to
+/// show. Second frame uses the just-measured viewport for real
+/// virtualisation.
+pub(crate) const LAZY_COLD_START_CAP: u32 = 30;
+
+impl<'u, 's, 'c, 'b> LazyColumnBuilder<'u, 's, 'c, 'b> {
+    pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, count: u32) -> Self {
+        Self {
+            ui, key: String::new(), count,
+            item_h: 0.0, gap: 0.0,
+            padding: (0.0, 0.0, 0.0, 0.0),
+            viewport_w: None, viewport_h: None,
+            overscan: DEFAULT_OVERSCAN, grow: 0.0,
+        }
+    }
+    pub fn key(mut self, key: impl Into<String>) -> Self { self.key = key.into(); self }
+    /// Required — every item is exactly this tall.
+    pub fn item_h(mut self, h: f32) -> Self { self.item_h = h.max(0.0); self }
+    pub fn gap(mut self, g: f32) -> Self { self.gap = g.max(0.0); self }
+    pub fn padding(mut self, p: f32) -> Self { self.padding = (p, p, p, p); self }
+    pub fn padding_trbl(mut self, t: f32, r: f32, b: f32, l: f32) -> Self {
+        self.padding = (t, r, b, l); self
+    }
+    /// Lock the viewport size. Without this the list inherits its slot
+    /// size — typical when sitting inside a `VStack { cross: Stretch }`.
+    pub fn size(mut self, w: f32, h: f32) -> Self {
+        self.viewport_w = Some(w.max(0.0));
+        self.viewport_h = Some(h.max(0.0));
+        self
+    }
+    pub fn height(mut self, h: f32) -> Self {
+        self.viewport_h = Some(h.max(0.0));
+        self
+    }
+    /// Items realised per side past the visible edge (default 2).
+    /// Higher = smoother edge fade-in at 60fps drag; lower = lower
+    /// memory + less wasted measure.
+    pub fn overscan(mut self, n: u32) -> Self { self.overscan = n; self }
+    pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
+
+    /// Build the LazyColumn by invoking `item_fn(ui, i)` for each
+    /// index in the visible range (+ overscan), pushing the
+    /// `Node::LazyColumn` once the items are realised, and returning
+    /// its NodeId. The closure runs *synchronously inside the build
+    /// pass* — no lazy futures, no per-frame allocation outside the
+    /// realised slice.
+    pub fn items<F>(self, mut item_fn: F) -> NodeId
+    where
+        F: FnMut(&mut Ui<'s, 'c, 'b>, u32) -> NodeId,
+    {
+        let LazyColumnBuilder {
+            ui, key, count, item_h, gap, padding,
+            viewport_w, viewport_h, overscan, grow,
+        } = self;
+
+        // Pick viewport_h: explicit `.size(_, h)` / `.height(h)` first,
+        // then last frame's cached cell, else 0 (cold-start fallback).
+        let cached_viewport_h = ui.scroll_cell_viewport_h(&key);
+        let cached_scroll_y = ui.scroll_offset(&key);
+        let resolved_vh = viewport_h.unwrap_or(cached_viewport_h);
+        let (top, _right, _bottom, _left) = padding;
+
+        // Item stride (item_h + gap). One row of N items takes
+        // N*(item_h+gap) - gap height in the content; the start of
+        // index i sits at `top + i * stride`.
+        let stride = item_h + gap;
+
+        let (start_idx, end_idx) = if count == 0 {
+            (0u32, 0u32)
+        } else if resolved_vh <= 0.0 || stride <= 0.0 {
+            // Cold start: viewport unknown / item_h missing →
+            // realise the first cap items so the first paint at
+            // least shows something.
+            (0u32, count.min(LAZY_COLD_START_CAP))
+        } else {
+            // Visible band runs from scroll_y to scroll_y + viewport_h
+            // (in content coords). First fully-or-partly visible item:
+            //   first = floor((scroll_y - top) / stride)   (clamped ≥ 0)
+            // Last partly visible:
+            //   last  = floor((scroll_y + viewport_h - top) / stride)
+            let scroll_y = cached_scroll_y;
+            let band_top = (scroll_y - top).max(0.0);
+            let band_bot = (scroll_y + resolved_vh - top).max(0.0);
+            let first = (band_top / stride).floor() as i64;
+            let last = (band_bot / stride).floor() as i64;
+            let s = (first - overscan as i64).max(0) as u32;
+            let e = ((last + overscan as i64).max(0) as u32 + 1).min(count);
+            (s, e)
+        };
+
+        // Materialise visible items via the caller's closure.
+        let mut realized: Vec<(u32, NodeId)> = Vec::with_capacity(
+            end_idx.saturating_sub(start_idx) as usize
+        );
+        for i in start_idx..end_idx {
+            let id = item_fn(ui, i);
+            realized.push((i, id));
+        }
+
+        let id = ui.push(Node::LazyColumn {
+            key, count, item_h, gap, padding,
+            viewport_w, viewport_h, realized,
+        });
+        ui.set_grow(id, grow);
         id
     }
 }

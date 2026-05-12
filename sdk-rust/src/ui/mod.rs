@@ -716,6 +716,23 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             .unwrap_or((0.0, 0.0))
     }
 
+    /// Cached viewport height for a scroll key from the last present.
+    /// `LazyColumnBuilder` reads this to compute its visible range on
+    /// rebuilds — second frame onward uses the real measurement so
+    /// virtualisation kicks in. Crate-private; apps query via
+    /// [`Self::scroll_extent`] instead.
+    pub(crate) fn scroll_cell_viewport_h(&self, key: &str) -> f32 {
+        self.state.scroll_states.get(key).map(|c| c.viewport_h).unwrap_or(0.0)
+    }
+
+    /// Begin a [`LazyColumn`][node::Node::LazyColumn]. Terminate with
+    /// `.items(|ui, i| ...)` — the closure is invoked once per
+    /// visible index, in order. Uniform `item_h` is required; gap +
+    /// padding are optional. See [`node::LazyColumnBuilder`].
+    pub fn lazy_column(&mut self, count: u32) -> node::LazyColumnBuilder<'_, 's, 'c, 'b> {
+        node::LazyColumnBuilder::new(self, count)
+    }
+
     // ── Present ──────────────────────────────────────────────────────
 
     /// Measure, lay out and paint the tree rooted at `root`. Consumes
@@ -764,26 +781,43 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             &sizes, &scroll_offsets, &mut rects,
         );
 
-        // Refresh every Scroll cell with this frame's measured
-        // content/viewport sizes + viewport rect, then clamp scroll_y
-        // against the fresh max. A node's first frame initialises the
-        // cell at scroll_y=0 (the default) so the very first paint
-        // shows the top of the content — programmatic `scroll_to`
-        // called before any present() honours the same default until
-        // the cell catches up.
+        // Refresh every Scroll / LazyColumn cell with this frame's
+        // measured content/viewport sizes + viewport rect, then clamp
+        // scroll_y against the fresh max. A node's first frame
+        // initialises the cell at scroll_y=0 (the default) so the
+        // very first paint shows the top of the content —
+        // programmatic `scroll_to` called before any present() honours
+        // the same default until the cell catches up.
         for (id, node) in self.nodes.iter().enumerate() {
-            if let Node::Scroll { child, key, .. } = node {
-                let viewport_rect = rects.get(&id).copied().unwrap_or_default();
-                let (_cw, ch) = sizes.get(child).copied().unwrap_or((0.0, 0.0));
-                let cell = self.state.scroll_states.entry(key.clone()).or_default();
-                cell.content_h = ch;
-                cell.viewport_w = viewport_rect.w;
-                cell.viewport_h = viewport_rect.h;
-                cell.last_rect = viewport_rect;
-                let max = (cell.content_h - cell.viewport_h).max(0.0);
-                if cell.scroll_y > max { cell.scroll_y = max; }
-                if cell.scroll_y < 0.0 { cell.scroll_y = 0.0; }
-            }
+            let (key, content_h) = match node {
+                Node::Scroll { child, key, .. } => {
+                    let (_cw, ch) = sizes.get(child).copied().unwrap_or((0.0, 0.0));
+                    (key, ch)
+                }
+                Node::LazyColumn { key, count, item_h, gap, padding, .. } => {
+                    // Content height is `count * item_h + (count-1) *
+                    // gap + padding_v`, regardless of which items are
+                    // realised — virtualisation must not change the
+                    // scrollable extent.
+                    let n = *count as f32;
+                    let ch = if *count == 0 {
+                        padding.0 + padding.2
+                    } else {
+                        n * item_h + (n - 1.0) * gap + padding.0 + padding.2
+                    };
+                    (key, ch)
+                }
+                _ => continue,
+            };
+            let viewport_rect = rects.get(&id).copied().unwrap_or_default();
+            let cell = self.state.scroll_states.entry(key.clone()).or_default();
+            cell.content_h = content_h;
+            cell.viewport_w = viewport_rect.w;
+            cell.viewport_h = viewport_rect.h;
+            cell.last_rect = viewport_rect;
+            let max = (cell.content_h - cell.viewport_h).max(0.0);
+            if cell.scroll_y > max { cell.scroll_y = max; }
+            if cell.scroll_y < 0.0 { cell.scroll_y = 0.0; }
         }
 
         // Record hit rects + actions for buttons before paint, so
@@ -881,7 +915,7 @@ fn build_semantic_tree(
             Node::VStack { .. } | Node::HStack { .. } | Node::Frame { .. } | Node::Grid { .. } => {
                 (SemanticRole::Group, None, None)
             }
-            Node::Scroll { key, .. } => {
+            Node::Scroll { key, .. } | Node::LazyColumn { key, .. } => {
                 let id = if key.is_empty() { None } else { Some(key.clone()) };
                 (SemanticRole::Scroll, id, None)
             }
@@ -926,6 +960,11 @@ fn build_semantic_tree(
             }
             Node::Scroll { child, .. } => {
                 visit(nodes, rects, tree, *child, Some(idx));
+            }
+            Node::LazyColumn { realized, .. } => {
+                for (_, c) in realized {
+                    visit(nodes, rects, tree, *c, Some(idx));
+                }
             }
             _ => {}
         }
@@ -1718,6 +1757,190 @@ mod tests {
         }
         assert!(state.scroll_states["feed"].scroll_y > scroll_y_before,
             "fling must advance during present()");
+    }
+
+    // ── Stage 2c.5: Node::LazyColumn ─────────────────────────────────
+
+    /// Build a LazyColumn with the given dimensions and capture the
+    /// indices the closure was invoked for. Returns
+    /// `(realized_indices, NodeId, UiState)`.
+    fn build_lazy(
+        viewport_h: f32, item_h: f32, count: u32,
+        seeded_cell: Option<(f32, f32)>,  // (scroll_y, cached_viewport_h)
+    ) -> (Vec<u32>, NodeId, UiState) {
+        use std::cell::RefCell;
+        let mut state = UiState::new();
+        if let Some((scroll_y, cached_vh)) = seeded_cell {
+            // Pre-seed so the cold-start path doesn't fire.
+            state.scroll_states.insert("feed".to_string(), ScrollCell {
+                scroll_y,
+                content_h: count as f32 * item_h,
+                viewport_w: 200.0,
+                viewport_h: cached_vh,
+                last_rect: Rect { x: 0.0, y: 0.0, w: 200.0, h: cached_vh },
+                ..Default::default()
+            });
+        }
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let realized: RefCell<Vec<u32>> = RefCell::new(Vec::new());
+        let lc = ui.lazy_column(count)
+            .key("feed")
+            .item_h(item_h)
+            .size(200.0, viewport_h)
+            .items(|ui, i| {
+                realized.borrow_mut().push(i);
+                ui.rect(0xff00ffff).size(200.0, item_h).build()
+            });
+        ui.present(lc);
+        (realized.into_inner(), lc, state)
+    }
+
+    #[test]
+    fn lazycolumn_first_frame_realises_up_to_cold_start_cap() {
+        // No cached cell + no item_h hint → cold start fires the
+        // first LAZY_COLD_START_CAP items.
+        let (realized, _, _) = build_lazy(400.0, 0.0, 80, None);
+        // item_h = 0 → stride = 0 → cold start path.
+        assert_eq!(realized.len(), node::LAZY_COLD_START_CAP as usize);
+        assert_eq!(realized.first(), Some(&0));
+    }
+
+    #[test]
+    fn lazycolumn_realises_only_visible_plus_overscan_with_seeded_cell() {
+        // Seed a cached cell so the second-frame virtualisation path
+        // kicks in. viewport_h=400, item_h=80, count=80, scroll_y=0:
+        // visible items 0..=5 (5*80=400). +overscan(2) → 0..=7 = 8 items.
+        let (realized, _, _) = build_lazy(400.0, 80.0, 80, Some((0.0, 400.0)));
+        assert!(realized.len() <= 8 + 2,
+            "expected ≤ 10 realised items, got {} ({realized:?})", realized.len());
+        assert_eq!(realized.first(), Some(&0));
+    }
+
+    #[test]
+    fn lazycolumn_advances_visible_range_when_scrolled() {
+        // scroll_y = 400 → 5 items past the top → first_visible = 5.
+        let (realized, _, _) = build_lazy(400.0, 80.0, 80, Some((400.0, 400.0)));
+        assert!(*realized.first().unwrap() >= 3,
+            "first realised index should advance with scroll_y, got {}",
+            realized.first().unwrap());
+        assert!(*realized.last().unwrap() < 80,
+            "last realised must stay inside count, got {}",
+            realized.last().unwrap());
+    }
+
+    #[test]
+    fn lazycolumn_clamps_realised_indices_to_count() {
+        // Scroll way past the end — no items past `count` should be
+        // built.
+        let (realized, _, _) = build_lazy(400.0, 80.0, 10, Some((10_000.0, 400.0)));
+        assert!(realized.iter().all(|&i| i < 10));
+    }
+
+    #[test]
+    fn lazycolumn_content_h_eq_count_times_item_h_plus_gap_padding() {
+        // 80 items × 80 dp + 79 × 8 gap + 16 + 16 padding =
+        //   6400 + 632 + 32 = 7064.
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        let lc = ui.lazy_column(80)
+            .key("feed").item_h(80.0).gap(8.0)
+            .padding(16.0).size(200.0, 400.0)
+            .items(|ui, _i| ui.rect(0xff00ffff).build());
+        ui.present(lc);
+        let (content_h, viewport_h) = ui.scroll_extent("feed");
+        assert_eq!(content_h, 80.0 * 80.0 + 79.0 * 8.0 + 32.0);
+        assert_eq!(viewport_h, 400.0);
+    }
+
+    #[test]
+    fn lazycolumn_empty_count_realises_nothing() {
+        let (realized, _, state) = build_lazy(400.0, 80.0, 0, Some((0.0, 400.0)));
+        assert!(realized.is_empty());
+        // content_h = padding only (none in this helper → 0).
+        assert_eq!(state.scroll_states["feed"].content_h, 0.0);
+    }
+
+    #[test]
+    fn lazycolumn_realised_count_independent_of_count() {
+        // 10 items vs 10 000 items should realise about the same
+        // number of items at scroll_y=0 — the whole point of
+        // virtualisation.
+        let (r_small, _, _) = build_lazy(400.0, 80.0, 10, Some((0.0, 400.0)));
+        let (r_huge, _, _) = build_lazy(400.0, 80.0, 10_000, Some((0.0, 400.0)));
+        // small is capped by count=10; huge is capped by viewport+overscan.
+        assert!(r_huge.len() <= r_small.len().max(12),
+            "huge realised ({}) must stay bounded vs viewport, not count",
+            r_huge.len());
+    }
+
+    #[test]
+    fn lazycolumn_publishes_scroll_role_with_key() {
+        // Same semantic shape as Node::Scroll — both project to
+        // SemanticRole::Scroll with their caller key as `id`.
+        let mut state = UiState::new();
+        // Need handle != 0 to test publish path? No — we test the
+        // build_semantic_tree directly.
+        let nodes = vec![
+            Node::Rect { color: 0xff00ffff, min: (200.0, 80.0), radius: 0.0 },
+            Node::LazyColumn {
+                key: "feed".to_string(),
+                count: 10, item_h: 80.0, gap: 0.0,
+                padding: (0.0, 0.0, 0.0, 0.0),
+                viewport_w: Some(200.0), viewport_h: Some(400.0),
+                realized: vec![(0, 0)],
+            },
+        ];
+        let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
+        let sizes = layout::measure(&nodes, 1, (800.0, 600.0), 1.0,
+            &layout::estimate_text_width);
+        let mut rects: HashMap<NodeId, Rect> = HashMap::new();
+        layout::layout(
+            &nodes, &attrs, 1,
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            &sizes, &HashMap::new(), &mut rects,
+        );
+        let tree = build_semantic_tree(&nodes, 1, &rects);
+        let root = &tree.nodes[0];
+        assert_eq!(root.role, semantics::SemanticRole::Scroll);
+        assert_eq!(root.id.as_deref(), Some("feed"));
+        let _ = &mut state;
+    }
+
+    #[test]
+    fn lazycolumn_items_placed_at_index_times_stride() {
+        // Item i should sit at y = padding_top + i * (item_h + gap) -
+        // scroll_y, within the viewport at (rect.x, rect.y).
+        let nodes = vec![
+            Node::Rect { color: 0xff00ffff, min: (200.0, 80.0), radius: 0.0 },
+            Node::Rect { color: 0xff00ffff, min: (200.0, 80.0), radius: 0.0 },
+            Node::LazyColumn {
+                key: "feed".to_string(),
+                count: 10, item_h: 80.0, gap: 8.0,
+                padding: (16.0, 16.0, 16.0, 16.0),
+                viewport_w: Some(200.0), viewport_h: Some(400.0),
+                realized: vec![(0, 0), (1, 1)],
+            },
+        ];
+        let attrs: Vec<NodeAttr> = (0..nodes.len()).map(|_| NodeAttr::default()).collect();
+        let sizes = layout::measure(&nodes, 2, (800.0, 600.0), 1.0,
+            &layout::estimate_text_width);
+        let mut rects: HashMap<NodeId, Rect> = HashMap::new();
+        layout::layout(
+            &nodes, &attrs, 2,
+            Rect { x: 0.0, y: 0.0, w: 800.0, h: 600.0 },
+            &sizes, &HashMap::new(), &mut rects,
+        );
+        // Item 0 at padding_top = 16, item 1 at 16 + 80 + 8 = 104.
+        assert_eq!(rects[&0].y, 16.0);
+        assert_eq!(rects[&1].y, 104.0);
+        // Width = viewport_w - padding_h*2 = 200 - 32 = 168.
+        assert_eq!(rects[&0].w, 168.0);
     }
 
     #[test]

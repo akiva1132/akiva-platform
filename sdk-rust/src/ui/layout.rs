@@ -239,6 +239,20 @@ fn measure_node(
             let _ = measure_node(nodes, *child, child_avail, text_width, out);
             (outer_w, outer_h)
         }
+        Node::LazyColumn { viewport_w, viewport_h, padding, item_h, realized, .. } => {
+            // Viewport is the locked size (or slot). Item children get
+            // a fixed slot `(inner_w, item_h)` so a future `text` /
+            // `frame` inside can wrap at the right width. Only the
+            // realised slice is measured — that's the whole point.
+            let outer_w = viewport_w.unwrap_or(avail.0);
+            let outer_h = viewport_h.unwrap_or(avail.1);
+            let inner_w = (outer_w - padding.1 - padding.3).max(0.0);
+            let item_avail = (inner_w, *item_h);
+            for (_, child) in realized {
+                let _ = measure_node(nodes, *child, item_avail, text_width, out);
+            }
+            (outer_w, outer_h)
+        }
         Node::Frame { children, padding, size, .. } => {
             // Z-stack: children overlap, so intrinsic = max child size on
             // each axis (not sum). Padding adds to both sides like stacks.
@@ -381,6 +395,11 @@ fn place(
             w = viewport_w.unwrap_or(slot.w);
             h = viewport_h.unwrap_or(slot.h);
         }
+        Node::LazyColumn { viewport_w, viewport_h, .. } => {
+            // Same sizing rule as Scroll: lock or fill the slot.
+            w = viewport_w.unwrap_or(slot.w);
+            h = viewport_h.unwrap_or(slot.h);
+        }
         _ => {}
     }
     let rect = Rect { x: slot.x, y: slot.y, w, h };
@@ -460,6 +479,27 @@ fn place(
                 /*stretch_w=*/ true, /*stretch_h=*/ false,
                 sizes, scroll_offsets, out,
             );
+        }
+        Node::LazyColumn { key, item_h, gap, padding, realized, .. } => {
+            // Each realised item gets a slot at its row's y in the
+            // content's coordinate space, shifted up by scroll_y.
+            // Virtualised (un-realised) items consume no layout —
+            // their positions are implicit in the index → y mapping
+            // but no rect is recorded for them.
+            let scroll_y = scroll_offsets.get(key).copied().unwrap_or(0.0);
+            let stride = *item_h + *gap;
+            let inner_x = rect.x + padding.3;
+            let inner_w = (rect.w - padding.1 - padding.3).max(0.0);
+            let inner_y_origin = rect.y + padding.0 - scroll_y;
+            for (idx, child) in realized {
+                let y = inner_y_origin + (*idx as f32) * stride;
+                let item_slot = Rect { x: inner_x, y, w: inner_w, h: *item_h };
+                place(
+                    nodes, attrs, *child, item_slot,
+                    /*stretch_w=*/ true, /*stretch_h=*/ true,
+                    sizes, scroll_offsets, out,
+                );
+            }
         }
         Node::Grid { children, cols, rows, gap_x, gap_y, padding } => {
             // Inner rect after padding; cells are equal-sized pieces of
