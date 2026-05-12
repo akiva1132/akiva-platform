@@ -27,6 +27,17 @@ pub enum Node {
         text: String,
         size: f32,
         color: u32,
+        /// Maximum lines before truncation. `1` (the default the SDK
+        /// builder sets) is single-line — long text overflows the
+        /// rect's width without wrap, matching the calculator-button
+        /// label behaviour on which the rest of the platform was
+        /// originally tuned. `> 1` enables greedy word-wrap inside
+        /// the available width passed to `measure`; the last line
+        /// gets a trailing `…` if more text remains. `u32::MAX`
+        /// means "wrap as many lines as needed, never truncate" —
+        /// the right choice for body copy that should reflow rather
+        /// than spill.
+        max_lines: u32,
     },
     Rect {
         color: u32,
@@ -74,6 +85,15 @@ pub enum Node {
         /// layout, before padding), matching CSS's `border-radius`
         /// + `overflow: hidden` shape.
         clip_radius: f32,
+        /// Lock the frame's measured size to `(w, h)`, regardless of
+        /// children's intrinsic sizes. `None` (the default) measures
+        /// from `max(child_size)` like a normal z-stack. Used for
+        /// "card with overflowing content": the bg Rect declares the
+        /// visible bounds and the body Text measures inside *those*
+        /// bounds, so wrap and ellipsis behave against the visible
+        /// width rather than the parent's full slot. Mirrors what a
+        /// CSS `width: 360px` does for a flex container.
+        size: Option<(f32, f32)>,
     },
     /// Fixed-dimension grid. `cols × rows` cells laid out in row-major
     /// order; every cell is the same size. Extra children past
@@ -136,18 +156,32 @@ pub struct TextBuilder<'u, 's, 'c, 'b> {
     size: f32,
     color: u32,
     grow: f32,
+    max_lines: u32,
 }
 
 impl<'u, 's, 'c, 'b> TextBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, text: String) -> Self {
-        Self { ui, text, size: 14.0, color: 0xfff0f4fa, grow: 0.0 }
+        Self { ui, text, size: 14.0, color: 0xfff0f4fa, grow: 0.0, max_lines: 1 }
     }
     pub fn size(mut self, size: f32) -> Self { self.size = size; self }
     pub fn color(mut self, color: u32) -> Self { self.color = color; self }
     /// Main-axis grow factor when placed in a stack. See [`super::NodeAttr::grow`].
     pub fn grow(mut self, factor: f32) -> Self { self.grow = factor; self }
+    /// Set a maximum line count. The default is `1` (single line, no
+    /// wrap, overflow continues past the rect's right edge — matches
+    /// the calculator-button label behaviour). Pass `n > 1` to enable
+    /// greedy word-wrap inside the available width; the last line
+    /// gets a trailing `…` if more text remains.
+    pub fn max_lines(mut self, n: u32) -> Self { self.max_lines = n.max(1); self }
+    /// Wrap as many lines as needed, never truncate. Use for body
+    /// copy that should reflow rather than spill (article paragraphs,
+    /// long descriptions). Equivalent to `max_lines(u32::MAX)`.
+    pub fn wrap(mut self) -> Self { self.max_lines = u32::MAX; self }
     pub fn build(self) -> NodeId {
-        let id = self.ui.push(Node::Text { text: self.text, size: self.size, color: self.color });
+        let id = self.ui.push(Node::Text {
+            text: self.text, size: self.size, color: self.color,
+            max_lines: self.max_lines,
+        });
         self.ui.set_grow(id, self.grow);
         id
     }
@@ -234,11 +268,15 @@ pub struct FrameBuilder<'u, 's, 'c, 'b> {
     padding: (f32, f32, f32, f32),
     grow: f32,
     clip_radius: f32,
+    size: Option<(f32, f32)>,
 }
 
 impl<'u, 's, 'c, 'b> FrameBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, children: Vec<NodeId>) -> Self {
-        Self { ui, children, padding: (0.0, 0.0, 0.0, 0.0), grow: 0.0, clip_radius: 0.0 }
+        Self {
+            ui, children, padding: (0.0, 0.0, 0.0, 0.0),
+            grow: 0.0, clip_radius: 0.0, size: None,
+        }
     }
     /// Uniform padding on all four sides.
     pub fn padding(mut self, p: f32) -> Self {
@@ -259,11 +297,21 @@ impl<'u, 's, 'c, 'b> FrameBuilder<'u, 's, 'c, 'b> {
         self.clip_radius = radius.max(0.0);
         self
     }
+    /// Lock the frame's measured size, overriding what children's
+    /// intrinsic sizes would compute. Use for cards whose visible
+    /// bounds (the bg Rect) should also bound their content's wrap
+    /// width — without this, a long single-line Text inside a card
+    /// would stretch the frame to the text's full unwrapped width.
+    pub fn size(mut self, w: f32, h: f32) -> Self {
+        self.size = Some((w.max(0.0), h.max(0.0)));
+        self
+    }
     pub fn build(self) -> NodeId {
         let id = self.ui.push(Node::Frame {
             children: self.children,
             padding: self.padding,
             clip_radius: self.clip_radius,
+            size: self.size,
         });
         self.ui.set_grow(id, self.grow);
         id

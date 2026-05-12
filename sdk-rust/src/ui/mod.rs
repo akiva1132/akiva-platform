@@ -476,7 +476,11 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             }
         }
 
-        paint::paint(&self.nodes, root, &rects, &self.state.current_clicks, self.canvas);
+        paint::paint(
+            &self.nodes, root, &rects, &self.state.current_clicks,
+            &|t, s| crate::runtime::text_width(t, s),
+            self.canvas,
+        );
 
         // Test-infra phase — publish the semantic projection of this
         // frame's tree. The host's AppRegistry forwards the bytes to

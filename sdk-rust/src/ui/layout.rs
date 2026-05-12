@@ -27,7 +27,109 @@ use super::{CrossAxis, MainAxis, NodeAttr, Rect};
 /// Line-height multiplier for intrinsic text height — matches the
 /// ~1.3 default line-height of most UA stylesheets, which is what
 /// Canvas2D `fillText` visually implies.
-const TEXT_LINE_H_RATIO: f32 = 1.3;
+pub(crate) const TEXT_LINE_H_RATIO: f32 = 1.3;
+
+/// Greedy word-wrap a string into at most `max_lines` lines that
+/// each fit within `avail_w` when measured by `text_width`. The last
+/// line gets a trailing `…` if more content remains; if a single
+/// word exceeds `avail_w`, it's placed alone on a line and accepts
+/// the overflow rather than infinite-loop. Returns the lines as
+/// owned `String`s so the paint pass can render them straight.
+///
+/// `max_lines == 0` is treated as `1` (single line, no wrap) so the
+/// empty-default case mirrors `TextBuilder::default`. `max_lines ==
+/// u32::MAX` disables truncation entirely (every word still fits on
+/// some line).
+pub(crate) fn wrap_text(
+    text: &str,
+    size: f32,
+    avail_w: f32,
+    max_lines: u32,
+    text_width: &dyn Fn(&str, f32) -> f32,
+) -> Vec<String> {
+    let max_lines = max_lines.max(1);
+    if max_lines == 1 {
+        return vec![text.to_string()];
+    }
+    if avail_w <= 0.0 {
+        // Degenerate slot — no horizontal room to fit even one
+        // glyph. Emit the original text on one line and let the
+        // overflow paint past the rect; better than producing zero
+        // visible content.
+        return vec![text.to_string()];
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (idx, w) in words.iter().enumerate() {
+        let candidate = if current.is_empty() {
+            (*w).to_string()
+        } else {
+            format!("{current} {w}")
+        };
+        if text_width(&candidate, size) <= avail_w {
+            current = candidate;
+            continue;
+        }
+        // Doesn't fit — commit the current line, start a new one
+        // with this word. If `current` is empty (first word doesn't
+        // fit on its own), accept the overflow on a single line.
+        if current.is_empty() {
+            lines.push((*w).to_string());
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = (*w).to_string();
+        }
+        // Truncation check — if we're at the last allowed line and
+        // there's still text left, append "…" to the previous line
+        // and stop.
+        if (lines.len() as u32) >= max_lines {
+            let trailing_words = &words[idx..];
+            if !trailing_words.is_empty() {
+                let last = lines.last_mut().unwrap();
+                truncate_with_ellipsis(last, size, avail_w, text_width);
+            }
+            return lines;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Trim the tail of `line` and append `…` until the result fits
+/// within `avail_w`. The ellipsis itself takes width — we measure
+/// `"<line>…"` each iteration. If the line is empty or even just
+/// `"…"` overflows (avail_w < ellipsis width), accept the overflow
+/// and keep at least the ellipsis so the truncation is visible.
+pub(crate) fn truncate_with_ellipsis(
+    line: &mut String,
+    size: f32,
+    avail_w: f32,
+    text_width: &dyn Fn(&str, f32) -> f32,
+) {
+    let ellipsis = "\u{2026}"; // U+2026 HORIZONTAL ELLIPSIS
+    if !line.is_empty() {
+        line.push_str(ellipsis);
+    } else {
+        *line = ellipsis.to_string();
+        return;
+    }
+    while text_width(line, size) > avail_w && line.chars().count() > 1 {
+        // Drop one char before the ellipsis. The ellipsis is one
+        // char (U+2026) so the "before-ellipsis" boundary is one
+        // char from the end.
+        let mut chars: Vec<char> = line.chars().collect();
+        // Remove the second-to-last char (last is the ellipsis).
+        let i = chars.len() - 2;
+        chars.remove(i);
+        *line = chars.into_iter().collect();
+    }
+}
 
 /// Estimate-based width used when the host isn't available (tests,
 /// fallback). 0.55 × size × char-count over-estimates narrow glyphs
@@ -60,10 +162,27 @@ fn measure_node(
     out: &mut HashMap<NodeId, (f32, f32)>,
 ) -> (f32, f32) {
     let size = match &nodes[id] {
-        Node::Text { text, size, .. } => {
-            let w = text_width(text, *size);
-            let h = *size * TEXT_LINE_H_RATIO;
-            (w, h)
+        Node::Text { text, size, max_lines, .. } => {
+            // Single-line: cheap path, return the unwrapped width and
+            // one-line height. Multi-line: greedy-wrap inside the
+            // available width and count the resulting lines.
+            let line_h = *size * TEXT_LINE_H_RATIO;
+            if *max_lines <= 1 {
+                let w = text_width(text, *size);
+                (w, line_h)
+            } else {
+                let lines = wrap_text(text, *size, avail.0, *max_lines, text_width);
+                // Width = widest line so the parent stack can still
+                // size around the text on the cross axis. Height =
+                // n_lines * line_h. We don't multiply by leading
+                // again here — TEXT_LINE_H_RATIO already covers it.
+                let mut w: f32 = 0.0;
+                for l in &lines {
+                    let lw = text_width(l, *size);
+                    if lw > w { w = lw; }
+                }
+                (w, lines.len() as f32 * line_h)
+            }
         }
         Node::Rect { min, .. } => *min,
         Node::Spacer { min } => *min,
@@ -103,12 +222,22 @@ fn measure_node(
             }
             (sum_w + padding.1 + padding.3, max_h + padding.0 + padding.2)
         }
-        Node::Frame { children, padding, .. } => {
+        Node::Frame { children, padding, size, .. } => {
             // Z-stack: children overlap, so intrinsic = max child size on
             // each axis (not sum). Padding adds to both sides like stacks.
+            //
+            // `size = Some((w, h))` locks the frame to (w, h) — the avail
+            // passed down to children becomes the locked inner box, so a
+            // body Text inside a 360-wide card wraps at 360 even when the
+            // outer slot is much wider. Without this, Text's full
+            // unwrapped intrinsic would stretch the frame past its bg.
+            let outer = match size {
+                Some((w, h)) => (*w, *h),
+                None => avail,
+            };
             let inner_avail = (
-                (avail.0 - padding.1 - padding.3).max(0.0),
-                (avail.1 - padding.0 - padding.2).max(0.0),
+                (outer.0 - padding.1 - padding.3).max(0.0),
+                (outer.1 - padding.0 - padding.2).max(0.0),
             );
             let mut max_w: f32 = 0.0;
             let mut max_h: f32 = 0.0;
@@ -117,7 +246,11 @@ fn measure_node(
                 if cw > max_w { max_w = cw; }
                 if ch > max_h { max_h = ch; }
             }
-            (max_w + padding.1 + padding.3, max_h + padding.0 + padding.2)
+            if let Some((w, h)) = size {
+                (*w, *h)
+            } else {
+                (max_w + padding.1 + padding.3, max_h + padding.0 + padding.2)
+            }
         }
         Node::Grid { children, cols, rows, gap_x, gap_y, padding } => {
             // Intrinsic = `cols × max_child_w + (cols-1) × gap_x` for
@@ -412,7 +545,198 @@ mod tests {
     fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-4 }
 
     fn text(s: &str, size: f32) -> Node {
-        Node::Text { text: s.into(), size, color: 0 }
+        Node::Text { text: s.into(), size, color: 0, max_lines: 1 }
+    }
+    fn text_wrap(s: &str, size: f32, max_lines: u32) -> Node {
+        Node::Text { text: s.into(), size, color: 0, max_lines }
+    }
+
+    // ── wrap_text + truncate_with_ellipsis ──────────────────────────────
+
+    /// Single-line passthrough — `max_lines == 1` skips word-wrap
+    /// regardless of the available width. Matches the pre-Stage-2b
+    /// default for every Text in the calculator + clip-shapes apps.
+    #[test]
+    fn wrap_text_single_line_no_wrap() {
+        let lines = wrap_text(
+            "the quick brown fox jumps over the lazy dog",
+            10.0, 50.0, 1, &estimate_text_width,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "the quick brown fox jumps over the lazy dog");
+    }
+
+    /// Greedy word-wrap fits as many words per line as the width
+    /// allows. `estimate_text_width` is `0.55 * size * char_count`
+    /// so at size=10, avail=55 fits 10 chars per line — "the quick"
+    /// (9 chars) fits, "the quick brown" (15) doesn't.
+    #[test]
+    fn wrap_text_greedy_packs_lines() {
+        let lines = wrap_text(
+            "the quick brown fox", 10.0, 55.0,
+            u32::MAX, &estimate_text_width,
+        );
+        assert_eq!(lines, vec!["the quick", "brown fox"]);
+    }
+
+    /// Truncation: when the wrapped output exceeds `max_lines`, the
+    /// last line gets a trailing ellipsis and the rest of the text
+    /// is dropped.
+    #[test]
+    fn wrap_text_truncates_with_ellipsis() {
+        // size=10, avail=55 → ~10 chars per line. "the quick brown
+        // fox jumps over the lazy dog" wraps to ≥ 4 lines; capping
+        // at 2 forces the ellipsis on the second.
+        let lines = wrap_text(
+            "the quick brown fox jumps over the lazy dog",
+            10.0, 55.0, 2, &estimate_text_width,
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "the quick");
+        assert!(lines[1].ends_with('\u{2026}'),
+            "second line should end with the ellipsis: got {:?}", lines[1]);
+        // The truncated content should be a prefix of "brown fox
+        // jumps over..." up to whatever still fits. Critical: the
+        // ellipsis IS visible (line non-empty + ends with U+2026).
+        assert!(lines[1].chars().count() > 1);
+    }
+
+    /// Unlimited wrap — `max_lines == u32::MAX` produces every word
+    /// across multiple lines without any truncation.
+    #[test]
+    fn wrap_text_unlimited_never_truncates() {
+        let lines = wrap_text(
+            "one two three four five six seven", 10.0, 55.0,
+            u32::MAX, &estimate_text_width,
+        );
+        // All seven words must appear, no ellipsis anywhere.
+        let joined = lines.join(" ");
+        assert_eq!(joined, "one two three four five six seven");
+        assert!(!lines.iter().any(|l| l.contains('\u{2026}')));
+    }
+
+    /// Single word longer than `avail_w` overflows on its own line
+    /// rather than infinite-looping or producing zero output.
+    #[test]
+    fn wrap_text_long_word_overflows_alone() {
+        // Word width at size=10 of "abcdefghijklmnop" is 16*0.55*10 = 88
+        // — way more than avail=20, but we still emit it.
+        let lines = wrap_text(
+            "abcdefghijklmnop hi", 10.0, 20.0,
+            u32::MAX, &estimate_text_width,
+        );
+        assert!(lines.contains(&"abcdefghijklmnop".to_string()));
+    }
+
+    /// Empty input returns one empty line so callers can still
+    /// compute height = lines.len() * line_h without a special case.
+    #[test]
+    fn wrap_text_empty_input() {
+        assert_eq!(wrap_text("", 10.0, 100.0, 3, &estimate_text_width), vec![""]);
+    }
+
+    /// `truncate_with_ellipsis` shrinks the line until "<line>…"
+    /// fits within `avail_w`. Always preserves at least the ellipsis
+    /// so the truncation is visible.
+    #[test]
+    fn truncate_with_ellipsis_shrinks_until_fit() {
+        let mut line = "the quick brown".to_string();
+        truncate_with_ellipsis(&mut line, 10.0, 30.0, &estimate_text_width);
+        assert!(line.ends_with('\u{2026}'));
+        assert!(estimate_text_width(&line, 10.0) <= 30.0,
+            "after truncation the line should fit: {:?}", line);
+    }
+
+    // ── Multi-line Text measurement ─────────────────────────────────────
+
+    /// Single-line Text reports height = size × line-height-ratio,
+    /// regardless of the slot's available width.
+    #[test]
+    fn text_single_line_height_unaffected_by_slot() {
+        let nodes = vec![text("hello", 14.0)];
+        let mut sizes = HashMap::new();
+        let (_w, h) = measure_node(&nodes, 0, (10.0, 10.0), &estimate_text_width, &mut sizes);
+        assert!(approx(h, 14.0 * TEXT_LINE_H_RATIO));
+    }
+
+    /// Multi-line Text: the height is N × line_h where N is the
+    /// number of wrapped lines. With size=10, avail=55, "the quick
+    /// brown fox" wraps to 2 lines.
+    #[test]
+    fn text_wrap_height_is_n_lines() {
+        let nodes = vec![text_wrap("the quick brown fox", 10.0, u32::MAX)];
+        let mut sizes = HashMap::new();
+        let (_w, h) = measure_node(&nodes, 0, (55.0, 100.0), &estimate_text_width, &mut sizes);
+        assert!(approx(h, 2.0 * 10.0 * TEXT_LINE_H_RATIO),
+            "expected 2-line height, got {h}");
+    }
+
+    /// Multi-line Text reports width = widest line (so the parent
+    /// stack can lay out around it on the cross axis), not the
+    /// available width.
+    #[test]
+    fn text_wrap_width_is_widest_line_not_avail() {
+        let nodes = vec![text_wrap("aaa bbb", 10.0, u32::MAX)];
+        let mut sizes = HashMap::new();
+        // avail=20 forces wrap (full text 38.5 doesn't fit). Each
+        // "aaa"/"bbb" alone is 3 × 0.55 × 10 = 16.5 wide.
+        let (w, _h) = measure_node(&nodes, 0, (20.0, 100.0), &estimate_text_width, &mut sizes);
+        assert!(w < 18.0 && w > 16.0,
+            "expected widest line ≈ 16.5, got {w}");
+    }
+    #[test]
+    fn frame_size_locks_measured_dimensions() {
+        // A frame with `size=Some((50, 30))` reports exactly that,
+        // even when its children would intrinsically measure larger.
+        let very_wide_text = text("super long text that would normally measure wider", 10.0);
+        let nodes = vec![very_wide_text, frame_sized(vec![0], (0.0, 0.0, 0.0, 0.0), 50.0, 30.0)];
+        let mut sizes = HashMap::new();
+        let (fw, fh) = measure_node(&nodes, 1, (1000.0, 1000.0), &estimate_text_width, &mut sizes);
+        assert_eq!((fw, fh), (50.0, 30.0));
+    }
+    #[test]
+    fn frame_size_caps_inner_text_wrap_width() {
+        // Inner Text inside a sized frame wraps at the frame's inner
+        // width, not at the parent's slot. Same long paragraph, two
+        // frames: `None` → wide unwrapped width, `Some((100, *))` →
+        // wrap width of 100.
+        let para = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda";
+        let unconstrained = vec![
+            text_wrap(para, 10.0, u32::MAX),
+            frame(vec![0], (0.0, 0.0, 0.0, 0.0)),
+        ];
+        let constrained = vec![
+            text_wrap(para, 10.0, u32::MAX),
+            frame_sized(vec![0], (0.0, 0.0, 0.0, 0.0), 100.0, 200.0),
+        ];
+        let mut s1 = HashMap::new();
+        let mut s2 = HashMap::new();
+        let (uw, _) = measure_node(&unconstrained, 1, (1000.0, 1000.0), &estimate_text_width, &mut s1);
+        let _ = measure_node(&constrained, 1, (1000.0, 1000.0), &estimate_text_width, &mut s2);
+        // Unconstrained: inner Text saw avail=1000, paragraph fits on
+        // one line, so it measures to its full width (≫ 100).
+        assert!(uw > 200.0, "unconstrained frame should be ≫ 100 wide, got {uw}");
+        // Constrained: the *Text node's* measured width is the widest
+        // wrapped line, capped near 100 (the frame's inner box).
+        let (text_w, _) = *s2.get(&0).expect("text was measured");
+        assert!(text_w <= 100.0,
+            "constrained text should wrap within the frame's 100-wide inner box, got {text_w}");
+    }
+    #[test]
+    fn frame_size_with_padding_passes_inner_box_to_children() {
+        // Frame size 100×40 with padding 5 → children measure with
+        // (100-10, 40-10) = (90, 30). The Text inside wraps at 90.
+        let para = "aaa bbb ccc ddd eee fff ggg hhh";
+        let nodes = vec![
+            text_wrap(para, 10.0, u32::MAX),
+            frame_sized(vec![0], (5.0, 5.0, 5.0, 5.0), 100.0, 40.0),
+        ];
+        let mut sizes = HashMap::new();
+        let (fw, fh) = measure_node(&nodes, 1, (1000.0, 1000.0), &estimate_text_width, &mut sizes);
+        assert_eq!((fw, fh), (100.0, 40.0));
+        let (text_w, _) = *sizes.get(&0).expect("text was measured");
+        assert!(text_w <= 90.0,
+            "text inside padded sized frame should wrap within inner 90-wide box, got {text_w}");
     }
     fn rect(w: f32, h: f32) -> Node {
         Node::Rect { color: 0, min: (w, h), radius: 0.0 }
@@ -437,7 +761,10 @@ mod tests {
         Node::HStack { children, gap, padding: (0.0, 0.0, 0.0, 0.0), main, cross }
     }
     fn frame(children: Vec<NodeId>, padding: (f32, f32, f32, f32)) -> Node {
-        Node::Frame { children, padding, clip_radius: 0.0 }
+        Node::Frame { children, padding, clip_radius: 0.0, size: None }
+    }
+    fn frame_sized(children: Vec<NodeId>, padding: (f32, f32, f32, f32), w: f32, h: f32) -> Node {
+        Node::Frame { children, padding, clip_radius: 0.0, size: Some((w, h)) }
     }
     /// Default attrs for a tree of `n` nodes — no grow anywhere. Used by
     /// every test that doesn't exercise grow specifically.
