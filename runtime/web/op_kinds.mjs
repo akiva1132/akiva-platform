@@ -85,6 +85,7 @@ export const CMD = Object.freeze({
   KEY:             0x11,
   RESIZE:          0x12,
   TEXT_INPUT:      0x13,  // Foundation gap — typed text (single-char keydown / compositionend.data)
+  WHEEL:           0x14,  // Wheel / scroll delta — `[handle:u32, dx:f32, dy:f32, ts:f64]` (20 bytes)
 
   RENDER:          0x20,
 

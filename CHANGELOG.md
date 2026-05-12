@@ -10,6 +10,30 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [0.13.0] — 2026-05 (Stage 2c.1 — wheel input pipeline)
+
+**MINOR** — additive: 1 new HAL event kind (`EVENT_WHEEL = 6`), 1 new
+host→app dispatch kind (`cmd::WHEEL = 0x14`), 1 new `Activity` callback
+(`on_wheel`). Plumbs DOM `wheel` end-to-end with `preventDefault`, so
+the canvas owns scroll input and the page never moves behind it. Sets
+up `Node::Scroll` / `Node::LazyColumn` in subsequent commits — see
+[`docs/scroll-lazycolumn-plan.md`](docs/scroll-lazycolumn-plan.md).
+
+- **Added (Stage 2c.1 — Wheel).**
+  - `EVENT_WHEEL = 6` — HAL→kernel — `[dx:f32, dy:f32, display_id:u32]`
+    (12 bytes). Wheel events are *not* coalesced — losing one means
+    losing scroll distance, which the user notices.
+  - `cmd::WHEEL = 0x14` — kernel→app — `[handle:u32, dx:f32, dy:f32,
+    ts:f64]` (20 bytes).
+  - SDK: `akiva_sdk::activity::WheelEvent { dx, dy }`,
+    `Activity::on_wheel(&mut self, ctx, ev)` (async, default no-op).
+  - Framework: `WheelEvent`, `Activity::on_wheel`,
+    `Framework::dispatch_wheel{,_on_display}` with dialog-shield mirror
+    of the pointer path.
+  - Browser layer: `canvas.addEventListener("wheel", h, { passive:
+    false })` + `preventDefault` — the page never scrolls behind the
+    Akiva canvas.
+
 ## [0.12.0] — 2026-05 (Stones 14.4 + 14.5 + 14.6 — Phase 14 closeout)
 
 **MINOR** — additive: 6 new op_kinds (3 io, 1 fire) plus 3 new

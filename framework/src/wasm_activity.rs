@@ -24,7 +24,7 @@
 use std::rc::Rc;
 use core::num::NonZeroU32;
 
-use crate::activity::{Activity, ActivityContext, KeyEvent, PointerEvent, PointerPhase, KeyPhase, SurfaceMetrics};
+use crate::activity::{Activity, ActivityContext, KeyEvent, PointerEvent, PointerPhase, KeyPhase, SurfaceMetrics, WheelEvent};
 use crate::compositor::{FrameCommands, PaintOp};
 use crate::intent::Intent;
 use crate::result::ActivityResult;
@@ -83,6 +83,13 @@ pub trait WasmHost {
     /// but the trait shape stays the same.
     fn pointer(&self, handle: AppHandle, ev: PointerEvent, ts_ms: f64) -> u64;
     fn key(&self, handle: AppHandle, ev: KeyEvent, ts_ms: f64) -> u64;
+    /// One-shot scroll delta. Default returns `0` so in-process
+    /// activities (Shell, test mocks) keep ignoring the hook without
+    /// having to override it; real wasm hosts dispatch `cmd::WHEEL`.
+    fn wheel(&self, handle: AppHandle, ev: WheelEvent, ts_ms: f64) -> u64 {
+        let _ = (handle, ev, ts_ms);
+        0
+    }
     /// Foundation gap — committed text input. Distinct dispatch from
     /// [`Self::key`] because the wire payload is variable-length
     /// (UTF-8 string) and the SDK splits the callback so apps don't
@@ -437,6 +444,10 @@ impl Activity for WasmActivity {
     }
     fn on_key(&mut self, ctx: &mut ActivityContext<'_>, ev: KeyEvent) {
         self.assert_sync("key", self.host.key(self.handle, ev, ctx.timestamp_ms));
+        self.drain_post(ctx);
+    }
+    fn on_wheel(&mut self, ctx: &mut ActivityContext<'_>, ev: WheelEvent) {
+        self.assert_sync("wheel", self.host.wheel(self.handle, ev, ctx.timestamp_ms));
         self.drain_post(ctx);
     }
     fn on_text_input(&mut self, ctx: &mut ActivityContext<'_>, text: &str) {

@@ -51,7 +51,7 @@ use std::task::Poll;
 
 use crate::activity::{
     Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState,
-    ScopeKind,
+    ScopeKind, WheelEvent,
 };
 use crate::executor;
 use crate::intent::Intent;
@@ -266,7 +266,7 @@ pub fn dealloc(ptr: *mut u8, size: u32) {
     unsafe { std_dealloc(ptr, layout); }
 }
 
-pub const ABI_VERSION: &[u8] = b"0.12.0\0";
+pub const ABI_VERSION: &[u8] = b"0.13.0\0";
 
 /// Stone 11.6.8 #2 — per-slot backpressure cap on concurrent
 /// in-flight dispatches.
@@ -672,6 +672,7 @@ fn install_and_poll<T: Activity + Default>(
             POINTER => install_pointer(slot, dispatch_id, rest)?,
             KEY     => install_key(slot, dispatch_id, rest)?,
             TEXT_INPUT => install_text_input(slot, dispatch_id, rest)?,
+            WHEEL   => install_wheel(slot, dispatch_id, rest)?,
             RESIZE  => install_resize(slot, dispatch_id, rest)?,
 
             RENDER => {
@@ -794,6 +795,27 @@ fn install_text_input(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) -> Result<
 
     let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
         Box::pin(async move { a.on_text_input(c, text).await; })
+    });
+    slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
+    Ok(())
+}
+
+/// Decode the WHEEL payload and fire [`Activity::on_wheel`].
+///
+/// Wire format: `[dx: f32 LE | dy: f32 LE | ts: f64 LE]` — 16 bytes
+/// after the host strips the `handle` prefix. Wheels carry no x/y of
+/// their own; the SDK's `Ui` uses the cached pointer position from
+/// `Context::pointer` to hit-test the topmost scroll region.
+fn install_wheel(slot: &mut Slot, dispatch_id: u64, rest: &[u8]) -> Result<(), u32> {
+    if rest.len() < 16 { return Err(1); }
+    let dx = f32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    let dy = f32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+    let ts = read_f64(&rest[8..16]);
+    slot.ctx.timestamp_ms = ts;
+
+    let ev = WheelEvent { dx, dy };
+    let fut = build_async_future(slot, DispatchOutcome::NoBytes, move |a, c| {
+        Box::pin(async move { a.on_wheel(c, ev).await; })
     });
     slot.pending.insert(dispatch_id, PendingDispatch { future: fut, completed: None, cmd_kind: 0 });
     Ok(())

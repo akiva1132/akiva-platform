@@ -116,6 +116,15 @@ impl Kernel {
                     fw.dispatch_text_input(&text, ts);
                 }
             }
+            Event::Wheel { dx, dy, display_id } => {
+                if let Some(fw) = self.framework.as_mut() {
+                    fw.dispatch_wheel_on_display(
+                        fw_act::WheelEvent { dx, dy },
+                        ts,
+                        display_id,
+                    );
+                }
+            }
         }
     }
 }
@@ -410,6 +419,21 @@ impl akiva_framework::wasm_activity::WasmHost for KernelWasmHost {
         );
         p[16..24].copy_from_slice(&ts_ms.to_le_bytes());
         self.dispatch(akiva_framework::wire::op_kinds::cmd::KEY, &p)
+    }
+
+    fn wheel(
+        &self,
+        handle: akiva_framework::wasm_activity::AppHandle,
+        ev: fw_act::WheelEvent,
+        ts_ms: f64,
+    ) -> u64 {
+        // [handle: u32, dx: f32, dy: f32, ts: f64] = 20 bytes
+        let mut p = [0u8; 20];
+        p[0..4].copy_from_slice(&handle.get().to_le_bytes());
+        p[4..8].copy_from_slice(&ev.dx.to_le_bytes());
+        p[8..12].copy_from_slice(&ev.dy.to_le_bytes());
+        p[12..20].copy_from_slice(&ts_ms.to_le_bytes());
+        self.dispatch(akiva_framework::wire::op_kinds::cmd::WHEEL, &p)
     }
 
     fn text_input(

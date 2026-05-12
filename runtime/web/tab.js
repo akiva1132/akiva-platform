@@ -518,6 +518,20 @@ function installInputForwarding(canvas) {
   canvas.addEventListener("pointerup", pointerEvent("up"));
   canvas.addEventListener("pointercancel", pointerEvent("cancel"));
 
+  // Wheel / scroll. `passive: false` is mandatory — without it
+  // `preventDefault` is ignored and the *page* scrolls behind the
+  // canvas. With it, scroll input is owned by the kernel and the SDK's
+  // `Node::Scroll` / `Node::LazyColumn` consumes the delta.
+  canvas.addEventListener("wheel", (e) => {
+    const ratio = dpr();
+    session.send({
+      type: "event", kind: "wheel", tabId,
+      dx: e.deltaX * ratio,
+      dy: e.deltaY * ratio,
+    });
+    e.preventDefault();
+  }, { passive: false });
+
   const keyEvent = (phase) => (e) => {
     session.send({
       type: "event", kind: "key", tabId,

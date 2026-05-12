@@ -849,6 +849,7 @@ const EVENT_KEY = 2;
 const EVENT_RESIZE = 3;
 const EVENT_VISIBILITY = 4;
 const EVENT_TEXT = 5;  // Foundation gap — committed typed text (single keydown char or compositionend.data).
+const EVENT_WHEEL = 6; // One-shot scroll delta — `[dx:f32, dy:f32, display_id:u32]` (12 bytes).
 
 function forwardEvent(msg) {
   if (!booted || !instance) return;
@@ -903,6 +904,19 @@ function forwardEvent(msg) {
     case "visibility": {
       const buf = new Uint8Array([msg.visible ? 1 : 0]);
       postEvent(EVENT_VISIBILITY, buf);
+      break;
+    }
+    case "wheel": {
+      // Wire format: [dx: f32 LE | dy: f32 LE | display_id: u32 LE] = 12 bytes.
+      // Wheels coalesce poorly (each notch is meaningful scroll distance),
+      // so the kernel-side queue keeps them separate — see
+      // `event_queue.rs::wheel_events_do_not_coalesce`.
+      const buf = new ArrayBuffer(12);
+      const dv = new DataView(buf);
+      dv.setFloat32(0, msg.dx, true);
+      dv.setFloat32(4, msg.dy, true);
+      dv.setUint32(8, displayId, true);
+      postEvent(EVENT_WHEEL, new Uint8Array(buf));
       break;
     }
   }

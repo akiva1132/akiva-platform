@@ -62,6 +62,18 @@ pub struct KeyEvent {
     pub phase: KeyPhase,
 }
 
+/// One-shot scroll delta — a wheel notch or a trackpad two-finger swipe.
+/// Distinct from `PointerEvent` because wheels carry no phase (no
+/// Down/Move/Up gesture grouping) and no x/y of their own — the delta is
+/// the event. Apps that host a scrollable region either override
+/// [`Activity::on_wheel`] or wire the event into `Ui::feed_wheel` and let
+/// the SDK's `Node::Scroll` / `Node::LazyColumn` consume it.
+#[derive(Debug, Clone, Copy)]
+pub struct WheelEvent {
+    pub dx: f32,
+    pub dy: f32,
+}
+
 /// Per-callback context the runtime constructs fresh each tick. Carries
 /// display metrics, a frame timestamp, and (when relevant) the most
 /// recent pointer state — so callbacks that need to look at the pointer
@@ -323,6 +335,13 @@ pub trait Activity: 'static {
         let _ = (ctx, ev);
     }
     async fn on_key(&mut self, ctx: &mut Context<'_>, ev: KeyEvent) {
+        let _ = (ctx, ev);
+    }
+    /// One-shot scroll delta. The wheel event carries no `(x, y)`; the
+    /// SDK caches the last pointer position on [`Context::pointer`] so
+    /// activities (or the immediate-mode `Ui`) can hit-test against the
+    /// scroll region under the cursor.
+    async fn on_wheel(&mut self, ctx: &mut Context<'_>, ev: WheelEvent) {
         let _ = (ctx, ev);
     }
     /// Foundation gap — committed text input. The host fires this for

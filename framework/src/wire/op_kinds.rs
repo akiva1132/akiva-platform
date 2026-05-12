@@ -444,6 +444,11 @@ pub mod cmd {
     /// keystrokes go through `KEY` and do not fire this. Variable
     /// payload size — minimum 14 bytes (empty text).
     pub const TEXT_INPUT: u32 = 0x13;
+    /// Wheel / scroll delta. Args: `[handle: u32 LE, dx: f32 LE,
+    /// dy: f32 LE, ts_ms: f64 LE]`. 20 bytes. Positive `dy` =
+    /// scroll-content-down (matches DOM convention). No phase /
+    /// button — wheels are one-shot deltas, not gestures.
+    pub const WHEEL: u32 = 0x14;
 
     /// Args: `[handle: u32 LE, ts_ms: f64 LE]`. 12 bytes. Result
     /// bytes (paint stream) fetched via `akiva_app_get_result`.
@@ -622,6 +627,7 @@ mod tests {
         assert_eq!(cmd::KEY,              sdk::cmd::KEY);
         assert_eq!(cmd::RESIZE,           sdk::cmd::RESIZE);
         assert_eq!(cmd::TEXT_INPUT,       sdk::cmd::TEXT_INPUT);
+        assert_eq!(cmd::WHEEL,            sdk::cmd::WHEEL);
         assert_eq!(cmd::RENDER,           sdk::cmd::RENDER);
         assert_eq!(cmd::SAVE_STATE,       sdk::cmd::SAVE_STATE);
         assert_eq!(cmd::RESTORE_STATE,    sdk::cmd::RESTORE_STATE);
@@ -633,7 +639,7 @@ mod tests {
     fn cmd_kinds_are_unique() {
         let cmds = [
             cmd::CREATE, cmd::START, cmd::RESUME, cmd::PAUSE, cmd::STOP, cmd::DESTROY,
-            cmd::POINTER, cmd::KEY, cmd::RESIZE, cmd::TEXT_INPUT,
+            cmd::POINTER, cmd::KEY, cmd::RESIZE, cmd::TEXT_INPUT, cmd::WHEEL,
             cmd::RENDER,
             cmd::SAVE_STATE, cmd::RESTORE_STATE,
             cmd::NEW_INTENT, cmd::ACTIVITY_RESULT,

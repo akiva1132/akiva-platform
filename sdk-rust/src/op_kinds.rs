@@ -281,6 +281,13 @@ pub mod cmd {
     /// for IME). Apps that want typed input override
     /// [`crate::Activity::on_text_input`].
     pub const TEXT_INPUT: u32 = 0x13;
+    /// Wheel / scroll delta. Distinct from POINTER because wheels
+    /// don't have phases (Down/Move/Up) and carry no x/y position of
+    /// their own — they're "delta at the last-known pointer". Apps
+    /// that want scroll input override [`crate::Activity::on_wheel`];
+    /// the SDK's `Ui::feed_wheel` consumes the same event to drive
+    /// `Node::Scroll` / `Node::LazyColumn`.
+    pub const WHEEL: u32 = 0x14;
 
     pub const RENDER: u32 = 0x20;
 
@@ -373,7 +380,7 @@ mod tests {
         // / `fire::` qualifier — keep the ranges visibly separate.
         let cmds = [
             cmd::CREATE, cmd::START, cmd::RESUME, cmd::PAUSE, cmd::STOP, cmd::DESTROY,
-            cmd::POINTER, cmd::KEY, cmd::RESIZE, cmd::TEXT_INPUT,
+            cmd::POINTER, cmd::KEY, cmd::RESIZE, cmd::TEXT_INPUT, cmd::WHEEL,
             cmd::RENDER,
             cmd::SAVE_STATE, cmd::RESTORE_STATE,
             cmd::NEW_INTENT, cmd::ACTIVITY_RESULT,

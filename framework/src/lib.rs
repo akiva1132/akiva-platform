@@ -46,7 +46,7 @@ pub mod window_manager;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use activity::{ActivityContext, KeyEvent, PointerEvent, SurfaceMetrics};
+use activity::{ActivityContext, KeyEvent, PointerEvent, SurfaceMetrics, WheelEvent};
 use activity_manager::{ActivityId, ActivityManager, LaunchMode, LifecycleState, TaskId};
 use compositor::{Compositor, FrameCommands};
 use intent::{Intent, IntentFilter};
@@ -606,6 +606,32 @@ impl Framework {
             self.windows.destroy_surface(sid);
             self.compositor.destroy_surface(sid);
         }
+    }
+
+    /// Wheel delta dispatch. Mirrors `dispatch_pointer_on_display` —
+    /// per-display routing, dialog-shielded so a wheel over an open
+    /// dialog doesn't scroll the activity behind it. The activity
+    /// receives the event in `on_wheel`; it's up to the SDK's `Ui`
+    /// to hit-test the topmost scroll region.
+    pub fn dispatch_wheel(&mut self, ev: WheelEvent, ts: f64) {
+        self.dispatch_wheel_on_display(ev, ts, 0);
+    }
+
+    /// Display-aware wheel dispatch. `display_id == 0` is the primary
+    /// surface (legacy single-display behaviour). Wheel events arriving
+    /// while a dialog is open are silently dropped — the dialog visually
+    /// covers its activity, so allowing the underlying scroll to advance
+    /// would be confusing.
+    pub fn dispatch_wheel_on_display(
+        &mut self, ev: WheelEvent, ts: f64, display_id: u32,
+    ) {
+        let Some(id) = self.foreground_activity_for_display(display_id) else { return; };
+        // Dialog shield — wheel over a dialog is eaten silently, same
+        // policy as pointer Move/Up inside `dispatch_pointer_on_display`.
+        let dialog_open = self.dialogs.open_dialogs().any(|d| d.owner == id);
+        if dialog_open { return; }
+        let (post, _) = self.with_ctx(id, ts, |a, ctx| a.on_wheel(ctx, ev));
+        self.apply_post(post, id, ts);
     }
 
     pub fn dispatch_key(&mut self, ev: KeyEvent, ts: f64) {

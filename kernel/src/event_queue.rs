@@ -23,6 +23,14 @@
 //!     Ctrl/Meta) and `compositionend` (`e.data`) both produce one of
 //!     these. Modifier-only keystrokes (Shift, arrows, F-keys) stay on
 //!     the key channel and don't fire a text event.
+//!   - input.wheel   (kind=6): { dx: f32, dy: f32, display_id: u32 }
+//!     A one-shot scroll delta from the `wheel` DOM event (mouse wheel,
+//!     trackpad two-finger swipe). Positive `dy` = "content should move
+//!     up" (matches DOM convention). Distinct channel from `pointer`
+//!     because wheels don't have Down/Move/Up phases, so the dispatcher
+//!     can't conflate them with drags, and they need to route to a
+//!     hit-test against the topmost `Scroll`/`LazyColumn` under the
+//!     cursor instead of the activity's focused widget.
 //!
 //! See docs/runtime-web.md §4 for the full pipeline, including where this
 //! queue sits between the worker's `akiva_on_event` and the kernel frame
@@ -64,6 +72,13 @@ pub enum Event {
     /// typing "abc" produces three events; an IME committing "שלום"
     /// produces one event of length 4.
     TextInput { text: String },
+    /// One-shot scroll delta from a `wheel` DOM event. `dx`/`dy` are
+    /// in CSS pixels times the device-pixel ratio (matches pointer
+    /// coordinate space). Positive `dy` = "content scrolls down" by
+    /// DOM convention. `display_id` is the originating tab's display
+    /// so the framework can route the event to the activity owning
+    /// that display, same pattern as `Pointer`.
+    Wheel { dx: f32, dy: f32, display_id: u32 },
 }
 
 const EVENT_POINTER: u32 = 1;
@@ -71,6 +86,7 @@ const EVENT_KEY: u32 = 2;
 const EVENT_RESIZE: u32 = 3;
 const EVENT_VISIBILITY: u32 = 4;
 const EVENT_TEXT: u32 = 5;
+const EVENT_WHEEL: u32 = 6;
 
 impl Event {
     pub fn decode(kind: u32, bytes: &[u8]) -> Option<Self> {
@@ -120,6 +136,11 @@ impl Event {
                 let text = std::str::from_utf8(&bytes[2..2 + text_len]).ok()?.to_string();
                 Some(Event::TextInput { text })
             }
+            EVENT_WHEEL if bytes.len() >= 12 => Some(Event::Wheel {
+                dx: f32::from_le_bytes(bytes[0..4].try_into().ok()?),
+                dy: f32::from_le_bytes(bytes[4..8].try_into().ok()?),
+                display_id: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
+            }),
             _ => None,
         }
     }
@@ -227,5 +248,46 @@ mod tests {
         // 1 byte — not even enough for the u16 length prefix.
         assert!(Event::decode(EVENT_TEXT, &[0x05]).is_none());
         assert!(Event::decode(EVENT_TEXT, &[]).is_none());
+    }
+
+    fn wheel_payload(dx: f32, dy: f32, display_id: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12);
+        buf.extend_from_slice(&dx.to_le_bytes());
+        buf.extend_from_slice(&dy.to_le_bytes());
+        buf.extend_from_slice(&display_id.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn wheel_event_decodes_full_payload() {
+        let buf = wheel_payload(-2.5, 17.0, 3);
+        match Event::decode(EVENT_WHEEL, &buf) {
+            Some(Event::Wheel { dx, dy, display_id }) => {
+                assert_eq!(dx, -2.5);
+                assert_eq!(dy, 17.0);
+                assert_eq!(display_id, 3);
+            }
+            other => panic!("expected Wheel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wheel_event_rejects_truncated_payload() {
+        // 11 bytes — one short of the required 12.
+        let mut buf = wheel_payload(1.0, 2.0, 0);
+        buf.pop();
+        assert!(Event::decode(EVENT_WHEEL, &buf).is_none());
+        assert!(Event::decode(EVENT_WHEEL, &[]).is_none());
+    }
+
+    #[test]
+    fn wheel_events_do_not_coalesce() {
+        // Pointer-moves coalesce (only latest matters). Wheel deltas are
+        // additive — losing one means losing scroll distance, which the
+        // user notices. Two wheel events should land in the queue.
+        let mut q = EventQueue::new();
+        q.push(Event::Wheel { dx: 0.0, dy: 10.0, display_id: 0 });
+        q.push(Event::Wheel { dx: 0.0, dy: 12.0, display_id: 0 });
+        assert_eq!(q.len(), 2);
     }
 }

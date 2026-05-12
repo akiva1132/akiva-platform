@@ -57,6 +57,16 @@ pub struct KeyEvent {
     pub phase: KeyPhase,
 }
 
+/// One-shot scroll delta — typically a mouse wheel notch or a trackpad
+/// two-finger swipe. No phase, no buttons: a wheel is the delta itself.
+/// The host produces these from the DOM `wheel` event with `preventDefault`,
+/// so the page never scrolls behind the canvas.
+#[derive(Debug, Clone, Copy)]
+pub struct WheelEvent {
+    pub dx: f32,
+    pub dy: f32,
+}
+
 /// State the framework hands to an activity on every callback. Cheap to
 /// construct — the framework rebuilds one per dispatch so activities never
 /// observe a stale view.
@@ -119,6 +129,14 @@ pub trait Activity: 'static {
         let _ = (ctx, ev);
     }
     fn on_key(&mut self, ctx: &mut ActivityContext<'_>, ev: KeyEvent) {
+        let _ = (ctx, ev);
+    }
+    /// One-shot scroll delta from a `wheel` DOM event. Default is a
+    /// no-op; activities that host a scrollable region override this
+    /// to update their scroll state. Note: the wheel event carries no
+    /// `(x, y)` of its own — apps should hit-test against the last
+    /// pointer position cached on [`ActivityContext::pointer`].
+    fn on_wheel(&mut self, ctx: &mut ActivityContext<'_>, ev: WheelEvent) {
         let _ = (ctx, ev);
     }
     /// Foundation gap — committed text input (single keydown char or
