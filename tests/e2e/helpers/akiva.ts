@@ -337,6 +337,21 @@ export async function launchArticles(page: Page, opts: { timeoutMs?: number } = 
   await waitForText(page, "Articles", { timeoutMs });
 }
 
+/** Boot Akiva, then click the feed launcher row. Alphabetically
+ *  `com.akiva.feed` sits between `com.akiva.clipshapes` (row 2) and
+ *  `com.akiva.hello` (row 4), so it lands at row 3. First-paint
+ *  signal is the inspector reporting the "feed" scroll region. */
+export async function launchFeed(page: Page, opts: { timeoutMs?: number } = {}) {
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  await bootAkiva(page, { timeoutMs });
+  await clickShellLauncherRow(page, 3);
+  await page.waitForFunction(
+    () => (window as any).__akiva?.scrollOf("feed") !== null,
+    null,
+    { timeout: timeoutMs },
+  );
+}
+
 /** Boot Akiva, then click the calculator's launcher row in the Shell.
  *  Returns once the calculator's first `PUBLISH_SEMANTICS` lands —
  *  i.e. when its semantic tree shows up in the inspector and the

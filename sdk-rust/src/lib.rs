@@ -40,7 +40,7 @@ pub mod vibration;
 
 pub use activity::{
     block_on_ready, Activity, ActivityContext, Context, KeyEvent, KeyPhase, Metrics,
-    PointerEvent, PointerPhase, SavedState, TaskScope,
+    PointerEvent, PointerPhase, SavedState, TaskScope, WheelEvent,
 };
 pub use app::{App, AppContext};
 pub use canvas::Canvas;
@@ -53,7 +53,7 @@ pub use result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
 pub mod prelude {
     pub use crate::activity::{
         Activity, Context, KeyEvent, KeyPhase, Metrics, PointerEvent, PointerPhase, SavedState,
-        TaskScope,
+        TaskScope, WheelEvent,
     };
     pub use crate::canvas::Canvas;
     pub use crate::dialog::{DialogFuture, DialogResult};
