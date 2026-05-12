@@ -241,6 +241,12 @@ pub struct UiState {
     /// the topmost scroll region under the cursor. `None` until the
     /// first pointer event arrives.
     last_pointer: Option<(f32, f32)>,
+    /// Frame timestamp of the most recent `present()`, in ms since
+    /// activity start (the value the host passes to `Context`). Used
+    /// to derive `dt_ms` for the fling-decay tick — see
+    /// [`UiState::tick_animations`]. `0.0` before any present has
+    /// run; the first frame then defaults to one 60fps frame.
+    last_present_ts: f64,
     /// Currently-tracked drag gesture, or `None`. Lifecycle:
     ///   Down inside a scroll region  → seeded (is_dragging=false)
     ///   Move past DRAG_SLOP           → is_dragging flips to true
@@ -273,6 +279,24 @@ pub(crate) struct DragGesture {
 /// Matches Android `ViewConfiguration.getScaledTouchSlop()` (8 dp on
 /// most devices, 6 dp on a few); 6 is a good cross-platform median.
 pub(crate) const DRAG_SLOP: f32 = 6.0;
+
+/// Fling decay multiplier *per typical 60fps frame*. The actual
+/// applied decay is `DECAY^(dt_ms / 16.667)` so a 30fps tick decays
+/// twice as much as a 60fps one — keeps fling distance roughly
+/// invariant to frame rate. 0.92 settles a 30 px/frame fling in ~25
+/// frames (≈ 0.4 s at 60fps), which feels "snappy native" without
+/// teleporting to rest.
+pub(crate) const FLING_DECAY_PER_FRAME: f32 = 0.92;
+
+/// Velocity below which we snap the fling to rest (0 px/frame). Pixel
+/// motion this slow is below visual perception anyway; cutting it
+/// short avoids dragging out a fling for 50+ extra frames just to
+/// asymptote.
+pub(crate) const FLING_STOP_VELOCITY: f32 = 0.5;
+
+/// One 60fps frame in milliseconds. Used to dt-normalise fling decay
+/// + position advance — see [`FLING_DECAY_PER_FRAME`].
+pub(crate) const FRAME_MS: f32 = 1000.0 / 60.0;
 
 impl UiState {
     /// Empty UI state. Equivalent to `UiState::default()`; the explicit
@@ -378,6 +402,53 @@ impl UiState {
         cell.velocity = 0.0;
     }
 
+    /// Advance every active fling by `dt_ms`. `Ui::present` calls this
+    /// once per frame; tests call it directly to step the simulation
+    /// without spinning up a full Ui.
+    ///
+    /// Decay model — exponential, dt-normalised against a 60fps frame:
+    /// ```text
+    ///   frames_dt = (dt_ms / 16.667).clamp(0, 4)
+    ///   velocity *= DECAY ^ frames_dt
+    ///   scroll_y += velocity * frames_dt
+    /// ```
+    /// Hitting an edge clamps `scroll_y` and zeroes velocity — no
+    /// rubber-band in this stage. Velocity below
+    /// [`FLING_STOP_VELOCITY`] snaps to 0 so we don't drift on past
+    /// the threshold of visual perception. The 4-frame clamp on
+    /// `frames_dt` keeps a tab-resume (which can deliver a single
+    /// `dt_ms = 500 ms`) from teleporting the scroll position.
+    pub(crate) fn tick_animations(&mut self, dt_ms: f32) {
+        if dt_ms <= 0.0 { return; }
+        let frames_dt = (dt_ms / FRAME_MS).clamp(0.0, 4.0);
+        for cell in self.scroll_states.values_mut() {
+            if cell.velocity == 0.0 { continue; }
+            cell.velocity *= FLING_DECAY_PER_FRAME.powf(frames_dt);
+            let new_y = cell.scroll_y + cell.velocity * frames_dt;
+            let max = (cell.content_h - cell.viewport_h).max(0.0);
+            let clamped = new_y.clamp(0.0, max);
+            if clamped != new_y {
+                // Hit an edge — kill velocity rather than perpetually
+                // try to scroll past it.
+                cell.velocity = 0.0;
+            }
+            cell.scroll_y = clamped;
+            if cell.velocity.abs() < FLING_STOP_VELOCITY {
+                cell.velocity = 0.0;
+            }
+        }
+    }
+
+    /// True iff any scroll cell has a non-zero velocity right now.
+    /// Useful for activities (or the framework) that want to keep
+    /// requesting frames while a fling is in flight. Today the
+    /// runtime renders every rAF regardless, so this is documentary
+    /// — but it gives a future "render-on-demand" optimisation a
+    /// clean predicate to gate on.
+    pub fn has_active_animation(&self) -> bool {
+        self.scroll_states.values().any(|c| c.velocity != 0.0)
+    }
+
     /// Find the topmost scroll region whose viewport rect contains
     /// `(x, y)`. For nested scrolls, the innermost wins (smallest-
     /// area rect among those that contain the point). `None` if no
@@ -404,6 +475,11 @@ pub struct Ui<'s, 'c, 'b> {
     canvas: &'c mut Canvas<'b>,
     viewport: (f32, f32),
     density: f32,
+    /// Frame timestamp from the host's `Context`. Threaded through so
+    /// `present` can compute the dt for the fling-decay tick. `0.0`
+    /// is a fine sentinel because activity timestamps are ms since
+    /// activity start, so the very first frame is always > 0.
+    ts_ms: f64,
     nodes: Vec<Node>,
     /// Parallel to `nodes`; `attrs[id]` is the layout-only side-info for
     /// the node at `id`. Kept as a separate vec so pattern matches on
@@ -441,6 +517,7 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             canvas,
             viewport: (ctx.metrics.width_px as f32, ctx.metrics.height_px as f32),
             density: if ctx.metrics.density > 0.0 { ctx.metrics.density } else { 1.0 },
+            ts_ms: ctx.timestamp_ms,
             nodes: Vec::new(),
             attrs: Vec::new(),
             presented: false,
@@ -649,6 +726,18 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
     pub fn present(&mut self, root: NodeId) {
         if self.presented { return; }
         self.presented = true;
+
+        // Advance any active fling for this frame. dt comes from
+        // (this frame's ts) - (last present's ts); first frame
+        // defaults to one 60fps frame so a fling started right
+        // before the first present advances by something reasonable.
+        let dt_ms = if self.state.last_present_ts > 0.0 {
+            (self.ts_ms - self.state.last_present_ts) as f32
+        } else {
+            FRAME_MS
+        };
+        self.state.tick_animations(dt_ms);
+        self.state.last_present_ts = self.ts_ms;
 
         // Wire the layout engine to the host's text measurer. The
         // indirection (rather than calling `runtime::text_width`
@@ -1420,6 +1509,215 @@ mod tests {
         state.feed_pointer(pointer(600.0, 400.0, PointerPhase::Move));
         state.feed_wheel(wheel(50.0));
         assert_eq!(state.scroll_states["outer"].scroll_y, 50.0);
+    }
+
+    // ── Stage 2c.4: fling animation ──────────────────────────────────
+
+    #[test]
+    fn fling_decays_monotonically_over_time() {
+        // Seed a strong upward fling; tick at 60fps and watch velocity
+        // strictly decrease until it snaps to 0.
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            10_000.0, 100.0,
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = 20.0;
+        let mut prev = 20.0;
+        for _ in 0..200 {
+            state.tick_animations(FRAME_MS);
+            let v = state.scroll_states["feed"].velocity;
+            assert!(v <= prev + 1e-3,
+                "velocity must be non-increasing each tick: prev={prev}, now={v}");
+            prev = v;
+            if v == 0.0 { break; }
+        }
+        assert_eq!(state.scroll_states["feed"].velocity, 0.0,
+            "fling must come to rest within 200 frames");
+    }
+
+    #[test]
+    fn fling_advances_scroll_position() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            10_000.0, 100.0,
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = 15.0;
+        let start = state.scroll_states["feed"].scroll_y;
+        state.tick_animations(FRAME_MS);
+        let after = state.scroll_states["feed"].scroll_y;
+        assert!(after > start, "scroll_y must advance with positive velocity");
+    }
+
+    #[test]
+    fn fling_clamps_at_bottom_edge_and_zeros_velocity() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            500.0,        // content_h
+            95.0,         // already near the max=100
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = 50.0;
+        state.tick_animations(FRAME_MS);
+        let cell = &state.scroll_states["feed"];
+        assert_eq!(cell.scroll_y, 100.0, "must clamp to content_h - viewport_h");
+        assert_eq!(cell.velocity, 0.0, "must zero velocity on edge clamp");
+    }
+
+    #[test]
+    fn fling_clamps_at_top_edge_and_zeros_velocity() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            500.0, 5.0,
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = -50.0;
+        state.tick_animations(FRAME_MS);
+        let cell = &state.scroll_states["feed"];
+        assert_eq!(cell.scroll_y, 0.0);
+        assert_eq!(cell.velocity, 0.0);
+    }
+
+    #[test]
+    fn fling_dt_normalisation_30fps_matches_60fps_distance() {
+        // 30fps means each tick is 2× as long, but velocity decays
+        // and position advances proportionally — so total distance
+        // travelled is invariant (modulo discretisation noise).
+        fn run(dt_ms: f32, n: u32) -> f32 {
+            let mut state = UiState::new();
+            seed_scroll_cell(
+                &mut state, "feed",
+                Rect { x: 0.0, y: 0.0, w: 200.0, h: 4000.0 },
+                10_000.0, 0.0,
+            );
+            state.scroll_states.get_mut("feed").unwrap().velocity = 30.0;
+            for _ in 0..n { state.tick_animations(dt_ms); }
+            state.scroll_states["feed"].scroll_y
+        }
+        let dist_60 = run(FRAME_MS, 60);
+        let dist_30 = run(FRAME_MS * 2.0, 30);
+        // Within 10% — discretisation noise + the snap-to-zero
+        // threshold means it won't be exactly equal.
+        let ratio = dist_30 / dist_60;
+        assert!((0.9..=1.1).contains(&ratio),
+            "30fps/60fps distance ratio = {ratio} (60: {dist_60}, 30: {dist_30})");
+    }
+
+    #[test]
+    fn has_active_animation_reflects_velocity() {
+        let mut state = UiState::new();
+        assert!(!state.has_active_animation());
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            10_000.0, 0.0,
+        );
+        assert!(!state.has_active_animation(), "velocity 0 doesn't count");
+        state.scroll_states.get_mut("feed").unwrap().velocity = 5.0;
+        assert!(state.has_active_animation());
+    }
+
+    #[test]
+    fn tick_animations_with_zero_dt_is_noop() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            10_000.0, 100.0,
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = 20.0;
+        let before = state.scroll_states["feed"].clone();
+        state.tick_animations(0.0);
+        let after = state.scroll_states["feed"];
+        assert_eq!(before.scroll_y, after.scroll_y);
+        assert_eq!(before.velocity, after.velocity);
+    }
+
+    #[test]
+    fn tick_animations_clamps_huge_dt_to_four_frames() {
+        // A tab-resume can deliver a single dt = 500 ms or more.
+        // Without a clamp the fling would teleport. We clamp to 4
+        // frames worth of advance / decay.
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 4000.0 },
+            10_000.0, 0.0,
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = 30.0;
+        // dt = 60 frames worth
+        state.tick_animations(FRAME_MS * 60.0);
+        let cell = &state.scroll_states["feed"];
+        // At most 4 frames of advance: 30 * 4 = 120 px upper bound
+        // (with decay it's less). Anything close to "60 * 30 = 1800"
+        // would be teleportation.
+        assert!(cell.scroll_y < 200.0,
+            "huge dt must be clamped — got scroll_y = {}", cell.scroll_y);
+    }
+
+    #[test]
+    fn scroll_to_during_active_fling_zeros_velocity() {
+        // scroll_to is "user intent overrides physics" — verified in
+        // 2c.2, re-checked here in the fling context.
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            10_000.0, 100.0,
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = 25.0;
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        let mut canvas = Canvas::new(&mut buf);
+        let mut ui = Ui::new(&mut state, &c, &mut canvas);
+        ui.scroll_to("feed", 500.0);
+        assert_eq!(state.scroll_states["feed"].velocity, 0.0);
+        assert_eq!(state.scroll_states["feed"].scroll_y, 500.0);
+    }
+
+    #[test]
+    fn fling_advances_during_present_pass() {
+        // Real-world: drag ends with a velocity; the next frame's
+        // present() ticks the fling forward. We seed a scroll cell +
+        // velocity, present twice at 16.67 ms apart, and observe
+        // scroll_y has advanced.
+        let mut state = UiState::new();
+        // First frame establishes last_present_ts.
+        {
+            let c = Context {
+                metrics: Metrics { width_px: 800, height_px: 600, density: 1.0 },
+                timestamp_ms: 100.0, pointer: None, class: "t", handle: 0,
+            };
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let r = ui.rect(0xff00ffff).size(200.0, 4000.0).build();
+            let s = ui.scroll(r).key("feed").size(200.0, 400.0).build();
+            ui.present(s);
+        }
+        // Seed a fling.
+        state.scroll_states.get_mut("feed").unwrap().velocity = 25.0;
+        let scroll_y_before = state.scroll_states["feed"].scroll_y;
+        // Second frame, 16.67ms later.
+        {
+            let c = Context {
+                metrics: Metrics { width_px: 800, height_px: 600, density: 1.0 },
+                timestamp_ms: 116.667, pointer: None, class: "t", handle: 0,
+            };
+            let mut buf = Vec::new();
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let r = ui.rect(0xff00ffff).size(200.0, 4000.0).build();
+            let s = ui.scroll(r).key("feed").size(200.0, 400.0).build();
+            ui.present(s);
+        }
+        assert!(state.scroll_states["feed"].scroll_y > scroll_y_before,
+            "fling must advance during present()");
     }
 
     #[test]
