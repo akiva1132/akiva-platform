@@ -697,7 +697,11 @@ v0.2 focused on the **system contract with apps**, not UI. See
 - 🟡 Runtime permission prompts (dangerous perms — camera /
   microphone) — open.
 - ❌ PendingIntent + Broadcast receivers.
-- 🟡 Image (✅) / Input (❌) / ScrollView (❌) widgets.
+- 🟡 Image (✅) / Input (❌) / ScrollView widgets — ScrollView
+  is planned in
+  [`docs/scroll-lazycolumn-plan.md`](docs/scroll-lazycolumn-plan.md)
+  (`Node::Scroll` + `Node::LazyColumn` virtualizer + Akiva-owned
+  fling, modeled on Android `RecyclerView` / `OverScroller`).
 - 🟡 Animations (✅ slide+fade with ease-out cubic).
 - 🟡 Themes / sophisticated layouts.
 - ✅ Network API (Phase 14.1+); ❌ keyboard input / IME.
