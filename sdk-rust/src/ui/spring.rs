@@ -187,6 +187,13 @@ pub struct AnimatedValue<T> {
     spring: Spring,
 }
 
+impl Default for AnimatedValue<f32> {
+    /// At rest at `0.0` with no active animation. Useful for
+    /// `#[derive(Default)]` on activity structs that carry one
+    /// animated property per axis.
+    fn default() -> Self { Self::new(0.0) }
+}
+
 impl AnimatedValue<f32> {
     /// Construct at rest at `initial` with no active animation.
     /// `target = initial` so `is_settled()` returns true straight
