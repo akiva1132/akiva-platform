@@ -1025,10 +1025,10 @@ mod tests {
         Node::HStack { children, gap, padding: (0.0, 0.0, 0.0, 0.0), main, cross }
     }
     fn frame(children: Vec<NodeId>, padding: (f32, f32, f32, f32)) -> Node {
-        Node::Frame { children, padding, clip_radius: 0.0, size: None }
+        Node::Frame { children, padding, clip_radius: 0.0, size: None, opacity: 1.0 }
     }
     fn frame_sized(children: Vec<NodeId>, padding: (f32, f32, f32, f32), w: f32, h: f32) -> Node {
-        Node::Frame { children, padding, clip_radius: 0.0, size: Some((w, h)) }
+        Node::Frame { children, padding, clip_radius: 0.0, size: Some((w, h)), opacity: 1.0 }
     }
     fn scroll_sized(child: NodeId, key: &str, w: f32, h: f32) -> Node {
         Node::Scroll {

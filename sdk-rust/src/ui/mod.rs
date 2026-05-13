@@ -2769,6 +2769,123 @@ mod tests {
         assert_eq!(root.id.as_deref(), Some("feed"));
     }
 
+    /// Stage 3.3 — `Frame::opacity(a)` with `a < 1.0` wraps the
+    /// frame's children in a push_opacity / pop_opacity pair. The
+    /// `OP_PUSH_OPACITY = 20` / `OP_POP_OPACITY = 21` byte tags are
+    /// wire-stable (canvas.rs).
+    #[test]
+    fn frame_opacity_below_one_emits_push_pop_opacity_pair() {
+        const OP_PUSH_OPACITY: u8 = 20;
+        const OP_POP_OPACITY:  u8 = 21;
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        {
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let inner = ui.rect(0xff_22_44_66).size(40.0, 40.0).build();
+            let f = ui.frame(&[inner]).opacity(0.5).build();
+            ui.present(f);
+        }
+        assert!(buf.iter().any(|&b| b == OP_PUSH_OPACITY),
+            "Frame::opacity(0.5) must emit push_opacity");
+        assert!(buf.iter().any(|&b| b == OP_POP_OPACITY),
+            "Frame::opacity(0.5) must emit a matching pop_opacity");
+    }
+
+    /// Stage 3.3 — `Frame::opacity(1.0)` (the default) is a paint-
+    /// stream no-op: no push/pop pair, just the children. Saves two
+    /// ops per Frame on the steady-state common path.
+    #[test]
+    fn frame_opacity_one_emits_no_opacity_pair() {
+        const OP_PUSH_OPACITY: u8 = 20;
+        const OP_POP_OPACITY:  u8 = 21;
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        {
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let inner = ui.rect(0xff_22_44_66).size(40.0, 40.0).build();
+            let f = ui.frame(&[inner]).build();   // default opacity = 1.0
+            ui.present(f);
+        }
+        assert!(!buf.iter().any(|&b| b == OP_PUSH_OPACITY),
+            "Frame at opacity 1.0 must NOT emit push_opacity");
+        assert!(!buf.iter().any(|&b| b == OP_POP_OPACITY),
+            "Frame at opacity 1.0 must NOT emit pop_opacity");
+    }
+
+    /// Stage 3.3 — `opacity_av` reads the AnimatedValue at build
+    /// time and threads its value into the Frame's opacity. A
+    /// settled animated value at 1.0 takes the no-op fast path; a
+    /// mid-flight one (e.g. fade-in still climbing from 0.0) emits
+    /// the push/pop pair.
+    #[test]
+    fn frame_opacity_av_reads_animated_value() {
+        use crate::ui::{AnimatedValue, Spring};
+        const OP_PUSH_OPACITY: u8 = 20;
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut av = AnimatedValue::<f32>::new(0.0);
+        av.spring_to(1.0, Spring::MEDIUM);  // not settled yet
+        let mut buf = Vec::new();
+        {
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let inner = ui.rect(0xff_22_44_66).size(40.0, 40.0).build();
+            let f = ui.frame(&[inner]).opacity_av(&av).build();
+            ui.present(f);
+        }
+        assert!(buf.iter().any(|&b| b == OP_PUSH_OPACITY),
+            "opacity_av(0.0-driven animation) must emit push_opacity");
+    }
+
+    /// Stage 3.3 — overshoot/undershoot values clamp to `[0, 1]`.
+    /// A spring that overshoots past 1.0 doesn't break the wire
+    /// stream; an undershoot below 0.0 still emits the pair (the
+    /// renderer treats 0.0 as fully-transparent — children paint
+    /// invisibly but the ops stream stays well-formed).
+    #[test]
+    fn frame_opacity_clamps_overshoot_to_one_no_op_path() {
+        const OP_PUSH_OPACITY: u8 = 20;
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        {
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let inner = ui.rect(0xff_aa_bb_cc).size(20.0, 20.0).build();
+            // 1.5 clamps to 1.0 → no-op fast path kicks in → push_opacity NOT emitted.
+            let f = ui.frame(&[inner]).opacity(1.5).build();
+            ui.present(f);
+        }
+        assert!(!buf.iter().any(|&b| b == OP_PUSH_OPACITY),
+            "opacity(1.5) clamps to 1.0 and must take the no-op path");
+    }
+
+    #[test]
+    fn frame_opacity_undershoot_clamps_to_zero_and_emits_pair() {
+        const OP_PUSH_OPACITY: u8 = 20;
+        const OP_POP_OPACITY:  u8 = 21;
+        let mut state = UiState::new();
+        let c = ctx("t");
+        let mut buf = Vec::new();
+        {
+            let mut canvas = Canvas::new(&mut buf);
+            let mut ui = Ui::new(&mut state, &c, &mut canvas);
+            let inner = ui.rect(0xff_aa_bb_cc).size(20.0, 20.0).build();
+            // -0.5 clamps to 0.0 → push/pop pair emitted (fully-
+            // transparent children, but the stream is well-formed).
+            let f = ui.frame(&[inner]).opacity(-0.5).build();
+            ui.present(f);
+        }
+        assert!(buf.iter().any(|&b| b == OP_PUSH_OPACITY),
+            "opacity(-0.5) clamps to 0.0 and must emit push_opacity");
+        assert!(buf.iter().any(|&b| b == OP_POP_OPACITY),
+            "opacity(-0.5) must emit matching pop_opacity");
+    }
+
     #[test]
     fn scroll_paint_pushes_clip_around_child() {
         // Paint emits a push_clip(viewport) → child paint → pop_clip,

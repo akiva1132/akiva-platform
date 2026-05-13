@@ -98,7 +98,7 @@ fn paint_node(
                 label,
             );
         }
-        Node::Frame { children, clip_radius, .. } => {
+        Node::Frame { children, clip_radius, opacity, .. } => {
             // Document order = paint order. Frame: earlier children
             // paint first (bottom of z-stack), later overlay them —
             // mirrors Android FrameLayout / SwiftUI ZStack.
@@ -108,6 +108,17 @@ fn paint_node(
             // a rounded rect / pill / circle without changing their
             // own paint. Cheaper than per-leaf clip discipline; the
             // renderer's save/restore pair is one save() per frame.
+            //
+            // `opacity < 1.0`: wrap children in a push/pop opacity
+            // layer so the whole sub-tree fades together. The pair
+            // sits OUTSIDE the round-clip pair so the clip itself
+            // doesn't get faded — only the painted content does.
+            // Skipping the pair when `opacity == 1.0` keeps the
+            // common case at zero wire-stream overhead.
+            let push_op = *opacity < 1.0;
+            if push_op {
+                canvas.push_opacity(*opacity);
+            }
             let push_clip = *clip_radius > 0.0;
             if push_clip {
                 canvas.push_round_clip(rect.x, rect.y, rect.w, rect.h, *clip_radius);
@@ -115,6 +126,9 @@ fn paint_node(
             for c in children { paint_node(nodes, *c, rects, clicked_ids, text_width, canvas); }
             if push_clip {
                 canvas.pop_clip();
+            }
+            if push_op {
+                canvas.pop_opacity();
             }
         }
         Node::Scroll { child, .. } => {

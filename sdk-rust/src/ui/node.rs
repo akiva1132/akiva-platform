@@ -94,6 +94,14 @@ pub enum Node {
         /// width rather than the parent's full slot. Mirrors what a
         /// CSS `width: 360px` does for a flex container.
         size: Option<(f32, f32)>,
+        /// Stage 3.3 — opacity applied to the children's paint as a
+        /// `push_opacity` / `pop_opacity` wrap. `1.0` is the default
+        /// (no wrap; the renderer never sees the pair). Values
+        /// outside `[0, 1]` are clamped at paint time. Paint-only:
+        /// does NOT affect layout, hit-test, or semantic visibility.
+        /// Use [`crate::AnimatedValue::value`] to drive a fade
+        /// animation here.
+        opacity: f32,
     },
     /// Fixed-dimension grid. `cols × rows` cells laid out in row-major
     /// order; every cell is the same size. Extra children past
@@ -340,13 +348,14 @@ pub struct FrameBuilder<'u, 's, 'c, 'b> {
     grow: f32,
     clip_radius: f32,
     size: Option<(f32, f32)>,
+    opacity: f32,
 }
 
 impl<'u, 's, 'c, 'b> FrameBuilder<'u, 's, 'c, 'b> {
     pub(crate) fn new(ui: &'u mut Ui<'s, 'c, 'b>, children: Vec<NodeId>) -> Self {
         Self {
             ui, children, padding: (0.0, 0.0, 0.0, 0.0),
-            grow: 0.0, clip_radius: 0.0, size: None,
+            grow: 0.0, clip_radius: 0.0, size: None, opacity: 1.0,
         }
     }
     /// Uniform padding on all four sides.
@@ -377,12 +386,35 @@ impl<'u, 's, 'c, 'b> FrameBuilder<'u, 's, 'c, 'b> {
         self.size = Some((w.max(0.0), h.max(0.0)));
         self
     }
+    /// Stage 3.3 — paint the frame's content through an opacity
+    /// layer. `alpha == 1.0` is a no-op; values outside `[0, 1]`
+    /// are clamped at paint time. Paint-only: this does NOT shrink
+    /// the frame's measured bounds, change hit-test behaviour, or
+    /// affect what the inspector reports about the children. Use
+    /// it for fade-in / fade-out groups, dim-while-disabled cards,
+    /// and image crossfades driven by `AnimatedValue<f32>`.
+    pub fn opacity(mut self, alpha: f32) -> Self {
+        self.opacity = alpha.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Sugar around [`Self::opacity`] for the common case: a
+    /// `Spring`-driven `AnimatedValue` whose value is the target
+    /// alpha. Reads `.value()` at build time, so the frame snaps
+    /// to the current value on each rebuild — drive the animation
+    /// from `on_render`'s wall-clock-delta tick and rebuild every
+    /// frame to see motion.
+    pub fn opacity_av(mut self, av: &crate::ui::AnimatedValue<f32>) -> Self {
+        self.opacity = av.value().clamp(0.0, 1.0);
+        self
+    }
     pub fn build(self) -> NodeId {
         let id = self.ui.push(Node::Frame {
             children: self.children,
             padding: self.padding,
             clip_radius: self.clip_radius,
             size: self.size,
+            opacity: self.opacity,
         });
         self.ui.set_grow(id, self.grow);
         id
