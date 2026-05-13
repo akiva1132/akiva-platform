@@ -10,6 +10,73 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [Unreleased] — Stage 3 (Pixelfeed — Instagram-style combined-primitives demo)
+
+No ABI bump — Stage 3 adds two opcodes (20, 21) to the v0 paint
+stream, additive in the same shape as Stage 2a's `PUSH_ROUND_CLIP`
+(= 19). Apps continue to require `min_abi_version = "0.13.0"`.
+
+- **Added — `Canvas::push_opacity` / `Canvas::pop_opacity` (Stage 3.2).**
+  Paint-stream opcodes 20 (push) and 21 (pop). Wire shape: 5-byte
+  push (`opcode + alpha f32 LE`) + 1-byte pop. Renderer maps the
+  pair to `ctx.save() / globalAlpha *= alpha / restore()`. Nested
+  pushes compose multiplicatively because each save snapshots the
+  current globalAlpha — pushing 0.5 inside 0.5 paints at 0.25
+  (CSS `opacity` cascade semantics). Differs from the pre-existing
+  flat `SET_GLOBAL_ALPHA` (= 13), which is framework-internal and
+  doesn't compose.
+- **Added — `Frame::opacity` / `Frame::opacity_av` (Stage 3.3).**
+  `Frame` gains an `opacity: f32` field (default `1.0`). The paint
+  pass wraps the frame's children in a `push_opacity`/`pop_opacity`
+  pair when `opacity < 1.0`; at `1.0` it emits nothing extra
+  (no-op fast path). `opacity_av` reads from an
+  `AnimatedValue<f32>` for animated fades. Paint-only — does NOT
+  affect layout, hit-test, or what the inspector reports for the
+  children.
+- **Added — `DoubleTapDetector` gesture helper (Stage 3.4).**
+  App-owned, pollable state machine for the double-tap gesture
+  (mirrors the post-event-polling shape of `was_clicked`).
+  Constants: `DOUBLE_TAP_MAX_INTERVAL_MS = 300.0`,
+  `DOUBLE_TAP_MAX_MOVE_PX = 32.0`, `TAP_SLOP_PX = 12.0`. Returns
+  `Some((x, y))` on the second `Up` that completes a pair; `None`
+  otherwise. Defensive resets: a bare `Up` (Down was killed by a
+  drag past slop) does NOT consume an armed streak.
+- **Demo — `apps/pixelfeed/` (Stage 3.5–3.7).**
+  50 cards × 5 photos per card combining every primitive from
+  2a–2e:
+  - LazyColumn (vertical feed virtualisation, Stage 2c)
+  - LazyRow + SnapMode::Page per card (Stage 2d) — keyed
+    `format!("post-{i}-photos")` so each card's pager position
+    survives realisation churn AND doesn't leak across cards
+  - Frame::clip_radius for circular avatars (Stage 2a)
+  - Text::max_lines(2) caption with ellipsis (Stage 2b)
+  - AnimatedValue<f32> + Spring driving the like-pop heart
+    overlay (Stage 2e) — alpha snaps to 1.0 on tap and springs
+    back to 0.0 via Spring::MEDIUM
+  - DoubleTapDetector for double-tap-to-like on the photo
+    region (Stage 3.4)
+  - Frame::opacity_av for image fade-in on viewport entry
+    (Stage 3.3 + 2e)
+  Per-card animation state lives in the app
+  (`HashMap<u32, CardAnim>`), split-borrowed against `self.ui` —
+  the SDK stays ignorant of how many AnimatedValues each app
+  wants per row. Synthetic coloured photo blocks (no bundled
+  PNGs) keep the wasm at ~140 KB.
+- **Re-exports.** `DoubleTapDetector` joins the SDK prelude.
+- **Tests (Stage 3, cumulative).**
+  - sdk-rust lib: 377 → 400 (+5 opacity encoder + 5 Frame::opacity
+    paint emission + 13 DoubleTapDetector)
+  - framework lib: 294 → 296 (+2 PUSH/POP_OPACITY roundtrip +
+    truncated-stream rejection)
+  - wire crate: 9 (unchanged)
+  - vitest (web runtime): 244 → 247 (+3 canvas2d pushOpacity /
+    popOpacity / clamping)
+  - Playwright e2e: 69 → 81 (+12 pixelfeed.spec.ts)
+  - visual goldens: 7 → 9 (+ pixelfeed-idle + pixelfeed-post-like)
+- **Inspector + wire.** No semantic-tree change. The opacity ops
+  are paint-only; hit-test rects and scroll regions stay
+  byte-identical to Stage 2e.
+
 ## [Unreleased] — Stage 2e (spring animations, overscroll bounce, bouncer demo)
 
 No ABI bump — Stage 2e is pure SDK-internal. Apps continue to

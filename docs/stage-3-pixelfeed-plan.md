@@ -1,6 +1,10 @@
 # Stage 3 — Akiva Pixelfeed (Instagram-style feed)
 
-> **Status:** Planning (2026-05-13).
+> **Status:** Done (2026-05-13). All 10 sub-stones landed; pixelfeed
+> app live with 50 cards × 5 photos, heart-pop spring animation,
+> double-tap-to-like, image fade-in on viewport entry. ABI stays
+> 0.13.0 — Stage 3 adds opcodes 20/21 additively to the v0 paint
+> stream. 12 e2e + 2 visual goldens green.
 > **Owner:** Claude × akiva1132. **Target:** ~10 commits, ~55-65 new tests.
 > Builds on Stages 2a-2e (clip, text, scroll, lazy-row, snap, spring).
 > **Why this stage:** all of 2a-2e gave us one primitive each in
