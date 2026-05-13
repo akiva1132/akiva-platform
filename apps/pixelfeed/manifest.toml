@@ -1,0 +1,34 @@
+[app]
+id = "com.akiva.pixelfeed"
+name = "Pixelfeed"
+version = "0.1.0"
+version_code = 1
+min_abi_version = "0.13.0"
+authors = ["Akiva Team"]
+description = "Instagram-style feed combining all SDK primitives — LazyColumn + per-card LazyRow page snap + Spring + clip + opacity + double-tap."
+category = "samples"
+
+[runtime]
+wasm = "app.wasm"
+min_memory_mb = 1
+max_memory_mb = 4
+
+[[activities]]
+id = "main"
+class = "PixelfeedMain"
+entry = true
+launch_mode = "singleTop"
+exported = true
+
+[[activities.intent_filters]]
+actions = ["akiva.intent.action.MAIN"]
+categories = ["akiva.intent.category.LAUNCHER"]
+
+[permissions]
+required = []
+optional = []
+
+[display]
+default_width_dp = 400
+default_height_dp = 700
+resizable = true
