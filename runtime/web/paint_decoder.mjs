@@ -37,6 +37,10 @@ const OP_COMPOSITE_SURFACE  = 16;
 const OP_DESTROY_SURFACE    = 17;
 const OP_SET_INSPECTOR_TRANSFORM = 18;   // test-infra; followers ignore
 const OP_PUSH_ROUND_CLIP    = 19;
+// Stage 3.2 — proper push/pop opacity layer. Apps emit these via
+// `Canvas::push_opacity` / `Canvas::pop_opacity` in the SDK.
+const OP_PUSH_OPACITY       = 20;
+const OP_POP_OPACITY        = 21;
 
 const decoder = new TextDecoder("utf-8");
 
@@ -183,6 +187,15 @@ export function applyPaintStream(bytes, backend) {
       case OP_SET_GLOBAL_ALPHA: {
         const alpha = readF32();
         backend.setGlobalAlpha?.(alpha);
+        break;
+      }
+      case OP_PUSH_OPACITY: {
+        const alpha = readF32();
+        backend.pushOpacity?.(alpha);
+        break;
+      }
+      case OP_POP_OPACITY: {
+        backend.popOpacity?.();
         break;
       }
       case OP_BEGIN_SURFACE: {

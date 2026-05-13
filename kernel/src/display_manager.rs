@@ -99,6 +99,12 @@ impl DrawHal for ExternDrawHal {
     fn set_global_alpha(&mut self, alpha: f32) {
         unsafe { host::hal_draw_set_global_alpha(alpha) }
     }
+    fn push_opacity(&mut self, alpha: f32) {
+        unsafe { host::hal_draw_push_opacity(alpha) }
+    }
+    fn pop_opacity(&mut self) {
+        unsafe { host::hal_draw_pop_opacity() }
+    }
     fn begin_surface(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {
         unsafe { host::hal_begin_surface(id, x, y, w, h) }
     }

@@ -108,6 +108,8 @@ export class CompositingPipeline {
   pushRoundClip(x, y, w, h, radius)                  { this.paint?.pushRoundClip(x, y, w, h, radius); }
   popClip()                                          { this.paint?.popClip(); }
   setGlobalAlpha(alpha)                              { this.paint?.setGlobalAlpha(alpha); }
+  pushOpacity(alpha)                                 { this.paint?.pushOpacity(alpha); }
+  popOpacity()                                       { this.paint?.popOpacity(); }
 
   // ── Surface markers ───────────────────────────────────────────────
 

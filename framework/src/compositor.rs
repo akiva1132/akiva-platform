@@ -21,6 +21,13 @@ pub trait PaintTarget {
     fn push_clip(&mut self, x: f32, y: f32, w: f32, h: f32);
     fn push_round_clip(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32);
     fn pop_clip(&mut self);
+    /// Stage 3.2 — push an opacity layer. Subsequent paint ops
+    /// multiply their alpha by `alpha` (clamped to `[0, 1]`) until
+    /// the matching `pop_opacity`. Nested pushes compose
+    /// multiplicatively. Default impl is a no-op so existing
+    /// PaintTarget consumers compile without change.
+    fn push_opacity(&mut self, _alpha: f32) {}
+    fn pop_opacity(&mut self) {}
 }
 
 #[derive(Debug, Default, Clone)]
@@ -220,7 +227,24 @@ pub enum PaintOp {
     /// to fade surfaces without rewriting every paint op's rgba —
     /// Canvas2D's `globalAlpha` is a free GPU-level multiplier, so a
     /// transition costs O(1) per frame instead of O(ops) per frame.
+    ///
+    /// Framework-internal: emitted by the compositor's surface-fade
+    /// path, not exposed to app `Canvas`. Apps that want app-level
+    /// fades use `PushOpacity` / `PopOpacity` instead, which compose
+    /// correctly under nesting.
     SetGlobalAlpha { alpha: f32 },
+    /// Stage 3.2 — push an opacity layer onto the renderer's
+    /// `ctx.save()` stack. `alpha ∈ [0, 1]` multiplies into
+    /// `ctx.globalAlpha` for subsequent paint ops until the matching
+    /// `PopOpacity`. Nested pushes compose multiplicatively (CSS
+    /// `opacity` cascade semantics).
+    ///
+    /// Emitted by `Frame::opacity` / `Image::opacity` in the SDK
+    /// widget toolkit. Differs from `SetGlobalAlpha` by saving and
+    /// restoring the canvas state — apps can wrap a sub-tree without
+    /// leaking alpha to siblings.
+    PushOpacity { alpha: f32 },
+    PopOpacity,
     // Phase 15.1 — per-Activity surface compositor ops. The pre-15.1
     // model flattened every surface's ops into one stream and let the
     // single screen backend paint them in order. The new model gives
@@ -349,6 +373,12 @@ pub trait DrawHal {
     fn push_round_clip(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32);
     fn pop_clip(&mut self);
     fn set_global_alpha(&mut self, alpha: f32);
+    /// Stage 3.2 — opacity layer with proper save/restore. `alpha`
+    /// composes multiplicatively with any enclosing `push_opacity`.
+    /// Renderer maps to `ctx.save(); globalAlpha *= a;` and
+    /// `ctx.restore()` for the matching pop.
+    fn push_opacity(&mut self, alpha: f32);
+    fn pop_opacity(&mut self);
     // Phase 15.1 — per-Activity surface ops. See PaintOp variants for
     // the frame shape and semantics.
     fn begin_surface(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32);
@@ -401,6 +431,8 @@ pub fn dispatch_paint_op<H: DrawHal + ?Sized>(hal: &mut H, op: &PaintOp) {
         }
         PaintOp::PopClip => hal.pop_clip(),
         PaintOp::SetGlobalAlpha { alpha } => hal.set_global_alpha(*alpha),
+        PaintOp::PushOpacity { alpha } => hal.push_opacity(*alpha),
+        PaintOp::PopOpacity => hal.pop_opacity(),
         PaintOp::BeginSurface { id, x, y, w, h } => hal.begin_surface(*id, *x, *y, *w, *h),
         PaintOp::EndSurface => hal.end_surface(),
         PaintOp::CompositeSurface { id, x, y, w, h, opts } => {
@@ -433,6 +465,12 @@ impl PaintTarget for FrameCommands {
     }
     fn pop_clip(&mut self) {
         self.ops.push(PaintOp::PopClip);
+    }
+    fn push_opacity(&mut self, alpha: f32) {
+        self.ops.push(PaintOp::PushOpacity { alpha });
+    }
+    fn pop_opacity(&mut self) {
+        self.ops.push(PaintOp::PopOpacity);
     }
 }
 
@@ -930,6 +968,10 @@ mod tests {
         fn set_global_alpha(&mut self, alpha: f32) {
             self.trace.push(format!("set_global_alpha({alpha})"));
         }
+        fn push_opacity(&mut self, alpha: f32) {
+            self.trace.push(format!("push_opacity({alpha})"));
+        }
+        fn pop_opacity(&mut self) { self.trace.push("pop_opacity".into()); }
         fn begin_surface(&mut self, id: u32, x: f32, y: f32, w: f32, h: f32) {
             self.trace.push(format!("begin_surface({id},{x},{y},{w},{h})"));
         }
@@ -993,6 +1035,8 @@ mod tests {
             PaintOp::PushClip { x: 1.0, y: 2.0, w: 3.0, h: 4.0 },
             PaintOp::PopClip,
             PaintOp::SetGlobalAlpha { alpha: 0.5 },
+            PaintOp::PushOpacity { alpha: 0.25 },
+            PaintOp::PopOpacity,
             PaintOp::BeginSurface { id: 42, x: 1.0, y: 2.0, w: 100.0, h: 200.0 },
             PaintOp::EndSurface,
             PaintOp::CompositeSurface {
@@ -1020,6 +1064,8 @@ mod tests {
             "push_clip(1,2,3,4)",
             "pop_clip",
             "set_global_alpha(0.5)",
+            "push_opacity(0.25)",
+            "pop_opacity",
             "begin_surface(42,1,2,100,200)",
             "end_surface",
             "composite_surface(42,1,2,100,200,opacity=1,tx=0,ty=0,scale=1,blur=0,shadow=0x00000000,tint=0x00000000)",

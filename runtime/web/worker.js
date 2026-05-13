@@ -579,6 +579,12 @@ function buildImports() {
       backend?.pushRoundClip(x, y, w, h, radius),
     hal_draw_pop_clip: () => backend?.popClip(),
     hal_draw_set_global_alpha: (alpha) => backend?.setGlobalAlpha(alpha),
+    // Stage 3.2 — push/pop opacity layer. Backend maps to
+    // ctx.save() / ctx.globalAlpha *= alpha and ctx.restore() for
+    // the matching pop; nested pushes compose multiplicatively
+    // (CSS opacity cascade).
+    hal_draw_push_opacity: (alpha) => backend?.pushOpacity(alpha),
+    hal_draw_pop_opacity: () => backend?.popOpacity(),
     hal_draw_present: () => backend?.present(),
 
     // Phase 15.1 — per-Activity surface compositor ops. The framework

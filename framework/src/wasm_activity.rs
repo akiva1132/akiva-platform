@@ -641,6 +641,14 @@ pub mod opcode {
     /// `PushRoundClip { x, y, w, h, radius }` — 21 bytes (opcode + 5×f32).
     /// Stacks alongside `PushClip`; popped by the same `PopClip`.
     pub const PUSH_ROUND_CLIP: u8 = 19;
+    /// Stage 3.2 — proper push/pop opacity layer. 5 bytes (opcode +
+    /// alpha f32 LE). Renderer maps to `ctx.save() / globalAlpha *= a
+    /// / restore`; nested pushes compose multiplicatively (CSS
+    /// `opacity` cascade). Differs from `SET_GLOBAL_ALPHA` (= 13)
+    /// which is flat (no save/restore) and framework-internal.
+    pub const PUSH_OPACITY:    u8 = 20;
+    /// Stage 3.2 — pop the matching `PUSH_OPACITY`. 1 byte (opcode only).
+    pub const POP_OPACITY:     u8 = 21;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -775,6 +783,11 @@ pub fn encode_op(out: &mut Vec<u8>, op: &PaintOp) {
             out.push(opcode::SET_GLOBAL_ALPHA);
             out.extend_from_slice(&alpha.to_le_bytes());
         }
+        PaintOp::PushOpacity { alpha } => {
+            out.push(opcode::PUSH_OPACITY);
+            out.extend_from_slice(&alpha.to_le_bytes());
+        }
+        PaintOp::PopOpacity => out.push(opcode::POP_OPACITY),
         PaintOp::BeginSurface { id, x, y, w, h } => {
             out.push(opcode::BEGIN_SURFACE);
             out.extend_from_slice(&id.to_le_bytes());
@@ -945,6 +958,11 @@ pub fn decode_frame(mut bytes: &[u8], out: &mut FrameCommands) -> Result<(), Dec
                 let alpha = read_f32(&mut bytes)?;
                 out.push(PaintOp::SetGlobalAlpha { alpha });
             }
+            opcode::PUSH_OPACITY => {
+                let alpha = read_f32(&mut bytes)?;
+                out.push(PaintOp::PushOpacity { alpha });
+            }
+            opcode::POP_OPACITY => out.push(PaintOp::PopOpacity),
             opcode::BEGIN_SURFACE => {
                 let id = read_u32(&mut bytes)?;
                 let x = read_f32(&mut bytes)?;
@@ -1353,6 +1371,9 @@ mod tests {
             PaintOp::PopClip,
             PaintOp::PushTransform { dx: 10.0, dy: 20.0, scale: 1.25 },
             PaintOp::PopTransform,
+            // Stage 3.2 — opacity layer (push/pop).
+            PaintOp::PushOpacity { alpha: 0.5 },
+            PaintOp::PopOpacity,
             // Phase 15.1 — surface compositor markers.
             PaintOp::BeginSurface { id: 7, x: 1.0, y: 2.0, w: 100.0, h: 200.0 },
             PaintOp::EndSurface,
@@ -1487,6 +1508,56 @@ mod tests {
         // 1 + 4 f32s (x0,y0,x1,y1) + width + rgba = 25
         assert_eq!(buf.len(), 1 + 4 * 4 + 4 + 4);
         assert_eq!(buf[0], opcode::DRAW_LINE);
+    }
+
+    /// Stage 3.2 — `OP_PUSH_OPACITY` / `OP_POP_OPACITY` encode +
+    /// roundtrip + wire-size pin. PUSH is 5 bytes (opcode + alpha
+    /// f32); POP is 1 byte (opcode only). Both round-trip
+    /// byte-identical, and decoding a PUSH/paint/POP triple lays
+    /// down the matching `PaintOp` sequence the renderer expects.
+    #[test]
+    fn opacity_ops_wire_sizes_and_roundtrip() {
+        let mut buf = Vec::new();
+        encode_op(&mut buf, &PaintOp::PushOpacity { alpha: 0.5 });
+        assert_eq!(buf.len(), 1 + 4, "PUSH_OPACITY = 5 bytes (op + alpha f32)");
+        assert_eq!(buf[0], opcode::PUSH_OPACITY);
+
+        buf.clear();
+        encode_op(&mut buf, &PaintOp::PopOpacity);
+        assert_eq!(buf.len(), 1, "POP_OPACITY = 1 byte (op only)");
+        assert_eq!(buf[0], opcode::POP_OPACITY);
+
+        // Roundtrip: PushOpacity(0.5) / FillRect / PopOpacity must
+        // decode back to the same three variants in order.
+        let inputs = vec![
+            PaintOp::PushOpacity { alpha: 0.75 },
+            PaintOp::FillRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0, rgba: 0xff_aa_bb_cc },
+            PaintOp::PopOpacity,
+        ];
+        let mut wire = Vec::new();
+        for op in &inputs { encode_op(&mut wire, op); }
+        // 5 (push) + 21 (fill_rect) + 1 (pop) = 27 bytes total.
+        assert_eq!(wire.len(), 5 + 21 + 1);
+        let mut frame = FrameCommands::new();
+        decode_frame(&wire, &mut frame).unwrap();
+        assert_eq!(frame.ops().len(), 3);
+        match &frame.ops()[0] {
+            PaintOp::PushOpacity { alpha } => assert!((alpha - 0.75).abs() < 1e-6),
+            other => panic!("expected PushOpacity, got {other:?}"),
+        }
+        assert!(matches!(frame.ops()[1], PaintOp::FillRect { .. }));
+        assert!(matches!(frame.ops()[2], PaintOp::PopOpacity));
+    }
+
+    /// Stage 3.2 — a truncated `OP_PUSH_OPACITY` (opcode byte but no
+    /// alpha payload) reports `Truncated`, not silent miss. Mirrors
+    /// the truncated-FillRect coverage in
+    /// `decode_rejects_truncated_stream`.
+    #[test]
+    fn truncated_push_opacity_is_rejected() {
+        let wire = vec![opcode::PUSH_OPACITY];
+        let mut frame = FrameCommands::new();
+        assert_eq!(decode_frame(&wire, &mut frame), Err(DecodeError::Truncated));
     }
 
     #[test]

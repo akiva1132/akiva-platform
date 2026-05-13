@@ -113,6 +113,17 @@ extern "C" {
     /// in dp; the renderer constructs a rounded-rect path internally.
     pub fn hal_draw_push_round_clip(x: f32, y: f32, w: f32, h: f32, radius: f32);
 
+    /// Stage 3.2 — push an opacity layer onto the renderer's
+    /// save/restore stack. Subsequent paint ops multiply their alpha
+    /// by `alpha` (clamped to `[0, 1]`) until the matching
+    /// `hal_draw_pop_opacity`. Nests: pushes compose multiplicatively
+    /// (CSS `opacity` cascade). Implementation maps to
+    /// `ctx.save(); ctx.globalAlpha *= alpha;` and `ctx.restore()`
+    /// for the pop. Differs from `hal_draw_set_global_alpha` which
+    /// is flat (no save/restore) and framework-internal.
+    pub fn hal_draw_push_opacity(alpha: f32);
+    pub fn hal_draw_pop_opacity();
+
     /// Test-infra — publish the current composite transform for activity
     /// `handle` so the host's inspector can return post-composite rects.
     /// Production tabs without `?inspector=1` ignore the call (the JS

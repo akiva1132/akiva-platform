@@ -37,6 +37,16 @@ const OP_DRAW_FOREIGN_IMAGE: u8 = 12;
 // trailing `radius: f32`. Shares the clip stack with the sharp
 // variant, popped by the same OP_POP_CLIP.
 const OP_PUSH_ROUND_CLIP:   u8 = 19;
+// Stage 3.2 — push/pop opacity layer. Carries one `alpha: f32` LE.
+// Renderer maps these to `ctx.save() / globalAlpha *= a / restore()`.
+// Nested pushes compose multiplicatively, matching the CSS `opacity`
+// cascade: `Frame::opacity(0.5)` inside another `Frame::opacity(0.5)`
+// paints at effective 0.25. Differs from the flat OP_SET_GLOBAL_ALPHA
+// (= 13) which the framework uses internally for surface composites
+// — that one persists until the next set, doesn't compose, and isn't
+// exposed to apps.
+const OP_PUSH_OPACITY:      u8 = 20;
+const OP_POP_OPACITY:       u8 = 21;
 
 /// Paint surface handed to `Activity::on_render`. All coordinates are in
 /// dp (density-independent pixels); colors are **`0xAARRGGBB`** — alpha
@@ -136,6 +146,32 @@ impl<'a> Canvas<'a> {
 
     pub fn pop_clip(&mut self) {
         self.buf.push(OP_POP_CLIP);
+    }
+
+    /// Push an opacity layer. Subsequent paint ops multiply their
+    /// effective alpha by `alpha` (clamped to `[0, 1]`) until the
+    /// matching [`Self::pop_opacity`]. Nests: pushing 0.5 inside an
+    /// outer 0.5 paints at 0.25, matching the CSS `opacity` cascade.
+    ///
+    /// Cheaper than rewriting each op's rgba byte: the renderer maps
+    /// the pair to a `ctx.save() / globalAlpha *= alpha / restore`
+    /// triple, which Canvas2D applies as a single GPU multiply per
+    /// drawn primitive. Use it for fade-in / fade-out groups
+    /// (`AnimatedValue<f32>` driving alpha), disabled-card dimming,
+    /// or any place an opacity *cascade* over a sub-tree beats
+    /// per-op alpha bookkeeping.
+    ///
+    /// `alpha == 1.0` is a legal call but wastes two ops — apps that
+    /// build trees dynamically should skip the pair when their
+    /// `AnimatedValue.value() == 1.0` on settled animations.
+    pub fn push_opacity(&mut self, alpha: f32) {
+        let a = alpha.clamp(0.0, 1.0);
+        self.buf.push(OP_PUSH_OPACITY);
+        self.buf.extend_from_slice(&a.to_le_bytes());
+    }
+
+    pub fn pop_opacity(&mut self) {
+        self.buf.push(OP_POP_OPACITY);
     }
 
     /// Translate + uniform scale. Useful for panning / zooming a sub-tree
@@ -241,5 +277,86 @@ impl<'a> Canvas<'a> {
         self.buf.extend_from_slice(&y.to_le_bytes());
         self.buf.extend_from_slice(&w.to_le_bytes());
         self.buf.extend_from_slice(&h.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `push_opacity` writes opcode 20 followed by the clamped alpha
+    /// as a little-endian f32. Five bytes total.
+    #[test]
+    fn push_opacity_encodes_five_bytes_with_alpha_le_f32() {
+        let mut buf = Vec::new();
+        let mut c = Canvas::new(&mut buf);
+        c.push_opacity(0.25);
+        assert_eq!(buf.len(), 5, "push_opacity emits opcode + f32 (5 bytes)");
+        assert_eq!(buf[0], OP_PUSH_OPACITY);
+        let alpha_bytes: [u8; 4] = buf[1..5].try_into().unwrap();
+        assert!((f32::from_le_bytes(alpha_bytes) - 0.25).abs() < 1e-7);
+    }
+
+    /// `pop_opacity` writes a single opcode byte (no payload).
+    #[test]
+    fn pop_opacity_encodes_one_byte() {
+        let mut buf = Vec::new();
+        let mut c = Canvas::new(&mut buf);
+        c.pop_opacity();
+        assert_eq!(buf, vec![OP_POP_OPACITY]);
+    }
+
+    /// Alpha is clamped to `[0, 1]` on encode — apps that overshoot
+    /// (animation past 1.0 due to spring overshoot, or below 0 due
+    /// to bouncy undershoot) emit the boundary, not the raw value.
+    /// The renderer would clamp anyway, but encoding the clamp here
+    /// makes the wire round-trip lossless and the test surface clear.
+    #[test]
+    fn push_opacity_clamps_alpha_to_zero_one_inclusive() {
+        for (input, want) in [(-0.5_f32, 0.0_f32), (1.5, 1.0), (0.0, 0.0), (1.0, 1.0)] {
+            let mut buf = Vec::new();
+            let mut c = Canvas::new(&mut buf);
+            c.push_opacity(input);
+            let alpha_bytes: [u8; 4] = buf[1..5].try_into().unwrap();
+            let got = f32::from_le_bytes(alpha_bytes);
+            assert!(
+                (got - want).abs() < 1e-7,
+                "push_opacity({input}) should encode {want}, got {got}",
+            );
+        }
+    }
+
+    /// Nested push/pop pairs build a stack-shaped byte stream — pops
+    /// after pushes, no resync magic, just the bytes the renderer
+    /// expects to walk in order.
+    #[test]
+    fn nested_opacity_layers_emit_balanced_push_pop_pairs() {
+        let mut buf = Vec::new();
+        let mut c = Canvas::new(&mut buf);
+        c.push_opacity(0.5);
+        c.push_opacity(0.5);
+        c.fill_rect(0.0, 0.0, 10.0, 10.0, 0xff_11_22_33);
+        c.pop_opacity();
+        c.pop_opacity();
+        // Two pushes (5 + 5) + one fill_rect (21) + two pops (1 + 1) = 33.
+        assert_eq!(buf.len(), 5 + 5 + 21 + 1 + 1);
+        // Byte at idx 0 / 5 = push opcode; idx 31 / 32 = pop opcode.
+        assert_eq!(buf[0], OP_PUSH_OPACITY);
+        assert_eq!(buf[5], OP_PUSH_OPACITY);
+        assert_eq!(buf[31], OP_POP_OPACITY);
+        assert_eq!(buf[32], OP_POP_OPACITY);
+    }
+
+    /// `push_opacity(1.0)` is a legal (but wasteful) call — encodes
+    /// the full 5 bytes the same as any other alpha. Apps avoid the
+    /// waste at build time (`if value < 1.0 { push; … pop }`), not
+    /// in the encoder.
+    #[test]
+    fn push_opacity_one_point_zero_still_encodes_full_op() {
+        let mut buf = Vec::new();
+        let mut c = Canvas::new(&mut buf);
+        c.push_opacity(1.0);
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf[0], OP_PUSH_OPACITY);
     }
 }

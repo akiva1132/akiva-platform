@@ -245,6 +245,30 @@ export class Canvas2DBackend {
     this.ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
   }
 
+  // Stage 3.2 — push an opacity layer onto the canvas state stack.
+  // Subsequent paint ops multiply their alpha by `alpha` (clamped to
+  // [0, 1]) until the matching `popOpacity`. Nested pushes compose
+  // multiplicatively because each `save()` snapshots the current
+  // globalAlpha — pushing 0.5 inside 0.5 yields effective 0.25,
+  // matching the CSS `opacity` cascade.
+  //
+  // Differs from `setGlobalAlpha` by saving and restoring the
+  // canvas state — apps can wrap a sub-tree without leaking the
+  // alpha to siblings. `setGlobalAlpha` is used by the surface
+  // compositor for cross-activity fades that *do* persist; this
+  // pair is the app-facing primitive.
+  pushOpacity(alpha) {
+    if (!this.ctx) return;
+    this.ctx.save();
+    const a = Math.max(0, Math.min(1, alpha));
+    this.ctx.globalAlpha *= a;
+  }
+
+  popOpacity() {
+    if (!this.ctx) return;
+    this.ctx.restore();
+  }
+
   // Stone 13.0prep C — drawable cache. The host populates this via
   // `registerDrawable(id, bitmap)` at install/boot time; `drawImage`
   // reads from it. Map<u32 id, ImageBitmap | OffscreenCanvas>.

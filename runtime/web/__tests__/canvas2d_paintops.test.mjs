@@ -253,6 +253,34 @@ describe("Canvas2DBackend — every paint op reaches the canvas", () => {
     ]);
   });
 
+  // ── Stage 3.2 — push/pop opacity layer ────────────────────────────
+
+  it("pushOpacity saves the canvas state and multiplies globalAlpha", () => {
+    backend.pushOpacity(0.5);
+    // The getter returns 1, so `*= 0.5` writes 0.5.
+    expect(tail(trace, "---init---")).toEqual([
+      ["save"],
+      ["set:globalAlpha", 0.5],
+    ]);
+  });
+
+  it("popOpacity restores via the canvas state stack", () => {
+    backend.popOpacity();
+    expect(tail(trace, "---init---")).toEqual([["restore"]]);
+  });
+
+  it("pushOpacity clamps values outside [0, 1]", () => {
+    backend.pushOpacity(1.5);
+    backend.pushOpacity(-0.2);
+    // Each push emits save + set:globalAlpha. Mock getter always
+    // returns 1, so the multiplied value equals the clamped input.
+    const ops = tail(trace, "---init---");
+    expect(ops).toEqual([
+      ["save"], ["set:globalAlpha", 1],
+      ["save"], ["set:globalAlpha", 0],
+    ]);
+  });
+
   it("a transition wrapper sets alpha inside a save/restore scope", () => {
     // The animation pipeline emits PushTransform → SetGlobalAlpha →
     // (activity ops) → PopTransform. Canvas2D's `restore()` pops the
