@@ -1,6 +1,9 @@
 # Stage 2e — spring animations + bouncer demo
 
-> **Status:** Planning. Builds on Stage 2d (stage-2d-carousel-plan.md).
+> **Status:** Done (2026-05-13). All six sub-stones landed; bouncer
+> demo + 6 e2e + visual golden green. Spring + AnimatedValue land
+> in one commit (2e.1+2 fused — same module, no natural seam).
+> Builds on Stage 2d (stage-2d-carousel-plan.md).
 > **Owner:** Claude × akiva1132. **Target:** 5-6 commits, ~25 new tests.
 > **Why a follow-up:** Stage 2c.4 gave us *one* animation kind
 > (exponential-decay fling), Stage 2d.3 added a *second* (cubic-out

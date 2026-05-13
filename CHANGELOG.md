@@ -10,6 +10,60 @@ adds (MINOR) or breaks (MAJOR).
 The "what" column lists the public surface that changed; details and
 rationale live in the linked stone or risk entry.
 
+## [Unreleased] — Stage 2e (spring animations, overscroll bounce, bouncer demo)
+
+No ABI bump — Stage 2e is pure SDK-internal. Apps continue to
+require `min_abi_version = "0.13.0"`.
+
+- **Added — `Spring` primitive (Stage 2e.1).**
+  Third animation kind alongside fling (2c.4) and snap (2d.3).
+  `pub struct Spring { stiffness, damping_ratio, epsilon }` with
+  presets `LOW`, `MEDIUM` (default), `HIGH`, `VERY_HIGH`, `BOUNCY`.
+  `tick(value, velocity, target, dt_ms) -> (value, velocity)` runs
+  one semi-implicit Euler step; the integrator substeps when
+  `k * sub_dt² + c * sub_dt` would exceed 1 (the stability bound
+  for damped semi-implicit Euler) so even `Spring::VERY_HIGH`
+  (k = 10 000) is stable at the 4-frame tab-resume clamp.
+  `settled(value, velocity, target)` returns true only when both
+  position and velocity are within `epsilon` of rest.
+- **Added — `AnimatedValue<f32>` (Stage 2e.2).**
+  Thin app-facing wrapper around `Spring` for per-property
+  animation: `new`, `set_immediately`, `spring_to(target, spring)`,
+  `tick(dt_ms)`, `value`, `velocity`, `target`, `is_settled`.
+  Velocity is preserved on retarget so motion stays continuous;
+  once below `epsilon`, value snaps exactly to target so
+  `is_settled` doesn't flicker. `impl Default` returns at rest
+  at `0.0` so `#[derive(Default)]` works on activity structs.
+- **Added — overscroll bounce (Stage 2e.3).**
+  `ScrollCell.is_bouncing: bool` + `OVERSCROLL_SPRING` + a per-
+  axis `OVERSCROLL_MAX_PX = 64.0` cap. Replaces the hard
+  edge-clamp in `tick_animations`: a fling that crosses an edge
+  with momentum now hands off to a soft critically-damped spring
+  that pulls scroll_y back to the exact edge. `feed_pointer(Down)`
+  / `feed_wheel` / `scroll_to` all cancel an in-flight bounce so
+  user input always wins. `present()` honours the flag by
+  relaxing its safety-net clamp to `[-OVERSCROLL_MAX_PX, max +
+  OVERSCROLL_MAX_PX]` while bouncing.
+- **`has_active_animation`** now reports
+  `velocity != 0 || snap_target != None || is_bouncing` — all
+  three kinds of motion.
+- **Demo — `apps/bouncer/` (Stage 2e.4).**
+  Drag-and-release demo for the spring primitive. An 88×88
+  rounded square sits in the centre of a 360-dp track; pointer-
+  drag moves it; pointer-up springs it back to the centre with
+  one of three preset chips (Bouncy = `Spring::BOUNCY`, Stiff =
+  `HIGH`, Wobbly = `{stiffness: 200, ζ: 0.3}`). Two
+  `AnimatedValue<f32>` (x and y) tick once per `on_render`.
+- **Re-exports.** `AnimatedValue` and `Spring` join the SDK
+  prelude.
+- **Tests (Stage 2e, cumulative).**
+  - sdk-rust lib: 360 → 377 (+13 spring + 6 overscroll - 2
+    deprecated fling-clamp).
+  - Playwright e2e: 63 → 69 (+6 bouncer; carousel + feed +
+    articles + calculator continue to pass after a row-index
+    shuffle to make room for `com.akiva.bouncer` at index 1).
+  - Visual goldens: 6 → 7 (+ `bouncer-idle-chromium-linux.png`).
+
 ## [Unreleased] — Stage 2d (horizontal scroll, LazyRow, snap, carousel)
 
 No ABI bump — Stage 2d is pure SDK-internal. Apps continue to require
