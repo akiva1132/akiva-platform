@@ -76,8 +76,13 @@ pub mod layout;
 pub mod paint;
 pub mod semantics;
 pub mod spring;
+pub mod gesture;
 
 pub use spring::{AnimatedValue, Spring};
+pub use gesture::{
+    DoubleTapDetector,
+    DOUBLE_TAP_MAX_INTERVAL_MS, DOUBLE_TAP_MAX_MOVE_PX, TAP_SLOP_PX,
+};
 
 // Re-export the most-used identifier so callers don't have to write
 // `akiva_sdk::ui::node::NodeId` for every builder return type.
