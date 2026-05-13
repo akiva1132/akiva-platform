@@ -223,6 +223,25 @@ pub(crate) const SNAP_DURATION_MS: f32 = 250.0;
 /// micro-animation when the fling happened to settle on the grid.
 pub(crate) const SNAP_THRESHOLD: f32 = 0.5;
 
+/// Maximum displacement past an edge during an overscroll bounce,
+/// in physical pixels. A fling that wants to carry further than
+/// this gets pinned and its velocity zeroed so the spring restoring
+/// force can pull from a known finite offset. Matches Android
+/// `EdgeEffect`'s default visible distance (~64 dp).
+pub(crate) const OVERSCROLL_MAX_PX: f32 = 64.0;
+
+/// Spring config used by the overscroll bounce. Soft-stiffness +
+/// critical damping → a single visible overshoot (the content
+/// briefly hangs past the edge), then a smooth return. We keep
+/// the epsilon larger than the default (0.5 px) because the
+/// settled state is exactly on the edge — anything smaller would
+/// just be sub-pixel jitter.
+pub(crate) const OVERSCROLL_SPRING: spring::Spring = spring::Spring {
+    stiffness: 150.0,
+    damping_ratio: 1.0,
+    epsilon: 0.5,
+};
+
 /// Persistent state for one scroll region. Lives in
 /// [`UiState::scroll_states`] keyed by the caller-supplied
 /// `ScrollBuilder::key`. Survives across frames so scroll position
@@ -301,6 +320,15 @@ pub struct ScrollCell {
     /// `tick_animations` when the snap kicks off, or cleared by
     /// any user-input interruption.
     pub snap_pending: bool,
+    /// Stage 2e.3 — true while `scroll_y` is intentionally past one
+    /// of the edges and the overscroll spring is pulling it back.
+    /// Set when a fling tick crosses an edge with velocity; cleared
+    /// when the spring settles or the user touches the region.
+    /// `present()` honours this flag by relaxing its clamp range
+    /// to `[-OVERSCROLL_MAX_PX, max + OVERSCROLL_MAX_PX]` while
+    /// it's set, so the bounce isn't clipped back to the edge on
+    /// the next frame.
+    pub is_bouncing: bool,
 }
 
 /// App-owned UI state. Carry one in your `Activity` struct (usually via
@@ -480,11 +508,19 @@ impl UiState {
                         ScrollAxis::Horizontal => ev.x,
                     };
                     // User is taking control back — cancel any
-                    // in-flight snap so the touch wins over the
-                    // animator. snap_pending stays false until Up.
+                    // in-flight snap or bounce so the touch wins
+                    // over the animator. scroll_y is hard-clamped
+                    // to [0, max] (no rubber-band during drag in
+                    // this stage). snap_pending stays false until Up.
                     if let Some(cell) = self.scroll_states.get_mut(&key) {
                         cell.snap_target = None;
                         cell.snap_pending = false;
+                        if cell.is_bouncing {
+                            let max = (cell.content_h - cell.viewport_h).max(0.0);
+                            cell.scroll_y = cell.scroll_y.clamp(0.0, max);
+                            cell.velocity = 0.0;
+                            cell.is_bouncing = false;
+                        }
                     }
                     self.drag_gesture = Some(DragGesture {
                         key,
@@ -585,14 +621,21 @@ impl UiState {
             ScrollAxis::Horizontal => ev.dx,
         };
         let max = (cell.content_h - cell.viewport_h).max(0.0);
-        cell.scroll_y = (cell.scroll_y + delta).clamp(0.0, max);
+        // If the cell is in overscroll bounce, treat the bounce as
+        // already resolved before applying the wheel delta — the
+        // user's input shouldn't have to first "spend" pixels
+        // cancelling an in-flight bounce.
+        let base = cell.scroll_y.clamp(0.0, max);
+        cell.scroll_y = (base + delta).clamp(0.0, max);
         // Wheel input is an explicit user override; kill any active
-        // fling and any pending/active snap so the user can wheel to
-        // a non-grid position and leave it there (Compose
-        // `HorizontalPager` doesn't snap wheel events either).
+        // fling, snap, or overscroll bounce so the user can wheel
+        // to a non-grid position and leave it there (Compose
+        // `HorizontalPager` doesn't snap wheel events either; iOS
+        // doesn't rubber-band on trackpad scroll).
         cell.velocity = 0.0;
         cell.snap_target = None;
         cell.snap_pending = false;
+        cell.is_bouncing = false;
     }
 
     /// Advance every active fling by `dt_ms`. `Ui::present` calls this
@@ -615,19 +658,67 @@ impl UiState {
         if dt_ms <= 0.0 { return; }
         let frames_dt = (dt_ms / FRAME_MS).clamp(0.0, 4.0);
         for cell in self.scroll_states.values_mut() {
-            // ── Phase 1: fling decay ──────────────────────────────
+            let max = (cell.content_h - cell.viewport_h).max(0.0);
+            // ── Phase 1a: bounce-back spring (overscroll) ─────────
+            // Stage 2e.3 — when `is_bouncing`, the cell is past an
+            // edge and a soft spring is pulling it back. This runs
+            // before the fling path because the fling's exit
+            // condition seeds the bounce (so we want the spring to
+            // tick on the same frame the fling stops). When the
+            // spring settles, we re-clamp scroll_y to the edge
+            // exactly and clear the flag — the cell returns to
+            // normal in-bounds physics.
+            if cell.is_bouncing {
+                let edge = if cell.scroll_y < 0.0 { 0.0 } else { max };
+                // Safety cap: a giant fling can't carry the bounce
+                // arbitrarily far. Clamp + zero outward velocity.
+                let over = cell.scroll_y - edge;
+                let capped = over.clamp(-OVERSCROLL_MAX_PX, OVERSCROLL_MAX_PX);
+                if capped != over {
+                    cell.scroll_y = edge + capped;
+                    cell.velocity = 0.0;
+                }
+                let over_now = cell.scroll_y - edge;
+                let (new_over, new_vel) = OVERSCROLL_SPRING.tick(
+                    over_now, cell.velocity, 0.0, dt_ms,
+                );
+                cell.scroll_y = edge + new_over;
+                cell.velocity = new_vel;
+                if OVERSCROLL_SPRING.settled(new_over, new_vel, 0.0) {
+                    cell.scroll_y = edge;
+                    cell.velocity = 0.0;
+                    cell.is_bouncing = false;
+                }
+                // Bounce phase consumed this tick — skip the fling
+                // path. Snap is also skipped (no snap target gets
+                // set while in bounce — overscroll always settles
+                // at a page edge anyway, which IS a valid snap
+                // target).
+                continue;
+            }
+            // ── Phase 1b: fling decay ──────────────────────────────
             let had_velocity = cell.velocity != 0.0;
             if had_velocity {
                 cell.velocity *= FLING_DECAY_PER_FRAME.powf(frames_dt);
                 let new_y = cell.scroll_y + cell.velocity * frames_dt;
-                let max = (cell.content_h - cell.viewport_h).max(0.0);
-                let clamped = new_y.clamp(0.0, max);
-                if clamped != new_y {
-                    // Hit an edge — kill velocity rather than
-                    // perpetually try to scroll past it.
-                    cell.velocity = 0.0;
+                if new_y < 0.0 || new_y > max {
+                    // Crossed an edge with momentum. Hand off to
+                    // the overscroll spring (next tick / this tick
+                    // via `continue` if we re-enter). Cap the
+                    // immediate overshoot so an absurd fling can't
+                    // teleport into oblivion.
+                    cell.scroll_y = new_y.clamp(
+                        -OVERSCROLL_MAX_PX, max + OVERSCROLL_MAX_PX,
+                    );
+                    if cell.scroll_y != new_y {
+                        // Pinned at cap — drop velocity so spring
+                        // pulls back from a known offset.
+                        cell.velocity = 0.0;
+                    }
+                    cell.is_bouncing = true;
+                    continue;
                 }
-                cell.scroll_y = clamped;
+                cell.scroll_y = new_y;
                 if cell.velocity.abs() < FLING_STOP_VELOCITY {
                     cell.velocity = 0.0;
                 }
@@ -681,8 +772,9 @@ impl UiState {
     /// this is documentary — but it gives a future "render-on-
     /// demand" optimisation a clean predicate to gate on.
     pub fn has_active_animation(&self) -> bool {
-        self.scroll_states.values()
-            .any(|c| c.velocity != 0.0 || c.snap_target.is_some())
+        self.scroll_states.values().any(|c| {
+            c.velocity != 0.0 || c.snap_target.is_some() || c.is_bouncing
+        })
     }
 
     /// Find the topmost scroll region whose viewport rect contains
@@ -943,11 +1035,12 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
         let max = (cell.content_h - cell.viewport_h).max(0.0);
         cell.scroll_y = y.clamp(0.0, max);
         cell.velocity = 0.0;
-        // Programmatic scroll is exact — never snap on top of a
-        // `scroll_to`. Callers that want a snap can target an
-        // already-aligned offset.
+        // Programmatic scroll is exact — never snap or bounce on
+        // top of a `scroll_to`. Callers that want a snap can
+        // target an already-aligned offset.
         cell.snap_target = None;
         cell.snap_pending = false;
+        cell.is_bouncing = false;
     }
 
     /// Current scroll position for `key`. Returns `0.0` if no scroll
@@ -1116,8 +1209,20 @@ impl<'s, 'c, 'b> Ui<'s, 'c, 'b> {
             }
             cell.last_rect = viewport_rect;
             let max = (cell.content_h - cell.viewport_h).max(0.0);
-            if cell.scroll_y > max { cell.scroll_y = max; }
-            if cell.scroll_y < 0.0 { cell.scroll_y = 0.0; }
+            // During a bounce, the cell is intentionally past edge —
+            // clamp only to the overscroll cap (safety net against
+            // content shrink during paint). Otherwise clamp tight
+            // so a content shrink doesn't strand scroll_y past the
+            // new end.
+            if cell.is_bouncing {
+                let upper = max + OVERSCROLL_MAX_PX;
+                let lower = -OVERSCROLL_MAX_PX;
+                if cell.scroll_y > upper { cell.scroll_y = upper; cell.velocity = 0.0; }
+                if cell.scroll_y < lower { cell.scroll_y = lower; cell.velocity = 0.0; }
+            } else {
+                if cell.scroll_y > max { cell.scroll_y = max; }
+                if cell.scroll_y < 0.0 { cell.scroll_y = 0.0; }
+            }
         }
 
         // Record hit rects + actions for buttons before paint, so
@@ -1962,23 +2067,33 @@ mod tests {
     }
 
     #[test]
-    fn fling_clamps_at_bottom_edge_and_zeros_velocity() {
+    fn fling_enters_overscroll_bounce_at_bottom_edge() {
+        // Pre-Stage 2e behaviour was: clamp scroll_y to max, zero
+        // velocity. After 2e.3 a fling that crosses the edge enters
+        // the overscroll bounce phase — scroll_y goes briefly past
+        // max with `is_bouncing = true`, and a soft spring pulls
+        // it back over subsequent frames.
         let mut state = UiState::new();
         seed_scroll_cell(
             &mut state, "feed",
             Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
-            500.0,        // content_h
-            95.0,         // already near the max=100
+            500.0,        // content_h → max scroll = 100
+            95.0,         // 5 px from the bottom edge
         );
         state.scroll_states.get_mut("feed").unwrap().velocity = 50.0;
         state.tick_animations(FRAME_MS);
         let cell = &state.scroll_states["feed"];
-        assert_eq!(cell.scroll_y, 100.0, "must clamp to content_h - viewport_h");
-        assert_eq!(cell.velocity, 0.0, "must zero velocity on edge clamp");
+        assert!(cell.is_bouncing, "must enter bounce when fling crosses bottom edge");
+        assert!(cell.scroll_y > 100.0,
+            "scroll_y must be past max during bounce (got {})", cell.scroll_y);
+        assert!(cell.scroll_y <= 100.0 + OVERSCROLL_MAX_PX,
+            "scroll_y must stay within overscroll cap");
     }
 
     #[test]
-    fn fling_clamps_at_top_edge_and_zeros_velocity() {
+    fn fling_enters_overscroll_bounce_at_top_edge() {
+        // Mirror of the bottom-edge case for negative velocity at
+        // the top.
         let mut state = UiState::new();
         seed_scroll_cell(
             &mut state, "feed",
@@ -1988,8 +2103,110 @@ mod tests {
         state.scroll_states.get_mut("feed").unwrap().velocity = -50.0;
         state.tick_animations(FRAME_MS);
         let cell = &state.scroll_states["feed"];
-        assert_eq!(cell.scroll_y, 0.0);
+        assert!(cell.is_bouncing);
+        assert!(cell.scroll_y < 0.0,
+            "scroll_y must be past top edge during bounce (got {})", cell.scroll_y);
+        assert!(cell.scroll_y >= -OVERSCROLL_MAX_PX);
+    }
+
+    #[test]
+    fn overscroll_bounce_settles_back_to_edge_in_finite_frames() {
+        // After the fling enters bounce, the overscroll spring
+        // pulls scroll_y exactly back to the edge. The spring is
+        // critically damped at low stiffness, so settling takes
+        // ~30–60 frames in worst case.
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            500.0, 95.0,
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = 50.0;
+        // Step until settled or budget exhausted (200 frames =
+        // ~3.3 s of simulated time — comfortably past the spring's
+        // settling time).
+        let mut settled = false;
+        for _ in 0..200 {
+            state.tick_animations(FRAME_MS);
+            if !state.scroll_states["feed"].is_bouncing {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "overscroll bounce must settle within 200 frames");
+        let cell = &state.scroll_states["feed"];
+        assert_eq!(cell.scroll_y, 100.0, "must land exactly on the edge");
         assert_eq!(cell.velocity, 0.0);
+        assert!(!cell.is_bouncing);
+    }
+
+    #[test]
+    fn pointer_down_in_bouncing_cell_clamps_back_to_edge() {
+        // Touch input wins over the animator — Down inside a
+        // bouncing region clamps scroll_y to [0, max], zeros
+        // velocity, and clears is_bouncing so the new gesture
+        // starts from a clean state.
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            500.0, 95.0,
+        );
+        {
+            let cell = state.scroll_states.get_mut("feed").unwrap();
+            cell.scroll_y = 120.0;  // past edge
+            cell.velocity = -10.0;
+            cell.is_bouncing = true;
+        }
+        state.feed_pointer(pointer(100.0, 200.0, PointerPhase::Down));
+        let cell = &state.scroll_states["feed"];
+        assert_eq!(cell.scroll_y, 100.0, "must clamp to max");
+        assert_eq!(cell.velocity, 0.0);
+        assert!(!cell.is_bouncing);
+    }
+
+    #[test]
+    fn wheel_during_bounce_clears_bounce_state() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            500.0, 95.0,
+        );
+        {
+            let cell = state.scroll_states.get_mut("feed").unwrap();
+            cell.scroll_y = 120.0;
+            cell.velocity = -10.0;
+            cell.is_bouncing = true;
+        }
+        // Position the pointer over the region so feed_wheel can
+        // hit-test, then dispatch a small wheel delta.
+        state.feed_pointer(pointer(100.0, 200.0, PointerPhase::Move));
+        state.feed_wheel(wheel(-30.0));
+        let cell = &state.scroll_states["feed"];
+        assert!(!cell.is_bouncing, "wheel must clear bounce");
+        assert_eq!(cell.velocity, 0.0);
+        // The wheel delta (-30) applied from scroll_y=120 (which
+        // got clamped to max=100 by the wheel's own clamp before
+        // the delta), landing at 70.
+        assert_eq!(cell.scroll_y, 70.0);
+    }
+
+    #[test]
+    fn overscroll_caps_at_max_px() {
+        // A massive fling can't carry the bounce arbitrarily far —
+        // OVERSCROLL_MAX_PX is the safety pin.
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 400.0 },
+            500.0, 99.0,
+        );
+        state.scroll_states.get_mut("feed").unwrap().velocity = 10000.0;
+        state.tick_animations(FRAME_MS);
+        let cell = &state.scroll_states["feed"];
+        assert!(cell.is_bouncing);
+        assert!(cell.scroll_y <= 100.0 + OVERSCROLL_MAX_PX);
     }
 
     #[test]
