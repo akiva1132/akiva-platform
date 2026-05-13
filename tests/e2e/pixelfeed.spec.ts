@@ -83,40 +83,24 @@ async function wheelOnCenter(page: Page, key: string, dx: number, dy: number) {
   await page.waitForTimeout(120);
 }
 
-/** Wheel just below the photo pager (in the action-row band of
- *  card 0). The feed scroll region contains every card; the photo
- *  pagers nest inside. `scroll_region_at` picks the smallest area
- *  region that contains the cursor, so a cursor inside the photo
- *  pager hits the *horizontal* pager (which ignores wheel.y). To
- *  scroll the feed vertically we wheel on a Y that's inside the
- *  feed but OUTSIDE any pager — the action-row strip directly
- *  below card 0's photo is the natural choice. */
-async function wheelOnFeedBelowPhoto(page: Page, dy: number) {
-  const r = await scrollOf(page, "feed");
-  const pager = await scrollOf(page, "post-0-photos");
-  expect(r).not.toBeNull();
-  expect(pager).not.toBeNull();
-  const cx = r!.rect.x + r!.rect.w / 2;
-  // Action row sits in the 22-dp band starting at pager.bottom + 8
-  // (the 8-dp padding inside the card before the action row).
-  const cy = pager!.rect.y + pager!.rect.h + 22;
-  await page.mouse.move(cx, cy);
-  await page.mouse.wheel(0, dy);
-  await page.waitForTimeout(120);
-}
-
-test("pixelfeed: wheel.y on the feed advances scrollY", async ({ page }) => {
+test("pixelfeed: wheel.y over a photo pager scrolls the OUTER feed (per-axis routing)", async ({ page }) => {
+  // Pre-fix this test would have failed: scroll_region_at picked
+  // the smallest-area region (the photo pager, horizontal) and
+  // dropped the dy on the floor. The fix routes each wheel
+  // component to the deepest scroll of its own axis — wheel.y
+  // bubbles up past the horizontal pager to the vertical feed.
   const before = await scrollOf(page, "feed");
   expect(before!.scrollY).toBe(0);
-  await wheelOnFeedBelowPhoto(page, 600);
+  // Cursor parked DEAD CENTRE of card 0's photo pager.
+  await wheelOnCenter(page, "post-0-photos", 0, 600);
   await page.waitForTimeout(400);
   const after = await scrollOf(page, "feed");
-  expect(after!.scrollY).toBeGreaterThan(before!.scrollY);
-  // first/last visible indices include the overscan band so an item
-  // partially clipped above the viewport still reports as "visible";
-  // assert on lastVisibleIndex (which strictly grows with scrollY) to
-  // confirm the LazyColumn's window actually slid downward.
+  expect(after!.scrollY).toBeGreaterThan(0);
   expect(after!.lastVisibleIndex).toBeGreaterThan(before!.lastVisibleIndex!);
+  // The pager underneath must NOT have advanced — dy doesn't
+  // leak across axes.
+  const pager = await scrollOf(page, "post-0-photos");
+  expect(pager!.scrollY).toBe(0);
 });
 
 test("pixelfeed: wheel.x on a photo pager advances its scrollY", async ({ page }) => {
@@ -138,6 +122,17 @@ test("pixelfeed: advancing card-0's pager leaves card-1's pager untouched", asyn
   const c1 = await scrollOf(page, "post-1-photos");
   expect(c0!.scrollY).toBeGreaterThan(0);
   expect(c1!.scrollY).toBe(0);
+});
+
+test("pixelfeed: diagonal wheel over photo routes dx to pager + dy to feed", async ({ page }) => {
+  // Diagonal trackpad swipe — both axes advance independently in
+  // one wheel event. Asserts the per-axis routing is symmetric.
+  await wheelOnCenter(page, "post-0-photos", 200, 200);
+  await page.waitForTimeout(400);
+  const pager = await scrollOf(page, "post-0-photos");
+  const feed = await scrollOf(page, "feed");
+  expect(pager!.scrollY).toBeGreaterThan(0);
+  expect(feed!.scrollY).toBeGreaterThan(0);
 });
 
 test("pixelfeed: tapping like-0 increments card 0's like count", async ({ page }) => {

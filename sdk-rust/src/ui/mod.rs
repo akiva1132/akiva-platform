@@ -612,19 +612,36 @@ impl UiState {
     /// yet (e.g. wheel before any cursor entry) or no scroll region
     /// is under the cursor.
     ///
-    /// Axis-aware: a vertical scroll consumes `ev.dy` and drops
-    /// `ev.dx`; a horizontal scroll consumes `ev.dx` and drops
-    /// `ev.dy`. No "axis stealing" — diagonal trackpad swipes are
-    /// projected onto the cell's main axis, with the cross
-    /// component ignored.
+    /// Per-axis routing: `ev.dy` looks for the deepest **vertical**
+    /// scroll region containing the cursor; `ev.dx` looks for the
+    /// deepest **horizontal** scroll region containing the cursor.
+    /// The two axes are independent — a diagonal trackpad swipe
+    /// routes each component to the closest matching region, and
+    /// a pure-`dy` wheel inside a nested horizontal pager bubbles
+    /// up past the pager to the enclosing vertical scroll (so a
+    /// user hovering over a photo pager can still scroll the
+    /// outer feed downward). Matches the native behaviour every
+    /// desktop OS gives wheel events over nested scroll views.
     pub fn feed_wheel(&mut self, ev: super::activity::WheelEvent) {
         let Some((px, py)) = self.last_pointer else { return; };
-        let Some(key) = self.scroll_region_at(px, py) else { return; };
-        let cell = self.scroll_states.entry(key).or_default();
-        let delta = match cell.axis {
-            ScrollAxis::Vertical => ev.dy,
-            ScrollAxis::Horizontal => ev.dx,
-        };
+        if ev.dy != 0.0 {
+            if let Some(key) = self.scroll_region_at_axis(px, py, ScrollAxis::Vertical) {
+                self.apply_wheel_delta(&key, ev.dy);
+            }
+        }
+        if ev.dx != 0.0 {
+            if let Some(key) = self.scroll_region_at_axis(px, py, ScrollAxis::Horizontal) {
+                self.apply_wheel_delta(&key, ev.dx);
+            }
+        }
+    }
+
+    /// Apply a wheel delta to one scroll cell. Wheel input is an
+    /// explicit user override, so any in-flight fling / snap /
+    /// overscroll bounce gets cleared — the cell ends up at exactly
+    /// `(scroll_y + delta).clamp(0, max)` with zero velocity.
+    fn apply_wheel_delta(&mut self, key: &str, delta: f32) {
+        let cell = self.scroll_states.entry(key.to_string()).or_default();
         let max = (cell.content_h - cell.viewport_h).max(0.0);
         // If the cell is in overscroll bounce, treat the bounce as
         // already resolved before applying the wheel delta — the
@@ -632,11 +649,6 @@ impl UiState {
         // cancelling an in-flight bounce.
         let base = cell.scroll_y.clamp(0.0, max);
         cell.scroll_y = (base + delta).clamp(0.0, max);
-        // Wheel input is an explicit user override; kill any active
-        // fling, snap, or overscroll bounce so the user can wheel
-        // to a non-grid position and leave it there (Compose
-        // `HorizontalPager` doesn't snap wheel events either; iOS
-        // doesn't rubber-band on trackpad scroll).
         cell.velocity = 0.0;
         cell.snap_target = None;
         cell.snap_pending = false;
@@ -790,6 +802,31 @@ impl UiState {
     fn scroll_region_at(&self, x: f32, y: f32) -> Option<String> {
         let mut best: Option<(String, f32)> = None;
         for (key, cell) in &self.scroll_states {
+            if cell.last_rect.contains(x, y) {
+                let area = cell.last_rect.w * cell.last_rect.h;
+                if best.as_ref().is_none_or(|(_, a)| area < *a) {
+                    best = Some((key.clone(), area));
+                }
+            }
+        }
+        best.map(|(k, _)| k)
+    }
+
+    /// Same as [`Self::scroll_region_at`] but only considers scroll
+    /// regions whose axis matches `axis`. Lets `feed_wheel` route
+    /// each wheel component to the right scroll: a pure-`dy` wheel
+    /// inside a nested horizontal photo pager skips the pager and
+    /// finds the enclosing vertical feed. Without this filter the
+    /// inner pager would consume the event (smallest area wins) but
+    /// then silently drop the `dy` component, freezing the outer
+    /// scroll while the cursor was over any inner horizontal
+    /// region.
+    fn scroll_region_at_axis(
+        &self, x: f32, y: f32, axis: ScrollAxis,
+    ) -> Option<String> {
+        let mut best: Option<(String, f32)> = None;
+        for (key, cell) in &self.scroll_states {
+            if cell.axis != axis { continue; }
             if cell.last_rect.contains(x, y) {
                 let area = cell.last_rect.w * cell.last_rect.h;
                 if best.as_ref().is_none_or(|(_, a)| area < *a) {
@@ -3018,6 +3055,90 @@ mod tests {
         state.feed_wheel(wheel_xy(400.0, 50.0));
         // Only the 50 dy lands.
         assert_eq!(state.scroll_states["col"].scroll_y, 50.0);
+    }
+
+    /// Regression — pre-fix, a wheel.y inside a nested horizontal
+    /// scroll region was silently dropped because `scroll_region_at`
+    /// picked the smallest-area region (the horizontal child) and
+    /// `feed_wheel` projected ev to `cell.axis`, dropping dy. The
+    /// fix routes each wheel component to the deepest scroll region
+    /// of its own axis — so wheel.y over an inner horizontal pager
+    /// bubbles up to the enclosing vertical scroll.
+    #[test]
+    fn vertical_wheel_over_nested_horizontal_scrolls_outer_vertical() {
+        let mut state = UiState::new();
+        // Outer feed: 800-dp-tall vertical scroll covering the
+        // whole viewport.
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 1280.0, h: 800.0 },
+            5000.0, 0.0,
+        );
+        // Inner photo-pager: smaller-area horizontal scroll nested
+        // inside the feed. Hit-test point (640, 400) sits inside
+        // both — the pager's smaller area would have won under the
+        // old behaviour.
+        seed_scroll_cell_axis(
+            &mut state, "pager",
+            Rect { x: 440.0, y: 200.0, w: 400.0, h: 400.0 },
+            2000.0, 0.0, ScrollAxis::Horizontal,
+        );
+        state.feed_pointer(pointer(640.0, 400.0, PointerPhase::Move));
+        // Pure-dy wheel — must scroll the OUTER feed even though the
+        // cursor sits inside the inner horizontal pager.
+        state.feed_wheel(wheel_xy(0.0, 250.0));
+        assert_eq!(state.scroll_states["feed"].scroll_y, 250.0,
+            "wheel.y over a nested horizontal scroll must bubble up to the vertical parent");
+        assert_eq!(state.scroll_states["pager"].scroll_y, 0.0,
+            "the horizontal pager must NOT receive the dy delta");
+    }
+
+    /// Companion to the above — wheel.x over the same nested layout
+    /// routes to the inner horizontal pager, not the outer vertical
+    /// feed (the deepest horizontal scroll wins for the x axis).
+    #[test]
+    fn horizontal_wheel_over_nested_horizontal_scrolls_inner_horizontal() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 1280.0, h: 800.0 },
+            5000.0, 0.0,
+        );
+        seed_scroll_cell_axis(
+            &mut state, "pager",
+            Rect { x: 440.0, y: 200.0, w: 400.0, h: 400.0 },
+            2000.0, 0.0, ScrollAxis::Horizontal,
+        );
+        state.feed_pointer(pointer(640.0, 400.0, PointerPhase::Move));
+        state.feed_wheel(wheel_xy(180.0, 0.0));
+        assert_eq!(state.scroll_states["pager"].scroll_y, 180.0,
+            "wheel.x routes to the deepest horizontal scroll");
+        assert_eq!(state.scroll_states["feed"].scroll_y, 0.0,
+            "the outer vertical feed must NOT receive the dx delta");
+    }
+
+    /// Diagonal trackpad swipe — `dx` and `dy` route independently
+    /// to the right scroll on each axis, both axes advance in the
+    /// same `feed_wheel` call.
+    #[test]
+    fn diagonal_wheel_routes_per_axis_independently() {
+        let mut state = UiState::new();
+        seed_scroll_cell(
+            &mut state, "feed",
+            Rect { x: 0.0, y: 0.0, w: 1280.0, h: 800.0 },
+            5000.0, 0.0,
+        );
+        seed_scroll_cell_axis(
+            &mut state, "pager",
+            Rect { x: 440.0, y: 200.0, w: 400.0, h: 400.0 },
+            2000.0, 0.0, ScrollAxis::Horizontal,
+        );
+        state.feed_pointer(pointer(640.0, 400.0, PointerPhase::Move));
+        state.feed_wheel(wheel_xy(120.0, 75.0));
+        assert_eq!(state.scroll_states["pager"].scroll_y, 120.0,
+            "diagonal wheel: dx component goes to the pager");
+        assert_eq!(state.scroll_states["feed"].scroll_y, 75.0,
+            "diagonal wheel: dy component goes to the feed");
     }
 
     #[test]
