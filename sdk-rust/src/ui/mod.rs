@@ -75,6 +75,9 @@ pub mod node;
 pub mod layout;
 pub mod paint;
 pub mod semantics;
+pub mod spring;
+
+pub use spring::{AnimatedValue, Spring};
 
 // Re-export the most-used identifier so callers don't have to write
 // `akiva_sdk::ui::node::NodeId` for every builder return type.

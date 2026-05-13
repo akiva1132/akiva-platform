@@ -59,7 +59,7 @@ pub mod prelude {
     pub use crate::dialog::{DialogFuture, DialogResult};
     pub use crate::intent::{Intent, IntentBuilder};
     pub use crate::result::{ActivityResult, RESULT_CANCELED, RESULT_OK};
-    pub use crate::ui::{CrossAxis, MainAxis, NodeId, Ui, UiState};
+    pub use crate::ui::{AnimatedValue, CrossAxis, MainAxis, NodeId, Spring, Ui, UiState};
     pub use crate::{log_debug, log_error, log_info, log_trace, log_warn};
     // Re-export `async_trait` so app code can write
     // `#[async_trait(?Send)] impl Activity for ...` without adding the
