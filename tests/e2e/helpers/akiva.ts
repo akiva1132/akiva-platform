@@ -386,6 +386,30 @@ export async function launchFeed(page: Page, opts: { timeoutMs?: number } = {}) 
   );
 }
 
+/** Boot Akiva, then click the pixelfeed launcher row. Stage 3
+ *  adds `com.akiva.pixelfeed`; alphabetically that sorts after
+ *  `network` (row 7) and before `test.infinite_loop` (row 9), so
+ *  pixelfeed lands at row 8. The shell filters its own
+ *  `sys.shell` entry out of the launcher list — so the visible
+ *  rows go: articles(0), bouncer(1), calculator(2), carousel(3),
+ *  clipshapes(4), feed(5), hello(6), network(7), pixelfeed(8),
+ *  test.infinite_loop(9), tictactoe(10).
+ *
+ *  First-paint signal: the inspector reports the "feed" scroll
+ *  region (pixelfeed uses the same key as the Stage 2c feed —
+ *  fine because only one feed-like app can be foregrounded at a
+ *  time). */
+export async function launchPixelfeed(page: Page, opts: { timeoutMs?: number } = {}) {
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  await bootAkiva(page, { timeoutMs });
+  await clickShellLauncherRow(page, 8);
+  // First-paint signal: the "Akiva Pixelfeed" title text shows up
+  // in the inspector. We use the title rather than scrollOf("feed")
+  // because the feed scroll key is shared with the prior `feed`
+  // app, so a stale snapshot from a previous test could match.
+  await waitForText(page, "Akiva Pixelfeed", { timeoutMs });
+}
+
 /** Boot Akiva, then click the calculator's launcher row in the Shell.
  *  Returns once the calculator's first `PUBLISH_SEMANTICS` lands —
  *  i.e. when its semantic tree shows up in the inspector and the
