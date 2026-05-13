@@ -56,9 +56,19 @@ struct CardAnim {
     like_count: u32,
     /// Crossfade alpha for the big heart overlay painted over the
     /// photo on like-tap. `1.0` at the moment of tap, springs back
-    /// to `0.0` over a few hundred ms. While > epsilon a Frame at
-    /// HEART_OVERLAY_SIZE is rendered centred on the photo.
+    /// to `0.0` over a few hundred ms.
     heart_overlay_alpha: AnimatedValue<f32>,
+    /// Stage 3.7 — per-card image fade-in alpha. `0.0` until the
+    /// card first enters the viewport, then springs to `1.0` over
+    /// a soft spring (~250 ms). Once `seen` flips true the spring
+    /// has been kicked off; subsequent rebuilds read the same
+    /// `AnimatedValue` and the fade continues / settles naturally.
+    image_alpha: AnimatedValue<f32>,
+    /// `true` after the first `kick_image_fade_in` call. Prevents
+    /// re-firing the spring on every realisation — once the card's
+    /// image has started fading in, scrolling away and back doesn't
+    /// reset the fade.
+    seen: bool,
     /// Per-card double-tap detector. Owns its own armed/streak
     /// state so a tap on one card doesn't chain to the next.
     dt: DoubleTapDetector,
@@ -70,8 +80,20 @@ impl CardAnim {
             liked: false,
             like_count: 0,
             heart_overlay_alpha: AnimatedValue::new(0.0),
+            image_alpha: AnimatedValue::new(0.0),
+            seen: false,
             dt: DoubleTapDetector::new(),
         }
+    }
+
+    /// Idempotent — kick off the image fade-in spring on the first
+    /// call, no-op on subsequent calls. Called from inside the
+    /// LazyColumn realisation closure (only for cards entering or
+    /// staying in the viewport).
+    fn kick_image_fade_in(&mut self) {
+        if self.seen { return; }
+        self.seen = true;
+        self.image_alpha.spring_to(1.0, Spring::MEDIUM);
     }
 
     /// Like-button tap or double-tap-to-like. Toggles `liked` and
@@ -105,6 +127,7 @@ impl CardAnim {
 
     fn tick(&mut self, dt_ms: f32) {
         self.heart_overlay_alpha.tick(dt_ms);
+        self.image_alpha.tick(dt_ms);
     }
 }
 
@@ -210,6 +233,14 @@ impl Activity for PixelfeedMain {
             .size(viewport_w, feed_h)
             .items(|ui, i| {
                 let anim = cards.entry(i).or_insert_with(CardAnim::new);
+                // The realisation closure is called only for cards
+                // entering or staying in the viewport (LazyColumn
+                // virtualises the rest), so it's the natural place
+                // to fire the image fade-in. `kick_image_fade_in`
+                // is idempotent — only the first call per card
+                // starts the spring; subsequent rebuilds let the
+                // spring continue ticking from `on_render`.
+                anim.kick_image_fade_in();
                 post_card(ui, i, anim)
             });
 
@@ -328,16 +359,30 @@ fn build_photo_pager(ui: &mut Ui<'_, '_, '_>, i: u32, anim: &CardAnim) -> NodeId
         .snap(SnapMode::Page)
         .items(move |ui, j| photo_block(ui, i, j));
 
+    // Stage 3.7 — wrap the pager in a Frame whose opacity is driven
+    // by `anim.image_alpha`. Cards just entering the viewport
+    // start at 0.0 and spring to 1.0 over ~250 ms. Once
+    // `image_alpha.is_settled()` at 1.0, `Frame::opacity_av(1.0)`
+    // takes the no-op fast path (no push/pop_opacity emitted).
+    let pager_faded = ui.frame(&[pager])
+        .size(CARD_W, PHOTO_SIZE)
+        .opacity_av(&anim.image_alpha)
+        .build();
+
     // Heart overlay — painted only while the alpha is non-trivially
     // visible. `Frame::opacity_av` reads `anim.heart_overlay_alpha`
     // at build time; when it's <= some threshold we skip the
     // overlay entirely so a settled card pays zero overhead.
+    //
+    // The overlay sits OUTSIDE the image_alpha layer so a freshly-
+    // entered card whose image is still fading in can still show
+    // the like-pop heart at full opacity (the user did just tap).
     let alpha_now = anim.heart_overlay_alpha.value();
     if alpha_now < 0.02 {
-        return pager;
+        return pager_faded;
     }
     let overlay = build_heart_overlay(ui, anim);
-    ui.frame(&[pager, overlay])
+    ui.frame(&[pager_faded, overlay])
         .size(CARD_W, PHOTO_SIZE)
         .build()
 }
