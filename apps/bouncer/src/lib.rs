@@ -204,13 +204,6 @@ impl Activity for BouncerMain {
 
         let mut ui = Ui::new(&mut self.ui, ctx, c);
 
-        // ── Chip clicks ──────────────────────────────────────────
-        // Resolve clicks before the build so the new active preset
-        // is reflected in the paint.
-        if ui.was_clicked(Preset::Bouncy.id()) { self.preset = Preset::Bouncy; }
-        if ui.was_clicked(Preset::Stiff.id())  { self.preset = Preset::Stiff;  }
-        if ui.was_clicked(Preset::Wobbly.id()) { self.preset = Preset::Wobbly; }
-
         // ── Title strip ──────────────────────────────────────────
         let title = ui.text("Akiva Bouncer")
             .size(22.0).color(0xff15172a).build();
@@ -282,6 +275,14 @@ impl Activity for BouncerMain {
             .gap(16.0).padding_trbl(0.0, 0.0, 20.0, 0.0)
             .cross(CrossAxis::Stretch).build();
         ui.present(root);
+
+        // Resolve chip clicks AFTER present — that's where the
+        // hit-test pipeline maps pending Down events against the
+        // freshly-laid-out button rects. The preset change shows
+        // up on the next frame's status line.
+        if ui.was_clicked(Preset::Bouncy.id()) { self.preset = Preset::Bouncy; }
+        if ui.was_clicked(Preset::Stiff.id())  { self.preset = Preset::Stiff;  }
+        if ui.was_clicked(Preset::Wobbly.id()) { self.preset = Preset::Wobbly; }
     }
 }
 

@@ -324,13 +324,13 @@ async function clickShellLauncherRow(page: Page, rowIndex: number) {
 
 /** Boot Akiva, then click the clip-shapes launcher row. Returns once
  *  the demo's first frame has published — gated on the title text
- *  showing up in the inspector. With carousel installed (Stage 2d),
- *  the alphabetical order is articles, calculator, carousel,
- *  clipshapes — so clipshapes sits at row 3. */
+ *  showing up in the inspector. With bouncer + carousel installed
+ *  (Stage 2d + 2e), the alphabetical order is articles, bouncer,
+ *  calculator, carousel, clipshapes — so clipshapes sits at row 4. */
 export async function launchClipShapes(page: Page, opts: { timeoutMs?: number } = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   await bootAkiva(page, { timeoutMs });
-  await clickShellLauncherRow(page, 3);
+  await clickShellLauncherRow(page, 4);
   await waitForText(page, "Clip Shapes", { timeoutMs });
 }
 
@@ -343,14 +343,26 @@ export async function launchArticles(page: Page, opts: { timeoutMs?: number } = 
   await waitForText(page, "Articles", { timeoutMs });
 }
 
-/** Boot Akiva, then click the carousel launcher row. `com.akiva.carousel`
- *  sorts between `com.akiva.calculator` (row 1) and `com.akiva.clipshapes`
- *  (row 3), so it lands at row 2. First-paint signal is the inspector
- *  reporting the "carousel" scroll region with axis=horizontal. */
+/** Boot Akiva, then click the bouncer launcher row. `com.akiva.bouncer`
+ *  sorts between `com.akiva.articles` (row 0) and `com.akiva.calculator`
+ *  (row 2), so it lands at row 1. First-paint signal is the title
+ *  text "Akiva Bouncer" appearing in the inspector. */
+export async function launchBouncer(page: Page, opts: { timeoutMs?: number } = {}) {
+  const timeoutMs = opts.timeoutMs ?? 20_000;
+  await bootAkiva(page, { timeoutMs });
+  await clickShellLauncherRow(page, 1);
+  await waitForText(page, "Akiva Bouncer", { timeoutMs });
+}
+
+/** Boot Akiva, then click the carousel launcher row. With bouncer
+ *  installed (Stage 2e) the alphabetical order is articles, bouncer,
+ *  calculator, carousel — so carousel sits at row 3. First-paint
+ *  signal is the inspector reporting the "carousel" scroll region
+ *  with axis=horizontal. */
 export async function launchCarousel(page: Page, opts: { timeoutMs?: number } = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   await bootAkiva(page, { timeoutMs });
-  await clickShellLauncherRow(page, 2);
+  await clickShellLauncherRow(page, 3);
   await page.waitForFunction(
     () => (window as any).__akiva?.scrollOf("carousel") !== null,
     null,
@@ -358,14 +370,15 @@ export async function launchCarousel(page: Page, opts: { timeoutMs?: number } = 
   );
 }
 
-/** Boot Akiva, then click the feed launcher row. With carousel
- *  installed the alphabetical order is articles, calculator,
- *  carousel, clipshapes, feed — so feed sits at row 4. First-paint
- *  signal is the inspector reporting the "feed" scroll region. */
+/** Boot Akiva, then click the feed launcher row. With bouncer +
+ *  carousel installed the alphabetical order is articles, bouncer,
+ *  calculator, carousel, clipshapes, feed — so feed sits at row 5.
+ *  First-paint signal is the inspector reporting the "feed" scroll
+ *  region. */
 export async function launchFeed(page: Page, opts: { timeoutMs?: number } = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   await bootAkiva(page, { timeoutMs });
-  await clickShellLauncherRow(page, 4);
+  await clickShellLauncherRow(page, 5);
   await page.waitForFunction(
     () => (window as any).__akiva?.scrollOf("feed") !== null,
     null,
@@ -382,15 +395,15 @@ export async function launchFeed(page: Page, opts: { timeoutMs?: number } = {}) 
  *  primitives, not `Ui` buttons, so we can't query them through the
  *  inspector. Click coordinates are derived from the constants in
  *  `apps/shell/src/lib.rs` (`LIST_TOP=120`, `ROW_HEIGHT=56`,
- *  `ROW_GAP=8`, `ROW_PAD_X=24`). Apps are sorted by id; calculator
- *  (`com.akiva.calculator`) is row 0. When the Shell migrates to
- *  the SDK widget toolkit, this helper switches to a real
- *  `tapRole(page, "button", "Calculator")` and the coordinate magic
- *  disappears. */
+ *  `ROW_GAP=8`, `ROW_PAD_X=24`). Apps are sorted by id; with
+ *  bouncer installed (Stage 2e) calculator's row is 2. When the
+ *  Shell migrates to the SDK widget toolkit, this helper switches
+ *  to a real `tapRole(page, "button", "Calculator")` and the
+ *  coordinate magic disappears. */
 export async function launchCalculator(page: Page, opts: { timeoutMs?: number } = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   await bootAkiva(page, { timeoutMs });
-  await clickShellLauncherRow(page, 1);   // articles, calculator
+  await clickShellLauncherRow(page, 2);   // articles, bouncer, calculator
   // First-paint signal — d2 is a digit button the calculator publishes
   // on its very first frame. The inspector applies the framework's
   // composite transform (translate / scale / opacity) to every rect
