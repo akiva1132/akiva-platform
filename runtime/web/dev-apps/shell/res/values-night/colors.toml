@@ -1,0 +1,18 @@
+# Akiva Shell palette — dark theme (values-night/ overlay).
+#
+# Stone 11.6.9 #3. Activated when `DeviceConfig::night` is true (i.e.
+# the OS is in dark mode and the browser reports
+# `prefers-color-scheme: dark`). Pre-Stone-11.6.9 this *was* the
+# Shell's only palette — the hardcoded `const u32` block in
+# src/lib.rs. The qualifier system moved it under the dark-mode
+# overlay so light-mode users see a fresh light theme.
+
+bg              = "#ff101418"
+fg              = "#ffe0e0e0"
+fg_dim          = "#ff8a94a8"
+
+button_bg       = "#ff1f2a3a"
+button_bg_hover = "#ff2a3a50"
+button_bg_press = "#ff3a5070"
+button_fg       = "#fff0f4fa"
+button_sub      = "#ff9aa8bc"

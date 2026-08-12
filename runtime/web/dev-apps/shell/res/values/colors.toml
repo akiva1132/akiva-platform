@@ -1,0 +1,24 @@
+# Akiva Shell palette — light theme (default).
+#
+# Stone 11.6.9 #3 moved the Shell from hardcoded `const u32` colours
+# to `@color/` lookups so dark mode auto-switching works. Light is
+# the default; the dark variant lives in res/values-night/colors.toml
+# and overrides each entry when the device is in dark mode.
+
+# Window background — everything else paints over this.
+bg              = "#fff7f8fb"
+# Header text and any "primary" foreground that wants the strongest
+# contrast against `bg`.
+fg              = "#ff15172a"
+# Subdued labels: app count subtitle, empty-state hint, "press escape"
+# hint at the bottom edge.
+fg_dim          = "#ff6c7686"
+
+# Launcher row backgrounds, in the three pointer states.
+button_bg       = "#ffe8edf3"
+button_bg_hover = "#ffd9e0ec"
+button_bg_press = "#ffc4cfdf"
+# Row foreground (app display name).
+button_fg       = "#ff15172a"
+# Secondary row text (package id under the name).
+button_sub      = "#ff5e6878"
