@@ -4,6 +4,35 @@
 
 > **לא web framework. לא מחולל אתרים. לא Flutter.** זו מערכת הפעלה שלמה שלוקחת את הדפדפן כ-kernel (כמו שאנדרואיד לוקחת את Linux kernel) ובונה מעליו אקוסיסטם אפליקציות native.
 
+[English](README.md)
+
+![ה-shell של Akiva עם רשימת האפליקציות המותקנות](docs/screenshots/shell.png)
+
+| מחשבון | Bouncer (פיזיקת קפיצים) |
+|---|---|
+| ![אפליקציית המחשבון](docs/screenshots/calculator.png) | ![אפליקציית Bouncer](docs/screenshots/bouncer.png) |
+
+צילומי מסך אמיתיים מ-`akiva run`, עם Canvas2D, ב-Chrome headless.
+
+## למה זה מעניין
+
+- **המודל של אנדרואיד, בנוי מחדש על הווב.** Activities עם lifecycle אמיתי ו-task stack, מצב שמור ששורד רענון, resources עם qualifiers (`-night`, `-he`, `-land`), ו-Intents שמנתבים בין אפליקציות.
+- **בידוד תהליכים אמיתי בתוך טאב.** כל אפליקציה רצה ב-Dedicated Worker משלה עם watchdog. `panic!` או `loop {}` אינסופי מפילים רק את האפליקציה שגרמה להם.
+- **אפליקציות לא נוגעות ב-DOM.** אפליקציה שולחת paint ops דרך ABI עם גרסה, וה-kernel מרכיב ומצייר אותם ב-Canvas2D או ב-WebGPU.
+- **מערכת אחת למשתמש, לא לטאב.** טאבים הם מסכים. leader נבחר עם Web Locks, וכשהוא נסגר טאב אחר ממשיך את המערכת שרצה.
+- **toolchain אמיתי.** CLI בשם `akiva` שיוצר, בונה, אורז ומגיש אפליקציות, ו-SDK ב-Rust עם `Activity` אסינכרוני, שפת layout דקלרטיבית (AKML) ו-builder בשם `Ui`.
+
+## הרצה מהירה
+
+```bash
+git clone https://github.com/akiva1132/akiva-platform
+cd akiva-platform
+cargo run --release -p akiva -- run     # בונה את ה-kernel ואת כל האפליקציות ומגיש
+# פותחים http://127.0.0.1:4173
+```
+
+ה-toolchain המוצמד ב-`rust-toolchain.toml` מותקן לבד דרך `rustup`, כולל `wasm32-unknown-unknown`.
+
 ---
 
 ## מסמכי תכנון
@@ -128,3 +157,9 @@ akiva-platform/
 3. **Single OS instance לכל משתמש.** מספר tabs = מספר displays, לא מספר מערכות. (ראה [ARCHITECTURE.md §9](ARCHITECTURE.md#9-single-instance-architecture-tabs--displays-not-devices))
 4. **בלי DOM.** רנדור ישיר על canvas עם layout engine אמיתי. מערכת resources, מערכת styles.
 5. **AOSP-inspired.** לוקחים את המושגים שהוכחו 20 שנה באנדרואיד ומיישמים אותם מחדש ב-Rust/wasm.
+
+---
+
+## רישיון
+
+[MIT](LICENSE)

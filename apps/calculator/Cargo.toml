@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["Akiva Team"]
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "First real Akiva app: a pocket calculator built on the Phase 3a widget toolkit."
 
 [lib]

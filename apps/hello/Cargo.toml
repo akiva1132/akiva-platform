@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["Akiva Team"]
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "First-party smoke-test app: draws a frame counter and reacts to the pointer."
 
 # The workspace excludes `apps/`, so this is a standalone crate. It still

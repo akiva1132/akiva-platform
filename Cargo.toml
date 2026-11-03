@@ -17,8 +17,8 @@ version = "0.0.1"
 edition = "2021"
 rust-version = "1.82"
 authors = ["Akiva Team"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/akiva-platform/akiva"
+license = "MIT"
+repository = "https://github.com/akiva1132/akiva-platform"
 
 [workspace.dependencies]
 akiva-framework = { path = "framework" }
