@@ -6,6 +6,7 @@ version_code = 1
 min_abi_version = "0.13.0"
 authors = ["Akiva Team"]
 description = "Page-snap carousel — LazyRow + SnapMode::Page, like a HorizontalPager."
+icon = "@drawable/icon"
 category = "samples"
 
 [runtime]

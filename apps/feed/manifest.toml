@@ -6,6 +6,7 @@ version_code = 1
 min_abi_version = "0.13.0"
 authors = ["Akiva Team"]
 description = "Virtualised feed — Scroll + LazyColumn + Akiva-owned fling, like a RecyclerView."
+icon = "@drawable/icon"
 category = "samples"
 
 [runtime]

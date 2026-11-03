@@ -6,9 +6,9 @@
 
 [English](README.md)
 
-| מחשבון | Bouncer (פיזיקת קפיצים) |
-|---|---|
-| ![אפליקציית המחשבון](docs/screenshots/calculator.png) | ![אפליקציית Bouncer](docs/screenshots/bouncer.png) |
+| מסך הבית | מחשבון | Bouncer (פיזיקת קפיצים) |
+|---|---|---|
+| ![מסך הבית: ה-Shell עם כל האפליקציות המותקנות](docs/screenshots/home.png) | ![אפליקציית המחשבון](docs/screenshots/calculator.png) | ![אפליקציית Bouncer](docs/screenshots/bouncer.png) |
 
 צילומי מסך אמיתיים מ-`akiva run`, עם Canvas2D, ב-Chrome headless.
 
@@ -77,3 +77,6 @@ cargo run --release -p akiva -- run     # בונה את ה-kernel ואת כל ה
 ## רישיון
 
 [MIT](LICENSE)
+
+אייקוני האפליקציות ב-`apps/*/res/drawable/icon.png` מבוססים על
+[Material Symbols](https://fonts.google.com/icons) (רישיון Apache 2.0).

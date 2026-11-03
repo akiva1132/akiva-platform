@@ -6,6 +6,7 @@ version_code = 1
 min_abi_version = "0.1.0"
 authors = ["Akiva Team"]
 description = "Stone 11.5e test app — press the button to hang the worker. Watchdog should kill it within ~1.5s and pop back to Shell."
+icon = "@drawable/icon"
 category = "utilities"
 
 [runtime]

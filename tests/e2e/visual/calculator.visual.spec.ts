@@ -31,7 +31,7 @@ test("calculator: idle state matches golden", async ({ page }) => {
   // — drawables (the @drawable/icon PNG → ImageBitmap path) decode
   // asynchronously off-thread and may land a few frames later. Without
   // this wait the screenshot occasionally captures the magenta
-  // missing-drawable placeholder instead of the orange icon.
+  // missing-drawable placeholder instead of the app icon.
   await waitForStableLayout(page);
   await expect(page).toHaveScreenshot("calc-idle.png");
 });
