@@ -3,6 +3,7 @@ name = "akiva-sdk"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Akiva SDK for Rust apps. Provides the #[akiva::app] macro, Activity trait, Resource helpers, Intent builders, and safe wrappers over the WIT bindings generated from wit/akiva.wit."

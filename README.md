@@ -8,8 +8,6 @@ framework: every pixel is laid out and painted by the platform itself.
 
 [עברית](README.he.md)
 
-![The Akiva shell listing the installed apps](docs/screenshots/shell.png)
-
 | Calculator | Bouncer (spring physics) |
 |---|---|
 | ![Calculator app](docs/screenshots/calculator.png) | ![Bouncer app](docs/screenshots/bouncer.png) |
@@ -22,8 +20,8 @@ Real screenshots from `akiva run`, Canvas2D backend, headless Chrome.
 
 - **The Android model, rebuilt on the web.** Activities with a real
   lifecycle state machine and task stack, launch modes, saved state
-  that survives a reload, resources with `-night` / `-he` / `-land`
-  qualifiers, and Intents that route between apps. The browser plays
+  that survives a reload, resources with qualifiers (`-night` today,
+  `-he` and `-land` planned), and Intents that route between apps. The browser plays
   the role the Linux kernel plays for Android.
 - **True process isolation in a tab.** Each app runs in its own
   Dedicated Worker with a watchdog. A `panic!` or an infinite `loop {}`
@@ -34,8 +32,8 @@ Real screenshots from `akiva run`, Canvas2D backend, headless Chrome.
   backend. The same app could run on a native shell later without a
   rewrite.
 - **One OS per user, not per tab.** Tabs are displays. A leader is
-  elected with Web Locks, and if the leader tab closes another one
-  takes over the running system.
+  elected with Web Locks; if the leader tab closes, another tab boots a
+  fresh kernel and restores the task stack and saved state from OPFS.
 - **Capabilities behind permissions.** WebSocket, WebTransport,
   notifications, clipboard, vibration and geolocation are exposed to
   apps only when declared in the manifest.
@@ -49,7 +47,7 @@ Real screenshots from `akiva run`, Canvas2D backend, headless Chrome.
  ┌───────────────────────────── browser tab ─────────────────────────────┐
  │  tab.js: canvas, input, leader election (Web Locks + BroadcastChannel) │
  └───────────────────────────────────┬───────────────────────────────────┘
-                                     │ events in, paint ops out
+                                     │ input events + OffscreenCanvas (transferred)
  ┌───────────────────────────────────▼───────────────────────────────────┐
  │  kernel.wasm (Dedicated Worker)                                        │
  │    framework: ActivityManager · PackageManager · IntentRouter          │
@@ -87,9 +85,7 @@ Click an app in the shell to launch it; press Escape to return.
 ## Running
 
 The `akiva` CLI lives in [`cli/`](cli/) and is the single entry
-point for every dev-loop task. Everything below assumes you have
-the `wasm32-unknown-unknown` target installed
-(`rustup target add wasm32-unknown-unknown`).
+point for every dev-loop task.
 
 ### One-shot dev loop
 

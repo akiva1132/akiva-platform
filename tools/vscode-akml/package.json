@@ -4,7 +4,7 @@
   "description": "Syntax highlighting and editor support for Akiva Markup Language (.akml)",
   "version": "0.0.1",
   "publisher": "akiva-platform",
-  "license": "MIT OR Apache-2.0",
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },

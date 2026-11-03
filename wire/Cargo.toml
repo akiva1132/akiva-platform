@@ -3,6 +3,7 @@ name = "akiva-wire"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+repository.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Shared wire-format codecs for Akiva — single source of truth for byte layouts crossing the kernel/SDK ABI."
