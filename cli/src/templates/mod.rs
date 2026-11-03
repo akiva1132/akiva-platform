@@ -106,7 +106,7 @@ name = "{crate_name}"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "{display} — {body}"
 
 # The workspace excludes apps/, so this is a standalone crate. It still

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["Akiva Team"]
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "System Shell as a regular wasm app — home screen + launcher (Stone 11.0b)."
 
 # Excluded from the workspace alongside the other apps. Will be loaded
