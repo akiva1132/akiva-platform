@@ -8,6 +8,8 @@ framework: every pixel is laid out and painted by the platform itself.
 
 [עברית](README.he.md)
 
+<img src="docs/screenshots/home.png" alt="Home screen: the Shell launcher with every installed app" width="420">
+
 | Calculator | Bouncer (spring physics) |
 |---|---|
 | ![Calculator app](docs/screenshots/calculator.png) | ![Bouncer app](docs/screenshots/bouncer.png) |
@@ -345,3 +347,7 @@ See [ROADMAP.md](ROADMAP.md) for the full phase-by-phase status.
 ## License
 
 [MIT](LICENSE)
+
+The launcher icons in `apps/*/res/drawable/icon.png` are drawn from
+[Material Symbols](https://fonts.google.com/icons) (Apache License 2.0);
+`node tools/app-icons/render.mjs` regenerates them.

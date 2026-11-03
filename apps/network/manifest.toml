@@ -6,6 +6,7 @@ version_code = 1
 min_abi_version = "0.12.0"
 authors = ["Akiva Team"]
 description = "Smoke-test for the NETWORK capability — runs an HTTPS request and a WebSocket echo round-trip."
+icon = "@drawable/icon"
 category = "utilities"
 
 [runtime]

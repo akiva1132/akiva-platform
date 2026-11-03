@@ -6,6 +6,7 @@ version_code = 1
 min_abi_version = "0.1.0"
 authors = ["Akiva Team"]
 description = "Classic 3×3 tic-tac-toe. Akiva's second app, proving the widget toolkit works beyond the calculator."
+icon = "@drawable/icon"
 category = "games"
 
 [runtime]

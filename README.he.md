@@ -6,6 +6,8 @@
 
 [English](README.md)
 
+<img src="docs/screenshots/home.png" alt="מסך הבית: ה-Shell עם כל האפליקציות המותקנות" width="420">
+
 | מחשבון | Bouncer (פיזיקת קפיצים) |
 |---|---|
 | ![אפליקציית המחשבון](docs/screenshots/calculator.png) | ![אפליקציית Bouncer](docs/screenshots/bouncer.png) |
@@ -77,3 +79,7 @@ cargo run --release -p akiva -- run     # בונה את ה-kernel ואת כל ה
 ## רישיון
 
 [MIT](LICENSE)
+
+אייקוני האפליקציות ב-`apps/*/res/drawable/icon.png` מבוססים על
+[Material Symbols](https://fonts.google.com/icons) (רישיון Apache 2.0).
+`node tools/app-icons/render.mjs` מייצר אותם מחדש.

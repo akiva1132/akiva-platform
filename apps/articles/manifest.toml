@@ -6,6 +6,7 @@ version_code = 1
 min_abi_version = "0.1.0"
 authors = ["Akiva Team"]
 description = "Showcases multi-line text — single-line vs wrap vs max_lines + ellipsis."
+icon = "@drawable/icon"
 category = "samples"
 
 [runtime]

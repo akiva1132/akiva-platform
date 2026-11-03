@@ -6,6 +6,7 @@ version_code = 1
 min_abi_version = "0.1.0"
 authors = ["Akiva Team"]
 description = "Showcases the SDK's rounded-clip primitive: circular avatars, pills, cards."
+icon = "@drawable/icon"
 category = "samples"
 
 [runtime]
