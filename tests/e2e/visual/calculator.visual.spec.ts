@@ -22,6 +22,7 @@
 // then commit the new PNGs alongside the source change.
 
 import { test, expect } from "@playwright/test";
+import { PNG } from "pngjs";
 import { launchCalculator, tapId, tapRole, waitForText, waitForStableLayout } from "../helpers/akiva";
 
 test("calculator: idle state matches golden", async ({ page }) => {
@@ -45,4 +46,21 @@ test("calculator: 7 × 8 = 56 result frame matches golden", async ({ page }) => 
   await waitForText(page, "56");
   await waitForStableLayout(page);
   await expect(page).toHaveScreenshot("calc-7x8-equals-56.png");
+});
+
+// The renderer's drawable cache is shared by every package. When each
+// package numbered its drawables from 1, every app's `@drawable/icon`
+// was id 1 and the calculator painted whichever app's icon decoded
+// last (Loop Test's red tile). The golden alone does not catch that:
+// a 24x24 tile is under `maxDiffPixels`. So sample the tile's colour
+// directly: the calculator's own icon is the amber one.
+test("calculator: header shows the calculator's own icon", async ({ page }) => {
+  await launchCalculator(page);
+  await waitForStableLayout(page);
+  const png = PNG.sync.read(await page.screenshot({ clip: { x: 1170, y: 50, width: 4, height: 4 } }));
+  const [r, g, b] = [png.data[0], png.data[1], png.data[2]];
+  // apps/calculator/res/drawable/icon.png fill: rgb(167, 126, 68).
+  expect(Math.abs(r - 167)).toBeLessThan(12);
+  expect(Math.abs(g - 126)).toBeLessThan(12);
+  expect(Math.abs(b - 68)).toBeLessThan(12);
 });

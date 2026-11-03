@@ -31,6 +31,9 @@ import { WATCHDOG, effectiveWatchdog } from "./config.js";
  */
 const HOME_PACKAGE_ID = "sys.shell";
 
+/** Size of each package's block of drawable ids (see `_buildDrawableIndex`). */
+const DRAWABLE_IDS_PER_PACKAGE = 65536;
+
 export class AppRegistry {
   /**
    * @param {object} deps
@@ -58,6 +61,8 @@ export class AppRegistry {
     this._backend = null;
     /** @type {Array<{id: number, bitmap: ImageBitmap}>} */
     this._pendingDrawableRegistrations = [];
+    /** packageId → first id of its drawable block (see `_buildDrawableIndex`). */
+    this._drawableIdBase = new Map();
 
     /** @type {Map<number, {packageId: string, class: string}>} */
     this._slots = new Map();
@@ -1250,9 +1255,24 @@ export class AppRegistry {
       }
     }
     names.sort();  // deterministic id assignment
+    // The renderer's drawable cache is one flat map shared by every
+    // package, so ids must not collide across packages: with a bare
+    // 1..n per package, every app's `@drawable/icon` was id 1 and the
+    // last package to finish decoding painted its icon into everyone
+    // else's. Each package gets its own block of DRAWABLE_IDS_PER_PACKAGE
+    // ids, allocated once and kept for the registry's lifetime, so a
+    // re-load still yields the same id for the same name.
+    let base = this._drawableIdBase.get(packageId);
+    if (base === undefined) {
+      base = this._drawableIdBase.size * DRAWABLE_IDS_PER_PACKAGE;
+      this._drawableIdBase.set(packageId, base);
+    }
     const out = {};
-    let nextId = 1;  // 0 is the missing sentinel
-    for (const name of names) out[name] = nextId++;
+    let nextId = base + 1;  // 0 is the missing sentinel
+    if (names.length >= DRAWABLE_IDS_PER_PACKAGE) {
+      this._log("warn", `[${packageId}] ${names.length} drawables; only the first ${DRAWABLE_IDS_PER_PACKAGE - 1} get ids`);
+    }
+    for (const name of names.slice(0, DRAWABLE_IDS_PER_PACKAGE - 1)) out[name] = nextId++;
     return out;
   }
 

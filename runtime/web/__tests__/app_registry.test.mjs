@@ -1486,8 +1486,29 @@ describe("@drawable/ resource index — Stone 13.0prep C", () => {
     const idx1 = registry._buildDrawableIndex(PACKAGE_ID);
     const idx2 = registry._buildDrawableIndex(PACKAGE_ID);
     expect(idx1).toEqual(idx2);
-    // Alphabetical sort → avatar=1, banner=2, icon=3
+    // Alphabetical sort → avatar, banner, icon in consecutive ids
+    // (the first package asked for gets the block starting at 1).
     expect(idx1).toEqual({ avatar: 1, banner: 2, icon: 3 });
+  });
+
+  it("gives each package its own ids, so two apps' `icon` never share a cache slot", () => {
+    // The renderer's drawable cache is flat across packages. With
+    // per-package numbering from 1, every app's `icon` was id 1 and the
+    // last decode won: the calculator painted Loop Test's icon.
+    const { registry, storage } = makeRegistry();
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    storage.set(`packages/com.a/res/drawable/icon.png`, png);
+    storage.set(`packages/com.b/res/drawable/icon.png`, png);
+    storage.set(`packages/com.b/res/drawable/banner.png`, png);
+
+    const a = registry._buildDrawableIndex("com.a");
+    const b = registry._buildDrawableIndex("com.b");
+    const all = [...Object.values(a), ...Object.values(b)];
+    expect(new Set(all).size).toBe(all.length);
+    expect(all.every((id) => id > 0)).toBe(true);
+    // Stable on re-load, regardless of the order packages are asked for.
+    expect(registry._buildDrawableIndex("com.b")).toEqual(b);
+    expect(registry._buildDrawableIndex("com.a")).toEqual(a);
   });
 
   it("ignores non-PNG files in the drawable directory", () => {

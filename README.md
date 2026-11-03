@@ -8,9 +8,11 @@ framework: every pixel is laid out and painted by the platform itself.
 
 [עברית](README.he.md)
 
-| Home screen | Calculator | Bouncer (spring physics) |
-|---|---|---|
-| ![Home screen: the Shell launcher with every installed app](docs/screenshots/home.png) | ![Calculator app](docs/screenshots/calculator.png) | ![Bouncer app](docs/screenshots/bouncer.png) |
+<img src="docs/screenshots/home.png" alt="Home screen: the Shell launcher with every installed app" width="420">
+
+| Calculator | Bouncer (spring physics) |
+|---|---|
+| ![Calculator app](docs/screenshots/calculator.png) | ![Bouncer app](docs/screenshots/bouncer.png) |
 
 Real screenshots from `akiva run`, Canvas2D backend, headless Chrome.
 
@@ -347,4 +349,5 @@ See [ROADMAP.md](ROADMAP.md) for the full phase-by-phase status.
 [MIT](LICENSE)
 
 The launcher icons in `apps/*/res/drawable/icon.png` are drawn from
-[Material Symbols](https://fonts.google.com/icons) (Apache License 2.0).
+[Material Symbols](https://fonts.google.com/icons) (Apache License 2.0);
+`node tools/app-icons/render.mjs` regenerates them.
