@@ -17,7 +17,7 @@
 - **המודל של אנדרואיד, בנוי מחדש על הווב.** Activities עם lifecycle אמיתי ו-task stack, מצב שמור ששורד רענון, resources עם qualifiers (`-night` היום, `-he` ו-`-land` מתוכננים), ו-Intents שמנתבים בין אפליקציות.
 - **בידוד תהליכים אמיתי בתוך טאב.** כל אפליקציה רצה ב-Dedicated Worker משלה עם watchdog. `panic!` או `loop {}` אינסופי מפילים רק את האפליקציה שגרמה להם.
 - **אפליקציות לא נוגעות ב-DOM.** אפליקציה שולחת paint ops דרך ABI עם גרסה, וה-kernel מרכיב ומצייר אותם ב-Canvas2D או ב-WebGPU.
-- **מערכת אחת למשתמש, לא לטאב.** טאבים הם מסכים. leader נבחר עם Web Locks. כשהוא נסגר, טאב אחר מעלה kernel חדש ומשחזר מ-OPFS את ה-task stack ואת המצב השמור.
+- **מערכת אחת למשתמש, לא לטאב.** טאבים הם מסכים. leader נבחר עם Web Locks. כשהוא נסגר, טאב אחר מעלה kernel חדש, והאפליקציות מקבלות בחזרה מ-OPFS את המצב השמור שלהן.
 - **toolchain אמיתי.** CLI בשם `akiva` שיוצר, בונה, אורז ומגיש אפליקציות, ו-SDK ב-Rust עם `Activity` אסינכרוני, שפת layout דקלרטיבית (AKML) ו-builder בשם `Ui`.
 
 ## הרצה מהירה
@@ -60,7 +60,7 @@ cargo run --release -p akiva -- run     # בונה את ה-kernel ואת כל ה
 
 ## מבנה הפרויקט ומצב נוכחי
 
-המבנה העדכני של התיקיות והסטטוס (Phase 14 סגור, ABI ‏`0.12.0`) מתוחזקים באנגלית: [Project layout](README.md#project-layout) ו-[Status](README.md#status). התוכנית המלאה שלב אחר שלב ב-[ROADMAP.he.md](ROADMAP.he.md).
+המבנה העדכני של התיקיות והסטטוס (Phase 14 סגור) מתוחזקים באנגלית: [Project layout](README.md#project-layout) ו-[Status](README.md#status). התוכנית המלאה שלב אחר שלב ב-[ROADMAP.he.md](ROADMAP.he.md).
 
 ---
 

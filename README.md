@@ -33,7 +33,7 @@ Real screenshots from `akiva run`, Canvas2D backend, headless Chrome.
   rewrite.
 - **One OS per user, not per tab.** Tabs are displays. A leader is
   elected with Web Locks; if the leader tab closes, another tab boots a
-  fresh kernel and restores the task stack and saved state from OPFS.
+  fresh kernel, and apps get their saved state back from OPFS.
 - **Capabilities behind permissions.** WebSocket, WebTransport,
   notifications, clipboard, vibration and geolocation are exposed to
   apps only when declared in the manifest.
